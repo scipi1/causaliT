@@ -1,0 +1,264 @@
+version: "proT_5.5"
+  # date: 21/08/2025
+  # 5.5 added training options
+  # 5.4 entropy regularization
+  # 5.3 added embedding for given val
+  # 5.2 min_pos for half IST prediction
+  # 5.1 separate encoder decoder causal mask
+  # 5.0 optuna and heavily restructured
+  # 4.5.1 added maximum dataset slicing
+  # 4.5.0 added causal mask
+  # 4.4.0 added optimizers with sparse gradients
+  # 4.3.0 added warmup steps
+  # 4.2.0 added embeddings lr  
+  # 4.1.0 added multivariate index
+
+model:
+  
+  model_object: "proT" # ["proT", "LSTM", "GRU", "TCN", "MLP"]
+
+  embed_dim:
+    d_model_set         : null # for spacetimeformer and summation embeddings
+    d_base_emb          : null # used for sweep experiments
+    d_base_model        : null # used for sweep experiments
+    enc_val_emb_hidden  : 50 #${embed_dim.d_base_emb}
+    enc_var_emb_hidden  : 50 #${embed_dim.d_base_emb}
+    enc_pos_emb_hidden  : 70 #${embed_dim.d_base_emb}
+    enc_time_emb_hidden : 90 #${embed_dim.d_base_emb}
+    dec_val_emb_hidden  : 130 #${embed_dim.d_base_emb}
+    dec_var_emb_hidden  : 100 #${embed_dim.d_base_emb}
+    dec_pos_emb_hidden  : 170 #${embed_dim.d_base_emb}
+    dec_val_given_emb_hidden : 150 #${embed_dim.d_base_emb}
+    dec_time_emb_hidden : 50
+  
+  kwargs:
+    model : ${model.model_object}
+    comps_embed_enc: "concat" # options: 'summation', 'concat', 'spatiotemporal'
+    comps_embed_dec: "concat"        
+    
+    ds_embed_enc:
+      setting:
+        sparse_grad: False # it will automatically be set depending on the optimization
+
+      modules:
+        - idx: ${data.features.X.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs: 
+            num_embeddings: 404 
+            embedding_dim : ${model.embed_dim.enc_var_emb_hidden}
+            padding_idx : 0
+            sparse: ${model.kwargs.ds_embed_enc.setting.sparse_grad}
+            max_norm : 1
+
+        - idx: ${data.features.X.position}
+          embed: "nn_embedding"
+          label: "position"
+          kwargs: 
+            num_embeddings: 26
+            padding_idx : 0
+            embedding_dim : ${model.embed_dim.enc_pos_emb_hidden}
+            sparse: ${model.kwargs.ds_embed_enc.setting.sparse_grad}
+            max_norm : 1
+
+        - idx: ${data.features.X.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1 
+            embedding_dim : ${model.embed_dim.enc_val_emb_hidden}
+
+        - idx: ${data.features.X.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+        - idx: ${data.features.X.order}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+
+
+        - idx: ${data.features.X.time}
+          embed: "time2vec"
+          label: "time"
+          kwargs:
+            input_dim: 5 
+            embed_dim: ${model.embed_dim.enc_time_emb_hidden}
+
+    ds_embed_dec:
+      setting:
+        sparse_grad: False
+
+      modules:
+        - idx: ${data.features.Y.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs: 
+            num_embeddings: 3
+            embedding_dim : ${model.embed_dim.dec_var_emb_hidden}
+
+        - idx: ${data.features.Y.position}
+          embed: "sinusoidal"
+          label: "position"
+          kwargs: 
+            max_pos: 800 
+            embed_dim : ${model.embed_dim.dec_pos_emb_hidden}
+
+
+        - idx: ${data.features.Y.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1 
+            embedding_dim : ${model.embed_dim.dec_val_emb_hidden}
+
+        - idx: ${data.features.Y.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+        - idx: ${data.features.Y.value}
+          embed: "mask_given"
+          label: "value_given"
+          kwargs: {}
+
+        - idx: ${data.features.Y.position}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+
+        - idx: ${data.features.Y.time}
+          embed: "time2vec"
+          label: "time"
+          kwargs:
+            input_dim: 5 
+            embed_dim: ${model.embed_dim.dec_time_emb_hidden}
+
+        - idx: ${data.features.Y.val_given}
+          embed: "nn_embedding"
+          label: "online_pos_mask"
+          kwargs:
+            num_embeddings: 3
+            embedding_dim : ${model.embed_dim.dec_val_given_emb_hidden}
+
+    # attention
+    enc_attention_type        : "ScaledDotProduct"
+    dec_self_attention_type   : "ScaledDotProduct"
+    dec_cross_attention_type  : "ScaledDotProduct"
+    enc_mask_type             : "Uniform"
+    dec_self_mask_type        : "Uniform"
+    dec_cross_mask_type       : "Uniform"
+    n_heads                   : 2
+    causal_mask               : False
+    enc_causal_mask           : True
+    dec_causal_mask           : True
+    
+    # options
+    e_layers : 1
+    d_layers : 1
+    activation : "gelu" # ["relu", "gelu"]
+    norm : "batch"
+    use_final_norm : True
+    device : "cuda"
+    out_dim : 2
+    d_ff : 400
+    d_model_enc: null # calculated
+    d_model_dec: null
+    d_qk : 100
+
+    # dropout
+    dropout_emb : 0.2
+    dropout_data : 0.2
+    dropout_attn_out : 0.0
+    dropout_ff : 0.0
+    enc_dropout_qkv : 0.1
+    enc_attention_dropout : 0.0
+    dec_self_dropout_qkv : 0.1
+    dec_self_attention_dropout : 0.0
+    dec_cross_dropout_qkv : 0.0
+    dec_cross_attention_dropout : 0.0
+
+
+training:
+  
+  # optimization options (only the embeddings)
+  # Mode  |Phase  | Model Optimizer | Enc. Emb. Opt. 
+  #-------|-------|-----------------|---------------
+  # 1     | NA    | Adam(base_lr)   | Adam(base_lr)
+  # 2     | NA    | Adam(base_lr)   | Adam(emb_lr)
+  # 3     | NA    | Adam(base_lr)   | SparseAdam(emb_lr)
+  # 4     | NA    | Adam(base_lr)   | Adagrad(emb_lr)
+  #-------|-------|-----------------|---------------- 
+  # 5     | p1    | SGD(sched.1)    | Adagrad(emb_start_lr)
+  #       | p2    | Adam(sched.2)   | SparseAdam(emb_lr)
+  #---------------------------------------------------
+  # 6     | p1    | SGD(sched.1)    | SparseAdam(emb_start_lr)
+  #       | p2    | Adam(sched.2)   | SparseAdam(emb_lr)
+  #---------------------------------------------------
+  # 7     | p1    | SGD(sched.1)    | Adagrad(emb_start_lr)
+  #       | p2    | Adam(sched.2)   | Adagrad(emb_lr)
+  # ----------------------------------------------------------------
+  optimization  : 1
+  # ----------------------------------------------------------------
+  base_lr       : 0.001
+  emb_lr        : 0.01
+  emb_start_lr  : 0.1
+  warmup_epochs : 1000 # deprecated
+  switch_epoch  : 500
+  switch_step   : 2000  # model_scheduler_p1 (set to 4* switch_epochs)
+  warmup_steps  : 3000 # model_scheduler_p2 (set to 4* warmup_epochs)
+  # -----------------------------------------------------------------
+  batch_size      : 50
+  max_epochs      : 1000  # make sure >= switch_epochs + warmup_epochs
+  
+  loss_fn         : "mse"
+  k_fold          : 5
+  seed            : 42
+  save_ckpt_every_n_epochs : 1000
+  
+  # show target
+  epoch_show_trg        : 300
+  target_show_mode      : "random" # in ["deterministic", "random"]
+  show_trg_max_idx  : 50
+  show_trg_max_idx_upper_bound : 50           # for random model
+
+  # simulator
+  pinn          : False
+
+  # regularizer
+  entropy_regularizer : True
+  gamma               : 0.05
+
+  # others
+  lam : 1.0
+
+data:
+  dataset         : "ds_dx_250806_panel_200_pad"
+  filename_input  : "X.npy"
+  filename_target : "Y.npy"
+  val_idx         : 4
+  pos_idx         : 3
+  test_ds_ixd     : "test_ds_idx.npy"
+  max_data_size   : null
+  features:
+    X : 
+      value     : 4
+      position  : 3
+      variable  : 2
+      order     : 5
+      time      : [6,7,8,9,10]
+
+    Y : 
+      value     : 4
+      position  : 3
+      variable  : 2
+      time      : [5,6,7,8,9]
+      val_given : 10
+
+
+special:
+  mode: [
+    #"debug_optimizer",  # adds callbacks to check gradients and layer drifts
+    #"early_stopping"
+  ]
