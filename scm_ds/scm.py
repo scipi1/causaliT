@@ -22,6 +22,7 @@ import pandas as pd
 import sympy as sp
 import json
 from graphviz import Digraph
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 
 # ----------------------------- Type aliases --------------------------------- #
@@ -512,6 +513,28 @@ class SCMDataset:
     def sample(self, n, seed=42):
         return self.scm.sample(n, seed)
     
+    def _normalize(self, data: np.ndarray, method: str = "standardize"):
+        """Normalize only the value features (feature index 0) using sklearn scalers."""
+        normalized_data = data.copy()
+        values = data[:, :, 0].reshape(-1, 1)  # Flatten to (batch*seq, 1)
+        
+        if method == "standardize":
+            scaler = StandardScaler()
+        elif method == "minmax":
+            scaler = MinMaxScaler()
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        normalized_values = scaler.fit_transform(values).reshape(data.shape[0], data.shape[1])
+        normalized_data[:, :, 0] = normalized_values
+        
+        stats = {"method": method, "mean": float(scaler.mean_[0]) if hasattr(scaler, 'mean_') else None, 
+                 "std": float(np.sqrt(scaler.var_[0])) if hasattr(scaler, 'var_') else None,
+                 "min": float(scaler.data_min_[0]) if hasattr(scaler, 'data_min_') else None,
+                 "max": float(scaler.data_max_[0]) if hasattr(scaler, 'data_max_') else None}
+        
+        return normalized_data, {k: v for k, v in stats.items() if v is not None}
+    
     def get_numpy(self, mode, n, seed=42):
         # reshape the dataset into B x L x D, where
                 # - B: batch/sample size
@@ -558,11 +581,22 @@ class SCMDataset:
             return input_np, (iv_map, if_map, iv_order), target_np , (tv_map, tf_map, tv_order)
 
             
-    def generate_ds(self, mode, n, save_dir: Union[str, Path]=None, meta_dict: dict=None, seed=42):
+    def generate_ds(self, mode, n, save_dir: Union[str, Path]=None, meta_dict: dict=None, 
+                    normalize: bool = True, normalize_method: str = "standardize", seed=42):
         
         # get numpy array
         input_np, (iv_map, if_map, iv_order), target_np , (tv_map, tf_map, tv_order) = self.get_numpy(mode, n, seed)
         print("numpy arrays generated")
+        
+        # Normalize if requested
+        norm_stats = {}
+        if normalize:
+            input_np, input_stats = self._normalize(input_np, method=normalize_method)
+            target_np, target_stats = self._normalize(target_np, method=normalize_method)
+            norm_stats = {"input": input_stats, "target": target_stats}
+            print(f"Data normalized using {normalize_method}")
+            print(f"  Input - mean: {input_stats.get('mean', 'N/A')}, std: {input_stats.get('std', 'N/A')}")
+            print(f"  Target - mean: {target_stats.get('mean', 'N/A')}, std: {target_stats.get('std', 'N/A')}")
         
         # todo train/test split
         
@@ -621,6 +655,11 @@ class SCMDataset:
             
         with open(join(save_dir, 'target_feat_map.json'),'w', encoding="utf-8")  as file:
             json.dump(tf_map, file, indent=2, sort_keys=True, ensure_ascii=False)
+        
+        # Export normalization stats if normalization was applied
+        if norm_stats:
+            with open(join(save_dir, 'normalization.json'),'w', encoding="utf-8")  as file:
+                json.dump(norm_stats, file, indent=2, sort_keys=True, ensure_ascii=False)
 
         graph.render(str(join(save_dir, 'graph')), format="pdf", cleanup=True)
 

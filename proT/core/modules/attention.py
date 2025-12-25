@@ -5,11 +5,89 @@ import sys
 from math import sqrt, log
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 import numpy as np
 from proT.core.modules.extra_layers import UniformAttentionMask
 from proT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List
+
+
+
+class LieAttention(nn.Module):
+    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+        
+        super(LieAttention, self).__init__()
+        
+        self.mask_layer = mask_layer
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        ):
+        
+        # Handle both single-head (3D) and multi-head (4D) tensors
+        is_multihead = query.dim() == 4
+        
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S, _ = key.shape
+            H = 1
+        
+        scale = 1.0 / sqrt(E)
+        
+        # Compute attention scores
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        # convert to commutator
+        scores = scores - scores.transpose(-1,-2)
+        
+        
+        #att = torch.softmax(scale * (scores), dim=-1)
+        att = F.gelu(scale * scores)
+        # Attention entropy hook - register entropy before dropout
+        # if self.register_entropy:
+        #     register_attention_entropy(self.layer_name, att)
+        
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+            
+            
+        A = torch.nan_to_num(self.dropout(att))
+        
+        # Compute output values
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+        
+        
+        return V.contiguous(), A, entropy
+
+
+
+
 
 class ScaledDotAttention(nn.Module):
     def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):

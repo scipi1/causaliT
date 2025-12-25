@@ -16,7 +16,7 @@ from proT.core import ProT
 class TransformerForecaster(pl.LightningModule):
     """
     Lightning wrapper for ProT transformer model.
-    Simplified version with AdamW optimizer.
+    Supports multiple optimizers (AdamW, SGD) configurable via config.
 
     Args:
         config: configuration dictionary
@@ -34,9 +34,13 @@ class TransformerForecaster(pl.LightningModule):
         # Data indices
         self.dec_val_idx = config["data"]["val_idx"]
         
-        # Entropy regularizer
-        self.gamma = config["training"].get("gamma", 0.1)
-        self.entropy_regularizer = config["training"].get("entropy_regularizer", False)
+        # Log
+        self.log_entropy = config["training"].get("log_entropy", False)
+        self.log_acyclicity = config["training"].get("log_acyclicity", False)
+        
+        # Regularizer
+        self.gamma = config["training"].get("gamma", 0)   # entropy  
+        self.kappa = config["training"].get("kappa", 0)   # acyclicity
             
         self.save_hyperparameters(config)
         
@@ -44,6 +48,27 @@ class TransformerForecaster(pl.LightningModule):
         self.mae   = tm.MeanAbsoluteError()
         self.rmse  = tm.MeanSquaredError(squared=False)
         self.r2    = tm.R2Score()
+        
+        # Optionally freeze embeddings based on config
+        if config["training"].get("freeze_embeddings", False):
+            self.freeze_embeddings()
+    
+    
+    def freeze_embeddings(self):
+        """
+        Freeze all embedding layers to train only attention mechanisms.
+        This sets requires_grad=False for all encoder and decoder embeddings.
+        """
+        # Freeze encoder embeddings
+        for param in self.model.enc_embedding.parameters():
+            param.requires_grad = False
+        
+        # Freeze decoder embeddings
+        for param in self.model.dec_embedding.parameters():
+            param.requires_grad = False
+        
+        print("✓ Embeddings frozen. Training only attention and feedforward layers.")
+        
         
         
     def forward(self, data_input: torch.Tensor, data_trg: torch.Tensor) -> Any:
@@ -70,17 +95,29 @@ class TransformerForecaster(pl.LightningModule):
         X, Y = batch
         trg_val = Y[:,:,self.dec_val_idx]
         
-        forecast_output, _, _, (enc_self_ent, dec_self_ent, dec_cross_ent) = self.forward(data_input=X, data_trg=Y)
+        forecast_output, (enc_self_att, dec_self_att, _), _, (enc_self_ent, dec_self_ent, dec_cross_ent) = self.forward(data_input=X, data_trg=Y)
         
         # Entropy regularization
-        enc_self = torch.concat(enc_self_ent, dim=0).mean()
-        dec_self = torch.concat(dec_self_ent, dim=0).mean()
-        dec_cross = torch.concat(dec_cross_ent, dim=0).mean()
+        if self.gamma > 0 or self.log_entropy:
+            enc_self_ent_batch = torch.concat(enc_self_ent, dim=0).mean()
+            dec_self_ent_batch = torch.concat(dec_self_ent, dim=0).mean()
+            dec_cross_ent_batch = torch.concat(dec_cross_ent, dim=0).mean()
             
-        if self.entropy_regularizer:
-            ent_regularizer = 1.0/enc_self + 1.0/dec_self + 1.0/dec_cross
+        if self.kappa > 0 or self.log_acyclicity:
+            enc_self_att_batch = torch.mean(torch.concat(enc_self_att, dim=0), dim=0)
+            dec_self_att_batch = torch.mean(torch.concat(dec_self_att, dim=0), dim=0)
+            
+        if self.gamma>0:
+            entropy_regularizer = self.gamma * (1.0/enc_self_ent_batch + 1.0/dec_self_ent_batch + 1.0/dec_cross_ent_batch)
         else:
-            ent_regularizer = 0.0
+            entropy_regularizer = 0.0
+            
+        if self.kappa > 0:
+            
+            acyclic_regularizer = self.kappa * (self._notears_acyclicity(enc_self_att_batch))
+        else:
+            acyclic_regularizer = 0.0
+        
         
         # Calculate loss
         predicted_value = forecast_output
@@ -94,11 +131,15 @@ class TransformerForecaster(pl.LightningModule):
             metric_eval = metric(predicted_value.reshape(-1), trg.reshape(-1))
             self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
             
-        for name, value in [("enc_self_entropy", enc_self), ("dec_self_entropy", dec_self), ("dec_cross_entropy", dec_cross)]:
-            self.log(f"{stage}_{name}", value, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        if self.log_entropy:
+            for name, value in [("enc_self_entropy", enc_self_ent_batch), ("dec_self_entropy", dec_self_ent_batch), ("dec_cross_entropy", dec_cross_ent_batch)]:
+                self.log(f"{stage}_{name}", value, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        
+        if self.log_acyclicity:
+            self.log(f"{stage}_{"notears"}", acyclic_regularizer, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
         
         # Add entropy regularization to loss
-        loss = loss + self.gamma * ent_regularizer
+        loss = loss + entropy_regularizer + acyclic_regularizer
             
         return loss, predicted_value, Y
     
@@ -125,16 +166,29 @@ class TransformerForecaster(pl.LightningModule):
     
     
     def configure_optimizers(self):
-        """Configure AdamW optimizer with optional learning rate scheduler."""
+        """Configure optimizer (AdamW or SGD) with optional learning rate scheduler."""
         
-        learning_rate = self.config["training"].get("base_lr", 1e-4)
+        learning_rate = self.config["training"].get("lr", 1e-4)
         weight_decay = self.config["training"].get("weight_decay", 0.01)
+        optimizer_type = self.config["training"].get("optimizer", "adamw").lower()
         
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
-        )
+        # Select optimizer based on config
+        if optimizer_type == "sgd":
+            momentum = self.config["training"].get("momentum", 0.0)
+            optimizer = torch.optim.SGD(
+                self.parameters(),
+                lr=learning_rate,
+                momentum=momentum,
+                weight_decay=weight_decay
+            )
+        elif optimizer_type == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer type: {optimizer_type}. Choose 'adamw' or 'sgd'.")
         
         # Optional: Add learning rate scheduler
         if self.config["training"].get("use_scheduler", False):
@@ -154,3 +208,13 @@ class TransformerForecaster(pl.LightningModule):
             }
         
         return optimizer
+    
+    @staticmethod
+    def _notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
+        """
+        A: (d, d) adjacency matrix (non-negative entries)
+        returns: scalar acyclicity penalty
+        """
+        d = A.shape[0]
+        expm_A = torch.matrix_exp(torch.relu(A))
+        return torch.trace(expm_A) - d

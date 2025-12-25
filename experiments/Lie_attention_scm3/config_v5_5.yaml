@@ -1,0 +1,180 @@
+version: "proT_5.5"
+  # date: 21/08/2025
+  # 5.5 added training options
+  # 5.4 entropy regularization
+  # 5.3 added embedding for given val
+  # 5.2 min_pos for half IST prediction
+  # 5.1 separate encoder decoder causal mask
+  # 5.0 optuna and heavily restructured
+  # 4.5.1 added maximum dataset slicing
+  # 4.5.0 added causal mask
+  # 4.4.0 added optimizers with sparse gradients
+  # 4.3.0 added warmup steps
+  # 4.2.0 added embeddings lr  
+  # 4.1.0 added multivariate index
+
+experiment:
+
+  # fixed parameters 
+  d_model_set: 10      # Embedding dimension
+  
+  # free parameters
+  e_layers  : 1
+  d_layers  : 1
+  n_heads   : 1
+  d_ff      : 20
+  d_qk      : 10
+  dropout   : 0
+
+model:
+  
+  model_object: "proT" # ["proT", "LSTM", "GRU", "TCN", "MLP"]
+
+  embed_dim:
+    d_model_set         : ${experiment.d_model_set} # for spacetimeformer and summation embeddings
+    d_base_emb          : null # used for sweep experiments
+    d_base_model        : null # used for sweep experiments
+    enc_pro_emb_hidden  : ${experiment.d_model_set}
+    enc_occ_emb_hidden  : ${experiment.d_model_set}
+    enc_step_emb_hidden : ${experiment.d_model_set}
+    enc_pos_emb_hidden  : ${experiment.d_model_set}
+    enc_val_emb_hidden  : ${experiment.d_model_set}
+    enc_var_emb_hidden  : ${experiment.d_model_set}
+    enc_time_emb_hidden : ${experiment.d_model_set}
+    dec_val_emb_hidden  : ${experiment.d_model_set}
+    dec_var_emb_hidden  : ${experiment.d_model_set}
+    dec_pos_emb_hidden  : ${experiment.d_model_set}
+    dec_time_emb_hidden : ${experiment.d_model_set}
+  
+  kwargs:
+    model : ${model.model_object}
+    comps_embed_enc: "summation" # options: 'summation', 'concat', 'spatiotemporal'
+    comps_embed_dec: "summation"        
+    
+    ds_embed_enc:
+      setting:
+        sparse_grad: False # it will automatically be set depending on the optimization
+
+      modules:
+        # - idx: ${data.features.X.variable}
+        #   embed: "nn_embedding"
+        #   label: "variable"
+        #   kwargs: 
+        #     num_embeddings: 20 
+        #     embedding_dim : ${model.embed_dim.enc_var_emb_hidden}
+        #     padding_idx : 0
+        #     sparse: ${model.kwargs.ds_embed_enc.setting.sparse_grad}
+        #     max_norm : 1
+
+        - idx: ${data.features.X.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1 
+            embedding_dim : ${model.embed_dim.enc_val_emb_hidden}
+
+        - idx: ${data.features.X.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    ds_embed_dec:
+      setting:
+        sparse_grad: False
+
+      modules:
+        # - idx: ${data.features.Y.variable}
+        #   embed: "nn_embedding"
+        #   label: "variable"
+        #   kwargs: 
+        #     num_embeddings: 2
+        #     embedding_dim : ${model.embed_dim.dec_var_emb_hidden}
+
+        - idx: ${data.features.Y.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1 
+            embedding_dim : ${model.embed_dim.dec_val_emb_hidden}
+
+        - idx: ${data.features.Y.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+
+    # attention
+    enc_attention_type        : "LieAttention"
+    dec_self_attention_type   : "ScaledDotProduct"
+    dec_cross_attention_type  : "ScaledDotProduct"
+    enc_mask_type             : "Uniform"
+    dec_self_mask_type        : "Uniform"
+    dec_cross_mask_type       : "Uniform"
+    n_heads                   : ${experiment.n_heads}
+    enc_causal_mask           : False
+    dec_causal_mask           : False
+    
+    # options
+    e_layers : ${experiment.e_layers}
+    d_layers : ${experiment.d_layers}
+    activation : "gelu" # ["relu", "gelu"]
+    norm : "layer"
+    use_final_norm : True
+    device : "cuda"
+    out_dim : 1
+    d_ff : ${experiment.d_ff}
+    d_model_enc: null # calculated
+    d_model_dec: null
+    d_qk : ${experiment.d_qk}
+
+    # dropout
+    dropout_emb         : ${experiment.dropout}
+    dropout_data        : ${experiment.dropout}
+    dropout_attn_out    : ${experiment.dropout}
+    dropout_ff          : ${experiment.dropout}
+    enc_dropout_qkv     : ${experiment.dropout}
+    enc_attention_dropout       : ${experiment.dropout}
+    dec_self_dropout_qkv        : ${experiment.dropout}
+    dec_self_attention_dropout  : ${experiment.dropout}
+    dec_cross_dropout_qkv       : ${experiment.dropout}
+    dec_cross_attention_dropout : ${experiment.dropout}
+
+
+training:
+  optimizer: "adamw"
+  lr       : 0.0005
+  batch_size      : 64
+  max_epochs      : 10
+  loss_fn         : "mse"
+  k_fold          : 5
+  seed            : 42
+  save_ckpt_every_n_epochs : 1000
+  log_entropy         : False
+  log_acyclicity      : True
+  gamma               : 0
+  kappa               : 1 # NOTEARS regularizer
+  freeze_embeddings   : false
+
+data:
+  dataset         : "scm3"
+  filename_input  : "ds.npz"
+  filename_target : "ds.npz"
+  val_idx         : ${data.features.Y.value}
+  test_ds_ixd     : null
+  max_data_size   : null
+  features:
+    X : 
+      value     : 0
+      variable  : 1
+
+    Y : 
+      value     : 0
+      variable  : 1
+      
+
+
+special:
+  mode: [
+    #"debug_optimizer",  # adds callbacks to check gradients and layer drifts
+    #"early_stopping"
+  ]

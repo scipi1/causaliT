@@ -14,7 +14,7 @@ import torch.distributions as pyd
 # ROOT_DIR = dirname(abspath(__file__))
 # sys.path.append(ROOT_DIR)
 from proT.core.modules import (
-    ScaledDotAttention, AttentionLayer,
+    LieAttention, ScaledDotAttention, AttentionLayer,
     Decoder, DecoderLayer,
     ModularEmbedding,
     Encoder, EncoderLayer,
@@ -45,7 +45,7 @@ class ProT(nn.Module):
         dec_cross_attention_type,
         dec_cross_mask_type,
         n_heads: int,
-        causal_mask: bool,
+        #causal_mask: bool,
         enc_causal_mask: bool,
         dec_causal_mask: bool,
         #attn_factor: int = 5, #TODO understand, DO NOT DEL for now!
@@ -132,7 +132,7 @@ class ProT(nn.Module):
             "layer_name": "cross_att"                       # Name for entropy registration
         }
         
-        self.causal_mask = causal_mask
+        #self.causal_mask = causal_mask
         self.enc_causal_mask = enc_causal_mask
         self.dec_causal_mask = dec_causal_mask
         
@@ -248,10 +248,13 @@ class ProT(nn.Module):
         ):
 
         # choose attention type
-        assert attention_type in ["Kernel","ScaledDotProduct"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention"]
             
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
+            
+        if attention_type == "LieAttention":
+            attention_module = LieAttention
             
         # choose mask type (currently only uniform)
         mask_layer = None # init

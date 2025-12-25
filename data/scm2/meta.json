@@ -1,0 +1,5 @@
+{
+  "created": "2025-12-23",
+  "description": "Every parent has one child and there is cross-talk between children (log-normal noise)",
+  "name": "one-to-one_with_crosstalk_lognormal"
+}

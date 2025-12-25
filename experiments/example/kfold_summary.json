@@ -1,0 +1,165 @@
+{
+  "total_folds": 5,
+  "completed_folds": 5,
+  "fold_results": {
+    "0": {
+      "metrics": {
+        "val_mae": "tensor(0.8718)",
+        "val_rmse": "tensor(1.0720)",
+        "val_r2": "tensor(0.8948)",
+        "val_enc_self_entropy": "tensor(1.8904)",
+        "val_dec_self_entropy": "tensor(0.)",
+        "val_dec_cross_entropy": "tensor(1.7158)",
+        "val_loss": "tensor(1.1555)",
+        "test_mae": "tensor(0.8115)",
+        "test_rmse": "tensor(1.0224)",
+        "test_r2": "tensor(0.9068)",
+        "test_enc_self_entropy": "tensor(1.8922)",
+        "test_dec_self_entropy": "tensor(0.)",
+        "test_dec_cross_entropy": "tensor(1.7113)",
+        "test_loss": "tensor(1.0552)",
+        "trainable_params": 43870,
+        "total_training_time": 1090.3910310268402,
+        "avg_time_per_epoch": 10.795950802245942
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\example\\k_0"
+    },
+    "1": {
+      "metrics": {
+        "val_mae": "tensor(0.8015)",
+        "val_rmse": "tensor(1.0149)",
+        "val_r2": "tensor(0.8905)",
+        "val_enc_self_entropy": "tensor(1.8216)",
+        "val_dec_self_entropy": "tensor(0.)",
+        "val_dec_cross_entropy": "tensor(1.8225)",
+        "val_loss": "tensor(1.0401)",
+        "test_mae": "tensor(0.7739)",
+        "test_rmse": "tensor(0.9860)",
+        "test_r2": "tensor(0.9131)",
+        "test_enc_self_entropy": "tensor(1.8181)",
+        "test_dec_self_entropy": "tensor(0.)",
+        "test_dec_cross_entropy": "tensor(1.8202)",
+        "test_loss": "tensor(0.9854)",
+        "trainable_params": 43870,
+        "total_training_time": 1117.368656873703,
+        "avg_time_per_epoch": 11.063056008650525
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\example\\k_1"
+    },
+    "2": {
+      "metrics": {
+        "val_mae": "tensor(0.8303)",
+        "val_rmse": "tensor(1.0574)",
+        "val_r2": "tensor(0.8858)",
+        "val_enc_self_entropy": "tensor(1.7192)",
+        "val_dec_self_entropy": "tensor(0.)",
+        "val_dec_cross_entropy": "tensor(1.7867)",
+        "val_loss": "tensor(1.1297)",
+        "test_mae": "tensor(0.8016)",
+        "test_rmse": "tensor(1.0248)",
+        "test_r2": "tensor(0.9057)",
+        "test_enc_self_entropy": "tensor(1.7226)",
+        "test_dec_self_entropy": "tensor(0.)",
+        "test_dec_cross_entropy": "tensor(1.7876)",
+        "test_loss": "tensor(1.0627)",
+        "trainable_params": 43870,
+        "total_training_time": 1147.964097738266,
+        "avg_time_per_epoch": 11.365981165725406
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\example\\k_2"
+    },
+    "3": {
+      "metrics": {
+        "val_mae": "tensor(0.7985)",
+        "val_rmse": "tensor(1.0186)",
+        "val_r2": "tensor(0.8971)",
+        "val_enc_self_entropy": "tensor(1.7719)",
+        "val_dec_self_entropy": "tensor(0.)",
+        "val_dec_cross_entropy": "tensor(1.7564)",
+        "val_loss": "tensor(1.0516)",
+        "test_mae": "tensor(0.7846)",
+        "test_rmse": "tensor(0.9971)",
+        "test_r2": "tensor(0.9110)",
+        "test_enc_self_entropy": "tensor(1.7714)",
+        "test_dec_self_entropy": "tensor(0.)",
+        "test_dec_cross_entropy": "tensor(1.7577)",
+        "test_loss": "tensor(1.0067)",
+        "trainable_params": 43870,
+        "total_training_time": 1174.796887397766,
+        "avg_time_per_epoch": 11.631652350472931
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\example\\k_3"
+    },
+    "4": {
+      "metrics": {
+        "val_mae": "tensor(0.7991)",
+        "val_rmse": "tensor(1.0047)",
+        "val_r2": "tensor(0.9018)",
+        "val_enc_self_entropy": "tensor(1.7423)",
+        "val_dec_self_entropy": "tensor(0.)",
+        "val_dec_cross_entropy": "tensor(1.8417)",
+        "val_loss": "tensor(1.0140)",
+        "test_mae": "tensor(0.7798)",
+        "test_rmse": "tensor(0.9924)",
+        "test_r2": "tensor(0.9118)",
+        "test_enc_self_entropy": "tensor(1.7412)",
+        "test_dec_self_entropy": "tensor(0.)",
+        "test_dec_cross_entropy": "tensor(1.8351)",
+        "test_loss": "tensor(0.9979)",
+        "trainable_params": 43870,
+        "total_training_time": 1254.0743956565857,
+        "avg_time_per_epoch": 12.41657817481768
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\example\\k_4"
+    }
+  },
+  "statistics": {
+    "trainable_params": {
+      "mean": 43870.0,
+      "std": 0.0,
+      "min": 43870.0,
+      "max": 43870.0
+    },
+    "total_training_time": {
+      "mean": 1156.9190137386322,
+      "std": 56.265762830717435,
+      "min": 1090.3910310268402,
+      "max": 1254.0743956565857
+    },
+    "avg_time_per_epoch": {
+      "mean": 11.454643700382498,
+      "std": 0.5570867607001726,
+      "min": 10.795950802245942,
+      "max": 12.41657817481768
+    }
+  },
+  "best_fold": {
+    "fold_number": 3,
+    "val_mae": "tensor(0.7985)",
+    "metrics": {
+      "val_mae": "tensor(0.7985)",
+      "val_rmse": "tensor(1.0186)",
+      "val_r2": "tensor(0.8971)",
+      "val_enc_self_entropy": "tensor(1.7719)",
+      "val_dec_self_entropy": "tensor(0.)",
+      "val_dec_cross_entropy": "tensor(1.7564)",
+      "val_loss": "tensor(1.0516)",
+      "test_mae": "tensor(0.7846)",
+      "test_rmse": "tensor(0.9971)",
+      "test_r2": "tensor(0.9110)",
+      "test_enc_self_entropy": "tensor(1.7714)",
+      "test_dec_self_entropy": "tensor(0.)",
+      "test_dec_cross_entropy": "tensor(1.7577)",
+      "test_loss": "tensor(1.0067)",
+      "trainable_params": 43870,
+      "total_training_time": 1174.796887397766,
+      "avg_time_per_epoch": 11.631652350472931
+    },
+    "checkpoint_path": null
+  }
+}

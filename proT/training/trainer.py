@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 from os.path import dirname, abspath, join
 
 # Third-party imports
@@ -82,23 +83,36 @@ def trainer(
         data_format = "float32",
         max_data_size = config["data"]["max_data_size"],
         seed = seed,
+        train_file = config["data"].get("train_file", None),
+        test_file = config["data"].get("test_file", None),
     )
     
     
-    dataset_size = dm.get_ds_len()
-    indices = np.arange(dataset_size)
+    # Check if using pre-split data
+    use_presplit = config["data"].get("train_file") is not None and config["data"].get("test_file") is not None
     
-    test_ds_idx_filename = config["data"]["test_ds_ixd"]
-    
-    if test_ds_idx_filename is not None:
-        test_idx = np.load(join(data_dir,config["data"]["dataset"],test_ds_idx_filename))
-        mask = np.isin(indices, test_idx)
-        train_val_idx = indices[~mask]
+    if use_presplit:
+        # Pre-split data: k-fold only on training data, test is already separate
+        dataset_size = dm.get_ds_len()  # This returns training data size
+        train_val_idx = np.arange(dataset_size)
+        test_idx = None  # Test data is already split separately
+        print("Using pre-split data: k-fold will be applied only to training data.")
     
     else:
-        test_size = int(0.2 * dataset_size)  # Reserve 20% for testing
-        test_idx = indices[:test_size]       # Fixed test indices
-        train_val_idx = indices[test_size:]  # Remaining for train/val cross-validation
+        # Normal data: need to create train/val/test split
+        dataset_size = dm.get_ds_len()
+        indices = np.arange(dataset_size)
+        
+        test_ds_idx_filename = config["data"]["test_ds_ixd"]
+        
+        if test_ds_idx_filename is not None:
+            test_idx = np.load(join(data_dir,config["data"]["dataset"],test_ds_idx_filename))
+            mask = np.isin(indices, test_idx)
+            train_val_idx = indices[~mask]
+        else:
+            test_size = int(0.2 * dataset_size)  # Reserve 20% for testing
+            test_idx = indices[:test_size]       # Fixed test indices
+            train_val_idx = indices[test_size:]  # Remaining for train/val cross-validation
     
     
     
@@ -111,6 +125,11 @@ def trainer(
     
     # Initialize k-fold results tracker
     kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
+    
+    # Count trainable parameters (same for all folds, calculated once)
+    temp_model = model_object(config)
+    trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
+    del temp_model  # Clean up temporary model
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
@@ -177,6 +196,9 @@ def trainer(
         # * other stuff we can do
         # trainer.tune() to find optimal hyperparameters
 
+        # Record start time
+        start_time = time.time()
+
         # training
         trainer.fit(
             model,
@@ -184,9 +206,17 @@ def trainer(
             ckpt_path=resume_ckpt, # resume training from checkpoint
         )
 
-        # validation
-        trainer.validate(model, dm)
-        val_metrics = trainer.callback_metrics.copy()
+        # Calculate training time
+        training_time = time.time() - start_time
+        num_epochs = trainer.current_epoch + 1
+        avg_time_per_epoch = training_time / num_epochs if num_epochs > 0 else 0
+
+        # validation (only if validation dataset exists)
+        if dm.val_ds is not None:
+            trainer.validate(model, dm)
+            val_metrics = trainer.callback_metrics.copy()
+        else:
+            val_metrics = {}
         
         # test
         trainer.test(model, dm)
@@ -212,6 +242,11 @@ def trainer(
             # Use current behavior - final epoch metrics
             fold_metrics = {**val_metrics, **test_metrics}
             best_checkpoint_path = None
+        
+        # Add model size and timing metrics
+        fold_metrics['trainable_params'] = trainable_params
+        fold_metrics['total_training_time'] = training_time
+        fold_metrics['avg_time_per_epoch'] = avg_time_per_epoch
         
         # Update metrics dictionary
         metrics_dict[fold] = fold_metrics
@@ -259,7 +294,7 @@ if __name__ == "__main__":
     import re
     from proT.paths import ROOT_DIR, DATA_DIR, EXPERIMENTS_DIR
     
-    exp_dir = EXPERIMENTS_DIR / "example"
+    exp_dir = EXPERIMENTS_DIR / "Lie_attention_scm3"
     data_dir = str(DATA_DIR)
     
     # look for config file

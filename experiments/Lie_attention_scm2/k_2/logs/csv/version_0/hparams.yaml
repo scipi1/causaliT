@@ -1,0 +1,118 @@
+version: proT_5.5
+experiment:
+  d_model_set: 10
+  e_layers: 1
+  d_layers: 1
+  n_heads: 1
+  d_ff: 20
+  d_qk: 10
+  dropout: 0
+model:
+  model_object: proT
+  embed_dim:
+    d_model_set: 10
+    d_base_emb: null
+    d_base_model: null
+    enc_pro_emb_hidden: 10
+    enc_occ_emb_hidden: 10
+    enc_step_emb_hidden: 10
+    enc_pos_emb_hidden: 10
+    enc_val_emb_hidden: 10
+    enc_var_emb_hidden: 10
+    enc_time_emb_hidden: 10
+    dec_val_emb_hidden: 10
+    dec_var_emb_hidden: 10
+    dec_pos_emb_hidden: 10
+    dec_time_emb_hidden: 10
+  kwargs:
+    model: proT
+    comps_embed_enc: summation
+    comps_embed_dec: summation
+    ds_embed_enc:
+      setting:
+        sparse_grad: false
+      modules:
+      - idx: 0
+        embed: linear
+        label: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: 10
+      - idx: 0
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    ds_embed_dec:
+      setting:
+        sparse_grad: false
+      modules:
+      - idx: 0
+        embed: linear
+        label: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: 10
+      - idx: 0
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    enc_attention_type: LieAttention
+    dec_self_attention_type: ScaledDotProduct
+    dec_cross_attention_type: ScaledDotProduct
+    enc_mask_type: Uniform
+    dec_self_mask_type: Uniform
+    dec_cross_mask_type: Uniform
+    n_heads: 1
+    enc_causal_mask: false
+    dec_causal_mask: false
+    e_layers: 1
+    d_layers: 1
+    activation: gelu
+    norm: layer
+    use_final_norm: true
+    device: cuda
+    out_dim: 1
+    d_ff: 20
+    d_model_enc: 10
+    d_model_dec: 10
+    d_qk: 10
+    dropout_emb: 0
+    dropout_data: 0
+    dropout_attn_out: 0
+    dropout_ff: 0
+    enc_dropout_qkv: 0
+    enc_attention_dropout: 0
+    dec_self_dropout_qkv: 0
+    dec_self_attention_dropout: 0
+    dec_cross_dropout_qkv: 0
+    dec_cross_attention_dropout: 0
+training:
+  optimizer: adamw
+  lr: 0.0005
+  batch_size: 64
+  max_epochs: 10
+  loss_fn: mse
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 1000
+  log_entropy: false
+  log_acyclicity: true
+  gamma: 0
+  kappa: 1
+  freeze_embeddings: false
+data:
+  dataset: scm2
+  filename_input: ds.npz
+  filename_target: ds.npz
+  val_idx: 0
+  test_ds_ixd: null
+  max_data_size: null
+  features:
+    X:
+      value: 0
+      variable: 1
+    'Y':
+      value: 0
+      variable: 1
+special:
+  mode: []

@@ -1,0 +1,103 @@
+{
+  "total_folds": 5,
+  "completed_folds": 3,
+  "fold_results": {
+    "0": {
+      "metrics": {
+        "val_mae": "tensor(0.0022)",
+        "val_rmse": "tensor(0.0029)",
+        "val_r2": "tensor(0.9967)",
+        "val_notears": "tensor(0.)",
+        "val_loss": "tensor(1.0537e-05)",
+        "test_mae": "tensor(0.0022)",
+        "test_rmse": "tensor(0.0027)",
+        "test_r2": "tensor(0.9967)",
+        "test_notears": "tensor(0.)",
+        "test_loss": "tensor(7.9240e-06)",
+        "trainable_params": 3230,
+        "total_training_time": 1028.6786601543427,
+        "avg_time_per_epoch": 93.51624183221297
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm2\\k_0"
+    },
+    "1": {
+      "metrics": {
+        "val_mae": "tensor(0.0032)",
+        "val_rmse": "tensor(0.0041)",
+        "val_r2": "tensor(0.9924)",
+        "val_notears": "tensor(0.)",
+        "val_loss": "tensor(1.7266e-05)",
+        "test_mae": "tensor(0.0033)",
+        "test_rmse": "tensor(0.0042)",
+        "test_r2": "tensor(0.9924)",
+        "test_notears": "tensor(0.)",
+        "test_loss": "tensor(1.8012e-05)",
+        "trainable_params": 3230,
+        "total_training_time": 965.9741914272308,
+        "avg_time_per_epoch": 87.81583558429371
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm2\\k_1"
+    },
+    "2": {
+      "metrics": {
+        "val_mae": "tensor(0.0022)",
+        "val_rmse": "tensor(0.0028)",
+        "val_r2": "tensor(0.9966)",
+        "val_notears": "tensor(0.)",
+        "val_loss": "tensor(7.8750e-06)",
+        "test_mae": "tensor(0.0022)",
+        "test_rmse": "tensor(0.0028)",
+        "test_r2": "tensor(0.9966)",
+        "test_notears": "tensor(0.)",
+        "test_loss": "tensor(7.8546e-06)",
+        "trainable_params": 3230,
+        "total_training_time": 1462.4680128097534,
+        "avg_time_per_epoch": 132.9516375281594
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm2\\k_2"
+    }
+  },
+  "statistics": {
+    "trainable_params": {
+      "mean": 3230.0,
+      "std": 0.0,
+      "min": 3230.0,
+      "max": 3230.0
+    },
+    "total_training_time": {
+      "mean": 1152.3736214637756,
+      "std": 220.7590862724366,
+      "min": 965.9741914272308,
+      "max": 1462.4680128097534
+    },
+    "avg_time_per_epoch": {
+      "mean": 104.7612383148887,
+      "std": 20.069007842948785,
+      "min": 87.81583558429371,
+      "max": 132.9516375281594
+    }
+  },
+  "best_fold": {
+    "fold_number": 2,
+    "val_mae": "tensor(0.0022)",
+    "metrics": {
+      "val_mae": "tensor(0.0022)",
+      "val_rmse": "tensor(0.0028)",
+      "val_r2": "tensor(0.9966)",
+      "val_notears": "tensor(0.)",
+      "val_loss": "tensor(7.8750e-06)",
+      "test_mae": "tensor(0.0022)",
+      "test_rmse": "tensor(0.0028)",
+      "test_r2": "tensor(0.9966)",
+      "test_notears": "tensor(0.)",
+      "test_loss": "tensor(7.8546e-06)",
+      "trainable_params": 3230,
+      "total_training_time": 1462.4680128097534,
+      "avg_time_per_epoch": 132.9516375281594
+    },
+    "checkpoint_path": null
+  }
+}

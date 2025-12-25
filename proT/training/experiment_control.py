@@ -244,9 +244,4 @@ def update_config(config: dict)->dict:
         if config.model.kwargs.comps_embed_dec == "summation":
             config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
             
-            
-        if config.training.optimization in [3,4,5,6,7]:
-            config.model.ds_embed_enc.set.sparse_grad = True
-            
-            
     return config

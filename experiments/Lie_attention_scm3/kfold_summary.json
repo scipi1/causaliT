@@ -1,0 +1,141 @@
+{
+  "total_folds": 5,
+  "completed_folds": 5,
+  "fold_results": {
+    "0": {
+      "metrics": {
+        "val_mae": "tensor(0.0210)",
+        "val_rmse": "tensor(0.0267)",
+        "val_r2": "tensor(0.8466)",
+        "val_notears": "tensor(3.4065e-06)",
+        "val_loss": "tensor(0.0007)",
+        "test_mae": "tensor(0.0210)",
+        "test_rmse": "tensor(0.0267)",
+        "test_r2": "tensor(0.8415)",
+        "test_notears": "tensor(1.0864e-06)",
+        "test_loss": "tensor(0.0007)",
+        "trainable_params": 3230,
+        "total_training_time": 991.3230831623077,
+        "avg_time_per_epoch": 90.12028028748252
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm3\\k_0"
+    },
+    "1": {
+      "metrics": {
+        "val_mae": "tensor(0.0218)",
+        "val_rmse": "tensor(0.0278)",
+        "val_r2": "tensor(0.8233)",
+        "val_notears": "tensor(2.5234e-06)",
+        "val_loss": "tensor(0.0008)",
+        "test_mae": "tensor(0.0214)",
+        "test_rmse": "tensor(0.0271)",
+        "test_r2": "tensor(0.8367)",
+        "test_notears": "tensor(1.3855e-06)",
+        "test_loss": "tensor(0.0007)",
+        "trainable_params": 3230,
+        "total_training_time": 1026.4265689849854,
+        "avg_time_per_epoch": 93.3115062713623
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm3\\k_1"
+    },
+    "2": {
+      "metrics": {
+        "val_mae": "tensor(0.0203)",
+        "val_rmse": "tensor(0.0262)",
+        "val_r2": "tensor(0.8445)",
+        "val_notears": "tensor(0.)",
+        "val_loss": "tensor(0.0007)",
+        "test_mae": "tensor(0.0202)",
+        "test_rmse": "tensor(0.0262)",
+        "test_r2": "tensor(0.8470)",
+        "test_notears": "tensor(7.3547e-07)",
+        "test_loss": "tensor(0.0007)",
+        "trainable_params": 3230,
+        "total_training_time": 1057.653567790985,
+        "avg_time_per_epoch": 96.15032434463501
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm3\\k_2"
+    },
+    "3": {
+      "metrics": {
+        "val_mae": "tensor(0.0217)",
+        "val_rmse": "tensor(0.0274)",
+        "val_r2": "tensor(0.8307)",
+        "val_notears": "tensor(6.9237e-07)",
+        "val_loss": "tensor(0.0008)",
+        "test_mae": "tensor(0.0218)",
+        "test_rmse": "tensor(0.0274)",
+        "test_r2": "tensor(0.8329)",
+        "test_notears": "tensor(5.2948e-07)",
+        "test_loss": "tensor(0.0008)",
+        "trainable_params": 3230,
+        "total_training_time": 997.868611574173,
+        "avg_time_per_epoch": 90.71532832492481
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm3\\k_3"
+    },
+    "4": {
+      "metrics": {
+        "val_mae": "tensor(0.0213)",
+        "val_rmse": "tensor(0.0270)",
+        "val_r2": "tensor(0.8312)",
+        "val_notears": "tensor(0.)",
+        "val_loss": "tensor(0.0007)",
+        "test_mae": "tensor(0.0210)",
+        "test_rmse": "tensor(0.0267)",
+        "test_r2": "tensor(0.8414)",
+        "test_notears": "tensor(3.1601e-06)",
+        "test_loss": "tensor(0.0007)",
+        "trainable_params": 3230,
+        "total_training_time": 1123.384812116623,
+        "avg_time_per_epoch": 102.12589201060209
+      },
+      "best_checkpoint_path": null,
+      "fold_dir": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm3\\k_4"
+    }
+  },
+  "statistics": {
+    "trainable_params": {
+      "mean": 3230.0,
+      "std": 0.0,
+      "min": 3230.0,
+      "max": 3230.0
+    },
+    "total_training_time": {
+      "mean": 1039.3313287258147,
+      "std": 48.148050623346506,
+      "min": 991.3230831623077,
+      "max": 1123.384812116623
+    },
+    "avg_time_per_epoch": {
+      "mean": 94.48466624780136,
+      "std": 4.377095511213322,
+      "min": 90.12028028748252,
+      "max": 102.12589201060209
+    }
+  },
+  "best_fold": {
+    "fold_number": 2,
+    "val_mae": "tensor(0.0203)",
+    "metrics": {
+      "val_mae": "tensor(0.0203)",
+      "val_rmse": "tensor(0.0262)",
+      "val_r2": "tensor(0.8445)",
+      "val_notears": "tensor(0.)",
+      "val_loss": "tensor(0.0007)",
+      "test_mae": "tensor(0.0202)",
+      "test_rmse": "tensor(0.0262)",
+      "test_r2": "tensor(0.8470)",
+      "test_notears": "tensor(7.3547e-07)",
+      "test_loss": "tensor(0.0007)",
+      "trainable_params": 3230,
+      "total_training_time": 1057.653567790985,
+      "avg_time_per_epoch": 96.15032434463501
+    },
+    "checkpoint_path": null
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "val_mae": 0.0019474179716780782,
+  "val_rmse": 0.0026862733066082,
+  "val_r2": 0.9968088269233704,
+  "val_notears": 0.0,
+  "val_loss": 7.422368071274832e-06,
+  "train_mae": 0.0020411282312124968,
+  "train_rmse": 0.0027187529485672712,
+  "train_r2": 0.9967748522758484,
+  "train_notears": 0.0,
+  "train_loss": 7.605812697875081e-06,
+  "test_mae": 0.0021824187133461237,
+  "test_rmse": 0.002777453977614641,
+  "test_r2": 0.9965623021125793,
+  "test_notears": 0.0,
+  "test_loss": 7.854579052946065e-06,
+  "best_epoch": 8,
+  "best_checkpoint_path": "C:\\Users\\ScipioneFrancesco\\Documents\\Projects\\causaliT\\experiments\\Lie_attention_scm2\\k_2\\checkpoints\\best_checkpoint.ckpt"
+}

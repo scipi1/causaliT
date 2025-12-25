@@ -13,28 +13,43 @@ version: "proT_5.5"
   # 4.2.0 added embeddings lr  
   # 4.1.0 added multivariate index
 
+experiment:
+
+  # fixed parameters 
+  d_model_set: 50      # Embedding dimension
+  
+  # free parameters
+  e_layers  : 1
+  d_layers  : 1
+  n_heads   : 1
+  d_ff      : 50
+  d_qk      : 20
+  dropout   : 0
+
 model:
   
   model_object: "proT" # ["proT", "LSTM", "GRU", "TCN", "MLP"]
 
   embed_dim:
-    d_model_set         : null # for spacetimeformer and summation embeddings
+    d_model_set         : ${experiment.d_model_set} # for spacetimeformer and summation embeddings
     d_base_emb          : null # used for sweep experiments
     d_base_model        : null # used for sweep experiments
-    enc_val_emb_hidden  : 50 #${embed_dim.d_base_emb}
-    enc_var_emb_hidden  : 50 #${embed_dim.d_base_emb}
-    enc_pos_emb_hidden  : 70 #${embed_dim.d_base_emb}
-    enc_time_emb_hidden : 90 #${embed_dim.d_base_emb}
-    dec_val_emb_hidden  : 130 #${embed_dim.d_base_emb}
-    dec_var_emb_hidden  : 100 #${embed_dim.d_base_emb}
-    dec_pos_emb_hidden  : 170 #${embed_dim.d_base_emb}
-    dec_val_given_emb_hidden : 150 #${embed_dim.d_base_emb}
-    dec_time_emb_hidden : 50
+    enc_pro_emb_hidden  : ${experiment.d_model_set}
+    enc_occ_emb_hidden  : ${experiment.d_model_set}
+    enc_step_emb_hidden : ${experiment.d_model_set}
+    enc_pos_emb_hidden  : ${experiment.d_model_set}
+    enc_val_emb_hidden  : ${experiment.d_model_set}
+    enc_var_emb_hidden  : ${experiment.d_model_set}
+    enc_time_emb_hidden : ${experiment.d_model_set}
+    dec_val_emb_hidden  : ${experiment.d_model_set}
+    dec_var_emb_hidden  : ${experiment.d_model_set}
+    dec_pos_emb_hidden  : ${experiment.d_model_set}
+    dec_time_emb_hidden : ${experiment.d_model_set}
   
   kwargs:
     model : ${model.model_object}
-    comps_embed_enc: "concat" # options: 'summation', 'concat', 'spatiotemporal'
-    comps_embed_dec: "concat"        
+    comps_embed_enc: "summation" # options: 'summation', 'concat', 'spatiotemporal'
+    comps_embed_dec: "summation"        
     
     ds_embed_enc:
       setting:
@@ -45,7 +60,7 @@ model:
           embed: "nn_embedding"
           label: "variable"
           kwargs: 
-            num_embeddings: 404 
+            num_embeddings: 20 
             embedding_dim : ${model.embed_dim.enc_var_emb_hidden}
             padding_idx : 0
             sparse: ${model.kwargs.ds_embed_enc.setting.sparse_grad}
@@ -72,7 +87,7 @@ model:
           embed: "nn_embedding"
           label: "variable"
           kwargs: 
-            num_embeddings: 3
+            num_embeddings: 2
             embedding_dim : ${model.embed_dim.dec_var_emb_hidden}
 
         - idx: ${data.features.Y.value}
@@ -95,89 +110,53 @@ model:
     enc_mask_type             : "Uniform"
     dec_self_mask_type        : "Uniform"
     dec_cross_mask_type       : "Uniform"
-    n_heads                   : 2
-    causal_mask               : False
+    n_heads                   : ${experiment.n_heads}
     enc_causal_mask           : False
     dec_causal_mask           : False
     
     # options
-    e_layers : 1
-    d_layers : 1
+    e_layers : ${experiment.e_layers}
+    d_layers : ${experiment.d_layers}
     activation : "gelu" # ["relu", "gelu"]
     norm : "layer"
     use_final_norm : True
     device : "cuda"
     out_dim : 1
-    d_ff : 400
+    d_ff : ${experiment.d_ff}
     d_model_enc: null # calculated
     d_model_dec: null
-    d_qk : 100
+    d_qk : ${experiment.d_qk}
 
     # dropout
-    dropout_emb : 0.2
-    dropout_data : 0.2
-    dropout_attn_out : 0.0
-    dropout_ff : 0.0
-    enc_dropout_qkv : 0.1
-    enc_attention_dropout : 0.0
-    dec_self_dropout_qkv : 0.1
-    dec_self_attention_dropout : 0.0
-    dec_cross_dropout_qkv : 0.0
-    dec_cross_attention_dropout : 0.0
+    dropout_emb         : ${experiment.dropout}
+    dropout_data        : ${experiment.dropout}
+    dropout_attn_out    : ${experiment.dropout}
+    dropout_ff          : ${experiment.dropout}
+    enc_dropout_qkv     : ${experiment.dropout}
+    enc_attention_dropout       : ${experiment.dropout}
+    dec_self_dropout_qkv        : ${experiment.dropout}
+    dec_self_attention_dropout  : ${experiment.dropout}
+    dec_cross_dropout_qkv       : ${experiment.dropout}
+    dec_cross_attention_dropout : ${experiment.dropout}
 
 
 training:
-  
-  # optimization options (only the embeddings)
-  # Mode  |Phase  | Model Optimizer | Enc. Emb. Opt. 
-  #-------|-------|-----------------|---------------
-  # 1     | NA    | Adam(base_lr)   | Adam(base_lr)
-  # 2     | NA    | Adam(base_lr)   | Adam(emb_lr)
-  # 3     | NA    | Adam(base_lr)   | SparseAdam(emb_lr)
-  # 4     | NA    | Adam(base_lr)   | Adagrad(emb_lr)
-  #-------|-------|-----------------|---------------- 
-  # 5     | p1    | SGD(sched.1)    | Adagrad(emb_start_lr)
-  #       | p2    | Adam(sched.2)   | SparseAdam(emb_lr)
-  #---------------------------------------------------
-  # 6     | p1    | SGD(sched.1)    | SparseAdam(emb_start_lr)
-  #       | p2    | Adam(sched.2)   | SparseAdam(emb_lr)
-  #---------------------------------------------------
-  # 7     | p1    | SGD(sched.1)    | Adagrad(emb_start_lr)
-  #       | p2    | Adam(sched.2)   | Adagrad(emb_lr)
-  # ----------------------------------------------------------------
-  optimization  : 1
-  # ----------------------------------------------------------------
-  base_lr       : 0.001
-  emb_lr        : 0.01
-  emb_start_lr  : 0.1
-  warmup_epochs : 1000 # deprecated
-  switch_epoch  : 500
-  switch_step   : 2000  # model_scheduler_p1 (set to 4* switch_epochs)
-  warmup_steps  : 3000 # model_scheduler_p2 (set to 4* warmup_epochs)
-  # -----------------------------------------------------------------
+  optimizer: "adamw"
+  lr       : 0.0005
   batch_size      : 50
-  max_epochs      : 1000  # make sure >= switch_epochs + warmup_epochs
-  
+  max_epochs      : 100  # make sure >= switch_epochs + warmup_epochs
   loss_fn         : "mse"
   k_fold          : 5
   seed            : 42
   save_ckpt_every_n_epochs : 1000
-  
-  
-
-  # regularizer
   entropy_regularizer : False
-  gamma               : 0.05
-
-  # others
-  lam : 1.0
+  gamma               : 0
 
 data:
   dataset         : "example"
   filename_input  : "ds.npz"
   filename_target : "ds.npz"
-  val_idx         : 0
-  pos_idx         : null
+  val_idx         : ${data.features.Y.value}
   test_ds_ixd     : null
   max_data_size   : null
   features:
