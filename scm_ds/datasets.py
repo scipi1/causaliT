@@ -174,6 +174,177 @@ ds_scm3 = SCMDataset(
     target_labels = ["Y"]
     )
 
+
+
+ds_scm3 = SCMDataset(
+    name = "simple non-linear Gaussian",
+    description ="Every parent has one child and there is cross-talk between children",
+    tags=None,
+    specs = [
+        NodeSpec("X1", [], "eps_X1"),                               # parent
+        NodeSpec("X2", ["X1"], "w12*(X1**2) + eps_X2"),             # child 1
+        NodeSpec("Y", ["X1", "X2"], "w13*(X1**3) + w23*X2 + eps_Y"),   # output
+        ],
+    params = {
+        "w12": 7,
+        "w13": 1,
+        "w23": 3,
+        },
+    singles = {
+        "X1": lambda rng,n: 0.1*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.1*rng.standard_normal(n),
+        "Y": lambda rng,n: 0.1*rng.standard_normal(n),
+        },
+    groups=None,
+    input_labels=["X1", "X2"],
+    target_labels = ["Y"]
+    )
+
+
+ds_scm3 = SCMDataset(
+    name = "simple non-linear Gaussian",
+    description ="Every parent has one child and there is cross-talk between children",
+    tags=None,
+    specs = [
+        NodeSpec("X1", [], "eps_X1"),                                   # parent
+        NodeSpec("X2", ["X1"], "w12*(X1**2) + eps_X2"),                 # child 1
+        NodeSpec("X2", ["X1"], "w12*(X1**2) + eps_X2"),                 # child 1
+        NodeSpec("Y", ["X1", "X2"], "w13*(X1**3) + w23*X2 + eps_Y"),    # output
+        ],
+    params = {
+        "w12": 7,
+        "w13": 1,
+        "w23": 3,
+        },
+    singles = {
+        "X1": lambda rng,n: 0.1*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.1*rng.standard_normal(n),
+        "Y": lambda rng,n: 0.1*rng.standard_normal(n),
+        },
+    groups=None,
+    input_labels=["X1", "X2"],
+    target_labels = ["Y"]
+    )
+
+
+
+ds_scm4 = SCMDataset(
+    name = "mid linear Gaussian",
+    description ="Every parent has one child and there is cross-talk between children",
+    tags=None,
+    specs = [
+        NodeSpec("X1", [], "eps_X1"),                            # input 1
+        NodeSpec("X2", [], "eps_X2"),                 # input 2
+        NodeSpec("X3", ["X1", "X2"], "b*X1 + c*X2 + eps_X3"),    # input 3
+        NodeSpec("Y1", ["X1", "X3"], "f*X1 + g*X3 + eps_Y1"),    # target 1
+        NodeSpec("Y2", ["X3"      ], "h*X3 + eps_Y2"),           # target 2
+        NodeSpec("Y3", ["X3", "Y2"], "j*X3 + k*Y2 + eps_Y3"),    # target 3
+        ],
+    params = {
+        "a": 1,
+        "b": 1,
+        "c": 1,
+        "f": 1,
+        "g": 1,
+        "h": 1,
+        "j": 1,
+        "k": 1,
+        },
+    singles = {
+        "X1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X3": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y3": lambda rng,n: 0.05*rng.standard_normal(n),
+        },
+    groups=None,
+    input_labels=["X1", "X2", "X3"],
+    target_labels = ["Y1", "Y2", "Y3"]
+    )
+
+
+
+
+ds_scm5 = SCMDataset(
+    name = "mid linear Gaussian",
+    description ="Children with different ancestors",
+    tags=None,
+    specs = [
+        NodeSpec("X1", [], "eps_X1"),                           # input 1
+        NodeSpec("X2", [], "eps_X2"),                           # input 2
+        NodeSpec("X3", ["X1", "X2"], "b*X1 + c*X2 + eps_X3"),   # input 3
+        NodeSpec("Y1", ["X1"], "f*X1 + eps_Y1"),                # target 1
+        NodeSpec("Y2", ["X3"      ], "h*X3 + eps_Y2"),          # target 2
+        NodeSpec("Y3", ["X3", "Y2"], "j*X3 + k*Y2 + eps_Y3"),   # target 3
+        ],
+    params = {
+        "a": 1,
+        "b": 1,
+        "c": 1,
+        "f": 1,
+        "g": 1,
+        "h": 1,
+        "j": 1,
+        "k": 1,
+        },
+    singles = {
+        "X1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X3": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y3": lambda rng,n: 0.05*rng.standard_normal(n),
+        },
+    groups=None,
+    input_labels=["X1", "X2", "X3"],
+    target_labels = ["Y1", "Y2", "Y3"]
+    )
+
+
+ds_scm6 = SCMDataset(
+    name = "linear Gaussian",
+    description ="Source nodes",
+    tags=None,
+    specs = [
+        NodeSpec("S1", [], "eps_S1"),                           # source 1
+        NodeSpec("S2", [], "eps_S2"),                           # source 2
+        NodeSpec("S3", [], "eps_S3"),                           # source 3
+        NodeSpec("X1", ["S1", "X2"], "a*S1 + b*X2 + eps_X1"),   # input 1
+        NodeSpec("X2", ["S2", "S3"], "c*S2 + f*S3 + eps_X2"),   # input 2
+        # NodeSpec("X3", ["X1", "X2"], "b*X1 + c*X2 + eps_X3"), # input 3
+        NodeSpec("Y1", ["X1"], "g*X1 + eps_Y1"),                # target 1
+        NodeSpec("Y2", ["X2"], "h*X2 + eps_Y2"),                # target 2
+        # NodeSpec("Y3", ["X3", "Y2"], "j*X3 + k*Y2 + eps_Y3"),   # target 3
+        ],
+    params = {
+        "a": 1,
+        "b": 1,
+        "c": 1,
+        "f": 1,
+        "g": 1,
+        "h": 1,
+        # "j": 1,
+        # "k": 1,
+        },
+    singles = {
+        "S1": lambda rng,n: 1.0*rng.standard_normal(n),
+        "S2": lambda rng,n: 1.0*rng.standard_normal(n),
+        "S3": lambda rng,n: 1.0*rng.standard_normal(n),
+        "X1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.05*rng.standard_normal(n),
+        # "X3": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y2": lambda rng,n: 0.05*rng.standard_normal(n),
+        # "Y3": lambda rng,n: 0.05*rng.standard_normal(n),
+        },
+    groups=None,
+    source_labels=["S1", "S2", "S3"],
+    input_labels=["X1", "X2"],
+    target_labels = ["Y1", "Y2"]
+    )
+
+
 # TODO
 # - one-to-one-CT
 # - one-to-many-noCT
@@ -184,4 +355,7 @@ ds_scm3 = SCMDataset(
 
 #ds_scm1.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm1"), normalize_method="minmax")
 #ds_scm2.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm2"), normalize_method="minmax")
-ds_scm3.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm3"), normalize_method="minmax")
+#ds_scm3.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm3"), normalize_method="minmax")
+#ds_scm4.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm4"), normalize_method="minmax")
+# ds_scm5.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm5"), normalize_method="minmax")
+ds_scm6.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm6"), normalize_method="minmax")

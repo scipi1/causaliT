@@ -9,9 +9,9 @@ via requirements.txt or your existing environment setup.
 from setuptools import setup, find_packages
 
 setup(
-    name="proT",
+    name="causaliT",
     version="0.1.0",
-    description="Process Transformer for sequence prediction",
+    description="Causal Process Transformer for sequence prediction",
     author="Your Name",
     packages=find_packages(),
     python_requires=">=3.8",
