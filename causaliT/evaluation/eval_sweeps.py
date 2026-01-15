@@ -20,6 +20,8 @@ from io import StringIO, BytesIO
 import torch
 import re
 
+from causaliT.paths import DATA_DIR
+
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 
@@ -131,6 +133,40 @@ def is_gradients_folder(directory: str, s3: bool = False, bucket: str = None) ->
 
 
 # helper functions________________________________________________________________________________________________
+
+def find_config_file(folder_path: str) -> str:
+    """
+    Find a configuration file matching the pattern config_*.yaml in the given folder.
+    
+    Args:
+        folder_path: Path to the folder to search in
+        
+    Returns:
+        str: Full path to the config file
+        
+    Raises:
+        FileNotFoundError: If no config file is found
+        ValueError: If more than one config file is found
+        
+    Example:
+        >>> config_path = find_config_file("experiments/my_experiment")
+        >>> config = OmegaConf.load(config_path)
+    """
+    pattern = re.compile(r'^config_.*\.yaml$')
+    matching_files = []
+    
+    for filename in listdir(folder_path):
+        if pattern.match(filename):
+            matching_files.append(join(folder_path, filename))
+    
+    if len(matching_files) == 0:
+        raise FileNotFoundError(f"No config_*.yaml found in {folder_path}")
+    
+    if len(matching_files) > 1:
+        raise ValueError(f"More than one config file found in {folder_path}: {matching_files}")
+    
+    return matching_files[0]
+
 
 def array_to_long_df(arr: np.ndarray) -> pd.DataFrame:
     """
@@ -278,7 +314,7 @@ def process_gradients_bottom_action(filepath: str, level_folders: List[str], s3:
         return pd.DataFrame()
 
 
-def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool = False, bucket: str = None, datadir_path: str = None) -> pd.DataFrame:
+def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool = False, bucket: str = None, datadir_path: str = None, input_conditioning_fn: Callable=None) -> pd.DataFrame:
     """
     Bottom action that evaluates trained models by:
     - Loading config and kfold_summary.json from each folder
@@ -297,6 +333,9 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
         s3: Whether files are on S3
         bucket: S3 bucket name (required if s3=True)
         datadir_path: Path to data directory. If None, uses "../data/input"
+        input_conditioning_fn: Optional function to condition inputs before forward pass.
+                              Use create_intervention_fn() to create intervention functions.
+                              Function signature: fn(X: torch.Tensor) -> torch.Tensor
         
     Returns:
         pd.DataFrame: Metrics results with columns:
@@ -316,9 +355,9 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
     from causaliT.evaluation.predict import predict_test_from_ckpt
     from causaliT.evaluation.metrics import compute_prediction_metrics
     
-    # Default data directory path
+    # Default data directory path - use project-level DATA_DIR
     if datadir_path is None:
-        datadir_path = "../data/input"
+        datadir_path = str(DATA_DIR)
     
     df_list = []
     
@@ -338,11 +377,12 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
             # Local paths
             folder_path = join(filepath, folder)
             kfold_summary_path = join(folder_path, "kfold_summary.json")
-            config_path = join(folder_path, "config.yaml")
             
-            # Validate required files exist
-            if not exists(config_path):
-                print(f"Warning: No config.yaml in {folder_path}, skipping...")
+            # Find config file using helper
+            try:
+                config_path = find_config_file(folder_path)
+            except (FileNotFoundError, ValueError) as e:
+                print(f"Warning: {e}, skipping...")
                 continue
                 
             if not exists(kfold_summary_path):
@@ -377,7 +417,8 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
                     datadir_path=datadir_path,
                     checkpoint_path=checkpoint_path,
                     dataset_label="test",
-                    cluster=False
+                    cluster=False,
+                    input_conditioning_fn=input_conditioning_fn
                 )
                 
                 # Compute metrics
@@ -640,6 +681,279 @@ def eval_gradients(filepath: str, outpath: str = None, s3: bool = False, bucket:
 
 
 # helpers________________________________________________________________________________________________
+
+def predictions_to_long_df(outputs: np.ndarray, targets: np.ndarray) -> pd.DataFrame:
+    """
+    Convert prediction outputs and targets to a long DataFrame format.
+    
+    Handles different output shapes:
+    - (B,) -> single value per sample
+    - (B, L) -> sequence output
+    - (B, L, F) -> multivariate sequence
+    
+    Args:
+        outputs: Prediction array from model (various shapes)
+        targets: Target array (B, L, D) or similar
+        
+    Returns:
+        pd.DataFrame with columns:
+            - sample_idx: sample index
+            - pos_idx: position index (if sequence)
+            - pred_feat_0, pred_feat_1, ...: prediction features
+            - trg_feat_0, trg_feat_1, ...: target features
+    """
+    # Ensure outputs is at least 2D
+    if outputs.ndim == 1:
+        outputs = outputs[:, np.newaxis]  # (B,) -> (B, 1)
+    
+    # Ensure outputs is 3D: (B, L, F)
+    if outputs.ndim == 2:
+        outputs = outputs[:, :, np.newaxis]  # (B, L) -> (B, L, 1)
+    
+    # Ensure targets is at least 2D
+    if targets.ndim == 1:
+        targets = targets[:, np.newaxis]
+    
+    # Ensure targets is 3D: (B, L, D)
+    if targets.ndim == 2:
+        targets = targets[:, :, np.newaxis]
+    
+    B, L_out, F_out = outputs.shape
+    B_trg, L_trg, D_trg = targets.shape
+    
+    # Build long format dataframe
+    records = []
+    
+    # Use the minimum length if they differ
+    L = min(L_out, L_trg)
+    
+    for sample_idx in range(B):
+        for pos_idx in range(L):
+            record = {
+                'sample_idx': sample_idx,
+                'pos_idx': pos_idx,
+            }
+            
+            # Add prediction features
+            for f in range(F_out):
+                record[f'pred_feat_{f}'] = outputs[sample_idx, pos_idx, f]
+            
+            # Add target features
+            for d in range(D_trg):
+                record[f'trg_feat_{d}'] = targets[sample_idx, pos_idx, d]
+            
+            records.append(record)
+    
+    return pd.DataFrame(records)
+
+
+def predict_all_checkpoints_bottom_action(filepath: str, level_folders: List[str], s3: bool = False, bucket: str = None, datadir_path: str = None, input_conditioning_fn: Callable = None) -> pd.DataFrame:
+    """
+    Bottom action that runs predictions for ALL checkpoints across ALL k-folds.
+    
+    For each experiment folder, iterates through:
+    - All k-fold directories (k_0, k_1, ...)
+    - All checkpoint files in each fold's checkpoints/ directory
+    
+    Returns full predictions (not metrics) in long DataFrame format.
+    
+    Args:
+        filepath: Current directory path
+        level_folders: List of subdirectories at this level
+        s3: Whether files are on S3
+        bucket: S3 bucket name (required if s3=True)
+        datadir_path: Path to data directory. If None, uses DATA_DIR from paths.py
+        input_conditioning_fn: Optional function to condition inputs before forward pass.
+                              Use create_intervention_fn() to create intervention functions.
+                              Function signature: fn(X: torch.Tensor) -> torch.Tensor
+        
+    Returns:
+        pd.DataFrame: Predictions with columns:
+            - sample_idx: sample index
+            - pos_idx: position index
+            - pred_feat_0, pred_feat_1, ...: prediction features
+            - trg_feat_0, trg_feat_1, ...: target features
+            - checkpoint_name: checkpoint filename
+            - kfold: fold identifier (e.g., "k_0")
+            - model_folder: folder name containing the model
+    """
+    from causaliT.evaluation.predict import predict_test_from_ckpt
+    
+    # Default data directory path - use project-level DATA_DIR
+    if datadir_path is None:
+        datadir_path = str(DATA_DIR)
+    
+    df_list = []
+    
+    for folder in level_folders:
+        if s3:
+            print(f"Warning: S3 support for predict_all_checkpoints_bottom_action not implemented")
+            continue
+        
+        # Local paths
+        folder_path = join(filepath, folder)
+        
+        # Find config file using helper
+        try:
+            config_path = find_config_file(folder_path)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"Warning: {e}, skipping...")
+            continue
+        
+        try:
+            # Load config
+            config = OmegaConf.load(config_path)
+            
+            # Find all k-fold directories
+            kfold_dirs = [d for d in listdir(folder_path) 
+                         if isdir(join(folder_path, d)) and d.startswith('k_')]
+            
+            if not kfold_dirs:
+                print(f"Warning: No k-fold directories found in {folder_path}, skipping...")
+                continue
+            
+            print(f"Processing {folder}...")
+            print(f"  Found {len(kfold_dirs)} k-fold directories")
+            
+            for kfold_dir in sorted(kfold_dirs):
+                kfold_path = join(folder_path, kfold_dir)
+                checkpoints_dir = join(kfold_path, 'checkpoints')
+                
+                if not exists(checkpoints_dir) or not isdir(checkpoints_dir):
+                    print(f"  Warning: No checkpoints directory in {kfold_dir}, skipping...")
+                    continue
+                
+                # Find all checkpoint files
+                checkpoint_files = [f for f in listdir(checkpoints_dir) 
+                                   if f.endswith('.ckpt')]
+                
+                if not checkpoint_files:
+                    print(f"  Warning: No checkpoint files in {kfold_dir}/checkpoints, skipping...")
+                    continue
+                
+                print(f"  Processing {kfold_dir}: {len(checkpoint_files)} checkpoints")
+                
+                for ckpt_file in checkpoint_files:
+                    checkpoint_path = join(checkpoints_dir, ckpt_file)
+                    
+                    try:
+                        print(f"    Running predictions for {ckpt_file}...")
+                        
+                        # Run predictions
+                        results = predict_test_from_ckpt(
+                            config=config,
+                            datadir_path=datadir_path,
+                            checkpoint_path=checkpoint_path,
+                            dataset_label="test",
+                            cluster=False,
+                            input_conditioning_fn=input_conditioning_fn
+                        )
+                        
+                        # Convert to long DataFrame
+                        df_pred = predictions_to_long_df(
+                            outputs=results.outputs,
+                            targets=results.targets
+                        )
+                        
+                        # Add metadata columns
+                        df_pred["checkpoint_name"] = ckpt_file
+                        df_pred["kfold"] = kfold_dir
+                        df_pred["model_folder"] = folder
+                        
+                        df_list.append(df_pred)
+                        print(f"    Successfully processed {ckpt_file}")
+                        
+                    except Exception as e:
+                        print(f"    Error processing {ckpt_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                        
+        except Exception as e:
+            print(f"Error processing {folder}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Concatenate all results
+    if df_list:
+        return pd.concat(df_list, ignore_index=True)
+    else:
+        print("Warning: No predictions were successfully processed")
+        return pd.DataFrame()
+
+
+def predict_nested_all_checkpoints(filepath: str, outpath: str = None, s3: bool = False, datadir_path: str = None, input_conditioning_fn: Callable = None):
+    """
+    Run predictions for all checkpoints across all k-folds in nested experiment directories.
+    
+    This function recursively traverses experiment directories and runs predictions
+    for every checkpoint file found, returning full prediction arrays (not metrics).
+    
+    Args:
+        filepath: Root directory containing experiment sweep
+        outpath: Output directory to save results CSV. If None, only returns DataFrame without saving
+        s3: Whether files are on S3 (default: False)
+        datadir_path: Path to data directory (default: DATA_DIR from paths.py)
+        input_conditioning_fn: Optional function to condition inputs before forward pass.
+                              Use create_intervention_fn() to create intervention functions.
+                              Function signature: fn(X: torch.Tensor) -> torch.Tensor
+        
+    Returns:
+        pd.DataFrame: Complete predictions with columns:
+            - sample_idx: sample index in test set
+            - pos_idx: position index within sequence
+            - pred_feat_0, pred_feat_1, ...: prediction features
+            - trg_feat_0, trg_feat_1, ...: target features
+            - checkpoint_name: name of checkpoint file
+            - kfold: fold identifier (e.g., "k_0", "k_1")
+            - model_folder: experiment folder name
+            - level_0, level_1, ...: hierarchy levels from recursive traversal
+            
+    Example:
+        >>> # Run predictions for all checkpoints and save results
+        >>> df = predict_nested_all_checkpoints(
+        ...     filepath="experiments/ds_size",
+        ...     outpath="results",
+        ...     datadir_path="../data/input"
+        ... )
+        >>> 
+        >>> # Run predictions with intervention
+        >>> from causaliT.evaluation.predict import create_intervention_fn
+        >>> intervention_fn = create_intervention_fn(interventions={1: 0.0})
+        >>> df = predict_nested_all_checkpoints(
+        ...     filepath="experiments/ds_size",
+        ...     input_conditioning_fn=intervention_fn
+        ... )
+        >>> 
+        >>> # Filter by specific checkpoint
+        >>> df_best = df[df['checkpoint_name'] == 'best_checkpoint.ckpt']
+    """
+    # Create a wrapper for bottom_action that includes datadir_path and input_conditioning_fn
+    def bottom_action_with_params(filepath, level_folders, s3=False, bucket=None):
+        return predict_all_checkpoints_bottom_action(filepath, level_folders, s3, bucket, datadir_path, input_conditioning_fn)
+    
+    df = get_df_recursive(
+        filepath=filepath, 
+        bottom_action=bottom_action_with_params, 
+        is_bottom=has_kfold_summary, 
+        s3=s3, 
+        bucket="scipi1-public"
+    )
+    
+    # Save results if outpath is provided
+    if outpath is not None:
+        makedirs(outpath, exist_ok=True)
+        output_path = join(outpath, "predictions_all_checkpoints.csv")
+        df.to_csv(output_path, index=False)
+        print(f"\nResults saved to {output_path}")
+    
+    print(f"Total rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+    
+    return df
+
+
 def get_s3_client(public_only: bool = True):
     if public_only:
         return boto3.client("s3", config=Config(signature_version=UNSIGNED))

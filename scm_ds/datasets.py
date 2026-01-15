@@ -358,4 +358,6 @@ ds_scm6 = SCMDataset(
 #ds_scm3.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm3"), normalize_method="minmax")
 #ds_scm4.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm4"), normalize_method="minmax")
 # ds_scm5.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm5"), normalize_method="minmax")
-ds_scm6.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm6"), normalize_method="minmax")
+
+# Test with shared_embedding=True for unified variable IDs across all categories
+ds_scm6.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm6"), normalize_method="minmax", shared_embedding=True)
