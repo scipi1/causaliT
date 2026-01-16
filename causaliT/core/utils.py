@@ -1,11 +1,13 @@
 import torch
 import logging
 import os
-from os.path import dirname, abspath
+from os.path import dirname, abspath, join, exists
 from datetime import datetime
+from typing import Dict, Optional
 from pytorch_lightning import seed_everything
 import glob
 import re
+import pandas as pd
 ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
 
 
@@ -72,6 +74,59 @@ def find_last_checkpoint(checkpoint_dir):
     # Find the checkpoint with the highest epoch number
     last_checkpoint = max(checkpoint_files, key=extract_epoch, default=None)
     return last_checkpoint
+
+
+def load_dag_masks(
+    data_dir: str, 
+    mask_files: Dict[str, str],
+    device: str = 'cpu'
+) -> Optional[Dict[str, torch.Tensor]]:
+    """
+    Load DAG adjacency masks from CSV files for StageCausaliT architecture.
+    
+    These masks represent the ground-truth causal structure from the SCM and can be 
+    used as hard masks to enforce causal constraints in attention mechanisms.
+    
+    CSV format:
+        - Rows = query variables, Columns = key variables
+        - Values in [0, 1], where 1 = attention is allowed
+    
+    Args:
+        data_dir: Path to directory containing mask CSV files
+        mask_files: Dictionary mapping mask names to filenames, e.g.:
+            {
+                'dec1_cross': 'dec1_cross_att_mask.csv',
+                'dec1_self': 'dec1_self_att_mask.csv',
+                'dec2_cross': 'dec2_cross_att_mask.csv',
+                'dec2_self': 'dec2_self_att_mask.csv',
+            }
+        device: Device to place tensors on ('cpu', 'cuda', etc.)
+        
+    Returns:
+        Dictionary mapping mask names to tensors, or None if no masks found.
+        Keys match the keys in mask_files parameter.
+        Tensor shapes: (query_len, key_len) e.g., dec1_cross is (X_len, S_len)
+    """
+    masks = {}
+    for key, filename in mask_files.items():
+        if filename is None:
+            continue
+        path = join(data_dir, filename)
+        if exists(path):
+            df = pd.read_csv(path, index_col=0)
+            # Convert to float tensor: shape (query_len, key_len)
+            mask_tensor = torch.tensor(df.values, dtype=torch.float32, device=device)
+            masks[key] = mask_tensor
+            print(f"  Loaded mask '{key}': shape {mask_tensor.shape} from {filename}")
+        else:
+            print(f"  Warning: Mask file not found: {path}")
+    
+    if masks:
+        print(f"✓ Loaded {len(masks)} DAG masks from {data_dir}")
+        return masks
+    else:
+        print(f"✗ No DAG mask files found in {data_dir}")
+        return None
 
 
 

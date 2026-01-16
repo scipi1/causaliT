@@ -20,6 +20,10 @@ class LieAttention(nn.Module):
     Note: Acyclicity regularization (NOTEARS) only supports single-head attention.
           For multi-head attention, phi will have shape (H, L, S) and acyclicity 
           regularization should be disabled in the forecaster.
+    
+    The causal DAG is learned through a learnable tensor (phi) that models edge probabilities.
+    A Gumbel-Softmax trick enables differentiable sampling from Bernoulli(sigmoid(phi)).
+    Running averages of attention statistics are used as priors for KL regularization.
     """
     def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
         
@@ -29,26 +33,66 @@ class LieAttention(nn.Module):
         self.register_entropy = register_entropy
         self.layer_name = layer_name
         
-        # Extract phi from mask_layer if it's a DAGMask
+        # Store DAGMask as submodule to ensure proper parameter registration
         from causaliT.core.modules.extra_layers import DAGMask
         if isinstance(mask_layer, DAGMask):
-            self.phi = mask_layer.phi  # This is already an nn.Parameter, registered by DAGMask
+            self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
+            self.phi = self.dag_mask.phi  # Reference for convenience
             
             # Initialize running averages as buffers (not optimized, but saved in state_dict)
             # These track EMA statistics for monitoring and prior regularization
             self.register_buffer('runav_att_mean', torch.zeros_like(self.phi))
             self.register_buffer('runav_att_snr', torch.zeros_like(self.phi))
         else:
+            self.dag_mask = None
             self.phi = None
             self.runav_att_mean = None
             self.runav_att_snr = None
-            
-        self.tau = 0.5
+        
+        # Gumbel-Softmax temperature - learnable with annealing
+        # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
+        self.log_tau = nn.Parameter(torch.tensor(log(2.0)))
+        self.tau_min = 0.1  # Minimum temperature
+        self.tau_max = 5.0  # Maximum temperature
 
         self.entropy_enabled = True
         
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+        
+        # --- Lie commutator amplification (new) ---
+        self.log_gain = nn.Parameter(torch.tensor(log(10.0)))   # start strong; set to 0.0 if you want gain=1
+        self.log_tau_comm = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature (linear slope = gain/tau)
+        self.max_gain = 1e3
+        self.enforce_nonneg_flow = True  # set False if you want to allow negative flow
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the posterior probability of each edge being active in the learned DAG.
+        
+        This is useful for:
+        - Inference: Extract the learned causal structure
+        - Visualization: Plot the learned DAG
+        - Evaluation: Compare against ground-truth DAG
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned (phi is None).
+        """
+        if self.phi is not None:
+            return torch.sigmoid(self.phi)
+        return None
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """
+        Returns the raw logits (phi) of the learned DAG.
+        
+        Returns:
+            torch.Tensor: Raw logits, shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned.
+        """
+        return self.phi
         
     def _update_running_average(self, att):
         """
@@ -92,8 +136,23 @@ class LieAttention(nn.Module):
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
         causal_mask: bool,
+        hard_mask: torch.Tensor = None,
         ):
+        """
+        Forward pass for Lie Attention.
         
+        Args:
+            query: Query tensor
+            key: Key tensor
+            value: Value tensor
+            mask_miss_k: Missing key mask
+            mask_miss_q: Missing query mask
+            pos: Positional encoding
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) for single-head or (H, L, S) for multi-head.
+                       Values should be in [0, 1], where 1 = attention allowed.
+                       Applied as element-wise product with attention scores.
+        """
         # Handle both single-head (3D) and multi-head (4D) tensors
         is_multihead = query.dim() == 4
         
@@ -112,16 +171,33 @@ class LieAttention(nn.Module):
             scores = torch.einsum("blhe,bshe->bhls", query, key)
         else:
             scores = torch.einsum("ble,bse->bls", query, key)
-        
+            
         # convert to commutator
-        scores = F.gelu(scores - scores.transpose(-1,-2))
+        comm = scores - scores.transpose(-1,-2)
         
-        # calculate alpha
-        # comment: the gelu is not needed in the new setup, as we want att to be negative
+        # gain-before-tanh amplifier
+        gain = torch.exp(self.log_gain).clamp(1e-3, self.max_gain)
+        tau_comm = torch.exp(self.log_tau_comm).clamp(1e-3, 10.0)
+
+        # amplify small commutators (linear near 0, saturates to +/-1)
+        comm_amp = torch.tanh((gain / tau_comm) * comm)
+
+        # gate negatives toward 0 (your design choice)
+        scores = F.gelu(comm_amp)
+        
+        # apply scaling
         att = scale * scores
         
+        # Optionally enforce strict "negative -> no flow"
+        if self.enforce_nonneg_flow:
+            A = torch.relu(att)
+        else:
+            A = att
+
+        A = torch.nan_to_num(self.dropout(A))
+        
         # Update running average for monitoring and store batch statistics for regularization
-        evidence = torch.relu(att)
+        evidence = A
         batch_mean, batch_snr = self._update_running_average(evidence)
         
         # Store batch statistics as attributes for access by forecaster (with gradients)
@@ -130,9 +206,12 @@ class LieAttention(nn.Module):
         
         # Apply DAG mask if phi is available
         if self.phi is not None:
+            # Get learnable temperature (clamped to safe range)
+            tau = torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
+            
             # Sample batch DAG logits using Gumbel-Softmax trick
             u = torch.rand_like(self.phi)
-            m_relaxed = torch.sigmoid((torch.log(u) - torch.log(1-u) + self.phi) / self.tau)
+            m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau)
             M = m_relaxed
             
             # Add batch dimension
@@ -141,6 +220,24 @@ class LieAttention(nn.Module):
             M = M.unsqueeze(0)
             
             att = att * M
+        
+        # Apply hard mask if provided (ground-truth DAG structure)
+        if hard_mask is not None:
+            # hard_mask shape: (L, S) for single-head, (H, L, S) for multi-head
+            # Expand to match attention shape: (B, L, S) or (B, H, L, S)
+            if is_multihead:
+                # hard_mask: (H, L, S) -> (1, H, L, S)
+                if hard_mask.dim() == 2:
+                    # Single mask for all heads: (L, S) -> (1, 1, L, S) -> broadcast
+                    hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+                else:
+                    # Per-head mask: (H, L, S) -> (1, H, L, S)
+                    hard_mask = hard_mask.unsqueeze(0)
+            else:
+                # hard_mask: (L, S) -> (1, L, S)
+                hard_mask = hard_mask.unsqueeze(0)
+            
+            att = att * hard_mask
         
         if self.entropy_enabled:
             entropy = calculate_attention_entropy(att)
@@ -156,16 +253,385 @@ class LieAttention(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
             
+            
         return V.contiguous(), A, entropy
 
 
 
+class CausalCrossAttention(nn.Module):
+    """
+    Causal Cross-Attention with DAG mask learning.
+    
+    This module implements cross-attention (query and key sequences may differ)
+    adapted for causality, with learnable DAG structure.
+    
+    Features:
+    - GeLU(Tanh) activation instead of Softmax for causality-friendly attention
+    - Learnable DAG mask (phi) via Gumbel-Softmax trick
+    - Running averages for KL prior regularization
+    - Decoupled attention scores and causal structure
+    
+    The causal DAG is learned through a learnable tensor (phi) that models edge probabilities.
+    A Gumbel-Softmax trick enables differentiable sampling from Bernoulli(sigmoid(phi)).
+    Running averages of attention statistics are used as priors for KL regularization.
+    
+    Note: Cross-attention DAGs are bipartite (query → key), inherently acyclic,
+          so NOTEARS regularization is not needed.
+    """
+    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+        
+        super(CausalCrossAttention, self).__init__()
+        
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+        # Store DAGMask as submodule to ensure proper parameter registration
+        from causaliT.core.modules.extra_layers import DAGMask
+        if isinstance(mask_layer, DAGMask):
+            self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
+            self.phi = self.dag_mask.phi  # Reference for convenience
+            
+            # Initialize running averages as buffers (not optimized, but saved in state_dict)
+            # These track EMA statistics for monitoring and prior regularization
+            self.register_buffer('runav_att_mean', torch.zeros_like(self.phi))
+            self.register_buffer('runav_att_snr', torch.zeros_like(self.phi))
+        else:
+            self.dag_mask = None
+            self.phi = None
+            self.runav_att_mean = None
+            self.runav_att_snr = None
+        
+        # Gumbel-Softmax temperature - learnable with annealing
+        # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
+        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
+        self.tau_gs_min = 0.1  # Minimum temperature
+        self.tau_gs_max = 5.0  # Maximum temperature
+        
+        # Gain/temperature parameters for GeLU(Tanh) activation
+        self.log_gain = nn.Parameter(torch.tensor(log(0.1)))
+        self.log_tau = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature
+        self.max_gain = 10.0
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the posterior probability of each edge being active in the learned DAG.
+        
+        This is useful for:
+        - Inference: Extract the learned causal structure
+        - Visualization: Plot the learned DAG
+        - Evaluation: Compare against ground-truth DAG
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned (phi is None).
+        """
+        if self.phi is not None:
+            return torch.sigmoid(self.phi)
+        return None
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """
+        Returns the raw logits (phi) of the learned DAG.
+        
+        Returns:
+            torch.Tensor: Raw logits, shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned.
+        """
+        return self.phi
+    
+    def _update_running_average(self, att):
+        """
+        Update running averages of attention statistics.
+        
+        Args:
+            att: Attention evidence tensor (batch_size, ...)
+            
+        Returns:
+            tuple: (batch_mean, batch_snr) with gradients attached for regularization
+        """
+        alpha = 0.9
+        
+        # Compute batch statistics (keep gradients for regularization)
+        batch_mean = torch.mean(att, dim=0)
+        batch_std = torch.std(att, dim=0)
+        batch_snr = batch_mean / (batch_std + 1e-6)
+        
+        # Update running averages (no gradients, in-place operations on buffers)
+        if self.runav_att_mean is not None:
+            with torch.no_grad():
+                if (self.runav_att_mean != 0).any():
+                    # EMA update using in-place operations
+                    self.runav_att_mean.mul_(alpha).add_(batch_mean, alpha=1-alpha)
+                    self.runav_att_snr.mul_(alpha).add_(batch_snr, alpha=1-alpha)
+                else:
+                    # First update: initialize with batch statistics
+                    self.runav_att_mean.copy_(batch_mean)
+                    self.runav_att_snr.copy_(batch_snr)
+        
+        # Return batch statistics with gradients for immediate use in regularization
+        return batch_mean, batch_snr
+    
+    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
+        """Expand hard_mask to match scores shape and convert to additive mask."""
+        if is_multihead:
+            if hard_mask.dim() == 2:
+                # Single mask for all heads: (L, S) -> (1, 1, L, S)
+                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                # Per-head mask: (H, L, S) -> (1, H, L, S)
+                hard_mask = hard_mask.unsqueeze(0)
+        else:
+            # hard_mask: (L, S) -> (1, L, S)
+            hard_mask = hard_mask.unsqueeze(0)
+        return hard_mask
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+        ):
+        """
+        Forward pass for Causal Cross-Attention with DAG learning.
+        
+        Args:
+            query: Query tensor (B, L, E) or (B, L, H, E) for multi-head
+            key: Key tensor (B, S, E) or (B, S, H, E) for multi-head
+            value: Value tensor (B, S, E) or (B, S, H, E) for multi-head
+            mask_miss_k: Missing key mask (unused in simplified version)
+            mask_miss_q: Missing query mask (unused in simplified version)
+            pos: Positional encoding for causal masking
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
+                       Values in [0, 1], where 1 = attention allowed.
+                       Applied AFTER the learned DAG mask as element-wise product.
+        """
+        is_multihead = query.dim() == 4
+        
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S, _ = key.shape
+            H = 1
+        
+        scale = 1.0 / sqrt(E)
+        
+        # Compute attention scores
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        scores = scale * scores
+        
+        # Apply causal mask (additive, before activation)
+        if pos is not None and causal_mask:
+            M_causal = build_causal_mask(pos, n_heads=H)
+            scores = scores + M_causal
+        
+        gain = torch.exp(self.log_gain).clamp(1e-3, self.max_gain)
+        tau = torch.exp(self.log_tau).clamp(1e-3, 10.0)
+        
+        # Causality-friendly activation: GeLU(Tanh(scores))
+        att = F.gelu(F.tanh((gain / tau) * scores))
+        
+        # Handle NaN from all-masked rows
+        att = torch.nan_to_num(att, nan=0.0)
+        
+        # Update running average for monitoring and store batch statistics for regularization
+        evidence = att
+        batch_mean, batch_snr = self._update_running_average(evidence)
+        
+        # Store batch statistics as attributes for access by forecaster (with gradients)
+        self.batch_att_mean = batch_mean
+        self.batch_att_snr = batch_snr
+        
+        # Apply learned DAG mask if phi is available
+        if self.phi is not None:
+            # Get learnable temperature (clamped to safe range)
+            tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
+            
+            # Sample batch DAG logits using Gumbel-Softmax trick
+            u = torch.rand_like(self.phi)
+            m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau_gs)
+            M = m_relaxed
+            
+            # Add batch dimension
+            # For single-head: phi shape is (L, S) -> M becomes (1, L, S)
+            # For multi-head: phi shape is (H, L, S) -> M becomes (1, H, L, S)
+            M = M.unsqueeze(0)
+            
+            att = att * M
+        
+        # Apply hard mask if provided (ground-truth DAG structure)
+        if hard_mask is not None:
+            hard_mask_expanded = self._expand_hard_mask(hard_mask, is_multihead)
+            att = att * hard_mask_expanded
+        
+        # Calculate entropy before dropout
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+        
+        # Apply dropout
+        A = self.dropout(att)
+        
+        # Compute output values
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+        
+        return V.contiguous(), A, entropy
+
 
 
 class ScaledDotAttention(nn.Module):
+    """
+    Simplified Scaled Dot-Product Attention.
+    
+    Hard mask is applied BEFORE softmax to ensure masked positions don't
+    influence the softmax normalization (preventing information leakage).
+    """
     def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(ScaledDotAttention, self).__init__()
+        
+        self.mask_layer = mask_layer
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+    
+    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
+        """Expand hard_mask to match scores shape and convert to additive mask."""
+        if is_multihead:
+            if hard_mask.dim() == 2:
+                # Single mask for all heads: (L, S) -> (1, 1, L, S)
+                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                # Per-head mask: (H, L, S) -> (1, H, L, S)
+                hard_mask = hard_mask.unsqueeze(0)
+        else:
+            # hard_mask: (L, S) -> (1, L, S)
+            hard_mask = hard_mask.unsqueeze(0)
+        return hard_mask
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+        ):
+        """
+        Forward pass for Scaled Dot-Product Attention.
+        
+        Args:
+            query: Query tensor (B, L, E) or (B, L, H, E) for multi-head
+            key: Key tensor (B, S, E) or (B, S, H, E) for multi-head
+            value: Value tensor (B, S, E) or (B, S, H, E) for multi-head
+            mask_miss_k: Missing key mask (unused in simplified version)
+            mask_miss_q: Missing query mask (unused in simplified version)
+            pos: Positional encoding for causal masking
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
+                       Values in [0, 1], where 1 = attention allowed.
+                       Applied BEFORE softmax via additive -inf masking.
+        """
+        is_multihead = query.dim() == 4
+        
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S, _ = key.shape
+            H = 1
+        
+        scale = 1.0 / sqrt(E)
+        
+        # Compute attention scores
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        # Apply causal mask (additive, before softmax)
+        if pos is not None and causal_mask:
+            M_causal = build_causal_mask(pos, n_heads=H)
+            scores = scores + M_causal
+        
+        # Apply hard mask BEFORE softmax (additive, -inf for masked positions)
+        # This ensures masked positions don't influence softmax normalization
+        if hard_mask is not None:
+            hard_mask_expanded = self._expand_hard_mask(hard_mask, is_multihead)
+            # Convert 0/1 mask to additive mask: 0 -> -inf, 1 -> 0
+            hard_mask_additive = torch.where(
+                hard_mask_expanded == 0,
+                torch.tensor(float('-inf'), device=scores.device, dtype=scores.dtype),
+                torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+            )
+            scores = scores + hard_mask_additive
+        
+        # Scaled softmax
+        att = torch.softmax(scale * scores, dim=-1)
+        
+        # Handle NaN from all-masked rows (softmax of all -inf gives NaN)
+        att = torch.nan_to_num(att, nan=0.0)
+        
+        # Calculate entropy before dropout
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+        
+        # Apply dropout
+        A = self.dropout(att)
+        
+        # Compute output values
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+        
+        return V.contiguous(), A, entropy
+
+
+class ScaledDotAttentionNAIM(nn.Module):
+    """
+    Scaled Dot-Product Attention with NAIM (Not All Is Missing) handling.
+    
+    This version includes special handling for missing data via mask_miss_k and mask_miss_q,
+    using ReLU after softmax to handle the missing query mask.
+    Reference: https://arxiv.org/abs/2407.11540
+    
+    NOTE: The hard_mask in this version is applied AFTER softmax, which can cause
+    information leakage. Use ScaledDotAttention for proper causal masking.
+    """
+    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+        
+        super(ScaledDotAttentionNAIM, self).__init__()
         
         self.mask_layer = mask_layer
         self.dropout = nn.Dropout(attention_dropout)
@@ -186,8 +652,23 @@ class ScaledDotAttention(nn.Module):
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
         causal_mask: bool,
+        hard_mask: torch.Tensor = None,
         ):
+        """
+        Forward pass for Scaled Dot-Product Attention with NAIM missing data handling.
         
+        Args:
+            query: Query tensor
+            key: Key tensor
+            value: Value tensor
+            mask_miss_k: Missing key mask (True = missing)
+            mask_miss_q: Missing query mask (True = missing)
+            pos: Positional encoding
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) for single-head or (H, L, S) for multi-head.
+                       Values should be in [0, 1], where 1 = attention allowed.
+                       WARNING: Applied AFTER softmax - may cause information leakage.
+        """
         # Handle both single-head (3D) and multi-head (4D) tensors
         is_multihead = query.dim() == 4
         
@@ -210,7 +691,6 @@ class ScaledDotAttention(nn.Module):
         # Apply causal mask
         if pos is not None and causal_mask:
             M_causal = build_causal_mask(pos, n_heads=H)
-            
             scores = scores + M_causal
         
         # Apply missing data masks
@@ -230,7 +710,6 @@ class ScaledDotAttention(nn.Module):
                 mask_miss_q_expanded = mask_miss_q.unsqueeze(1).expand(-1, H, -1, -1).expand(-1, -1, -1, key_size)
         else:
             # For single-head: scores shape is (B, L, S)
-            
             key_size = scores.size(-1)  # S
             query_size = scores.size(-2)  # L
             
@@ -252,15 +731,23 @@ class ScaledDotAttention(nn.Module):
         
         att = torch.relu(torch.softmax(scale * (scores + M_k), dim=-1) + M_q)
         
-        # Attention entropy hook - register entropy before dropout
-        # if self.register_entropy:
-        #     register_attention_entropy(self.layer_name, att)
+        # Apply hard mask if provided (ground-truth DAG structure)
+        # WARNING: This is applied AFTER softmax which may cause information leakage
+        if hard_mask is not None:
+            if is_multihead:
+                if hard_mask.dim() == 2:
+                    hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+                else:
+                    hard_mask = hard_mask.unsqueeze(0)
+            else:
+                hard_mask = hard_mask.unsqueeze(0)
+            
+            att = att * hard_mask
         
         if self.entropy_enabled:
             entropy = calculate_attention_entropy(att)
         else:
             entropy = None
-            
             
         A = torch.nan_to_num(self.dropout(att))
         
@@ -349,9 +836,11 @@ class AttentionLayer(nn.Module):
         
         super(AttentionLayer, self).__init__()
         
-        # Create DAGMask for LieAttention if sequence lengths are provided
+        # Create DAGMask for attention types that support DAG learning
         from causaliT.core.modules.extra_layers import DAGMask
-        if attention == LieAttention and query_seq_len is not None and key_seq_len is not None:
+        
+        # LieAttention and CausalCrossAttention both support DAG learning
+        if attention in (LieAttention, CausalCrossAttention) and query_seq_len is not None and key_seq_len is not None:
             mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len)
         
         self.inner_attention = attention(
@@ -376,8 +865,22 @@ class AttentionLayer(nn.Module):
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
         causal_mask: bool,
+        hard_mask: torch.Tensor = None,
         ):
+        """
+        Forward pass through attention layer.
         
+        Args:
+            query: Query tensor (B, L, d_model)
+            key: Key tensor (B, S, d_model)
+            value: Value tensor (B, S, d_model)
+            mask_miss_k: Missing key mask
+            mask_miss_q: Missing query mask
+            pos: Positional encoding
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
+                       Values in [0, 1], where 1 = attention allowed.
+        """
         B, L, _ = query.shape
         _, S, _ = key.shape
         H = self.n_heads
@@ -400,6 +903,7 @@ class AttentionLayer(nn.Module):
             mask_miss_q=mask_miss_q,
             pos=pos,
             causal_mask=causal_mask,
+            hard_mask=hard_mask,
             )
         
         # Reshape output and apply final projection if multi-head
@@ -499,4 +1003,3 @@ def main():
 if __name__ == "__main__":
     main()
     main()
-    

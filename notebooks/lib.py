@@ -156,42 +156,65 @@ def get_architecture_type(config: dict) -> str:
 
 def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[np.ndarray]]:
     """
-    Extract phi tensors from a loaded model.
+    Extract learned DAG probabilities (sigmoid(phi)) from a loaded model.
+    
+    This function extracts the posterior DAG structure learned by LieAttention and
+    CausalCrossAttention modules. It uses `get_dag_probabilities()` which returns
+    sigmoid(phi), the actual edge probabilities, rather than raw phi logits.
     
     Args:
         model: Loaded model (TransformerForecaster or StageCausalForecaster)
         architecture_type: "TransformerForecaster" or "StageCausalForecaster"
         
     Returns:
-        Dict mapping component name to phi array (or None if not available)
+        Dict mapping component name to DAG probability array (or None if not available)
+        Keys:
+        - TransformerForecaster: "encoder", "decoder", "cross"
+        - StageCausalForecaster: "decoder1", "decoder1_cross", "decoder2", "decoder2_cross"
     """
     phi_dict = {}
     
+    def _get_dag_probs(inner_attention):
+        """Helper to safely extract DAG probabilities from an attention module."""
+        if hasattr(inner_attention, 'get_dag_probabilities'):
+            dag_probs = inner_attention.get_dag_probabilities()
+            if dag_probs is not None:
+                return dag_probs.detach().cpu().numpy()
+        return None
+    
     if architecture_type == "TransformerForecaster":
-        # Encoder phi
-        enc_inner_att = model.model.encoder.layers[0].global_attention.inner_attention
-        enc_phi = getattr(enc_inner_att, 'phi', None)
+        # Encoder self-attention DAG
+        enc_inner = model.model.encoder.layers[0].global_attention.inner_attention
+        phi_dict["encoder"] = _get_dag_probs(enc_inner)
         
-        # Decoder phi
-        dec_inner_att = model.model.decoder.layers[0].global_self_attention.inner_attention
-        dec_phi = getattr(dec_inner_att, 'phi', None)
+        # Decoder self-attention DAG
+        dec_self_inner = model.model.decoder.layers[0].global_self_attention.inner_attention
+        phi_dict["decoder"] = _get_dag_probs(dec_self_inner)
         
-        phi_dict["encoder"] = enc_phi.detach().cpu().numpy() if enc_phi is not None else None
-        phi_dict["decoder"] = dec_phi.detach().cpu().numpy() if dec_phi is not None else None
+        # Decoder cross-attention DAG (for CausalCrossAttention)
+        dec_cross_inner = model.model.decoder.layers[0].global_cross_attention.inner_attention
+        phi_dict["cross"] = _get_dag_probs(dec_cross_inner)
         
     elif architecture_type == "StageCausalForecaster":
-        # Decoder1 phi (S -> X)
-        dec1_inner_att = model.model.decoder1.layers[0].global_self_attention.inner_attention
-        dec1_phi = getattr(dec1_inner_att, 'phi', None)
+        # Decoder1 self-attention DAG (X -> X structure)
+        dec1_self_inner = model.model.decoder1.layers[0].global_self_attention.inner_attention
+        phi_dict["decoder1"] = _get_dag_probs(dec1_self_inner)
         
-        # Decoder2 phi (X -> Y)
-        dec2_inner_att = model.model.decoder2.layers[0].global_self_attention.inner_attention
-        dec2_phi = getattr(dec2_inner_att, 'phi', None)
+        # Decoder1 cross-attention DAG (S -> X structure)
+        dec1_cross_inner = model.model.decoder1.layers[0].global_cross_attention.inner_attention
+        phi_dict["decoder1_cross"] = _get_dag_probs(dec1_cross_inner)
         
+        # Decoder2 self-attention DAG (Y -> Y structure)
+        dec2_self_inner = model.model.decoder2.layers[0].global_self_attention.inner_attention
+        phi_dict["decoder2"] = _get_dag_probs(dec2_self_inner)
+        
+        # Decoder2 cross-attention DAG (X -> Y structure)
+        dec2_cross_inner = model.model.decoder2.layers[0].global_cross_attention.inner_attention
+        phi_dict["decoder2_cross"] = _get_dag_probs(dec2_cross_inner)
+        
+        # Compatibility keys
         phi_dict["encoder"] = None  # No encoder in StageCausal
         phi_dict["decoder"] = None  # For compatibility
-        phi_dict["decoder1"] = dec1_phi.detach().cpu().numpy() if dec1_phi is not None else None
-        phi_dict["decoder2"] = dec2_phi.detach().cpu().numpy() if dec2_phi is not None else None
     
     return phi_dict
 
@@ -280,6 +303,7 @@ def load_attention_data(
         result.phi_tensors = {
             "encoder": [],
             "decoder": [],
+            "cross": [],  # Cross-attention DAG (for CausalCrossAttention)
         }
     else:  # StageCausalForecaster
         result.attention_weights = {
@@ -295,7 +319,9 @@ def load_attention_data(
             "encoder": [],
             "decoder": [],
             "decoder1": [],
+            "decoder1_cross": [],  # Cross-attention DAG (S -> X)
             "decoder2": [],
+            "decoder2_cross": [],  # Cross-attention DAG (X -> Y)
         }
     
     # Process each k-fold
@@ -432,18 +458,20 @@ def plot_attention_scores(
             phi_mapping["decoder"] = "decoder"
         if any(x is not None for x in data.attention_weights.get("cross", [])):
             attention_blocks.append("cross")
-            # cross attention doesn't have phi
+            phi_mapping["cross"] = "cross"  # Cross-attention DAG (for CausalCrossAttention)
     else:  # StageCausalForecaster
         if any(x is not None for x in data.attention_weights.get("decoder1_self", [])):
             attention_blocks.append("decoder1_self")
             phi_mapping["decoder1_self"] = "decoder1"
         if any(x is not None for x in data.attention_weights.get("decoder1_cross", [])):
             attention_blocks.append("decoder1_cross")
+            phi_mapping["decoder1_cross"] = "decoder1_cross"  # Cross-attention DAG (S -> X)
         if any(x is not None for x in data.attention_weights.get("decoder2_self", [])):
             attention_blocks.append("decoder2_self")
             phi_mapping["decoder2_self"] = "decoder2"
         if any(x is not None for x in data.attention_weights.get("decoder2_cross", [])):
             attention_blocks.append("decoder2_cross")
+            phi_mapping["decoder2_cross"] = "decoder2_cross"  # Cross-attention DAG (X -> Y)
     
     if not attention_blocks:
         raise ValueError("No attention blocks with data found")

@@ -194,14 +194,15 @@ def predict_test_from_ckpt(
     external_dataset: dict = None,
     dataset_label: str = "test",
     cluster: bool = False,
-    input_conditioning_fn: Callable[[torch.Tensor], torch.Tensor] = None
+    input_conditioning_fn: Callable[[torch.Tensor], torch.Tensor] = None,
+    toggle_off_hard_masks: bool = False,
 ) -> PredictionResult:
     """
     Run standard prediction on specified dataset using a trained model checkpoint.
     
     This function:
     1. Creates appropriate predictor based on model type in config
-    2. Loads the model from checkpoint
+    2. Loads the model from checkpoint (including hard masks if model was trained with them)
     3. Creates data module
     4. Runs prediction
     5. Returns PredictionResult object
@@ -213,6 +214,10 @@ def predict_test_from_ckpt(
         external_dataset: Optional dict with 'dataset', 'filename_input', 'filename_target'
         dataset_label: One of ["train", "test", "all"]
         cluster: Whether running on cluster
+        input_conditioning_fn: Optional function to condition inputs before forward pass
+        toggle_off_hard_masks: If True, disables hard masks even if model was trained with them.
+                              Useful for testing causality retention. Default False = use masks
+                              if model was trained with them. (StageCausaliT only)
         
     Returns:
         PredictionResult: Object containing:
@@ -242,11 +247,12 @@ def predict_test_from_ckpt(
         cluster=cluster
     )
     
-    # Run prediction
+    # Run prediction - pass toggle_off_hard_masks for StageCausaliT models
     results = predictor.predict(
         dm=dm,
         dataset_label=dataset_label,
-        input_conditioning_fn=input_conditioning_fn
+        input_conditioning_fn=input_conditioning_fn,
+        toggle_off_hard_masks=toggle_off_hard_masks,
     )
     
     return results
@@ -642,8 +648,8 @@ if __name__ == "__main__":
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
     print(ROOT_DIR)
     datadir_path = join(ROOT_DIR, r"data/")
-    config_path = join(ROOT_DIR, r"experiments/example/config_v5_5.yaml")
-    checkpoint_path = join(ROOT_DIR, r"experiments/example/k_0/checkpoints/best_checkpoint.ckpt")
+    config_path = join(ROOT_DIR, r"experiments/stage_Lie_hard_scm6_54252297/config_stage_causaliT_v1.yaml")
+    checkpoint_path = join(ROOT_DIR, r"experiments/stage_Lie_hard_scm6_54252297/k_0/checkpoints/epoch=9-train_loss=0.00.ckpt")
 
     config = OmegaConf.load(config_path)
     

@@ -65,7 +65,9 @@ class ReversedDecoderLayer(nn.Module):
         cross_mask_miss_k: torch.Tensor,
         cross_mask_miss_q: torch.Tensor,
         dec_input_pos: torch.Tensor,
-        causal_mask: bool
+        causal_mask: bool,
+        cross_hard_mask: torch.Tensor = None,
+        self_hard_mask: torch.Tensor = None,
     ):
         """
         Forward pass with REVERSED attention order.
@@ -79,6 +81,8 @@ class ReversedDecoderLayer(nn.Module):
             cross_mask_miss_q: Missing value mask for cross-attention queries
             dec_input_pos: Positional information for decoder input
             causal_mask: Whether to apply causal masking
+            cross_hard_mask: Optional hard mask for cross-attention (L_q, L_k), values in [0,1]
+            self_hard_mask: Optional hard mask for self-attention (L, L), values in [0,1]
             
         Returns:
             decoder_out: Output tensor after all operations
@@ -101,7 +105,8 @@ class ReversedDecoderLayer(nn.Module):
             mask_miss_k=cross_mask_miss_k,
             mask_miss_q=cross_mask_miss_q,
             pos=None,
-            causal_mask=False
+            causal_mask=False,
+            hard_mask=cross_hard_mask,
         )
         
         X2 = X + self.dropout_attn_out(X1)
@@ -116,7 +121,8 @@ class ReversedDecoderLayer(nn.Module):
             mask_miss_k=self_mask_miss_k,
             mask_miss_q=self_mask_miss_q,
             pos=dec_input_pos,
-            causal_mask=causal_mask
+            causal_mask=causal_mask,
+            hard_mask=self_hard_mask,
         )
         
         X4 = X2 + self.dropout_attn_out(X3)
@@ -162,7 +168,9 @@ class ReversedDecoder(nn.Module):
         cross_mask_miss_k: torch.Tensor,
         cross_mask_miss_q: torch.Tensor,
         dec_input_pos: torch.Tensor,
-        causal_mask: bool
+        causal_mask: bool,
+        cross_hard_mask: torch.Tensor = None,
+        self_hard_mask: torch.Tensor = None,
     ):
         """
         Forward pass through all decoder layers.
@@ -176,6 +184,8 @@ class ReversedDecoder(nn.Module):
             cross_mask_miss_q: Cross-attention query mask
             dec_input_pos: Positional information
             causal_mask: Whether to use causal masking
+            cross_hard_mask: Optional hard mask for cross-attention (L_q, L_k), values in [0,1]
+            self_hard_mask: Optional hard mask for self-attention (L, L), values in [0,1]
             
         Returns:
             X: Output tensor after all layers
@@ -199,7 +209,9 @@ class ReversedDecoder(nn.Module):
                 cross_mask_miss_k=cross_mask_miss_k,
                 cross_mask_miss_q=cross_mask_miss_q,
                 dec_input_pos=dec_input_pos,
-                causal_mask=causal_mask
+                causal_mask=causal_mask,
+                cross_hard_mask=cross_hard_mask,
+                self_hard_mask=self_hard_mask,
             )
             
             cross_att_list.append(cross_att)

@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, AttentionLayer,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, AttentionLayer,
     ModularEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -221,7 +221,8 @@ class StageCausaliT(nn.Module):
         intermediate_tensor_blanked,
         intermediate_tensor_actual,
         target_tensor,
-        use_teacher_forcing: bool = False
+        use_teacher_forcing: bool = False,
+        hard_masks: dict = None,
     ):
         """
         Forward pass through both decoder stages.
@@ -234,6 +235,12 @@ class StageCausaliT(nn.Module):
                                         shape (B, X_seq_len, features). Used for decoder 2 with teacher forcing.
             target_tensor: Target variables (Y, blanked), shape (B, Y_seq_len, features)
             use_teacher_forcing: If True, use actual X for decoder 2 instead of predicted X
+            hard_masks: Optional dict of hard masks for attention. Keys:
+                        - 'dec1_cross': mask for decoder 1 cross-attention (X_len, S_len)
+                        - 'dec1_self': mask for decoder 1 self-attention (X_len, X_len)
+                        - 'dec2_cross': mask for decoder 2 cross-attention (Y_len, X_len)
+                        - 'dec2_self': mask for decoder 2 self-attention (Y_len, Y_len)
+                        Values in [0, 1], where 1 = attention allowed.
             
         Returns:
             pred_x: Predicted X from decoder 1
@@ -242,6 +249,18 @@ class StageCausaliT(nn.Module):
             masks: Tuple of masks for S, X, Y
             entropies: Tuple of attention entropies from both decoders
         """
+        
+        # Extract hard masks if provided
+        dec1_cross_hard = None
+        dec1_self_hard = None
+        dec2_cross_hard = None
+        dec2_self_hard = None
+        
+        if hard_masks is not None:
+            dec1_cross_hard = hard_masks.get('dec1_cross', None)
+            dec1_self_hard = hard_masks.get('dec1_self', None)
+            dec2_cross_hard = hard_masks.get('dec2_cross', None)
+            dec2_self_hard = hard_masks.get('dec2_self', None)
         
         # ===== Stage 1: Source → Intermediate (S → X) =====
         
@@ -264,7 +283,9 @@ class StageCausaliT(nn.Module):
             cross_mask_miss_k=s_mask,
             cross_mask_miss_q=x_mask,
             dec_input_pos=x_input_pos,
-            causal_mask=self.dec1_causal_mask
+            causal_mask=self.dec1_causal_mask,
+            cross_hard_mask=dec1_cross_hard,
+            self_hard_mask=dec1_self_hard,
         )
         
         # De-embed to get predicted X
@@ -301,7 +322,9 @@ class StageCausaliT(nn.Module):
             cross_mask_miss_k=x_for_dec2_mask,
             cross_mask_miss_q=y_mask,
             dec_input_pos=y_input_pos,
-            causal_mask=self.dec2_causal_mask
+            causal_mask=self.dec2_causal_mask,
+            cross_hard_mask=dec2_cross_hard,
+            self_hard_mask=dec2_self_hard,
         )
         
         # De-embed to get predicted Y
@@ -353,12 +376,14 @@ class StageCausaliT(nn.Module):
         """
         
         # Choose attention type
-        assert attention_type in ["ScaledDotProduct", "LieAttention"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
         elif attention_type == "LieAttention":
             attention_module = LieAttention
+        elif attention_type == "CausalCrossAttention":
+            attention_module = CausalCrossAttention
         
         # Choose mask type
         mask_layer = None

@@ -12,7 +12,7 @@ This package contains all training-related components:
 from .forecasters import TransformerForecaster, StageCausalForecaster
 from .dataloader import ProcessDataModule
 from .stage_causal_dataloader import StageCausalDataModule
-from .trainer import trainer, get_model_object, get_dataloader
+from .trainer import trainer, get_model_class, create_model_instance, get_dataloader
 from .experiment_control import combination_sweep, update_config
 
 __all__ = [
@@ -21,7 +21,8 @@ __all__ = [
     'ProcessDataModule',
     'StageCausalDataModule',
     'trainer',
-    'get_model_object',
+    'get_model_class',
+    'create_model_instance',
     'get_dataloader',
     'combination_sweep',
     'update_config',

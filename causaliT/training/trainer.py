@@ -71,8 +71,8 @@ def trainer(
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     
-    # get model object and dataloader from configuration
-    model_object = get_model_object(config)
+    # get model class and dataloader from configuration
+    model_class = get_model_class(config)
     dm = get_dataloader(config, data_dir, cluster, seed)
     
     
@@ -115,14 +115,14 @@ def trainer(
     kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
     
     # Count trainable parameters (same for all folds, calculated once)
-    temp_model = model_object(config)
+    temp_model = create_model_instance(config, data_dir)
     trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
     del temp_model  # Clean up temporary model
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
         # re-initialize the model at any fold
-        model = model_object(config)
+        model = create_model_instance(config, data_dir)
         
         print(f"Fold {fold + 1}/{k_folds}")
         logger_info.info(f"Fold {fold + 1}/{k_folds}")
@@ -255,14 +255,11 @@ def trainer(
     df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
     df_metric = df_metric.applymap(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
     
-    if plot_pred_check:
-        mk_quick_pred_plot(model=model, dm=dm, val_idx=config["data"]["val_idx"], save_dir=save_dir)
-
     return df_metric
 
 
 
-def get_model_object(config: dict) -> pl.LightningModule:
+def get_model_class(config: dict):
     """
     Get the appropriate model class based on configuration.
     
@@ -270,7 +267,7 @@ def get_model_object(config: dict) -> pl.LightningModule:
         config: Configuration dictionary
         
     Returns:
-        Model class (Lightning Module)
+        Model class (Lightning Module class, not instance)
     """
     model_obj = config["model"]["model_object"]
     available_models = ["proT", "StageCausaliT", "LSTM", "GRU", "TCN", "MLP"]
@@ -286,6 +283,30 @@ def get_model_object(config: dict) -> pl.LightningModule:
         # "MLP": RNNForecaster,
     }
     return MODEL_REGISTRY[model_obj]
+
+
+def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningModule:
+    """
+    Create a model instance based on configuration.
+    
+    Args:
+        config: Configuration dictionary
+        data_dir: Data directory path (needed for StageCausaliT hard masks)
+        
+    Returns:
+        Model instance (Lightning Module)
+    """
+    model_obj = config["model"]["model_object"]
+    
+    # StageCausaliT needs data_dir for hard mask loading
+    if model_obj == "StageCausaliT":
+        return StageCausalForecaster(config, data_dir=data_dir)
+    elif model_obj == "proT":
+        return TransformerForecaster(config)
+    else:
+        # For other models, use the class from registry
+        model_class = get_model_class(config)
+        return model_class(config)
 
 
 def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):

@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .base_predictor import BasePredictor, PredictionResult
 from causaliT.training.forecasters.stage_causal_forecaster import StageCausalForecaster
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
+from causaliT.core.utils import load_dag_masks
 
 
 class StageCausalPredictor(BasePredictor):
@@ -22,6 +23,7 @@ class StageCausalPredictor(BasePredictor):
     - StageCausalForecaster with dual decoders
     - Three-input data format (S, X, Y)
     - Dual outputs (pred_x, pred_y)
+    - Automatic loading of hard masks if model was trained with them
     
     Returns predictions along with attention weights from both decoders:
     - Decoder 1: S → X (dec1_cross, dec1_self)
@@ -36,8 +38,12 @@ class StageCausalPredictor(BasePredictor):
         """
         Load StageCausalForecaster model from checkpoint.
         
+        If the model was trained with hard masks (config has use_hard_masks=True),
+        this method also loads the masks from the data directory to ensure
+        they are available during inference.
+        
         Returns:
-            Loaded StageCausalForecaster model
+            Loaded StageCausalForecaster model with masks loaded if applicable
         """
         model = StageCausalForecaster.load_from_checkpoint(self.checkpoint_path)
         
@@ -48,7 +54,51 @@ class StageCausalPredictor(BasePredictor):
         if not any(param.requires_grad for param in model.parameters()):
             raise RuntimeError("Model parameters seem uninitialized. Check the checkpoint path.")
         
+        # If model was trained with hard masks, ensure they are loaded
+        if model.use_hard_masks and not model._hard_masks_loaded:
+            self._load_hard_masks_for_model(model)
+        
         return model
+    
+    def _load_hard_masks_for_model(self, model: StageCausalForecaster):
+        """
+        Load hard masks from data directory and register them to the model.
+        
+        This is called when loading from checkpoint if the model was trained
+        with hard masks but they weren't saved/restored properly from the checkpoint.
+        
+        Args:
+            model: StageCausalForecaster model to load masks into
+        """
+        # Get mask filenames from config
+        mask_files = self.config["training"].get("hard_mask_files", None)
+        
+        if mask_files is None:
+            print("Warning: Model was trained with use_hard_masks=True but no hard_mask_files in config.")
+            return
+        
+        if self.datadir_path is None:
+            print("Warning: Cannot load hard masks - no datadir_path provided.")
+            return
+        
+        # Construct full data path
+        dataset_name = self.config["data"]["dataset"]
+        dataset_dir = join(self.datadir_path, dataset_name)
+        
+        # Load masks
+        masks = load_dag_masks(dataset_dir, mask_files, device='cpu')
+        
+        if masks is not None:
+            model._hard_masks = masks
+            model._hard_masks_loaded = True
+            
+            # Register masks as buffers (ensures correct device handling)
+            for name, mask in masks.items():
+                model.register_buffer(f'hard_mask_{name}', mask)
+            
+            print(f"✓ Hard masks loaded from data directory for inference.")
+        else:
+            print("Warning: Failed to load hard masks from data directory.")
     
     def create_data_module(
         self,
@@ -105,7 +155,8 @@ class StageCausalPredictor(BasePredictor):
         
         return dm
     
-    def _forward(self, S: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, **kwargs) -> Any:
+    def _forward(self, S: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, 
+                 toggle_off_hard_masks: bool = False, **kwargs) -> Any:
         """
         Perform forward pass through StageCausalForecaster model.
         
@@ -119,6 +170,9 @@ class StageCausalPredictor(BasePredictor):
             S: Source tensor (B x L_s x F)
             X: Intermediate tensor (B x L_x x F) - will be blanked internally
             Y: Target tensor (B x L_y x F) - will be blanked internally
+            toggle_off_hard_masks: If True, disables hard masks even if model was trained
+                                   with them. Useful for testing causality retention.
+                                   Default False = use masks if model was trained with them.
             **kwargs: Additional arguments
             
         Returns:
@@ -132,6 +186,7 @@ class StageCausalPredictor(BasePredictor):
             data_source=S,
             data_intermediate=X,
             data_target=Y,
+            toggle_off_hard_masks=toggle_off_hard_masks,
             **kwargs
         )
         return output
@@ -176,6 +231,7 @@ class StageCausalPredictor(BasePredictor):
         dataset_label: str = "test",
         debug_flag: bool = False,
         input_conditioning_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        toggle_off_hard_masks: bool = False,
         **kwargs
     ) -> PredictionResult:
         """
@@ -194,6 +250,9 @@ class StageCausalPredictor(BasePredictor):
             dataset_label: One of ["train", "test", "all"]
             debug_flag: If True, predict only one batch
             input_conditioning_fn: Optional function to condition S inputs before forward pass
+            toggle_off_hard_masks: If True, disables hard masks even if model was trained
+                                   with them. Useful for testing causality retention.
+                                   Default False = use masks if model was trained with them.
             **kwargs: Additional arguments passed to forward
             
         Returns:
@@ -253,7 +312,7 @@ class StageCausalPredictor(BasePredictor):
             
             # Forward pass - model handles blanking of X and Y internally
             with torch.no_grad():
-                output = self._forward(S, X, Y, **kwargs)
+                output = self._forward(S, X, Y, toggle_off_hard_masks=toggle_off_hard_masks, **kwargs)
             
             # Process output
             processed = self._process_forward_output(output)
