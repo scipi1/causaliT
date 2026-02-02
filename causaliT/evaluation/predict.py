@@ -21,6 +21,7 @@ from causaliT.evaluation.predictors import (
     PredictionResult,
     TransformerPredictor,
     StageCausalPredictor,
+    SingleCausalPredictor,
 )
 
 
@@ -49,6 +50,7 @@ def create_predictor(
     PREDICTOR_REGISTRY = {
         "proT": TransformerPredictor,
         "StageCausaliT": StageCausalPredictor,
+        "SingleCausalLayer": SingleCausalPredictor,
     }
     
     predictor_class = PREDICTOR_REGISTRY.get(model_obj)

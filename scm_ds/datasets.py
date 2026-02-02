@@ -328,9 +328,9 @@ ds_scm6 = SCMDataset(
         # "k": 1,
         },
     singles = {
-        "S1": lambda rng,n: 1.0*rng.standard_normal(n),
-        "S2": lambda rng,n: 1.0*rng.standard_normal(n),
-        "S3": lambda rng,n: 1.0*rng.standard_normal(n),
+        "S1": lambda rng,n: rng.uniform(-1, 1, n),
+        "S2": lambda rng,n: rng.uniform(-1, 1, n),
+        "S3": lambda rng,n: rng.uniform(-1, 1, n),
         "X1": lambda rng,n: 0.05*rng.standard_normal(n),
         "X2": lambda rng,n: 0.05*rng.standard_normal(n),
         # "X3": lambda rng,n: 0.05*rng.standard_normal(n),
@@ -344,6 +344,79 @@ ds_scm6 = SCMDataset(
     target_labels = ["Y1", "Y2"]
     )
 
+
+ds_scm7 = SCMDataset(
+    name = "non-linear Gaussian",
+    description ="non-linear version of scm6 with different weights",
+    tags=None,
+    specs = [
+        NodeSpec("S1", [], "eps_S1"),                               # source 1
+        NodeSpec("S2", [], "eps_S2"),                               # source 2
+        NodeSpec("S3", [], "eps_S3"),                               # source 3
+        NodeSpec("X1", ["S1", "X2"], "a*S1^2 + b*X2^5 + eps_X1"), # input 1
+        NodeSpec("X2", ["S2", "S3"], "c*S2 + f*S3^3 + eps_X2"),     # input 2
+        NodeSpec("Y1", ["X1"], "g*X1 + eps_Y1"),                    # target 1
+        NodeSpec("Y2", ["X2"], "h*X2 + eps_Y2"),                    # target 2
+        ],
+    params = {
+        "a": 1,
+        "b": 7,
+        "c": 0.5,
+        "f": 1,
+        "g": 1,
+        "h": 1,
+        },
+    singles = {
+        "S1": lambda rng,n: rng.uniform(-1, 1, n),
+        "S2": lambda rng,n: rng.uniform(-1, 1, n),
+        "S3": lambda rng,n: rng.uniform(-1, 1, n),
+        "X1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y2": lambda rng,n: 0.05*rng.standard_normal(n),
+        },
+    groups=None,
+    source_labels=["S1", "S2", "S3"],
+    input_labels=["X1", "X2"],
+    target_labels = ["Y1", "Y2"]
+    )
+
+
+ds_scm8 = SCMDataset(
+    name = "linear Gaussian",
+    description ="Source nodes, fixed recipe",
+    tags=None,
+    specs = [
+        NodeSpec("S1", [], "eps_S1"),                           # source 1
+        NodeSpec("S2", [], "eps_S2"),                           # source 2
+        NodeSpec("S3", [], "eps_S3"),                           # source 3
+        NodeSpec("X1", ["S1", "X2"], "a*S1 + b*X2 + eps_X1"),   # input 1
+        NodeSpec("X2", ["S2", "S3"], "c*S2 + f*S3 + eps_X2"),   # input 2
+        NodeSpec("Y1", ["X1"], "g*X1 + eps_Y1"),                # target 1
+        NodeSpec("Y2", ["X2"], "h*X2 + eps_Y2"),                # target 2
+        ],
+    params = {
+        "a": 1,
+        "b": 1,
+        "c": 1,
+        "f": 1,
+        "g": 1,
+        "h": 1,
+        },
+    singles = {
+        "S1": lambda rng,n: rng.choice([1, 1.5, 3], size=n),
+        "S2": lambda rng,n: rng.choice([2, 2.5, 3], size=n),
+        "S3": lambda rng,n: rng.choice([0.4, 0.5, 0.6], size=n),
+        "X1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "X2": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y1": lambda rng,n: 0.05*rng.standard_normal(n),
+        "Y2": lambda rng,n: 0.05*rng.standard_normal(n),
+        },
+    groups=None,
+    source_labels=["S1", "S2", "S3"],
+    input_labels=["X1", "X2"],
+    target_labels = ["Y1", "Y2"]
+    )
 
 # TODO
 # - one-to-one-CT
@@ -360,4 +433,5 @@ ds_scm6 = SCMDataset(
 # ds_scm5.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm5"), normalize_method="minmax")
 
 # Test with shared_embedding=True for unified variable IDs across all categories
-ds_scm6.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm6"), normalize_method="minmax", shared_embedding=True)
+#ds_scm6.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm6"), normalize_method="minmax", shared_embedding=True)
+ds_scm7.generate_ds(mode="flat", n=50_000, save_dir=join(ROOT_DIR, "data/scm7"), normalize_method="minmax", shared_embedding=True)

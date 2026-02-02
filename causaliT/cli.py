@@ -46,10 +46,14 @@ def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot
     data_dir = join(ROOT_DIR, "data")
     
     
+    # Create logs directory if it doesn't exist
+    logs_dir = join(ROOT_DIR, "logs")
+    makedirs(logs_dir, exist_ok=True)
+    
     # Create loggers
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     logger_info = logging.getLogger("logger_info")
-    info_handler = logging.FileHandler(join(ROOT_DIR,  mk_fname(filename="log", label="train", suffix="log")))
+    info_handler = logging.FileHandler(join(logs_dir,  mk_fname(filename="log", label="train", suffix="log")))
     logger_info.setLevel(logging.INFO)
     info_handler.setFormatter(formatter)
     logger_info.addHandler(info_handler)
@@ -57,7 +61,7 @@ def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot
     if debug:
         # memory logger
         logger_memory = logging.getLogger("logger_memory")
-        memory_handler = logging.FileHandler(join(ROOT_DIR, mk_fname(filename="log", label="memory", suffix="log")))
+        memory_handler = logging.FileHandler(join(logs_dir, mk_fname(filename="log", label="memory", suffix="log")))
         logger_memory.setLevel(logging.INFO)
         memory_handler.setFormatter(formatter)
         logger_memory.addHandler(memory_handler)

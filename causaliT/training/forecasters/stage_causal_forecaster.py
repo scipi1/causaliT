@@ -82,7 +82,13 @@ class StageCausalForecaster(pl.LightningModule):
         self._hard_masks_loaded = False
         self._hard_masks = None
         
-        # Load hard masks if enabled and data_dir provided
+        # ALWAYS register placeholder buffers if hard masks are enabled
+        # This ensures checkpoint loading works (buffers must exist before load_state_dict)
+        if self.use_hard_masks:
+            self._register_hard_mask_placeholders()
+        
+        # Load hard masks if enabled and data_dir provided (during training)
+        # This will overwrite the placeholders with actual mask values
         if self.use_hard_masks and data_dir is not None:
             self._load_hard_masks(config, data_dir)
         
@@ -101,6 +107,32 @@ class StageCausalForecaster(pl.LightningModule):
         # Optionally freeze embeddings
         if config["training"].get("freeze_embeddings", False):
             self.freeze_embeddings()
+    
+    def _register_hard_mask_placeholders(self):
+        """
+        Register placeholder buffers for hard masks.
+        
+        This must be called during __init__ (before save_hyperparameters and before
+        checkpoint loading) to ensure the buffers exist before load_state_dict is called.
+        
+        The placeholders will be overwritten by:
+        - Actual mask values from checkpoint (during load_from_checkpoint)
+        - Actual mask values from data directory (during training via _load_hard_masks)
+        """
+        # Get expected mask shapes from config
+        S_len = self.config["data"]["S_seq_len"]
+        X_len = self.config["data"]["X_seq_len"]
+        Y_len = self.config["data"]["Y_seq_len"]
+        
+        # Register placeholder buffers with correct shapes
+        # dec1_cross: S → X cross-attention (X_len queries, S_len keys)
+        self.register_buffer('hard_mask_dec1_cross', torch.zeros(X_len, S_len))
+        # dec1_self: X self-attention (X_len x X_len)
+        self.register_buffer('hard_mask_dec1_self', torch.zeros(X_len, X_len))
+        # dec2_cross: X → Y cross-attention (Y_len queries, X_len keys)
+        self.register_buffer('hard_mask_dec2_cross', torch.zeros(Y_len, X_len))
+        # dec2_self: Y self-attention (Y_len x Y_len)
+        self.register_buffer('hard_mask_dec2_self', torch.zeros(Y_len, Y_len))
     
     def _load_hard_masks(self, config: dict, data_dir: str):
         """
@@ -128,7 +160,7 @@ class StageCausalForecaster(pl.LightningModule):
             self._hard_masks = masks
             self._hard_masks_loaded = True
             
-            # Register masks as buffers (saved with model, moved with model)
+            # Register masks as buffers (overwrites placeholders, saved with model, moved with model)
             for name, mask in masks.items():
                 self.register_buffer(f'hard_mask_{name}', mask)
             
@@ -140,13 +172,18 @@ class StageCausalForecaster(pl.LightningModule):
         """
         Get hard masks dictionary, retrieving from buffers.
         
+        This method retrieves masks from registered buffers. Masks can be present either:
+        - From checkpoint loading (buffers populated by load_state_dict)
+        - From explicit loading via _load_hard_masks during training
+        
         Returns:
-            Dictionary of hard masks or None if not loaded.
+            Dictionary of hard masks or None if use_hard_masks is False.
         """
-        if not self._hard_masks_loaded:
+        if not self.use_hard_masks:
             return None
         
         # Retrieve masks from buffers (ensures correct device)
+        # Buffers exist if use_hard_masks=True (registered by _register_hard_mask_placeholders)
         masks = {}
         for name in ['dec1_cross', 'dec1_self', 'dec2_cross', 'dec2_self']:
             buffer_name = f'hard_mask_{name}'
@@ -336,16 +373,26 @@ class StageCausalForecaster(pl.LightningModule):
         
         # Prior regularizer - KL divergence between learned phi and empirical evidence
         def _get_prior_reg(phi, evidence, alpha):
-            """KL divergence between learned phi and empirical evidence, weighted by SNR."""
+            """KL divergence between learned phi and empirical evidence, weighted by |SNR|.
+            
+            Uses absolute value of SNR to ensure the regularizer is always non-negative.
+            SNR can be negative when batch_mean is negative (possible with GeLU activation),
+            but we only care about the magnitude of confidence, not its sign.
+            """
             if phi is None or evidence is None or alpha is None:
                 return 0.0
             _eps = 1E-6
             p = torch.sigmoid(phi)
             p0 = torch.sigmoid(evidence)
             
+            # Use absolute value of alpha (SNR) to ensure non-negative weighting
+            # SNR magnitude indicates confidence; sign is irrelevant for weighting
+            alpha_abs = torch.abs(alpha)
+            
             # Explicit KL divergence for two Bernoulli distributions p and p0
-            kl = (alpha * (p * (torch.log(p + _eps) - torch.log(p0 + _eps)) + 
-                         (1 - p) * (torch.log(1 - p + _eps) - torch.log(1 - p0 + _eps)))).mean()
+            # KL(p || p0) is always >= 0, and alpha_abs >= 0, so result is always >= 0
+            kl = (alpha_abs * (p * (torch.log(p + _eps) - torch.log(p0 + _eps)) + 
+                              (1 - p) * (torch.log(1 - p + _eps) - torch.log(1 - p0 + _eps)))).mean()
             return kl
         
         # Self-attention prior regularization (LieAttention)
