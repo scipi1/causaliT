@@ -1221,9 +1221,19 @@ def load_attention_evolution(
     datadir_path: str = None,
     dataset_label: str = "test",
     input_conditioning_fn: Callable = None,
+    n_evaluations: int = None,
 ) -> pd.DataFrame:
     """
     Load attention scores and phi tensors across all training epochs to track their evolution.
+    
+    .. deprecated::
+        This function has been moved to `notebooks.eval_fun.load_attention_evolution` 
+        with an improved `n_evaluations` parameter. Please use:
+        
+        >>> from notebooks.eval_fun import load_attention_evolution
+        
+        The new version supports `n_evaluations` parameter (default=10) which selects
+        evenly-spaced checkpoints for consistent evaluation time regardless of total epochs.
     
     This function tracks how learned DAG structure (attention scores and phi tensors) 
     evolve during training from initialization. For each checkpoint across all k-folds,
@@ -1235,6 +1245,8 @@ def load_attention_evolution(
         datadir_path: Path to data directory. If None, uses "../data/" relative to notebooks
         dataset_label: One of ["train", "test", "all"]
         input_conditioning_fn: Optional function to condition inputs before forward pass
+        n_evaluations: [DEPRECATED - use eval_fun.load_attention_evolution instead]
+                      Number of checkpoints to evaluate. If None, evaluates ALL checkpoints.
         
     Returns:
         pd.DataFrame with columns:
@@ -1252,24 +1264,24 @@ def load_attention_evolution(
             - phi_{block}_{i}{j}_diff: difference from initialization
             
     Example:
-        >>> from lib import load_attention_evolution
+        >>> # DEPRECATED: Use notebooks.eval_fun.load_attention_evolution instead
+        >>> from notebooks.eval_fun import load_attention_evolution
         >>> 
-        >>> # Load attention evolution for an experiment
+        >>> # Load attention evolution with 10 evaluation points (default)
         >>> df = load_attention_evolution("../experiments/euler/stage_Lie_scm6")
         >>> 
-        >>> # Plot evolution of a specific attention entry over epochs
-        >>> import matplotlib.pyplot as plt
-        >>> for kfold in df['kfold'].unique():
-        ...     fold_data = df[df['kfold'] == kfold]
-        ...     plt.plot(fold_data['epoch'], fold_data['dec1_self_00_diff_mean'], label=kfold)
-        >>> plt.xlabel('Epoch')
-        >>> plt.ylabel('Attention score change from init')
-        >>> plt.legend()
-        >>> plt.show()
-        >>> 
-        >>> # Analyze variance of changes across samples
-        >>> df.groupby('epoch')['dec1_self_00_diff_std'].mean()
+        >>> # Load ALL checkpoints (slower, more detailed)
+        >>> df = load_attention_evolution("../experiments/euler/stage_Lie_scm6", n_evaluations=0)
     """
+    import warnings
+    warnings.warn(
+        "load_attention_evolution in lib.py is deprecated. "
+        "Use 'from notebooks.eval_fun import load_attention_evolution' instead. "
+        "The new version supports n_evaluations parameter for faster evaluation.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     # Default data directory
     if datadir_path is None:
         datadir_path = join(os.path.dirname(os.path.abspath(__file__)), "..", "data")

@@ -236,8 +236,18 @@ class KFoldResultsTracker:
     
     def add_fold_result(self, fold_num: int, metrics: dict, best_checkpoint_path: str = None):
         """Add results for a specific fold."""
+        # Convert any tensor values to Python floats for JSON serialization
+        clean_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                clean_metrics[key] = float(value.cpu().item()) if value.numel() == 1 else value.cpu().tolist()
+            elif isinstance(value, (np.ndarray, np.floating, np.integer)):
+                clean_metrics[key] = float(value) if np.isscalar(value) or value.ndim == 0 else value.tolist()
+            else:
+                clean_metrics[key] = value
+        
         self.fold_results[fold_num] = {
-            "metrics": metrics,
+            "metrics": clean_metrics,
             "best_checkpoint_path": best_checkpoint_path,
             "fold_dir": join(self.save_dir, f"k_{fold_num}")
         }
