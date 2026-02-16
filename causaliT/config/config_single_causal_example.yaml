@@ -121,6 +121,13 @@ training:
   lambda_sparse: 0.0 # Sparsity regularization for self-attention
   lambda_sparse_cross: 0.0  # Sparsity regularization for cross-attention
   
+  # KL divergence prior regularization
+  # The KL term encourages the learned DAG (phi) to stay close to 
+  # the empirical running average of attention weights.
+  lambda_kl: 1.0            # Scalar weight for KL prior term (0 = disabled)
+  adaptive_z_scaling: true  # If true, use SNR-based adaptive confidence scaling
+                            # If false, use uniform confidence (alpha=1)
+  
   # Freezing options for staged learning experiments
   freeze_embeddings: False   # Freeze embedding layers
   freeze_decoder: False      # Freeze entire decoder

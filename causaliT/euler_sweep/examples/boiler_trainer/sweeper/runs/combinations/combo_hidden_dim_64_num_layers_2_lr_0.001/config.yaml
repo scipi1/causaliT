@@ -1,0 +1,14 @@
+model:
+  hidden_dim: 64
+  num_layers: 2
+training:
+  num_epochs: 10
+  batch_size: 32
+  lr: 0.001
+  dropout: 0.1
+data:
+  dataset_name: synthetic
+  num_samples: 1000
+experiment:
+  name: boilerplate_sweep
+  seed: 42

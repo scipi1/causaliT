@@ -1,0 +1,24 @@
+# Boilerplate Trainer Configuration
+# Small/fast configuration for quick sweep testing
+
+# Model configuration
+model:
+  hidden_dim: 128
+  num_layers: 3
+
+# Training configuration
+training:
+  num_epochs: 10              # Fast training for quick sweeps
+  batch_size: 32
+  lr: 0.001
+  dropout: 0.1
+
+# Data configuration
+data:
+  dataset_name: "synthetic"
+  num_samples: 1000
+
+# Experiment settings
+experiment:
+  name: "boilerplate_sweep"
+  seed: 42

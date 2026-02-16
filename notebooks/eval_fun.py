@@ -2883,12 +2883,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     exp_dir = join(root_path, "experiments")
     experiments: List[str] = [
-        join(exp_dir, "single/euler/single_Lie_CC_scm6_54803384"),
-        join(exp_dir, "single/euler/single_Lie_CC_scm6_54834710"),
-        join(exp_dir, "single/euler/single_Lie_CC_scm6_54916195"),
-        join(exp_dir, "single/euler/single_Lie_CC_scm6_54946595"),
-        join(exp_dir, "single/euler/single_Lie_CC_scm6_55015699"),
-        join(exp_dir, "single/euler/single_Lie_CC_scm7_55058272"),
+        join(exp_dir, "single/local/single_Lie_CC_scm6_loc001"),
         # Add more individual experiment paths here...
     ]
     

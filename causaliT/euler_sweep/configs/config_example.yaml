@@ -1,0 +1,105 @@
+# Example Configuration File for Parameter Sweeps
+#
+# This is a template configuration file. Copy this to your experiment directory
+# and customize it for your specific model and training setup.
+#
+# Usage:
+#   1. Copy this file to: experiments/your_experiment_name/config.yaml
+#   2. Customize the values below
+#   3. Create a sweep.yaml file to define parameter ranges
+#   4. Run sweep with: python cli.py sweep --exp_id your_experiment_name --sweep_mode combination
+
+# Model configuration
+model:
+  # Model architecture type (customize based on your models)
+  model_type: "mlp"  # or "transformer", "cnn", etc.
+  
+  # Model dimensions
+  input_dim: 784
+  output_dim: 10
+  
+  # Parameters that will be swept (values here are defaults)
+  hidden_dim: 128
+  num_layers: 3
+  
+  # Fixed model parameters (not typically swept)
+  activation: "relu"
+  dropout: 0.1
+  batch_norm: true
+
+# Training configuration
+training:
+  # Training duration
+  num_epochs: 50
+  
+  # Parameters that may be swept
+  batch_size: 64
+  learning_rate: 0.001
+  
+  # Optimizer settings
+  optimizer: "adam"
+  weight_decay: 0.0001
+  momentum: 0.9  # for SGD
+  
+  # Learning rate scheduler
+  scheduler:
+    enabled: false
+    type: "plateau"  # or "step", "cosine", "exponential"
+    patience: 10
+    factor: 0.5
+    min_lr: 1.0e-06
+  
+  # Early stopping
+  early_stopping:
+    enabled: false
+    patience: 15
+    min_delta: 0.001
+
+# Data configuration
+data:
+  # Dataset information
+  dataset_name: "MNIST"  # or your custom dataset
+  num_train_samples: 50000
+  num_val_samples: 10000
+  num_test_samples: 10000
+  
+  # Data preprocessing
+  normalize: true
+  standardize: false
+  augmentation: false
+  
+  # Data loading
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+# Experiment settings
+experiment:
+  name: "parameter_sweep"
+  seed: 42
+  save_checkpoints: true
+  checkpoint_interval: 10
+  log_interval: 100
+  
+  # Reproducibility
+  deterministic: true
+  cudnn_benchmark: false
+
+# Device settings
+device:
+  use_cuda: true
+  device_id: 0  # GPU ID, or "cpu"
+
+# Logging and monitoring
+logging:
+  use_tensorboard: false
+  use_wandb: false
+  log_gradients: false
+  log_weights: false
+
+# Notes
+# =====
+# 1. Parameters you want to sweep should be defined here with their default values
+# 2. Create a sweep.yaml file to specify which parameters to vary and their ranges
+# 3. Use ${control.param_name} syntax if you want to reference a control parameter
+# 4. Nested parameters are accessed with dot notation in sweep.yaml (e.g., "model.hidden_dim")

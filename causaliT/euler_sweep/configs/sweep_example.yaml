@@ -1,0 +1,138 @@
+# Example Sweep Configuration File
+#
+# This file defines which parameters to sweep and their possible values.
+# Parameters must exist in the corresponding config.yaml file.
+#
+# Usage:
+#   1. Copy this file to: experiments/your_experiment_name/sweep.yaml
+#   2. Define parameters to sweep using the format below
+#   3. Run with: python cli.py sweep --exp_id your_experiment_name --sweep_mode [independent|combination]
+
+# Sweep Configuration
+# ===================
+# 
+# Format:
+#   category_name:        # Must match a top-level key in config.yaml (e.g., "model", "training")
+#     parameter_name:     # Must exist under that category in config.yaml
+#       - value1          # List of values to try
+#       - value2
+#       - value3
+#
+# Sweep Modes:
+#   - independent: Tests each parameter value separately (one at a time)
+#                  Example: If you have 3 values for param1 and 2 for param2,
+#                           you get 5 runs (3 + 2)
+#   
+#   - combination: Tests all possible combinations (Cartesian product)
+#                  Example: If you have 3 values for param1 and 2 for param2,
+#                           you get 6 runs (3 × 2)
+
+# Example 1: Basic sweep over model architecture
+# -----------------------------------------------
+model:
+  hidden_dim: [64, 128, 256, 512]
+  num_layers: [2, 3, 4, 5]
+
+training:
+  learning_rate: [0.0001, 0.001, 0.01]
+  batch_size: [32, 64, 128]
+
+# This creates:
+#   - Independent mode: 4 + 4 + 3 + 3 = 14 runs
+#   - Combination mode: 4 × 4 × 3 × 3 = 144 runs
+
+
+# Example 2: Focused sweep for learning rate
+# -------------------------------------------
+# Uncomment to use this instead:
+#
+# training:
+#   learning_rate: [1.0e-05, 5.0e-05, 0.0001, 0.0005, 0.001, 0.005, 0.01]
+#
+# This creates:
+#   - Independent mode: 7 runs
+#   - Combination mode: 7 runs (same, since only one parameter)
+
+
+# Example 3: Optimizer comparison
+# --------------------------------
+# Uncomment to use this instead:
+#
+# training:
+#   optimizer: ["adam", "sgd", "adamw", "rmsprop"]
+#   learning_rate: [0.001, 0.01, 0.1]
+#   weight_decay: [0.0, 0.0001, 0.001]
+#
+# This creates:
+#   - Independent mode: 4 + 3 + 3 = 10 runs
+#   - Combination mode: 4 × 3 × 3 = 36 runs
+
+
+# Example 4: Architecture search
+# -------------------------------
+# Uncomment to use this instead:
+#
+# model:
+#   model_type: ["mlp", "cnn", "transformer"]
+#   hidden_dim: [128, 256, 512]
+#   dropout: [0.0, 0.1, 0.2, 0.3]
+#
+# training:
+#   learning_rate: [0.0001, 0.001, 0.01]
+#
+# This creates:
+#   - Independent mode: 3 + 3 + 4 + 3 = 13 runs
+#   - Combination mode: 3 × 3 × 4 × 3 = 108 runs
+
+
+# Example 5: Seed sweep for statistical significance
+# ---------------------------------------------------
+# Uncomment to use this instead:
+#
+# experiment:
+#   seed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+#
+# This creates:
+#   - Independent mode: 10 runs
+#   - Combination mode: 10 runs (same, since only one parameter)
+
+
+# Tips for Effective Sweeps
+# ==========================
+#
+# 1. Start Small:
+#    - Begin with a small sweep (2-3 values per parameter)
+#    - Use independent mode first to identify promising ranges
+#    - Then do combination sweeps on narrowed ranges
+#
+# 2. Beware of Combinatorial Explosion:
+#    - With N parameters each with M values: M^N combinations!
+#    - 5 parameters with 3 values each = 3^5 = 243 runs
+#    - Use parallel execution for large sweeps
+#
+# 3. Organize Your Sweeps:
+#    - Create separate experiment folders for different sweep types
+#    - Example: experiments/lr_sweep/, experiments/arch_sweep/
+#
+# 4. Use Independent Mode For:
+#    - Initial exploration
+#    - Identifying important parameters
+#    - Quick baseline comparisons
+#
+# 5. Use Combination Mode For:
+#    - Finding optimal parameter combinations
+#    - Studying parameter interactions
+#    - Final hyperparameter tuning (on narrowed ranges)
+#
+# 6. Parameter Types:
+#    - Numerical: [1, 2, 3] or [0.001, 0.01, 0.1]
+#    - Strings: ["adam", "sgd"] (use quotes)
+#    - Booleans: [true, false]
+#    - Can mix types: [1, 2, "auto"]
+
+# Notes
+# =====
+# - Parameters must be defined in config.yaml before sweeping
+# - Use exact nested paths as they appear in config.yaml
+# - Values will replace the default values in config.yaml
+# - Each combination gets its own directory with results and config

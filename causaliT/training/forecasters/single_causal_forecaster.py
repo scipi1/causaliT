@@ -71,6 +71,13 @@ class SingleCausalForecaster(pl.LightningModule):
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.log_hsic = config["training"].get("log_hsic", False)
         
+        # KL divergence prior regularization
+        # lambda_kl: scalar weight for the KL prior term
+        # adaptive_z_scaling: if True, use SNR-based adaptive confidence (alpha)
+        #                     if False, set alpha=1 (uniform confidence)
+        self.lambda_kl = config["training"].get("lambda_kl", 1.0)
+        self.adaptive_z_scaling = config["training"].get("adaptive_z_scaling", True)
+        
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
@@ -319,12 +326,6 @@ class SingleCausalForecaster(pl.LightningModule):
         dec_self_phi = getattr(dec_self_inner, 'phi', None)
         dec_cross_phi = getattr(dec_cross_inner, 'phi', None)
         
-        # Batch statistics (with gradients for regularization)
-        dec_self_batch_mean = getattr(dec_self_inner, 'batch_att_mean', None)
-        dec_self_batch_snr = getattr(dec_self_inner, 'batch_att_snr', None)
-        dec_cross_batch_mean = getattr(dec_cross_inner, 'batch_att_mean', None)
-        dec_cross_batch_snr = getattr(dec_cross_inner, 'batch_att_snr', None)
-        
         # Running averages (detached, used as priors)
         dec_self_runav_mean = getattr(dec_self_inner, 'runav_att_mean', None)
         dec_self_runav_snr = getattr(dec_self_inner, 'runav_att_snr', None)
@@ -356,23 +357,40 @@ class SingleCausalForecaster(pl.LightningModule):
         else:
             acyclic_regularizer = 0.0
         
-        # Prior regularizer
-        def _get_prior_reg(phi, evidence, alpha):
-            """KL divergence between learned phi and empirical evidence."""
-            if phi is None or evidence is None or alpha is None:
+        # Prior regularizer with configurable scaling
+        def _get_prior_reg(phi, evidence, alpha, use_adaptive_scaling, lambda_kl):
+            """
+            KL divergence between learned phi and empirical evidence.
+            
+            Args:
+                phi: Learned DAG parameters
+                evidence: Running average of attention (prior)
+                alpha: SNR-based confidence (adaptive scaling)
+                use_adaptive_scaling: If True, use alpha; if False, use 1.0
+                lambda_kl: Scalar weight for the KL term
+            """
+            if phi is None or evidence is None:
                 return 0.0
             _eps = 1E-6
             p = torch.sigmoid(phi)
             p0 = torch.sigmoid(evidence)
-            alpha_abs = torch.abs(alpha)
+            
+            # Apply adaptive scaling only if enabled and alpha is available
+            if use_adaptive_scaling and alpha is not None:
+                alpha_abs = torch.abs(alpha)
+            else:
+                alpha_abs = 1.0
+            
             kl = (alpha_abs * (p * (torch.log(p + _eps) - torch.log(p0 + _eps)) + 
                               (1 - p) * (torch.log(1 - p + _eps) - torch.log(1 - p0 + _eps)))).mean()
-            return kl
+            return lambda_kl * kl
         
         # Self and cross-attention prior regularization
         prior_regularizer = (
-            _get_prior_reg(dec_self_phi, dec_self_runav_mean, dec_self_runav_snr) + 
-            _get_prior_reg(dec_cross_phi, dec_cross_runav_mean, dec_cross_runav_snr)
+            _get_prior_reg(dec_self_phi, dec_self_runav_mean, dec_self_runav_snr, 
+                          self.adaptive_z_scaling, self.lambda_kl) + 
+            _get_prior_reg(dec_cross_phi, dec_cross_runav_mean, dec_cross_runav_snr,
+                          self.adaptive_z_scaling, self.lambda_kl)
         )
         
         # Sparsity regularizer

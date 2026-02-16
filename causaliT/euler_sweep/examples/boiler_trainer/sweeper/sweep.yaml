@@ -1,0 +1,17 @@
+# Small Sweep Configuration for Quick Testing
+# This creates a small number of combinations for fast local execution
+
+# Model parameters to sweep
+model:
+  hidden_dim: [64, 128]        # 2 values
+  num_layers: [2, 3]           # 2 values
+
+# Training parameters to sweep
+training:
+  lr: [0.001, 0.01]           # 2 values
+
+# Results:
+#   - Independent sweep: 2 + 2 + 2 = 6 runs  (~1-2 minutes)
+#   - Combination sweep: 2 × 2 × 2 = 8 runs  (~2-3 minutes)
+#
+# All runs are fast (10 epochs each) for quick testing
