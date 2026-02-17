@@ -3,10 +3,10 @@
 #SBATCH --output=my_job_output_%j.log
 #SBATCH --error=my_job_error_%j.log
 #SBATCH --ntasks=1
-#SBATCH --time=15-00:00:00
+#SBATCH --time=4:00:00
 #SBATCH --gpus=1
 #SBATCH --mem-per-cpu=10g
-#SBATCH --gres=gpumem:24g
+#SBATCH --gres=gpumem:11g
 
 set -euo pipefail                                      
 
@@ -16,7 +16,7 @@ echo "Job ID: $SLURM_JOB_ID"
 # ───────────────────────────────────────────────
 # 1)  EXPERIMENT SELECTION
 # ───────────────────────────────────────────────
-EXPERIMENT_ID="fusion_proT_ishigami_ideal_cat"
+EXPERIMENT_ID="single_Lie_PhiSM_scm7"
 
 # Project root and experiment folder in $HOME
 PROJ_HOME="$HOME/causaliT"

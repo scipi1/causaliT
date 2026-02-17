@@ -31,7 +31,7 @@ The easiest way to run parallel sweeps is using the provided shell script:
    EXPERIMENT_ID="my_experiment"
    MAX_CONCURRENT_JOBS=6
    WALLTIME="5-00:00:00"
-   GPU_MEM="24g"
+   GPU_MEM="11g"
    MEM_PER_CPU="10g"
    ```
 
@@ -72,7 +72,7 @@ python teacher_student/cli.py train \
 - `--parallel`: Enable parallel execution (default: False)
 - `--max_concurrent_jobs`: Maximum concurrent SLURM jobs (default: 6)
 - `--walltime`: SLURM walltime limit (default: "5-00:00:00")
-- `--gpu_mem`: GPU memory requirement (default: "24g")
+- `--gpu_mem`: GPU memory requirement (default: "11g")
 - `--mem_per_cpu`: CPU memory requirement (default: "10g")
 - `--submit_jobs`: Actually submit jobs vs. dry run (default: True)
 

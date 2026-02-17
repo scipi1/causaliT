@@ -60,6 +60,13 @@ class ModularEmbedding(nn.Module):
 
     Options
     - embed: "mask", "nn_embedding", "time2vec", "identity", "pass"
+    - role (for SVFA mode): "structure" (used for Q, K) or "value" (used for V)
+    
+    SVFA (Structure-Value Factorized Attention) mode:
+    - When comps="svfa", embeddings are separated by role
+    - Structure embeddings (role="structure") -> used for Query and Key projections
+    - Value embeddings (role="value") -> used for Value projections
+    - Returns tuple (emb_struct, emb_val) instead of single tensor
     
     """
     def __init__(
@@ -71,17 +78,22 @@ class ModularEmbedding(nn.Module):
     ):
         super().__init__()
         
-        assert comps in ["concat","summation","spatiotemporal","sum_val_to_concat"]
+        assert comps in ["concat","summation","spatiotemporal","sum_val_to_concat","svfa"]
         
         self.comps = comps
         
         # assemble list of embeddings according to "ds_embed"
         self.embed_list = []
         self.embed_label_list = []
+        self.embed_role_list = []  # NEW: track roles for SVFA
         self.pass_idx_list = None
         self.mask_idx = None
         self.mask_given_idx = None
         self.val_idx = None
+        
+        # SVFA-specific: separate lists for structure and value embeddings
+        self.structure_embed_list = []
+        self.value_embed_list = []
         
         # unpack settings for spatiotemporal
         d_model = ds_embed["setting"]["d_model"] if comps == "spatiotemporal" else None
@@ -94,6 +106,11 @@ class ModularEmbedding(nn.Module):
         for var in ds_embed["modules"]:
             
             idx_, embed_, label_ ,kwargs = var["idx"], var["embed"], var["label"], var["kwargs"]
+            
+            # SVFA: parse role field (default to None for backward compatibility)
+            role_ = var.get("role", None)
+            if comps == "svfa" and role_ is not None:
+                assert role_ in ["structure", "value"], f"Invalid role '{role_}' for SVFA mode. Must be 'structure' or 'value'."
             
             # assign embedding layers
             assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value"], AssertionError("Invalid embedding selected!")
@@ -140,16 +157,35 @@ class ModularEmbedding(nn.Module):
                 
                 
             if emb_module is not None:
-                self.embed_list.append(EmbeddingMap(var_idx=idx_ ,embedding=emb_module, kwargs=kwargs, device=device))
+                emb_map = EmbeddingMap(var_idx=idx_, embedding=emb_module, kwargs=kwargs, device=device)
+                self.embed_list.append(emb_map)
                 
                 if label_ is not None:
                     self.embed_label_list.append(label_)
                 else:
                     self.embed_label_list.append("empty_label")
+                
+                # SVFA: track role and add to appropriate list
+                self.embed_role_list.append(role_)
+                if role_ == "structure":
+                    self.structure_embed_list.append(emb_map)
+                elif role_ == "value":
+                    self.value_embed_list.append(emb_map)
                     
         
         # save the list into a ModuleList to train/save them
         self.embed_modules_list = nn.ModuleList(self.embed_list)
+        
+        # SVFA: also create ModuleLists for structure and value embeddings
+        if comps == "svfa":
+            self.structure_modules_list = nn.ModuleList(self.structure_embed_list)
+            self.value_modules_list = nn.ModuleList(self.value_embed_list)
+            
+            # Validation: ensure we have at least one of each for SVFA mode
+            if len(self.structure_embed_list) == 0:
+                raise ValueError("SVFA mode requires at least one embedding with role='structure'")
+            if len(self.value_embed_list) == 0:
+                raise ValueError("SVFA mode requires at least one embedding with role='value'")
 
 
     def __call__(
@@ -182,6 +218,9 @@ class ModularEmbedding(nn.Module):
         
         elif self.comps == "spatiotemporal":
             return self.spatiotemporal(X_)
+        
+        elif self.comps == "svfa":
+            return self.svfa(X_)
         
         
     def concat(self, X: torch.Tensor)->torch.Tensor:
@@ -243,6 +282,49 @@ class ModularEmbedding(nn.Module):
         res = time_val_emb + var if var.shape[-1]!=0 else res
         
         return res
+    
+    
+    def svfa(self, X: torch.Tensor) -> tuple:
+        """
+        Structure-Value Factorized Attention (SVFA) embedding composition.
+        
+        Returns separate embeddings for structure (Q, K) and value (V) in attention:
+        - Structure embeddings (role="structure"): Used for Query and Key projections
+          → Determines "which variables should attend to which" based on variable identity
+        - Value embeddings (role="value"): Used for Value projections
+          → Determines "what information to propagate" based on realizations
+        
+        This factorization decouples:
+        - Structural alignment: Q·K depends only on variable IDs (causal structure)
+        - Value aggregation: Attention output depends only on realization values
+        
+        Args:
+            X (torch.Tensor): Input tensor of shape (B, L, D)
+        
+        Returns:
+            tuple: (emb_struct, emb_val) where both have shape (B, L, d_model)
+                   emb_struct: Summed structure embeddings for Q, K
+                   emb_val: Summed value embeddings for V and residual
+        """
+        # Sum all structure embeddings (for Q, K projections)
+        struct_embs = [embed(X) for embed in self.structure_embed_list]
+        emb_struct = torch.sum(
+            torch.stack([e for e in struct_embs if e.shape[-1] != 0], dim=-1), 
+            dim=-1
+        )
+        
+        # Sum all value embeddings (for V projection and residual)
+        val_embs = [embed(X) for embed in self.value_embed_list]
+        emb_val = torch.sum(
+            torch.stack([e for e in val_embs if e.shape[-1] != 0], dim=-1), 
+            dim=-1
+        )
+        
+        # Replace NaN with 0 (consistent with other methods)
+        emb_struct = torch.nan_to_num(emb_struct)
+        emb_val = torch.nan_to_num(emb_val)
+        
+        return emb_struct, emb_val
     
     
     def get_mask_tensor(self, X: torch.Tensor)->torch.Tensor:

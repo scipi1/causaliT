@@ -125,13 +125,13 @@ def cli():
 )
 @click.option(
     "--walltime",
-    default="5-00:00:00",
-    help="SLURM walltime limit (default: 5-00:00:00)"
+    default="4:00:00",
+    help="SLURM walltime limit (default: 4:00:00)"
 )
 @click.option(
     "--gpu_mem",
-    default="24g",
-    help="GPU memory requirement (default: 24g)"
+    default="11g",
+    help="GPU memory requirement (default: 11g)"
 )
 @click.option(
     "--mem_per_cpu",
@@ -314,6 +314,7 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
             sweep_mode=sweep_mode,
             train_fn_module=train_fn_module,
             train_fn_name=train_fn_name,
+            experiment_id=exp_id,
             data_dir=data_dir,
             scratch_path=scratch_path,
             slurm_params=slurm_params,

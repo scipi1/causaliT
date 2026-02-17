@@ -3,10 +3,10 @@
 #SBATCH --output=my_job_output_%A_%a.log       # %A = job-ID, %a = array index
 #SBATCH --error=my_job_error_%A_%a.log
 #SBATCH --ntasks=1
-#SBATCH --time=15-00:00:00
+#SBATCH --time=4:00:00
 #SBATCH --gpus=1
 #SBATCH --mem-per-cpu=10g
-#SBATCH --gres=gpumem:24g
+#SBATCH --gres=gpumem:11g
 #SBATCH --array=0-99%10                        # edit or override at sbatch
 
 set -euo pipefail
@@ -18,10 +18,10 @@ echo "Array index   : $SLURM_ARRAY_TASK_ID"
 # ───────────────────────────────────────────────
 # 1)  EXPERIMENT SELECTION  (⇦ only real change)
 # ───────────────────────────────────────────────
-PROJ_HOME="$HOME/prochain_transformer"
+PROJ_HOME="$HOME/causaliT"
 
 # Folder that *contains* all experiment sub-folders you want to run
-JOBS_ROOT="$PROJ_HOME/experiments/training/jobs_array"
+JOBS_ROOT="$PROJ_HOME/experiments/jobs_array"
 
 # Build a bash array of absolute paths, sorted for reproducibility
 mapfile -t ALL_EXPERIMENTS < <(find "$JOBS_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
@@ -40,7 +40,7 @@ scontrol update JobId="$SLURM_JOB_ID" JobName="$EXPERIMENT_ID" || true
 
 # Scratch locations (kept identical to original layout)
 RUN_DIR="$SCRATCH/${EXPERIMENT_ID}_${SLURM_JOB_ID}"
-SCRATCH_EXP="$RUN_DIR/experiments/training/$EXPERIMENT_ID"
+SCRATCH_EXP= "$RUN_DIR"
 
 mkdir -p "$SCRATCH_EXP"
 
@@ -61,7 +61,7 @@ module load gcc/12.2.0
 module load python_cuda/3.11.6
 
 # Activate virtual-env (use absolute path)
-source "$PROJ_HOME/venv/bin/activate"
+source "$HOME/myenv/bin/activate"
 
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     echo "[$(date)] Failed to activate Python environment!" >&2
@@ -75,7 +75,7 @@ echo "[$(date)] Python env: $VIRTUAL_ENV"
 cd "$SCRATCH_EXP"
 
 echo "[$(date)] Running script…"
-python "$PROJ_HOME/prochain_transformer/cli.py" train --exp_id "$EXPERIMENT_ID" --cluster True --scratch_path "$SCRATCH_EXP" --plot_pred_check True
+python -m causaliT.cli train --exp_id "$EXPERIMENT_ID" --cluster True --scratch_path "$SCRATCH_EXP" --plot_pred_check True
 
 # ───────────────────────────────────────────────
 # 5)  WRAP-UP

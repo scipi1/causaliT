@@ -24,6 +24,13 @@ class ReversedDecoderLayer(nn.Module):
     
     This enables the decoder to first attend to external context (e.g., source nodes)
     before performing self-attention on the combined representation.
+    
+    SVFA Mode (factorization="svfa"):
+    - X is tuple (X_struct, X_val)
+    - external_context can be single tensor or tuple (ext_struct, ext_val)
+    - Cross-attention: Q from X_struct, K from ext (or ext_struct), V from ext (or ext_val)
+    - Self-attention: Q, K from X_struct, V from X_val
+    - Only X_val is updated; X_struct passes through unchanged
     """
     def __init__(
         self,
@@ -35,17 +42,24 @@ class ReversedDecoderLayer(nn.Module):
         d_ff,
         dropout_ff,
         dropout_attn_out,
+        factorization: str = "standard"
     ):
         super(ReversedDecoderLayer, self).__init__()
         
         # Attention modules initialized in the parent model
         self.global_cross_attention = global_cross_attention
         self.global_self_attention = global_self_attention
+        self.factorization = factorization
         
         # Normalization layers
         self.norm1 = Normalization(method=norm, d_model=d_model_dec)
         self.norm2 = Normalization(method=norm, d_model=d_model_dec)
         self.norm3 = Normalization(method=norm, d_model=d_model_dec)
+        
+        # For SVFA: separate normalization for structure embeddings
+        if factorization == "svfa":
+            self.norm1_struct = Normalization(method=norm, d_model=d_model_dec)
+            self.norm2_struct = Normalization(method=norm, d_model=d_model_dec)
 
         # Feedforward layers (linear)
         self.linear1 = nn.Linear(in_features=d_model_dec, out_features=d_ff, bias=True)
@@ -58,8 +72,8 @@ class ReversedDecoderLayer(nn.Module):
         
     def forward(
         self,
-        X: torch.Tensor,
-        external_context: torch.Tensor,
+        X,
+        external_context,
         self_mask_miss_k: torch.Tensor,
         self_mask_miss_q: torch.Tensor,
         cross_mask_miss_k: torch.Tensor,
@@ -73,8 +87,10 @@ class ReversedDecoderLayer(nn.Module):
         Forward pass with REVERSED attention order.
         
         Args:
-            X: Input tensor (queries for both attentions)
-            external_context: External context (keys/values for cross-attention)
+            X: In standard mode: tensor (B, L, d_model)
+               In SVFA mode: tuple (X_struct, X_val) each (B, L, d_model)
+            external_context: In standard mode: tensor (B, S, d_model)
+                             In SVFA mode: single tensor or tuple (ext_struct, ext_val)
             self_mask_miss_k: Missing value mask for self-attention keys
             self_mask_miss_q: Missing value mask for self-attention queries
             cross_mask_miss_k: Missing value mask for cross-attention keys
@@ -85,58 +101,119 @@ class ReversedDecoderLayer(nn.Module):
             self_hard_mask: Optional hard mask for self-attention (L, L), values in [0,1]
             
         Returns:
-            decoder_out: Output tensor after all operations
-            cross_att: Cross-attention weights
-            self_att: Self-attention weights
-            cross_ent: Cross-attention entropy
-            self_ent: Self-attention entropy
+            In standard mode: (decoder_out, cross_att, self_att, cross_ent, self_ent)
+            In SVFA mode: ((X_struct, X_val), cross_att, self_att, cross_ent, self_ent)
         """
         
         not_cross_mask_miss_q = ~cross_mask_miss_q if cross_mask_miss_q is not None else None
         not_self_mask_miss_q = ~self_mask_miss_q if self_mask_miss_q is not None else None
         
-        # Step 1: Cross-attention (FIRST)
-        X1 = self.norm1(X, not_cross_mask_miss_q)
+        if self.factorization == "svfa":
+            # SVFA mode: unpack X tuple
+            X_struct, X_val = X
+            
+            # Handle external_context - can be single tensor or tuple
+            if isinstance(external_context, tuple):
+                ext_struct, ext_val = external_context
+            else:
+                # External context is single tensor (e.g., OrthogonalMaskEmbedding)
+                # Use same tensor for both K and V
+                ext_struct = external_context
+                ext_val = external_context
+            
+            # === Step 1: Cross-attention (FIRST) ===
+            # Q from X_struct, K from ext_struct, V from ext_val
+            X_struct_norm = self.norm1_struct(X_struct, not_cross_mask_miss_q)
+            X_val_norm = self.norm1(X_val, not_cross_mask_miss_q)
+            
+            cross_attn_out, cross_att, cross_ent = self.global_cross_attention(
+                query=X_struct_norm,        # Q: structure
+                key=ext_struct,             # K: external structure (or full embedding)
+                value=ext_val,              # V: external value (or full embedding)
+                mask_miss_k=cross_mask_miss_k,
+                mask_miss_q=cross_mask_miss_q,
+                pos=None,
+                causal_mask=False,
+                hard_mask=cross_hard_mask,
+            )
+            
+            # Residual on VALUE only
+            X_val = X_val + self.dropout_attn_out(cross_attn_out)
+            
+            # === Step 2: Self-attention (SECOND) ===
+            # Q, K from X_struct, V from X_val
+            X_struct_norm = self.norm2_struct(X_struct, not_self_mask_miss_q)
+            X_val_norm = self.norm2(X_val, not_self_mask_miss_q)
+            
+            self_attn_out, self_att, self_ent = self.global_self_attention(
+                query=X_struct_norm,        # Q: structure
+                key=X_struct_norm,          # K: structure
+                value=X_val_norm,           # V: value
+                mask_miss_k=self_mask_miss_k,
+                mask_miss_q=self_mask_miss_q,
+                pos=dec_input_pos,
+                causal_mask=causal_mask,
+                hard_mask=self_hard_mask,
+            )
+            
+            # Residual on VALUE only
+            X_val = X_val + self.dropout_attn_out(self_attn_out)
+            
+            # === Step 3: Feedforward ===
+            X_val_norm = self.norm3(X_val, not_self_mask_miss_q)
+            X_val_ff = self.dropout_ff(self.activation(self.linear1(X_val_norm)))
+            X_val_ff = self.dropout_ff(self.linear2(X_val_ff))
+            
+            # Final residual on value
+            X_val = X_val + X_val_ff
+            
+            # Structure passes through unchanged
+            return (X_struct, X_val), cross_att, self_att, cross_ent, self_ent
         
-        X1, cross_att, cross_ent = self.global_cross_attention(
-            query=X1,
-            key=external_context,
-            value=external_context,
-            mask_miss_k=cross_mask_miss_k,
-            mask_miss_q=cross_mask_miss_q,
-            pos=None,
-            causal_mask=False,
-            hard_mask=cross_hard_mask,
-        )
-        
-        X2 = X + self.dropout_attn_out(X1)
-        
-        # Step 2: Self-attention (SECOND)
-        X3 = self.norm2(X2, not_self_mask_miss_q)
-        
-        X3, self_att, self_ent = self.global_self_attention(
-            query=X3,
-            key=X3,
-            value=X3,
-            mask_miss_k=self_mask_miss_k,
-            mask_miss_q=self_mask_miss_q,
-            pos=dec_input_pos,
-            causal_mask=causal_mask,
-            hard_mask=self_hard_mask,
-        )
-        
-        X4 = X2 + self.dropout_attn_out(X3)
-        
-        # Step 3: Feedforward
-        X5 = self.norm3(X4, not_self_mask_miss_q)
-        
-        X5 = self.dropout_ff(self.activation(self.linear1(X5)))
-        X5 = self.dropout_ff(self.linear2(X5))
-        
-        # Final residual connection
-        decoder_out = X4 + X5
-        
-        return decoder_out, cross_att, self_att, cross_ent, self_ent
+        else:
+            # Standard mode
+            # Step 1: Cross-attention (FIRST)
+            X1 = self.norm1(X, not_cross_mask_miss_q)
+            
+            X1, cross_att, cross_ent = self.global_cross_attention(
+                query=X1,
+                key=external_context,
+                value=external_context,
+                mask_miss_k=cross_mask_miss_k,
+                mask_miss_q=cross_mask_miss_q,
+                pos=None,
+                causal_mask=False,
+                hard_mask=cross_hard_mask,
+            )
+            
+            X2 = X + self.dropout_attn_out(X1)
+            
+            # Step 2: Self-attention (SECOND)
+            X3 = self.norm2(X2, not_self_mask_miss_q)
+            
+            X3, self_att, self_ent = self.global_self_attention(
+                query=X3,
+                key=X3,
+                value=X3,
+                mask_miss_k=self_mask_miss_k,
+                mask_miss_q=self_mask_miss_q,
+                pos=dec_input_pos,
+                causal_mask=causal_mask,
+                hard_mask=self_hard_mask,
+            )
+            
+            X4 = X2 + self.dropout_attn_out(X3)
+            
+            # Step 3: Feedforward
+            X5 = self.norm3(X4, not_self_mask_miss_q)
+            
+            X5 = self.dropout_ff(self.activation(self.linear1(X5)))
+            X5 = self.dropout_ff(self.linear2(X5))
+            
+            # Final residual connection
+            decoder_out = X4 + X5
+            
+            return decoder_out, cross_att, self_att, cross_ent, self_ent
 
 
 class ReversedDecoder(nn.Module):
@@ -147,22 +224,28 @@ class ReversedDecoder(nn.Module):
     1. Cross-attention to external context
     2. Self-attention on internal representations
     3. Feedforward transformation
+    
+    SVFA Mode (factorization="svfa"):
+    - X is tuple (X_struct, X_val)
+    - Only X_val is updated; X_struct passes through unchanged
     """
     def __init__(
         self,
         decoder_layers: list,
         norm_layer: nn.Module,
-        emb_dropout: float
+        emb_dropout: float,
+        factorization: str = "standard"
     ):
         super().__init__()
         self.layers = nn.ModuleList(decoder_layers)
         self.norm_layer = norm_layer
         self.emb_dropout = nn.Dropout(emb_dropout)
+        self.factorization = factorization
     
     def forward(
         self,
-        X: torch.Tensor,
-        external_context: torch.Tensor,
+        X,
+        external_context,
         self_mask_miss_k: torch.Tensor,
         self_mask_miss_q: torch.Tensor,
         cross_mask_miss_k: torch.Tensor,
@@ -176,8 +259,10 @@ class ReversedDecoder(nn.Module):
         Forward pass through all decoder layers.
         
         Args:
-            X: Input tensor
+            X: In standard mode: tensor (B, L, d_model)
+               In SVFA mode: tuple (X_struct, X_val) each (B, L, d_model)
             external_context: External context for cross-attention
+                             Can be tensor or tuple in SVFA mode
             self_mask_miss_k: Self-attention key mask
             self_mask_miss_q: Self-attention query mask
             cross_mask_miss_k: Cross-attention key mask
@@ -188,14 +273,19 @@ class ReversedDecoder(nn.Module):
             self_hard_mask: Optional hard mask for self-attention (L, L), values in [0,1]
             
         Returns:
-            X: Output tensor after all layers
-            cross_att_list: List of cross-attention weights
-            self_att_list: List of self-attention weights
-            cross_ent_list: List of cross-attention entropies
-            self_ent_list: List of self-attention entropies
+            In standard mode: (X, cross_att_list, self_att_list, cross_ent_list, self_ent_list)
+            In SVFA mode: ((X_struct, X_val), cross_att_list, self_att_list, cross_ent_list, self_ent_list)
         """
+        not_mask = ~self_mask_miss_q if self_mask_miss_q is not None else None
         
-        X = self.emb_dropout(X)
+        # Apply embedding dropout
+        if self.factorization == "svfa":
+            X_struct, X_val = X
+            X_struct = self.emb_dropout(X_struct)
+            X_val = self.emb_dropout(X_val)
+            X = (X_struct, X_val)
+        else:
+            X = self.emb_dropout(X)
         
         cross_att_list, self_att_list = [], []
         cross_ent_list, self_ent_list = [], []
@@ -219,8 +309,13 @@ class ReversedDecoder(nn.Module):
             cross_ent_list.append(cross_ent)
             self_ent_list.append(self_ent)
         
+        # Apply final normalization
         if self.norm_layer is not None:
-            not_self_mask_miss_q = ~self_mask_miss_q if self_mask_miss_q is not None else None
-            X = self.norm_layer(X, not_self_mask_miss_q)
+            if self.factorization == "svfa":
+                X_struct, X_val = X
+                X_val = self.norm_layer(X_val, not_mask)
+                X = (X_struct, X_val)
+            else:
+                X = self.norm_layer(X, not_mask)
         
         return X, cross_att_list, self_att_list, cross_ent_list, self_ent_list

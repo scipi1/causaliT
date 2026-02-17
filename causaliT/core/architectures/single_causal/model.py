@@ -42,6 +42,13 @@ class SingleCausalLayer(nn.Module):
     - S (source): OrthogonalMaskEmbedding - frozen orthogonal basis
     - X (intermediate): ModularEmbedding - learnable
     
+    SVFA Mode (factorization="svfa"):
+    - X embedding returns tuple (X_struct, X_val)
+    - S embedding remains single tensor (orthogonal basis)
+    - Cross-attention: Q from X_struct, K/V from S
+    - Self-attention: Q, K from X_struct, V from X_val
+    - Only X_val is used for forecasting
+    
     Required data shapes: (BATCH_SIZE, sequence_length, features)
     """
     def __init__(
@@ -90,6 +97,9 @@ class SingleCausalLayer(nn.Module):
         # Sequence lengths for attention initialization
         S_seq_len: int,
         X_seq_len: int,
+        
+        # SVFA: factorization mode ("standard" or "svfa")
+        factorization: str = "standard",
     ):
         super().__init__()
         
@@ -97,6 +107,7 @@ class SingleCausalLayer(nn.Module):
         self.model_name = model
         self.dec_causal_mask = dec_causal_mask
         self.d_model = d_model
+        self.factorization = factorization
         
         # =====================================================================
         # EMBEDDINGS
@@ -175,10 +186,12 @@ class SingleCausalLayer(nn.Module):
                     dropout_attn_out=dropout_attn_out,
                     activation=activation,
                     norm=norm,
+                    factorization=factorization,
                 ) for _ in range(dec_layers)
             ],
             norm_layer=Normalization(norm, d_model=d_model) if use_final_norm else None,
-            emb_dropout=dropout_emb
+            emb_dropout=dropout_emb,
+            factorization=factorization
         )
         
         # De-embedding head (forecaster)
@@ -228,6 +241,8 @@ class SingleCausalLayer(nn.Module):
         x_mask = self.embedding_X.get_mask(X=intermediate_tensor_blanked)
         
         # ===== DECODER: Source → Intermediate (S → X) =====
+        # In SVFA mode: x_embedded is tuple (X_struct, X_val), s_embedded is single tensor
+        # Decoder will return tuple in SVFA mode
         
         dec_out, dec_cross_att, dec_self_att, dec_cross_ent, dec_self_ent = self.decoder(
             X=x_embedded,
@@ -243,7 +258,12 @@ class SingleCausalLayer(nn.Module):
         )
         
         # De-embed to get predicted X
-        pred_x = self.forecaster(dec_out)
+        # In SVFA mode: extract value embedding from tuple for forecasting
+        if self.factorization == "svfa":
+            _, x_val = dec_out
+            pred_x = self.forecaster(x_val)
+        else:
+            pred_x = self.forecaster(dec_out)
         
         # Collect outputs
         attention_weights = (dec_cross_att, dec_self_att)

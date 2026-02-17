@@ -221,6 +221,63 @@ def _get_learned_dag(
     return None, "none"
 
 
+def _compute_dag_confidence(fold_dags: List[np.ndarray]) -> float:
+    """
+    Compute DAG confidence metric across k-folds.
+    
+    DAG confidence measures how consistent the learned DAG structure is across
+    different cross-validation folds. It is computed as:
+    
+        dag_confidence = 1 - 2 * mean(std(edge_ij across folds))
+    
+    Interpretation:
+    - 1.0 = Maximum confidence: All folds learned exactly the same DAG
+    - 0.0 = Minimum confidence: Maximum disagreement across folds
+           (e.g., half folds have edge=0, half have edge=1 for all edges)
+    
+    The factor of 2 normalizes because the maximum standard deviation for 
+    values in [0,1] is 0.5 (when values are perfectly split between 0 and 1).
+    
+    Args:
+        fold_dags: List of learned DAG adjacency matrices, one per fold.
+                   Each matrix has shape (n_targets, n_sources) with values in [0,1].
+                   
+    Returns:
+        float: DAG confidence score in [0, 1]
+        
+    Example:
+        >>> # Perfect agreement across 3 folds
+        >>> dag1 = np.array([[0.9, 0.1], [0.2, 0.8]])
+        >>> fold_dags = [dag1, dag1, dag1]
+        >>> _compute_dag_confidence(fold_dags)
+        1.0
+        
+        >>> # Some disagreement
+        >>> dag2 = np.array([[0.7, 0.3], [0.4, 0.6]])
+        >>> fold_dags = [dag1, dag2]
+        >>> confidence = _compute_dag_confidence(fold_dags)
+        >>> 0 < confidence < 1
+        True
+    """
+    if len(fold_dags) < 2:
+        # With fewer than 2 folds, we can't compute meaningful confidence
+        # Return 1.0 (no evidence of disagreement)
+        return 1.0
+    
+    # Stack DAGs: (K, n_targets, n_sources)
+    stacked = np.stack(fold_dags, axis=0)
+    
+    # Compute std for each edge across folds: (n_targets, n_sources)
+    edge_std = np.std(stacked, axis=0)
+    
+    # Confidence = 1 - 2 * mean(std)
+    # Factor of 2 normalizes since max std for [0,1] values is 0.5
+    confidence = 1.0 - 2.0 * np.mean(edge_std)
+    
+    # Clip to [0, 1] to handle numerical edge cases
+    return float(np.clip(confidence, 0.0, 1.0))
+
+
 def _get_learned_dag_per_fold(
     attention_data,
     attention_key: str,
@@ -1090,6 +1147,8 @@ def update_experiments_manifest(
         "soft_hamming_self_best": None,
         "soft_hamming_self_mean": None,
         "soft_hamming_self_worst": None,
+        "dag_confidence_cross": None,  # DAG consistency across folds (1=identical, 0=max disagreement)
+        "dag_confidence_self": None,
         "dag_source": None,  # "phi" or "attention"
         # HSIC (independence regularization)
         "final_hsic_mean": None,  # Mean HSIC across folds at final epoch
@@ -1210,6 +1269,11 @@ def update_experiments_manifest(
                 metadata["dag_source"] = dag_metrics["soft_hamming_cross_source"]
             elif "soft_hamming_self_source" in dag_metrics:
                 metadata["dag_source"] = dag_metrics["soft_hamming_self_source"]
+            
+            # Extract DAG confidence metrics
+            for key in ["dag_confidence_cross", "dag_confidence_self"]:
+                if key in dag_metrics:
+                    metadata[key] = dag_metrics[key]
                 
             print(f"Loaded DAG metrics from {dag_metrics_path}")
         except Exception as e:
@@ -1818,7 +1882,11 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         show_plots: If True (default), display plots interactively. If False, only save to files.
         
     Returns:
-        dict: DAG recovery metrics with keys like "soft_hamming_cross", "soft_hamming_self"
+        dict: DAG recovery metrics with keys:
+            - soft_hamming_cross: Soft Hamming distance for S→X edges (best/mean/worst/std/per_fold)
+            - soft_hamming_self: Soft Hamming distance for X→X edges (best/mean/worst/std/per_fold)
+            - dag_confidence_cross: DAG consistency across folds for S→X (1=identical, 0=max disagreement)
+            - dag_confidence_self: DAG consistency across folds for X→X (1=identical, 0=max disagreement)
         
     Output Files:
         - fig/attention_scores_{exp_id}.pdf: Attention score heatmaps for all folds
@@ -1826,16 +1894,18 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         - fig/dag_comparison_{exp_id}.pdf: Learned vs true DAG comparison heatmaps
         - files/final_scores/: Saved attention data (can be reloaded quickly)
         - files/scores_evol.csv: Attention evolution data
-        - files/dag_metrics.json: DAG recovery metrics
+        - files/dag_metrics.json: DAG recovery metrics (soft Hamming + dag_confidence)
         
     Notes:
         - Supports TransformerForecaster, StageCausalForecaster, and SingleCausalForecaster
         - Results are cached; delete files/ contents to recompute
         - DAG metrics compare phi (if available) or mean attention scores to true DAG masks
+        - dag_confidence = 1 - 2*mean(std of edges across folds), measuring fold consistency
         
     Example:
         >>> metrics = eval_attention_scores("../experiments/single/local/my_experiment")
-        >>> print(f"Soft Hamming (cross): {metrics['soft_hamming_cross']:.4f}")
+        >>> print(f"Soft Hamming (cross): {metrics['soft_hamming_cross']['mean']:.4f}")
+        >>> print(f"DAG Confidence (cross): {metrics['dag_confidence_cross']:.4f}")
     """
     import json
     from os import listdir
@@ -2112,6 +2182,18 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             dag_metrics[f"{metric_key}_source"] = source  # "phi" or "attention"
             
             print(f"    Statistics: best={np.min(fold_sh_array):.4f}, mean={np.mean(fold_sh_array):.4f}, worst={np.max(fold_sh_array):.4f}, std={np.std(fold_sh_array):.4f}")
+        
+        # Compute DAG confidence (consistency across folds)
+        valid_fold_dags = [dag for _, dag in fold_dags if dag is not None]
+        if len(valid_fold_dags) >= 2:
+            confidence_key = f"dag_confidence_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
+            confidence = _compute_dag_confidence(valid_fold_dags)
+            dag_metrics[confidence_key] = confidence
+            print(f"    DAG Confidence: {confidence:.4f}")
+        elif len(valid_fold_dags) == 1:
+            confidence_key = f"dag_confidence_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
+            dag_metrics[confidence_key] = 1.0  # Single fold = no disagreement
+            print(f"    DAG Confidence: 1.0 (single fold)")
     
     # Save DAG metrics to JSON
     with open(join(eval_path_files, dag_metrics_filename), 'w') as f:
@@ -2883,7 +2965,7 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     exp_dir = join(root_path, "experiments")
     experiments: List[str] = [
-        join(exp_dir, "single/local/single_Lie_CC_scm6_loc001"),
+        # join(exp_dir, "single/local/single_Lie_CC_scm6_loc001"),
         # Add more individual experiment paths here...
     ]
     
@@ -2891,7 +2973,7 @@ if __name__ == "__main__":
     # CONFIGURE: Folders containing experiments (all subdirectories will be added)
     # -------------------------------------------------------------------------
     experiments_folders: List[str] = [
-        #join(exp_dir, "single/euler")
+        join(exp_dir, "single/euler")
         # join(exp_dir, "single/local"),  # Uncomment to add all experiments in this folder
         # join(exp_dir, "stage/local"),   # Uncomment to add all experiments in this folder
     ]
@@ -2908,10 +2990,10 @@ if __name__ == "__main__":
     # CONFIGURE: Evaluation functions to run (in order)
     # -------------------------------------------------------------------------
     eval_functions = [
-        eval_train_metrics,
+        #eval_train_metrics,
         eval_attention_scores,
-        eval_embed,
-        eval_interventions,
+        #eval_embed,
+        #eval_interventions,
     ]
     
     # -------------------------------------------------------------------------

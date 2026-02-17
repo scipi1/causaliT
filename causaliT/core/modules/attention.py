@@ -1110,6 +1110,16 @@ def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) ->
         
         
 class AttentionLayer(nn.Module):
+    """
+    Multi-head attention layer.
+    
+    For SVFA (Structure-Value Factorized Attention), the caller (encoder/decoder)
+    should pass the appropriate tensors:
+        - query, key: Structure embeddings (for Q, K projections)
+        - value: Value embeddings (for V projection)
+    
+    This keeps the attention layer simple and agnostic to the factorization strategy.
+    """
     def __init__(
         self,
         attention: nn.Module,
@@ -1144,8 +1154,8 @@ class AttentionLayer(nn.Module):
             )
         self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
         self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
-        self.value_projection = nn.Linear(d_model_keys, d_model_values * n_heads)
-        self.out_projection = nn.Linear(d_model_values * n_heads, d_model_queries)
+        self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
+        self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
 
@@ -1164,15 +1174,19 @@ class AttentionLayer(nn.Module):
         Forward pass through attention layer.
         
         Args:
-            query: Query tensor (B, L, d_model)
-            key: Key tensor (B, S, d_model)
-            value: Value tensor (B, S, d_model)
+            query: Query tensor (B, L, d_model) - for Q projection
+            key: Key tensor (B, S, d_model) - for K projection
+            value: Value tensor (B, S, d_model) - for V projection
             mask_miss_k: Missing key mask
             mask_miss_q: Missing query mask
             pos: Positional encoding
             causal_mask: Whether to apply causal masking
             hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
                        Values in [0, 1], where 1 = attention allowed.
+                       
+        Note for SVFA:
+            The caller should pass structure embeddings for query/key and
+            value embeddings for value. This layer is agnostic to factorization.
         """
         B, L, _ = query.shape
         _, S, _ = key.shape
@@ -1180,18 +1194,18 @@ class AttentionLayer(nn.Module):
         
         # Apply projections and reshape for multi-head attention
         if H > 1:
-            query = self.dropout_qkv(self.query_projection(query)).view(B, L, H, -1)
-            key = self.dropout_qkv(self.key_projection(key)).view(B, S, H, -1)
-            value = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)
+            q = self.dropout_qkv(self.query_projection(query)).view(B, L, H, -1)
+            k = self.dropout_qkv(self.key_projection(key)).view(B, S, H, -1)
+            v = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)
         else:
-            query = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
-            key = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
-            value = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
+            q = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
+            k = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
+            v = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
             
         out, attn, ent = self.inner_attention(
-            query=query,
-            key=key,
-            value=value,
+            query=q,
+            key=k,
+            value=v,
             mask_miss_k=mask_miss_k,
             mask_miss_q=mask_miss_q,
             pos=pos,

@@ -80,8 +80,14 @@ class ProT(nn.Module):
         # sequence lengths for DAG mask initialization
         X_seq_len: int = None,
         Y_seq_len: int = None,
+        
+        # SVFA: factorization mode ("standard" or "svfa")
+        factorization: str = "standard",
         ):
         super().__init__()
+        
+        # Store factorization mode
+        self.factorization = factorization
         
         # embeddings. separate enc/dec in case the variable indices are not aligned
         self.enc_embedding = ModularEmbedding(
@@ -155,12 +161,14 @@ class ProT(nn.Module):
                     dropout_ff=dropout_ff,
                     dropout_attn_out=dropout_attn_out,
                     activation=activation,
-                    norm=norm
+                    norm=norm,
+                    factorization=factorization
                     ) for _ in range(e_layers)],
             
             #conv_layers = [ConvBlock(split_length_into=split_length_into, d_model=d_model) for l in range(intermediate_downsample_convs)],
             norm_layer = Normalization(norm, d_model=d_model_enc) if use_final_norm else None,
-            emb_dropout = dropout_emb
+            emb_dropout = dropout_emb,
+            factorization=factorization
             )
 
 
@@ -175,10 +183,12 @@ class ProT(nn.Module):
                     dropout_attn_out=dropout_attn_out,
                     activation=activation,
                     norm=norm,
+                    factorization=factorization
                     ) for _ in range(d_layers)],
 
             norm_layer=Normalization(norm, d_model=d_model_dec) if use_final_norm else None,
-            emb_dropout=dropout_emb
+            emb_dropout=dropout_emb,
+            factorization=factorization
             )
         
         # final linear layer turns Transformer output into predictions
@@ -191,8 +201,18 @@ class ProT(nn.Module):
         target_tensor,
         trg_pos_mask=None
         ):
+        """
+        Forward pass through ProT model.
+        
+        In SVFA mode:
+            - Embeddings return (emb_struct, emb_val) tuples
+            - Encoder/Decoder process tuples, passing structure through unchanged
+            - Only the value embedding is used for forecasting
+        """
         
         # embed input and get mask for missing values
+        # In SVFA mode: returns (emb_struct, emb_val) tuple
+        # In standard mode: returns single tensor
         enc_input = self.enc_embedding(X=input_tensor)
         enc_input_pos = self.enc_embedding.pass_var(X=input_tensor) #TODO still relevant?
         enc_mask = self.enc_embedding.get_mask(X=input_tensor)
@@ -202,6 +222,7 @@ class ProT(nn.Module):
             warnings.warn(f"encoder causal_mask required {self.enc_causal_mask} but encoder got null input positions, set to False.")
         
         # pass embedded input to encoder
+        # In SVFA mode: enc_out is (emb_struct, emb_val) tuple
         enc_out, enc_self_att, enc_self_ent = self.encoder(
             X=enc_input,
             mask_miss_k=enc_mask,
@@ -211,6 +232,7 @@ class ProT(nn.Module):
             )
         
         # embed target
+        # In SVFA mode: returns (emb_struct, emb_val) tuple
         dec_input = self.dec_embedding(X=target_tensor, mask_given=trg_pos_mask)
         dec_input_pos = self.dec_embedding.pass_var(X=target_tensor)
         dec_self_mask=self.dec_embedding.get_mask(X=target_tensor)
@@ -225,6 +247,7 @@ class ProT(nn.Module):
             warnings.warn(f"decoder causal_mask required {self.dec_causal_mask} but encoder got null input positions, set to False.")
         
         # pass embedded target and encoder output to decoder
+        # In SVFA mode: dec_out is (emb_struct, emb_val) tuple
         dec_out, dec_self_att, dec_cross_att, dec_self_ent, dec_cross_ent = self.decoder(
             X=dec_input,
             enc_out=enc_out,
@@ -237,7 +260,12 @@ class ProT(nn.Module):
             )
         
         # forecasting predictions
-        forecast_out = self.forecaster(dec_out)
+        # In SVFA mode: extract value embedding from tuple for forecasting
+        if self.factorization == "svfa":
+            _, dec_val = dec_out
+            forecast_out = self.forecaster(dec_val)
+        else:
+            forecast_out = self.forecaster(dec_out)
         
         return forecast_out, (enc_self_att, dec_self_att, dec_cross_att), enc_mask, (enc_self_ent, dec_self_ent, dec_cross_ent)
     

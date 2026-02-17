@@ -12,9 +12,9 @@ set -euo pipefail
 #############################################################################
 # 0)  User-tweakable settings
 #############################################################################
-PROJ_HOME="$HOME/prochain_transformer"
-JOBS_ROOT="$PROJ_HOME/experiments/training/jobs_array"
-SCRIPT="$PROJ_HOME/scripts/run_on_scratch_array.sh"
+PROJ_HOME="$HOME/causaliT"
+JOBS_ROOT="$PROJ_HOME/experiments/jobs_array"
+SCRIPT="$PROJ_HOME/causaliT/euler_sweep/scripts/run_on_scratch_array.sh"
 
 DEFAULT_MAX_PAR=10        # fallback concurrency cap
 #############################################################################

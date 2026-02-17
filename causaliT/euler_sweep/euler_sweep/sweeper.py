@@ -353,6 +353,7 @@ def run_parallel_sweep(
     sweep_mode: str,
     train_fn_module: str,
     train_fn_name: str,
+    experiment_id: Optional[str] = None,
     data_dir: Optional[str] = None,
     scratch_path: Optional[str] = None,
     slurm_params: Optional[Dict] = None,
@@ -380,12 +381,13 @@ def run_parallel_sweep(
         sweep_mode: "independent" or "combination"
         train_fn_module: Module path to training function (e.g., "my_project.trainer")
         train_fn_name: Function name (e.g., "train_model")
+        experiment_id: Experiment ID for SLURM job naming (optional, derived from home_exp_dir if not provided)
         data_dir: Path to data directory (optional)
         scratch_path: Scratch path if using scratch storage
         slurm_params: Dictionary of SLURM parameters:
             - max_concurrent_jobs: Maximum parallel jobs (default: 6)
             - walltime: Time limit (default: "5-00:00:00")
-            - gpu_mem: GPU memory (default: "24g")
+            - gpu_mem: GPU memory (default: "11g")
             - mem_per_cpu: CPU memory (default: "10g")
         cluster: Whether running on cluster
         submit_jobs: Whether to actually submit jobs (False for dry run)
@@ -418,11 +420,12 @@ def run_parallel_sweep(
     logger = logging.getLogger(__name__)
     
     # Default SLURM parameters
+    # TODO define those from config
     if slurm_params is None:
         slurm_params = {}
     slurm_params.setdefault('max_concurrent_jobs', 6)
-    slurm_params.setdefault('walltime', '5-00:00:00')
-    slurm_params.setdefault('gpu_mem', '24g')
+    slurm_params.setdefault('walltime', '4:00:00')
+    slurm_params.setdefault('gpu_mem', '11g')
     slurm_params.setdefault('mem_per_cpu', '10g')
     
     # Load configuration files from home directory
@@ -470,8 +473,9 @@ def run_parallel_sweep(
     logger.info(f"Saved combinations metadata to: {combinations_file}")
     
     if submit_jobs:
-        # Extract experiment ID from path
-        experiment_id = Path(exp_dir).name
+        # Use provided experiment_id or extract from home_exp_dir (not exp_dir which may be scratch path)
+        if experiment_id is None:
+            experiment_id = Path(home_exp_dir).name
         
         # Generate SLURM job array script
         script_path = generate_slurm_job_array_script(
@@ -680,7 +684,7 @@ module load gcc/12.2.0
 module load python_cuda/3.11.6
 
 # TODO: Update this path to your virtual environment
-VENV_PATH="$HOME/your_project/venv"
+VENV_PATH="$HOME/myenv"
 source "$VENV_PATH/bin/activate"
 
 if [[ -z "${{VIRTUAL_ENV:-}}" ]]; then
