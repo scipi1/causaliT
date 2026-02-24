@@ -2611,6 +2611,104 @@ def eval_interventions(
     return df, df_dev
 
 
+# =============================================================================
+# Post-Training Evaluation Wrapper
+# =============================================================================
+
+def run_all_evaluations(
+    experiment: str,
+    datadir_path: str = None,
+    show_plots: bool = False,
+) -> dict:
+    """
+    Run all evaluation functions on an experiment after training.
+    
+    This function is called automatically by trainer.py after training completes
+    on the cluster. It runs all standard evaluations with error handling to ensure
+    that failures in one evaluation don't prevent others from running.
+    
+    Args:
+        experiment: Path to the experiment folder containing k_* subdirectories
+        datadir_path: Path to data directory. If None, uses default "../data/" relative to project root
+        show_plots: If True, display plots. If False (default), only save to files.
+                   Should be False for cluster execution (headless environment).
+        
+    Returns:
+        dict: Summary of evaluation results with keys:
+            - experiment: Path to experiment
+            - evaluations: Dict mapping function names to "success" or error message
+            
+    Example:
+        >>> from notebooks.eval_fun import run_all_evaluations
+        >>> results = run_all_evaluations("../experiments/single/euler/my_experiment")
+        >>> print(results)
+        {'experiment': '...', 'evaluations': {'eval_train_metrics': 'success', ...}}
+    """
+    import traceback
+    
+    print(f"\n{'='*60}")
+    print(f"Running post-training evaluations")
+    print(f"Experiment: {experiment}")
+    print('='*60)
+    
+    results = {
+        "experiment": experiment,
+        "evaluations": {},
+    }
+    
+    # Step 1: Fix and enrich kfold_summary.json
+    print(f"\n--- Step 1: Fixing kfold_summary.json ---")
+    try:
+        fix_kfold_summary(experiment)
+        results["evaluations"]["fix_kfold_summary"] = "success"
+    except Exception as e:
+        print(f"Warning: fix_kfold_summary failed: {e}")
+        results["evaluations"]["fix_kfold_summary"] = f"failed: {e}"
+    
+    print(f"\n--- Step 2: Enriching kfold_summary.json ---")
+    try:
+        enrich_kfold_summary(experiment)
+        results["evaluations"]["enrich_kfold_summary"] = "success"
+    except Exception as e:
+        print(f"Warning: enrich_kfold_summary failed: {e}")
+        results["evaluations"]["enrich_kfold_summary"] = f"failed: {e}"
+    
+    # Step 3: Run all evaluation functions (hard-coded list)
+    # Order matters: some evaluations depend on others
+    eval_functions = [
+        ("eval_train_metrics", lambda exp: eval_train_metrics(exp, show_plots=show_plots)),
+        ("eval_attention_scores", lambda exp: eval_attention_scores(exp, show_plots=show_plots)),
+        ("eval_embed", lambda exp: eval_embed(exp, show_plots=show_plots)),
+        ("eval_interventions", lambda exp: eval_interventions(exp, show_plots=show_plots)),
+        # eval_embedding_dag_correlation requires eval_embed and eval_attention_scores to run first
+        ("eval_embedding_dag_correlation", lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots)),
+    ]
+    
+    for idx, (name, func) in enumerate(eval_functions, start=3):
+        print(f"\n--- Step {idx}: Running {name} ---")
+        try:
+            func(experiment)
+            results["evaluations"][name] = "success"
+            print(f"  ✓ {name} completed successfully")
+        except Exception as e:
+            print(f"  ✗ {name} failed: {e}")
+            traceback.print_exc()
+            results["evaluations"][name] = f"failed: {e}"
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("Evaluation Summary:")
+    print('='*60)
+    success_count = sum(1 for v in results["evaluations"].values() if v == "success")
+    total_count = len(results["evaluations"])
+    print(f"  Completed: {success_count}/{total_count}")
+    for name, status in results["evaluations"].items():
+        status_icon = "✓" if status == "success" else "✗"
+        print(f"    {status_icon} {name}: {status}")
+    
+    return results
+
+
 def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> dict:
     """
     Evaluate correlation between embedding similarity and learned DAG structure.
@@ -2945,27 +3043,141 @@ def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> 
 
 
 # =============================================================================
+# Batch Manifest Update (Local Use)
+# =============================================================================
+
+def batch_update_manifest(
+    experiments: List[str] = None,
+    experiments_folders: List[str] = None,
+    manifest_path: str = None,
+) -> pd.DataFrame:
+    """
+    Update the experiments manifest for multiple experiments.
+    
+    This function is designed for local use after syncing experiments from the cluster.
+    It reads existing evaluation results (generated by run_all_evaluations on the cluster)
+    and updates the manifest CSV without recomputing evaluations.
+    
+    Args:
+        experiments: List of individual experiment paths to update
+        experiments_folders: List of folders containing experiments. All subdirectories
+                            will be discovered and added to the experiments list.
+        manifest_path: Path to manifest CSV. If None, uses default location
+                      (experiments/experiments_manifest.csv)
+        
+    Returns:
+        pd.DataFrame: The updated manifest DataFrame
+        
+    Example:
+        >>> from notebooks.eval_fun import batch_update_manifest
+        >>> 
+        >>> # Update manifest for specific experiments
+        >>> manifest = batch_update_manifest(
+        ...     experiments=["../experiments/single/euler/my_exp_1", "../experiments/single/euler/my_exp_2"]
+        ... )
+        >>> 
+        >>> # Update manifest for all experiments in folders
+        >>> manifest = batch_update_manifest(
+        ...     experiments_folders=["../experiments/single/euler", "../experiments/stage/euler"]
+        ... )
+    """
+    from os import listdir
+    from os.path import isdir
+    
+    # Initialize experiments list
+    all_experiments = []
+    
+    if experiments:
+        all_experiments.extend(experiments)
+    
+    # Discover experiments from folders
+    if experiments_folders:
+        for folder in experiments_folders:
+            if exists(folder) and isdir(folder):
+                for subdir in listdir(folder):
+                    subdir_path = join(folder, subdir)
+                    if isdir(subdir_path):
+                        # Check if it looks like an experiment folder (has config or k_* folders)
+                        contents = listdir(subdir_path)
+                        has_config = any(f.startswith("config") and f.endswith(".yaml") for f in contents)
+                        has_kfold = any(f.startswith("k_") for f in contents)
+                        if has_config or has_kfold:
+                            all_experiments.append(subdir_path)
+    
+    if not all_experiments:
+        print("No experiments found to update.")
+        return pd.DataFrame()
+    
+    print(f"\n{'='*60}")
+    print(f"Batch updating manifest for {len(all_experiments)} experiments")
+    print('='*60)
+    
+    # Update manifest for each experiment
+    success_count = 0
+    error_count = 0
+    
+    for exp in all_experiments:
+        try:
+            print(f"\n--- Updating: {exp} ---")
+            update_experiments_manifest(exp, manifest_path)
+            success_count += 1
+        except Exception as e:
+            print(f"  Error: {e}")
+            error_count += 1
+    
+    # Load and return final manifest
+    manifest_df = load_experiments_manifest(manifest_path)
+    
+    print(f"\n{'='*60}")
+    print(f"Batch Update Summary:")
+    print(f"  Success: {success_count}")
+    print(f"  Errors:  {error_count}")
+    print(f"  Total experiments in manifest: {len(manifest_df)}")
+    print('='*60)
+    
+    return manifest_df
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
 if __name__ == "__main__":
     """
-    Run batch evaluation on multiple experiments.
+    Batch process experiments: optionally run evaluations, then update manifest.
     
-    Edit the lists below to configure:
-    - experiments: List of individual experiment paths to evaluate
-    - experiments_folders: List of folders containing experiments (all subdirectories will be added)
-    - eval_functions: List of evaluation functions to run (in order)
+    This script supports two workflows:
+    
+    1. MANIFEST UPDATE ONLY (default):
+       For experiments that already have evaluations (from cluster training).
+       Just reads existing eval results and updates the manifest CSV.
+    
+    2. RUN EVALUATIONS FIRST:
+       For old experiments that were trained before automatic evaluation was added.
+       Runs all evaluations, then updates the manifest.
+       Set RUN_EVALUATIONS = True below.
+    
+    Edit the configuration below to specify which experiments to process.
     """
     from os import listdir
     from os.path import isdir
+    import traceback
     
     # -------------------------------------------------------------------------
-    # CONFIGURE: Individual experiments to evaluate
+    # CONFIGURE: Whether to run evaluations before updating manifest
+    # -------------------------------------------------------------------------
+    # Set to True for old experiments that need evaluation
+    # Set to False (default) if evaluations were already run on cluster
+    RUN_EVALUATIONS = False
+    
+    # -------------------------------------------------------------------------
+    # CONFIGURE: Individual experiments to process
     # -------------------------------------------------------------------------
     exp_dir = join(root_path, "experiments")
     experiments: List[str] = [
-        # join(exp_dir, "single/local/single_Lie_CC_scm6_loc001"),
+        # join(exp_dir, "single/euler/single_Lie_CC_scm6_SVFA_57610394"),
+        # join(exp_dir, "single/euler/single_PhiSM_PhiSM_scm6_SVFA_57610277"),
+        # join(exp_dir, "single/euler/single_SM_SM_scm6_SVFA_57610339"),
         # Add more individual experiment paths here...
     ]
     
@@ -2973,65 +3185,72 @@ if __name__ == "__main__":
     # CONFIGURE: Folders containing experiments (all subdirectories will be added)
     # -------------------------------------------------------------------------
     experiments_folders: List[str] = [
-        join(exp_dir, "single/euler")
-        # join(exp_dir, "single/local"),  # Uncomment to add all experiments in this folder
-        # join(exp_dir, "stage/local"),   # Uncomment to add all experiments in this folder
+        # join(exp_dir, "single/euler"),  # Uncomment to add all experiments in this folder
+        # join(exp_dir, "stage/euler"),   # Uncomment to add all experiments in this folder
     ]
     
-    # Discover experiments from folders and add to experiments list
+    # -------------------------------------------------------------------------
+    # Discover all experiments from folders
+    # -------------------------------------------------------------------------
+    all_experiments = list(experiments)  # Copy to avoid modifying original
+    
     for folder in experiments_folders:
         if exists(folder) and isdir(folder):
             for subdir in listdir(folder):
                 subdir_path = join(folder, subdir)
                 if isdir(subdir_path):
-                    experiments.append(subdir_path)
+                    # Check if it looks like an experiment folder
+                    contents = listdir(subdir_path)
+                    has_config = any(f.startswith("config") and f.endswith(".yaml") for f in contents)
+                    has_kfold = any(f.startswith("k_") for f in contents)
+                    if has_config or has_kfold:
+                        all_experiments.append(subdir_path)
     
     # -------------------------------------------------------------------------
-    # CONFIGURE: Evaluation functions to run (in order)
+    # Optionally run evaluations first
     # -------------------------------------------------------------------------
-    eval_functions = [
-        #eval_train_metrics,
-        eval_attention_scores,
-        #eval_embed,
-        #eval_interventions,
-    ]
-    
-    # -------------------------------------------------------------------------
-    # Run evaluations (show_plots=False for batch mode)
-    # -------------------------------------------------------------------------
-    for exp in experiments:
+    if RUN_EVALUATIONS and all_experiments:
         print(f"\n{'='*60}")
-        print(f"Evaluating: {exp}")
+        print(f"STEP 1: Running evaluations for {len(all_experiments)} experiments")
+        print("(Set RUN_EVALUATIONS = False to skip this step)")
         print('='*60)
         
-        # First, fix any tensor strings in kfold_summary.json
-        print(f"\n--- Running fix_kfold_summary ---")
-        try:
-            fix_kfold_summary(exp)
-        except Exception as e:
-            print(f"Error in fix_kfold_summary: {e}")
+        eval_success = 0
+        eval_failed = 0
         
-        # Enrich kfold_summary.json with aggregated statistics
-        print(f"\n--- Running enrich_kfold_summary ---")
-        try:
-            enrich_kfold_summary(exp)
-        except Exception as e:
-            print(f"Error in enrich_kfold_summary: {e}")
-        
-        # Then run all evaluation functions
-        for eval_fn in eval_functions:
-            print(f"\n--- Running {eval_fn.__name__} ---")
+        for exp in all_experiments:
+            print(f"\n--- Evaluating: {exp} ---")
             try:
-                # Pass show_plots=False for batch mode (no interactive display)
-                eval_fn(exp, show_plots=False)
+                run_all_evaluations(exp, show_plots=False)
+                eval_success += 1
             except Exception as e:
-                print(f"Error in {eval_fn.__name__}: {e}")
-                import traceback
+                print(f"  Error running evaluations: {e}")
                 traceback.print_exc()
+                eval_failed += 1
         
-        # Finally, update the experiments manifest
-        print(f"\n--- Updating experiments manifest ---")
-        try:
-            update_experiments_manifest(exp)
-        except Exception as e:
-            print(f"Error updating manifest: {e}")
+        print(f"\n{'='*60}")
+        print(f"Evaluation Summary:")
+        print(f"  Success: {eval_success}")
+        print(f"  Failed:  {eval_failed}")
+        print('='*60)
+    
+    # -------------------------------------------------------------------------
+    # Update manifest for all experiments
+    # -------------------------------------------------------------------------
+    if all_experiments:
+        print(f"\n{'='*60}")
+        if RUN_EVALUATIONS:
+            print("STEP 2: Updating manifest")
+        else:
+            print("Updating manifest (evaluations assumed already complete)")
+        print('='*60)
+        
+        manifest = batch_update_manifest(
+            experiments=all_experiments,
+            experiments_folders=[],  # Already discovered above
+        )
+        
+        print(f"\nManifest saved to: {MANIFEST_PATH}")
+    else:
+        print("No experiments found to process.")
+        print("Add experiment paths to 'experiments' or folder paths to 'experiments_folders'.")

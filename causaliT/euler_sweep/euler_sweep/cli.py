@@ -274,7 +274,8 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
             sweep_mode=sweep_mode,
             train_fn=train_fn,
             data_dir=data_dir,
-            cluster=cluster
+            cluster=cluster,
+            experiment_id=exp_id  # Pass exp_id for unique folder naming
         )
         
         print("\n" + "="*60)

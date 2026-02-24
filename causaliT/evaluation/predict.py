@@ -182,7 +182,9 @@ def create_intervention_fn(
             mask = (variable_ids == target_var_id)
             
             # Set value feature to intervention value where mask is True
-            S_intervened[mask, val_idx] = intervention_value
+            # Use torch.where() for explicit 3D indexing (avoids ambiguous boolean mask indexing across PyTorch versions)
+            batch_indices, seq_indices = torch.where(mask)
+            S_intervened[batch_indices, seq_indices, val_idx] = intervention_value
         
         return S_intervened
     

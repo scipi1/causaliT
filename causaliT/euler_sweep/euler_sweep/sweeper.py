@@ -44,7 +44,7 @@ from omegaconf import OmegaConf
 # 1. COMBINATION GENERATION
 # ════════════════════════════════════════════════════════════════════════════
 
-def generate_independent_combinations(config: OmegaConf, sweep_config: OmegaConf) -> List[Dict]:
+def generate_independent_combinations(config: OmegaConf, sweep_config: OmegaConf, experiment_id: str = None) -> List[Dict]:
     """
     Generate combinations for independent parameter sweep.
     
@@ -64,15 +64,19 @@ def generate_independent_combinations(config: OmegaConf, sweep_config: OmegaConf
     Args:
         config: Base configuration (OmegaConf)
         sweep_config: Sweep definition (OmegaConf)
+        experiment_id: Experiment identifier to prefix folder names (optional)
         
     Returns:
         List of combination dictionaries, each containing:
             - 'params': dict of parameter changes {param_name: value}
             - 'categories': dict mapping param names to config categories
-            - 'name': unique folder name for this combination
+            - 'name': unique folder name for this combination (prefixed with experiment_id if provided)
             - 'description': human-readable description
     """
     combinations = []
+    
+    # Build name prefix from experiment_id if provided
+    name_prefix = f"{experiment_id}_" if experiment_id else ""
     
     for category in sweep_config:
         for param_name in sweep_config[category]:
@@ -86,7 +90,7 @@ def generate_independent_combinations(config: OmegaConf, sweep_config: OmegaConf
                 combination = {
                     'params': {param_name: param_value},
                     'categories': {param_name: category},
-                    'name': f"sweep_{param_name}_{param_value}",
+                    'name': f"{name_prefix}sweep_{param_name}_{param_value}",
                     'description': f"{category}.{param_name}={param_value}"
                 }
                 combinations.append(combination)
@@ -94,7 +98,7 @@ def generate_independent_combinations(config: OmegaConf, sweep_config: OmegaConf
     return combinations
 
 
-def generate_all_combinations(config: OmegaConf, sweep_config: OmegaConf) -> List[Dict]:
+def generate_all_combinations(config: OmegaConf, sweep_config: OmegaConf, experiment_id: str = None) -> List[Dict]:
     """
     Generate all possible parameter combinations (Cartesian product).
     
@@ -113,6 +117,7 @@ def generate_all_combinations(config: OmegaConf, sweep_config: OmegaConf) -> Lis
     Args:
         config: Base configuration (OmegaConf)
         sweep_config: Sweep definition (OmegaConf)
+        experiment_id: Experiment identifier to prefix folder names (optional)
         
     Returns:
         List of combination dictionaries with same structure as generate_independent_combinations
@@ -135,15 +140,18 @@ def generate_all_combinations(config: OmegaConf, sweep_config: OmegaConf) -> Lis
     param_names = list(param_values.keys())
     value_combinations = list(itertools.product(*(param_values[param] for param in param_names)))
     
+    # Build name prefix from experiment_id if provided
+    name_prefix = f"{experiment_id}_" if experiment_id else ""
+    
     # Create combination dictionaries
     combinations = []
     for value_combo in value_combinations:
         # Build parameter dict for this combination
         params = {param_names[i]: value_combo[i] for i in range(len(param_names))}
         
-        # Create descriptive name
+        # Create descriptive name (with experiment_id prefix if provided)
         name_parts = [f"{param}_{value}" for param, value in params.items()]
-        combo_name = "combo_" + "_".join(name_parts)
+        combo_name = f"{name_prefix}combo_" + "_".join(name_parts)
         
         # Create description
         desc_parts = [
@@ -203,6 +211,12 @@ def run_single_combination(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
+    # Save the config BEFORE training starts
+    # This ensures config.yaml exists even if training fails or is still running,
+    # allowing evaluation functions to find it during training
+    config_path = save_dir / "config.yaml"
+    OmegaConf.save(config, config_path)
+    
     # Call user's training function
     results = train_fn(
         config=config,
@@ -211,10 +225,6 @@ def run_single_combination(
         cluster=cluster,
         **kwargs
     )
-    
-    # Save the config used for this run
-    config_path = save_dir / "config.yaml"
-    OmegaConf.save(config, config_path)
     
     return results
 
@@ -229,6 +239,7 @@ def run_sequential_sweep(
     train_fn: Callable,
     data_dir: Optional[str] = None,
     cluster: bool = False,
+    experiment_id: Optional[str] = None,
     **kwargs
 ) -> None:
     """
@@ -246,6 +257,7 @@ def run_sequential_sweep(
         train_fn: User's training function
         data_dir: Path to data directory (optional)
         cluster: Whether running on cluster
+        experiment_id: Experiment identifier for folder naming (optional, derived from exp_dir if not provided)
         **kwargs: Additional arguments passed to train_fn
         
     Raises:
@@ -259,9 +271,9 @@ def run_sequential_sweep(
                 └── runs/
                     └── sweeps/
                         ├── sweep_param1/
-                        │   ├── sweep_param1_value1/
+                        │   ├── {exp_id}_sweep_param1_value1/
                         │   │   └── config.yaml
-                        │   └── sweep_param1_value2/
+                        │   └── {exp_id}_sweep_param1_value2/
                         │       └── config.yaml
                         └── sweep_param2/
                             └── ...
@@ -271,9 +283,9 @@ def run_sequential_sweep(
             └── sweeper/
                 └── runs/
                     └── combinations/
-                        ├── combo_param1_val1_param2_val1/
+                        ├── {exp_id}_combo_param1_val1_param2_val1/
                         │   └── config.yaml
-                        ├── combo_param1_val1_param2_val2/
+                        ├── {exp_id}_combo_param1_val1_param2_val2/
                         │   └── config.yaml
                         └── ...
     """
@@ -287,14 +299,18 @@ def run_sequential_sweep(
         logger.warning("No sweep configuration found. Nothing to sweep.")
         return
     
+    # Extract experiment_id from exp_dir if not provided
+    if experiment_id is None:
+        experiment_id = Path(exp_dir).name
+    
     # Generate combinations based on mode
     # Results are saved in sweeper/runs/ folder
     runs_dir = join(exp_dir, "sweeper", "runs")
     if sweep_mode == "independent":
-        combinations = generate_independent_combinations(config, sweep_config)
+        combinations = generate_independent_combinations(config, sweep_config, experiment_id=experiment_id)
         base_dir = join(runs_dir, "sweeps")
     elif sweep_mode == "combination":
-        combinations = generate_all_combinations(config, sweep_config)
+        combinations = generate_all_combinations(config, sweep_config, experiment_id=experiment_id)
         base_dir = join(runs_dir, "combinations")
     else:
         raise ValueError(
@@ -436,11 +452,15 @@ def run_parallel_sweep(
         logger.error("No sweep configuration found. Cannot run parallel sweep.")
         return
     
-    # Generate combinations
+    # Use provided experiment_id or extract from home_exp_dir (not exp_dir which may be scratch path)
+    if experiment_id is None:
+        experiment_id = Path(home_exp_dir).name
+    
+    # Generate combinations (with experiment_id prefix for unique folder names)
     if sweep_mode == "independent":
-        combinations = generate_independent_combinations(config, sweep_config)
+        combinations = generate_independent_combinations(config, sweep_config, experiment_id=experiment_id)
     elif sweep_mode == "combination":
-        combinations = generate_all_combinations(config, sweep_config)
+        combinations = generate_all_combinations(config, sweep_config, experiment_id=experiment_id)
     else:
         raise ValueError(
             f"Unknown sweep_mode: {sweep_mode}. Use 'independent' or 'combination'."

@@ -255,6 +255,34 @@ def trainer(
     df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
     df_metric = df_metric.applymap(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
     
+    # =========================================================================
+    # Post-Training Evaluations
+    # =========================================================================
+    # Run all evaluation functions after training completes.
+    # This is wrapped in try-except to ensure training results are not lost
+    # if evaluation fails. Evaluations include:
+    # - eval_train_metrics: Training curves and loss analysis
+    # - eval_attention_scores: DAG recovery metrics
+    # - eval_embed: Embedding evolution analysis
+    # - eval_interventions: Causal intervention tests
+    # - eval_embedding_dag_correlation: Embedding-DAG correlation
+    try:
+        from notebooks.eval_fun import run_all_evaluations
+        print("\n" + "="*60)
+        print("Running post-training evaluations...")
+        print("="*60)
+        eval_results = run_all_evaluations(
+            experiment=save_dir,
+            datadir_path=data_dir,
+            show_plots=False,  # Always False for cluster (headless)
+        )
+        print("\nPost-training evaluations completed!")
+    except Exception as e:
+        print(f"\nWarning: Post-training evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Training results are still saved. You can run evaluations manually later.")
+    
     return df_metric
 
 

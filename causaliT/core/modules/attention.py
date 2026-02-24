@@ -34,21 +34,23 @@ class LieAttention(nn.Module):
         self.layer_name = layer_name
         
         # Store DAGMask as submodule to ensure proper parameter registration
-        from causaliT.core.modules.extra_layers import DAGMask
-        if isinstance(mask_layer, DAGMask):
+        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
+        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
+        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
             self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            self.phi = self.dag_mask.phi  # Reference for convenience
+            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
+            # We need to get the current value for buffer initialization
+            phi_value = self.dag_mask.phi
             
             # Initialize running averages as buffers (not optimized, but saved in state_dict)
             # These track EMA statistics for monitoring and prior regularization
-            self.register_buffer('runav_att_mean', torch.zeros_like(self.phi))
-            self.register_buffer('runav_att_snr', torch.zeros_like(self.phi))
+            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
+            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
         else:
             self.dag_mask = None
-            self.phi = None
             self.runav_att_mean = None
             self.runav_att_snr = None
-        
+    
         # Gumbel-Softmax temperature - learnable with annealing
         # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
         self.log_tau = nn.Parameter(torch.tensor(log(2.0)))
@@ -66,6 +68,13 @@ class LieAttention(nn.Module):
         self.log_tau_comm = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature (linear slope = gain/tau)
         self.max_gain = 1e3
         self.enforce_nonneg_flow = True  # set False if you want to allow negative flow
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi through dag_mask to support both DAGMask and DAGMaskAntisym."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
     
     def get_dag_probabilities(self) -> torch.Tensor:
         """
@@ -214,6 +223,20 @@ class LieAttention(nn.Module):
             m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau)
             M = m_relaxed
             
+            # Zero out diagonal for antisymmetric DAG (no self-loops)
+            # For DAGMaskAntisym, phi[i,i] = 0 leads to sigmoid(0) = 0.5
+            # We explicitly force diagonal to 0 to ensure no self-loops
+            from causaliT.core.modules.extra_layers import DAGMaskAntisym
+            if isinstance(self.dag_mask, DAGMaskAntisym):
+                if M.dim() == 2:
+                    # Single-head: M shape is (L, S)
+                    diag_mask = torch.eye(M.shape[-2], M.shape[-1], device=M.device, dtype=torch.bool)
+                    M = M.masked_fill(diag_mask, 0.0)
+                elif M.dim() == 3:
+                    # Multi-head: M shape is (H, L, S)
+                    diag_mask = torch.eye(M.shape[-2], M.shape[-1], device=M.device, dtype=torch.bool)
+                    M = M.masked_fill(diag_mask.unsqueeze(0), 0.0)
+            
             # Add batch dimension
             # For single-head: phi shape is (L, S) -> M becomes (1, L, S)
             # For multi-head: phi shape is (H, L, S) -> M becomes (1, H, L, S)
@@ -291,18 +314,20 @@ class CausalCrossAttention(nn.Module):
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
         # Store DAGMask as submodule to ensure proper parameter registration
-        from causaliT.core.modules.extra_layers import DAGMask
-        if isinstance(mask_layer, DAGMask):
+        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
+        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
+        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
             self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            self.phi = self.dag_mask.phi  # Reference for convenience
+            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
+            # We need to get the current value for buffer initialization
+            phi_value = self.dag_mask.phi
             
             # Initialize running averages as buffers (not optimized, but saved in state_dict)
             # These track EMA statistics for monitoring and prior regularization
-            self.register_buffer('runav_att_mean', torch.zeros_like(self.phi))
-            self.register_buffer('runav_att_snr', torch.zeros_like(self.phi))
+            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
+            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
         else:
             self.dag_mask = None
-            self.phi = None
             self.runav_att_mean = None
             self.runav_att_snr = None
         
@@ -316,6 +341,13 @@ class CausalCrossAttention(nn.Module):
         self.log_gain = nn.Parameter(torch.tensor(log(1.0)))
         self.log_tau = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature
         self.max_gain = 10.0
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi through dag_mask to support both DAGMask and DAGMaskAntisym."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
     
     def get_dag_probabilities(self) -> torch.Tensor:
         """
@@ -531,18 +563,20 @@ class PhiSoftMax(nn.Module):
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
         # Store DAGMask as submodule to ensure proper parameter registration
-        from causaliT.core.modules.extra_layers import DAGMask
-        if isinstance(mask_layer, DAGMask):
+        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
+        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
+        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
             self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            self.phi = self.dag_mask.phi  # Reference for convenience
+            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
+            # We need to get the current value for buffer initialization
+            phi_value = self.dag_mask.phi
             
             # Initialize running averages as buffers (not optimized, but saved in state_dict)
             # These track EMA statistics for monitoring and prior regularization
-            self.register_buffer('runav_att_mean', torch.zeros_like(self.phi))
-            self.register_buffer('runav_att_snr', torch.zeros_like(self.phi))
+            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
+            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
         else:
             self.dag_mask = None
-            self.phi = None
             self.runav_att_mean = None
             self.runav_att_snr = None
         
@@ -560,6 +594,13 @@ class PhiSoftMax(nn.Module):
         
         # Large constant for soft thresholding (makes the transition sharp but differentiable)
         self.mask_scale = 1e4
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi through dag_mask to support both DAGMask and DAGMaskAntisym."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
     
     def get_dag_probabilities(self) -> torch.Tensor:
         """
@@ -693,6 +734,20 @@ class PhiSoftMax(nn.Module):
             gumbel_noise = torch.log(u + 1e-8) - torch.log(1 - u + 1e-8)
             m_relaxed = torch.sigmoid((gumbel_noise + self.phi) / tau)
             
+            # Zero out diagonal for antisymmetric DAG (no self-loops)
+            # For DAGMaskAntisym, phi[i,i] = 0 leads to sigmoid(0) = 0.5
+            # We explicitly force diagonal to 0 to ensure no self-loops
+            from causaliT.core.modules.extra_layers import DAGMaskAntisym
+            if isinstance(self.dag_mask, DAGMaskAntisym):
+                if m_relaxed.dim() == 2:
+                    # Single-head: m_relaxed shape is (L, S)
+                    diag_mask = torch.eye(m_relaxed.shape[-2], m_relaxed.shape[-1], device=m_relaxed.device, dtype=torch.bool)
+                    m_relaxed = m_relaxed.masked_fill(diag_mask, 0.0)
+                elif m_relaxed.dim() == 3:
+                    # Multi-head: m_relaxed shape is (H, L, S)
+                    diag_mask = torch.eye(m_relaxed.shape[-2], m_relaxed.shape[-1], device=m_relaxed.device, dtype=torch.bool)
+                    m_relaxed = m_relaxed.masked_fill(diag_mask.unsqueeze(0), 0.0)
+            
             # Clamp threshold to valid range
             thresh = self.threshold.clamp(self.threshold_min, self.threshold_max)
             
@@ -701,6 +756,15 @@ class PhiSoftMax(nn.Module):
             # Using: -scale * relu(threshold - m_relaxed) 
             # This gives: 0 when m_relaxed >= threshold, negative when m_relaxed < threshold
             phi_mask_additive = -self.mask_scale * F.relu(thresh - m_relaxed)
+            
+            # For antisymmetric DAG, force diagonal to -inf (no self-attention)
+            if isinstance(self.dag_mask, DAGMaskAntisym):
+                if phi_mask_additive.dim() == 2:
+                    diag_mask = torch.eye(phi_mask_additive.shape[-2], phi_mask_additive.shape[-1], device=phi_mask_additive.device, dtype=torch.bool)
+                    phi_mask_additive = phi_mask_additive.masked_fill(diag_mask, -self.mask_scale)
+                elif phi_mask_additive.dim() == 3:
+                    diag_mask = torch.eye(phi_mask_additive.shape[-2], phi_mask_additive.shape[-1], device=phi_mask_additive.device, dtype=torch.bool)
+                    phi_mask_additive = phi_mask_additive.masked_fill(diag_mask.unsqueeze(0), -self.mask_scale)
             
             # Add batch dimension
             # For single-head: phi shape is (L, S) -> M becomes (1, L, S)
@@ -1119,6 +1183,14 @@ class AttentionLayer(nn.Module):
         - value: Value embeddings (for V projection)
     
     This keeps the attention layer simple and agnostic to the factorization strategy.
+    
+    Args:
+        dag_parameterization: str, one of:
+            - "independent": Original parameterization where each edge (i,j) is independent.
+                            Allows bidirectional edges. (default)
+            - "antisymmetric": Uses antisymmetric constraint so P(i→j) + P(j→i) = 1.
+                              Enforces competition between edge directions.
+                              Only works for self-attention (query_seq_len == key_seq_len).
     """
     def __init__(
         self,
@@ -1134,17 +1206,28 @@ class AttentionLayer(nn.Module):
         register_entropy: bool = False, 
         layer_name: str = None,
         query_seq_len: int = None,
-        key_seq_len: int = None
+        key_seq_len: int = None,
+        dag_parameterization: str = "independent",
+        phi_init_std: float = 0.1
         ):
         
         super(AttentionLayer, self).__init__()
         
         # Create DAGMask for attention types that support DAG learning
-        from causaliT.core.modules.extra_layers import DAGMask
+        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
         
         # LieAttention, CausalCrossAttention, and PhiSoftMax all support DAG learning
         if attention in (LieAttention, CausalCrossAttention, PhiSoftMax) and query_seq_len is not None and key_seq_len is not None:
-            mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len)
+            if dag_parameterization == "antisymmetric":
+                # Antisymmetric only works for self-attention (square attention)
+                if query_seq_len != key_seq_len:
+                    print(f"Warning: dag_parameterization='antisymmetric' requested but query_seq_len ({query_seq_len}) != key_seq_len ({key_seq_len}). Falling back to 'independent'.")
+                    mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
+                else:
+                    mask_layer = DAGMaskAntisym(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
+            else:
+                # Default: independent parameterization
+                mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
         
         self.inner_attention = attention(
             mask_layer=mask_layer,

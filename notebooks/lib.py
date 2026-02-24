@@ -77,7 +77,7 @@ def find_config_file(folder_path: str) -> str:
         FileNotFoundError: If no config file is found
         ValueError: If more than one config file is found
     """
-    pattern = re.compile(r'^config_.*\.yaml$')
+    pattern = re.compile(r'^config(_.*)?\.yaml$')
     matching_files = []
     
     for filename in listdir(folder_path):
@@ -85,7 +85,7 @@ def find_config_file(folder_path: str) -> str:
             matching_files.append(join(folder_path, filename))
     
     if len(matching_files) == 0:
-        raise FileNotFoundError(f"No config_*.yaml found in {folder_path}")
+        raise FileNotFoundError(f"No config*.yaml found in {folder_path}")
     
     if len(matching_files) > 1:
         raise ValueError(f"More than one config file found in {folder_path}: {matching_files}")

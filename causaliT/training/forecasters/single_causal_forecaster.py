@@ -16,6 +16,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.single_causal import SingleCausalLayer
 from causaliT.core.utils import load_dag_masks
 from causaliT.utils.hsic_utils import hsic_per_token
+from causaliT.core.modules.extra_layers import dag_decisiveness_loss, dag_temperature_loss
 
 
 class SingleCausalForecaster(pl.LightningModule):
@@ -77,6 +78,20 @@ class SingleCausalForecaster(pl.LightningModule):
         #                     if False, set alpha=1 (uniform confidence)
         self.lambda_kl = config["training"].get("lambda_kl", 1.0)
         self.adaptive_z_scaling = config["training"].get("adaptive_z_scaling", True)
+        
+        # DAG decisiveness regularization - encourages decisive edge probabilities (away from 0.5)
+        # This is particularly important for DAGMaskAntisym where sigmoid(0) = 0.5
+        # lambda_decisive: Weight for decisiveness (binary entropy) loss
+        # lambda_tau: Weight for temperature penalty (encourages lower tau for sharper masks)
+        # target_tau: Target temperature for annealing (no penalty below this value)
+        self.lambda_decisive = config["training"].get("lambda_decisive", 0)
+        self.lambda_decisive_cross = config["training"].get("lambda_decisive_cross", None)
+        self.lambda_tau = config["training"].get("lambda_tau", 0)
+        self.target_tau = config["training"].get("target_tau", 0.1)
+        self.log_decisiveness = config["training"].get("log_decisiveness", False)
+        
+        if self.lambda_decisive_cross is None:
+            self.lambda_decisive_cross = self.lambda_decisive
         
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
@@ -435,13 +450,62 @@ class SingleCausalForecaster(pl.LightningModule):
             hsic_regularizer = 0.0
             hsic_value = None
         
+        # DAG Decisiveness regularizer - encourages edge probabilities away from 0.5
+        # This addresses the problem with antisymmetric DAG parameterization where
+        # sigmoid(0) = 0.5, leading to indecisive edges
+        decisive_self_loss = torch.tensor(0.0, device=x_target.device)
+        decisive_cross_loss = torch.tensor(0.0, device=x_target.device)
+        tau_self_loss = torch.tensor(0.0, device=x_target.device)
+        tau_cross_loss = torch.tensor(0.0, device=x_target.device)
+        
+        if self.lambda_decisive > 0 or self.lambda_tau > 0 or self.log_decisiveness:
+            # Self-attention decisiveness
+            if dec_self_phi is not None:
+                # Get temperature for self-attention
+                log_tau_self = getattr(dec_self_inner, 'log_tau', None)
+                tau_self = torch.exp(log_tau_self) if log_tau_self is not None else None
+                
+                # Exclude diagonal for self-attention (it's always 0 for antisymmetric)
+                is_square = dec_self_phi.shape[-2] == dec_self_phi.shape[-1]
+                decisive_self_loss = dag_decisiveness_loss(
+                    dec_self_phi, tau=tau_self, exclude_diagonal=is_square
+                )
+                
+                # Temperature penalty for self-attention
+                if log_tau_self is not None and self.lambda_tau > 0:
+                    tau_self_loss = dag_temperature_loss(log_tau_self, target_tau=self.target_tau)
+            
+            # Cross-attention decisiveness
+            if dec_cross_phi is not None:
+                # Get temperature for cross-attention
+                log_tau_cross = getattr(dec_cross_inner, 'log_tau', None)
+                if log_tau_cross is None:
+                    log_tau_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+                tau_cross = torch.exp(log_tau_cross) if log_tau_cross is not None else None
+                
+                # Cross-attention is not square, so no diagonal to exclude
+                decisive_cross_loss = dag_decisiveness_loss(
+                    dec_cross_phi, tau=tau_cross, exclude_diagonal=False
+                )
+                
+                # Temperature penalty for cross-attention
+                if log_tau_cross is not None and self.lambda_tau > 0:
+                    tau_cross_loss = dag_temperature_loss(log_tau_cross, target_tau=self.target_tau)
+        
+        decisiveness_regularizer = (
+            self.lambda_decisive * decisive_self_loss +
+            self.lambda_decisive_cross * decisive_cross_loss +
+            self.lambda_tau * (tau_self_loss + tau_cross_loss)
+        )
+        
         # Total loss
         total_loss = (loss_x + 
                      entropy_regularizer + 
                      acyclic_regularizer +
                      prior_regularizer +
                      sparsity_regularizer +
-                     hsic_regularizer)
+                     hsic_regularizer +
+                     decisiveness_regularizer)
         
         # Log loss
         self.log(f"{stage}_loss_x", loss_x, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
@@ -470,6 +534,25 @@ class SingleCausalForecaster(pl.LightningModule):
         if self.log_hsic and hsic_value is not None:
             self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
             self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
+        
+        # Log decisiveness if requested
+        if self.log_decisiveness:
+            self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_tau_self", tau_self_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_tau_cross", tau_cross_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_decisive_total", decisiveness_regularizer, on_step=False, on_epoch=True)
+            # Also log actual temperature values for monitoring
+            if dec_self_phi is not None:
+                log_tau_self = getattr(dec_self_inner, 'log_tau', None)
+                if log_tau_self is not None:
+                    self.log(f"{stage}_tau_self_value", torch.exp(log_tau_self), on_step=False, on_epoch=True)
+            if dec_cross_phi is not None:
+                log_tau_cross = getattr(dec_cross_inner, 'log_tau', None)
+                if log_tau_cross is None:
+                    log_tau_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+                if log_tau_cross is not None:
+                    self.log(f"{stage}_tau_cross_value", torch.exp(log_tau_cross), on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     

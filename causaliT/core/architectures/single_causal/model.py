@@ -100,6 +100,10 @@ class SingleCausalLayer(nn.Module):
         
         # SVFA: factorization mode ("standard" or "svfa")
         factorization: str = "standard",
+        
+        # DAG parameterization: "independent" (default) or "antisymmetric"
+        # "antisymmetric" enforces P(i→j) + P(j→i) = 1, preventing bidirectional edges
+        dag_parameterization: str = "independent",
     ):
         super().__init__()
         
@@ -108,6 +112,7 @@ class SingleCausalLayer(nn.Module):
         self.dec_causal_mask = dec_causal_mask
         self.d_model = d_model
         self.factorization = factorization
+        self.dag_parameterization = dag_parameterization
         
         # =====================================================================
         # EMBEDDINGS
@@ -319,7 +324,8 @@ class SingleCausalLayer(nn.Module):
             register_entropy=register_entropy,
             layer_name=layer_name,
             query_seq_len=query_seq_len,
-            key_seq_len=key_seq_len
+            key_seq_len=key_seq_len,
+            dag_parameterization=self.dag_parameterization
         )
         
         return att
