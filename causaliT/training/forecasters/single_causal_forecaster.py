@@ -311,7 +311,6 @@ class SingleCausalForecaster(pl.LightningModule):
             pred_x: Predicted X values
             X: Actual X values
         """
-        
         # Unpack batch (ignore Y)
         S, X, Y = batch
         
@@ -461,36 +460,34 @@ class SingleCausalForecaster(pl.LightningModule):
         if self.lambda_decisive > 0 or self.lambda_tau > 0 or self.log_decisiveness:
             # Self-attention decisiveness
             if dec_self_phi is not None:
-                # Get temperature for self-attention
-                log_tau_self = getattr(dec_self_inner, 'log_tau', None)
-                tau_self = torch.exp(log_tau_self) if log_tau_self is not None else None
+                # Get Gumbel-Softmax temperature for self-attention (log_tau_gs is used for DAG mask)
+                log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
+                tau_gs_self = torch.exp(log_tau_gs_self) if log_tau_gs_self is not None else None
                 
                 # Exclude diagonal for self-attention (it's always 0 for antisymmetric)
                 is_square = dec_self_phi.shape[-2] == dec_self_phi.shape[-1]
                 decisive_self_loss = dag_decisiveness_loss(
-                    dec_self_phi, tau=tau_self, exclude_diagonal=is_square
+                    dec_self_phi, tau=tau_gs_self, exclude_diagonal=is_square
                 )
                 
                 # Temperature penalty for self-attention
-                if log_tau_self is not None and self.lambda_tau > 0:
-                    tau_self_loss = dag_temperature_loss(log_tau_self, target_tau=self.target_tau)
+                if log_tau_gs_self is not None and self.lambda_tau > 0:
+                    tau_self_loss = dag_temperature_loss(log_tau_gs_self, target_tau=self.target_tau)
             
             # Cross-attention decisiveness
             if dec_cross_phi is not None:
-                # Get temperature for cross-attention
-                log_tau_cross = getattr(dec_cross_inner, 'log_tau', None)
-                if log_tau_cross is None:
-                    log_tau_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
-                tau_cross = torch.exp(log_tau_cross) if log_tau_cross is not None else None
+                # Get Gumbel-Softmax temperature for cross-attention (log_tau_gs is used for DAG mask)
+                log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+                tau_gs_cross = torch.exp(log_tau_gs_cross) if log_tau_gs_cross is not None else None
                 
                 # Cross-attention is not square, so no diagonal to exclude
                 decisive_cross_loss = dag_decisiveness_loss(
-                    dec_cross_phi, tau=tau_cross, exclude_diagonal=False
+                    dec_cross_phi, tau=tau_gs_cross, exclude_diagonal=False
                 )
                 
                 # Temperature penalty for cross-attention
-                if log_tau_cross is not None and self.lambda_tau > 0:
-                    tau_cross_loss = dag_temperature_loss(log_tau_cross, target_tau=self.target_tau)
+                if log_tau_gs_cross is not None and self.lambda_tau > 0:
+                    tau_cross_loss = dag_temperature_loss(log_tau_gs_cross, target_tau=self.target_tau)
         
         decisiveness_regularizer = (
             self.lambda_decisive * decisive_self_loss +
@@ -542,17 +539,16 @@ class SingleCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_tau_self", tau_self_loss, on_step=False, on_epoch=True)
             self.log(f"{stage}_tau_cross", tau_cross_loss, on_step=False, on_epoch=True)
             self.log(f"{stage}_decisive_total", decisiveness_regularizer, on_step=False, on_epoch=True)
-            # Also log actual temperature values for monitoring
+            # Log actual Gumbel-Softmax temperature values for monitoring
+            # log_tau_gs is the Gumbel-Softmax temperature used for DAG mask sampling
             if dec_self_phi is not None:
-                log_tau_self = getattr(dec_self_inner, 'log_tau', None)
-                if log_tau_self is not None:
-                    self.log(f"{stage}_tau_self_value", torch.exp(log_tau_self), on_step=False, on_epoch=True)
+                log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
+                if log_tau_gs_self is not None:
+                    self.log(f"{stage}_tau_gs_self_value", torch.exp(log_tau_gs_self), on_step=False, on_epoch=True)
             if dec_cross_phi is not None:
-                log_tau_cross = getattr(dec_cross_inner, 'log_tau', None)
-                if log_tau_cross is None:
-                    log_tau_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
-                if log_tau_cross is not None:
-                    self.log(f"{stage}_tau_cross_value", torch.exp(log_tau_cross), on_step=False, on_epoch=True)
+                log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+                if log_tau_gs_cross is not None:
+                    self.log(f"{stage}_tau_gs_cross_value", torch.exp(log_tau_gs_cross), on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     

@@ -53,9 +53,10 @@ class LieAttention(nn.Module):
     
         # Gumbel-Softmax temperature - learnable with annealing
         # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
-        self.log_tau = nn.Parameter(torch.tensor(log(2.0)))
-        self.tau_min = 0.1  # Minimum temperature
-        self.tau_max = 5.0  # Maximum temperature
+        # Named log_tau_gs to distinguish from other temperature parameters (e.g., log_tau_comm)
+        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
+        self.tau_gs_min = 0.1  # Minimum temperature
+        self.tau_gs_max = 5.0  # Maximum temperature
 
         self.entropy_enabled = True
         
@@ -215,12 +216,12 @@ class LieAttention(nn.Module):
         
         # Apply DAG mask if phi is available
         if self.phi is not None:
-            # Get learnable temperature (clamped to safe range)
-            tau = torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
+            # Get learnable Gumbel-Softmax temperature (clamped to safe range)
+            tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
             
             # Sample batch DAG logits using Gumbel-Softmax trick
             u = torch.rand_like(self.phi)
-            m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau)
+            m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau_gs)
             M = m_relaxed
             
             # Zero out diagonal for antisymmetric DAG (no self-loops)
@@ -338,8 +339,9 @@ class CausalCrossAttention(nn.Module):
         self.tau_gs_max = 5.0  # Maximum temperature
         
         # Gain/temperature parameters for GeLU(Tanh) activation
+        # log_tau_act controls the sharpness of the tanh activation (not the DAG mask)
         self.log_gain = nn.Parameter(torch.tensor(log(1.0)))
-        self.log_tau = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature
+        self.log_tau_act = nn.Parameter(torch.tensor(log(0.2)))  # tanh activation temperature
         self.max_gain = 10.0
     
     @property
@@ -474,10 +476,10 @@ class CausalCrossAttention(nn.Module):
             scores = scores + M_causal
         
         gain = torch.exp(self.log_gain).clamp(1e-3, self.max_gain)
-        tau = torch.exp(self.log_tau).clamp(1e-3, 10.0)
+        tau_act = torch.exp(self.log_tau_act).clamp(1e-3, 10.0)
         
         # Causality-friendly activation: GeLU(Tanh(scores))
-        att = F.gelu(F.tanh((gain / tau) * scores))
+        att = F.gelu(F.tanh((gain / tau_act) * scores))
         
         # Handle NaN from all-masked rows
         att = torch.nan_to_num(att, nan=0.0)
@@ -582,9 +584,10 @@ class PhiSoftMax(nn.Module):
         
         # Gumbel-Softmax temperature - learnable with annealing
         # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
-        self.log_tau = nn.Parameter(torch.tensor(log(2.0)))
-        self.tau_min = 0.1  # Minimum temperature
-        self.tau_max = 5.0  # Maximum temperature
+        # Named log_tau_gs to be consistent with other attention types
+        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
+        self.tau_gs_min = 0.1  # Minimum temperature
+        self.tau_gs_max = 5.0  # Maximum temperature
         
         # Threshold for converting soft phi to hard mask (values below threshold -> -inf)
         # This is learnable to allow the model to adjust the sparsity
@@ -726,13 +729,13 @@ class PhiSoftMax(nn.Module):
         
         # Apply learned DAG mask BEFORE softmax (if phi is available)
         if self.phi is not None:
-            # Get learnable temperature (clamped to safe range)
-            tau = torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
+            # Get learnable Gumbel-Softmax temperature (clamped to safe range)
+            tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
             
             # Sample batch DAG logits using Gumbel-Softmax trick
             u = torch.rand_like(self.phi)
             gumbel_noise = torch.log(u + 1e-8) - torch.log(1 - u + 1e-8)
-            m_relaxed = torch.sigmoid((gumbel_noise + self.phi) / tau)
+            m_relaxed = torch.sigmoid((gumbel_noise + self.phi) / tau_gs)
             
             # Zero out diagonal for antisymmetric DAG (no self-loops)
             # For DAGMaskAntisym, phi[i,i] = 0 leads to sigmoid(0) = 0.5

@@ -8,7 +8,7 @@ def dag_decisiveness_loss(
     phi: torch.Tensor, 
     tau: torch.Tensor = None,
     exclude_diagonal: bool = True,
-    eps: float = 1e-8
+    eps: float = 1e-6  # Increased from 1e-8 to prevent 0 * -inf = NaN when p ≈ 1
 ) -> torch.Tensor:
     """
     Compute decisiveness loss for DAG edge probabilities.
@@ -60,7 +60,8 @@ def dag_decisiveness_loss(
     # Compute edge probabilities
     if tau is not None:
         # Use temperature-scaled sigmoid to match Gumbel-Softmax distribution
-        p = torch.sigmoid(phi / tau.clamp(min=0.01))
+        tau_clamped = tau.clamp(min=0.01)
+        p = torch.sigmoid(phi / tau_clamped)
     else:
         p = torch.sigmoid(phi)
     

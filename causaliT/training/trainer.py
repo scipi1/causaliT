@@ -274,7 +274,7 @@ def trainer(
         eval_results = run_all_evaluations(
             experiment=save_dir,
             datadir_path=data_dir,
-            show_plots=False,  # Always False for cluster (headless)
+            show_plots=False,  # Always False
         )
         print("\nPost-training evaluations completed!")
     except Exception as e:
