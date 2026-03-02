@@ -1,7 +1,218 @@
+from math import log
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+
+# =============================================================================
+# DAG Learning Mixin
+# =============================================================================
+
+class DAGLearningMixin:
+    """
+    Mixin class providing common DAG learning functionality for attention modules.
+    
+    This mixin centralizes the initialization and utility methods for DAG mask learning,
+    reducing code duplication across LieAttention, CausalCrossAttention, PhiSoftMax, etc.
+    
+    Usage:
+        class MyAttention(DAGLearningMixin, nn.Module):
+            def __init__(self, dag_mask, ...):
+                super().__init__()
+                self._init_dag_learning(dag_mask)
+                # ... rest of initialization
+    
+    The mixin provides:
+    - _init_dag_learning(dag_mask): Initialize DAG-related attributes and buffers
+    - phi property: Access the DAG logits
+    - get_dag_probabilities(): Get edge probabilities
+    - get_dag_logits(): Get raw logits
+    - _update_running_average(att): Update EMA statistics
+    - _apply_dag_mask(att, is_multihead): Apply learned DAG mask with Gumbel-Softmax
+    - _zero_diagonal(tensor, is_multihead): Zero out diagonal for antisymmetric DAGs
+    """
+    
+    def _init_dag_learning(self, dag_mask: nn.Module):
+        """
+        Initialize DAG learning attributes and buffers.
+        
+        Args:
+            dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None.
+                     If not None, registers as submodule and initializes buffers.
+        """
+        self.dag_mask = dag_mask
+        
+        if dag_mask is not None:
+            # Get phi value for buffer initialization
+            phi_value = dag_mask.phi
+            
+            # Initialize running averages as buffers (not optimized, but saved in state_dict)
+            # These track EMA statistics for monitoring and prior regularization
+            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
+            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
+            
+            # Gumbel-Softmax temperature - learnable with annealing
+            # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
+            self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
+            self.tau_gs_min = 0.1  # Minimum temperature
+            self.tau_gs_max = 5.0  # Maximum temperature
+        else:
+            self.runav_att_mean = None
+            self.runav_att_snr = None
+            self.log_tau_gs = None
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi through dag_mask. Returns None if no DAG learning."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
+    
+    @property
+    def gamma(self) -> torch.Tensor:
+        """Access gamma (gate logits) for DAGMaskGated. Returns None otherwise."""
+        if self.dag_mask is not None and hasattr(self.dag_mask, 'gamma'):
+            return self.dag_mask.gamma
+        return None
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the posterior probability of each edge being active in the learned DAG.
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S).
+                         Returns None if no DAG is being learned.
+        """
+        if self.dag_mask is not None:
+            return self.dag_mask.get_dag_probabilities()
+        return None
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """
+        Returns the raw logits (phi) of the learned DAG.
+        
+        Returns:
+            torch.Tensor: Raw logits, shape (L, S) or (H, L, S).
+                         Returns None if no DAG is being learned.
+        """
+        return self.phi
+    
+    def _update_running_average(self, att: torch.Tensor) -> tuple:
+        """
+        Update running averages of attention statistics.
+        
+        Args:
+            att: Attention evidence tensor (batch_size, ...)
+            
+        Returns:
+            tuple: (batch_mean, batch_snr) with gradients attached for regularization
+        """
+        alpha = 0.9
+        
+        # Compute batch statistics (keep gradients for regularization)
+        batch_mean = torch.mean(att, dim=0)
+        batch_std = torch.std(att, dim=0)
+        batch_snr = batch_mean / (batch_std + 1e-6)
+        
+        # Update running averages (no gradients, in-place operations on buffers)
+        if self.runav_att_mean is not None:
+            with torch.no_grad():
+                if (self.runav_att_mean != 0).any():
+                    # EMA update using in-place operations
+                    self.runav_att_mean.mul_(alpha).add_(batch_mean, alpha=1-alpha)
+                    self.runav_att_snr.mul_(alpha).add_(batch_snr, alpha=1-alpha)
+                else:
+                    # First update: initialize with batch statistics
+                    self.runav_att_mean.copy_(batch_mean)
+                    self.runav_att_snr.copy_(batch_snr)
+        
+        # Store batch statistics as attributes for access by forecaster (with gradients)
+        self.batch_att_mean = batch_mean
+        self.batch_att_snr = batch_snr
+        
+        return batch_mean, batch_snr
+    
+    def _apply_dag_mask(self, att: torch.Tensor, is_multihead: bool) -> torch.Tensor:
+        """
+        Apply learned DAG mask using Gumbel-Softmax trick.
+        
+        Args:
+            att: Attention tensor, shape (B, L, S) or (B, H, L, S)
+            is_multihead: Whether attention is multi-head
+            
+        Returns:
+            Masked attention tensor
+        """
+        if self.phi is None:
+            return att
+        
+        # Get learnable Gumbel-Softmax temperature (clamped to safe range)
+        tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
+        
+        # Sample batch DAG logits using Gumbel-Softmax trick
+        u = torch.rand_like(self.phi)
+        m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau_gs)
+        M = m_relaxed
+        
+        # Zero out diagonal for square matrices (no self-loops)
+        M = self._zero_diagonal(M, is_multihead=False)  # phi is not batched
+        
+        # Add batch dimension
+        # For single-head: phi shape is (L, S) -> M becomes (1, L, S)
+        # For multi-head: phi shape is (H, L, S) -> M becomes (1, H, L, S)
+        M = M.unsqueeze(0)
+        
+        return att * M
+    
+    def _zero_diagonal(self, tensor: torch.Tensor, is_multihead: bool) -> torch.Tensor:
+        """
+        Zero out diagonal entries for square matrices (no self-loops).
+        
+        This is important for antisymmetric and gated parameterizations where
+        diagonal would otherwise be sigmoid(0) = 0.5.
+        
+        Args:
+            tensor: Tensor of shape (L, S), (H, L, S), (B, L, S), or (B, H, L, S)
+            is_multihead: Whether tensor has head dimension
+            
+        Returns:
+            Tensor with diagonal zeroed (if square)
+        """
+        # Check if square
+        L, S = tensor.shape[-2], tensor.shape[-1]
+        if L != S:
+            return tensor
+        
+        # Create diagonal mask
+        diag_mask = torch.eye(L, S, device=tensor.device, dtype=torch.bool)
+        
+        # Expand mask based on tensor dimensions
+        if tensor.dim() == 2:
+            # (L, S)
+            return tensor.masked_fill(diag_mask, 0.0)
+        elif tensor.dim() == 3:
+            # (H, L, S) or (B, L, S)
+            return tensor.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        elif tensor.dim() == 4:
+            # (B, H, L, S)
+            return tensor.masked_fill(diag_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        
+        return tensor
+    
+    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
+        """Expand hard_mask to match attention shape."""
+        if is_multihead:
+            if hard_mask.dim() == 2:
+                # Single mask for all heads: (L, S) -> (1, 1, L, S)
+                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                # Per-head mask: (H, L, S) -> (1, H, L, S)
+                hard_mask = hard_mask.unsqueeze(0)
+        else:
+            # hard_mask: (L, S) -> (1, L, S)
+            hard_mask = hard_mask.unsqueeze(0)
+        return hard_mask
 
 
 def dag_decisiveness_loss(
@@ -278,6 +489,26 @@ class DAGMask(nn.Module):
         else:
             self.phi = nn.Parameter(torch.randn(query_seq_len, key_seq_len) * init_std)
     
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the posterior probability of each edge being active in the learned DAG.
+        
+        For independent parameterization, this is simply sigmoid(phi).
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
+        """
+        return torch.sigmoid(self.phi)
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """
+        Returns the raw logits (phi) of the learned DAG.
+        
+        Returns:
+            torch.Tensor: Raw logits, shape (L, S) or (H, L, S) for multi-head.
+        """
+        return self.phi
+    
     def forward(self, attention_scores: torch.Tensor, mask: torch.Tensor = None, mask_val=-float("inf")):
         """
         For compatibility with mask_layer interface.
@@ -382,12 +613,28 @@ class DAGMaskAntisym(nn.Module):
         Due to antisymmetric parameterization:
         - P(i→j) = sigmoid(W_antisym[i,j])
         - P(j→i) = sigmoid(W_antisym[j,i]) = sigmoid(-W_antisym[i,j]) = 1 - P(i→j)
-        - P(i→i) = 0.5 (from sigmoid(0)), but in practice diagonal should be masked
+        - P(i→i) = 0 (forced, since no self-loops in DAG)
+        
+        Note: The diagonal of phi is 0 by construction (antisymmetric), which gives
+        sigmoid(0) = 0.5. We explicitly zero out the diagonal to enforce no self-loops.
         
         Returns:
             torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S).
+                         Diagonal entries are forced to 0.
         """
-        return torch.sigmoid(self.phi)
+        probs = torch.sigmoid(self.phi)
+        
+        # Zero out diagonal (no self-loops in DAG)
+        if probs.dim() == 2:
+            # Single-head: (L, S)
+            diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+            probs = probs.masked_fill(diag_mask, 0.0)
+        elif probs.dim() == 3:
+            # Multi-head: (H, L, S)
+            diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+            probs = probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        return probs
     
     def get_dag_logits(self) -> torch.Tensor:
         """
@@ -403,6 +650,142 @@ class DAGMaskAntisym(nn.Module):
         For compatibility with mask_layer interface.
         Currently just returns attention_scores as is.
         """
+        return attention_scores
+
+
+class DAGMaskGated(nn.Module):
+    """
+    Gated antisymmetric DAG mask with symmetric gate + antisymmetric direction.
+    
+    This parameterization combines two components:
+    - Symmetric gate γ: P(edge exists between i and j) - same in both directions
+    - Antisymmetric direction φ: P(flow i→j | edge exists) - competitive
+    
+    Final edge probability:
+        P(i→j) = σ(γ_ij) × σ(φ_ij)
+    
+    Where:
+    - γ_ij = γ_ji (symmetric): Learnable edge existence gate
+    - φ_ij = -φ_ji (antisymmetric): Learnable flow direction
+    
+    Properties:
+    - P(i→j) = 0 and P(j→i) = 0 is possible (when γ_ij → -∞)
+    - P(i→j) + P(j→i) ≤ 1 (always, by construction)
+    - P(i→i) = 0 (diagonal forced to 0)
+    - Sparsity via L1 on γ (pushes gates closed)
+    
+    See docs/TOEPLITZ_DECOMPOSITION.md for theoretical background.
+    
+    Args:
+        n_heads: Number of attention heads
+        query_seq_len: Length of query sequence (must equal key_seq_len)
+        key_seq_len: Length of key sequence
+        init_std_gate: Std for symmetric gate initialization (default 0.0 = neutral)
+        init_std_dir: Std for direction initialization (default 0.1)
+    """
+    def __init__(
+        self, 
+        n_heads: int, 
+        query_seq_len: int, 
+        key_seq_len: int, 
+        init_std_gate: float = 0.0,
+        init_std_dir: float = 0.1
+    ):
+        super(DAGMaskGated, self).__init__()
+        
+        assert query_seq_len == key_seq_len, \
+            "DAGMaskGated only supports square attention (query_seq_len == key_seq_len)."
+        
+        self.n_vars = query_seq_len
+        self.n_heads = n_heads
+        
+        # Symmetric gate: G_upper such that γ = G_upper + G_upper.T
+        # Initialize near 0 so initial gates are ~0.5 (neutral)
+        if n_heads > 1:
+            self.G = nn.Parameter(torch.randn(n_heads, self.n_vars, self.n_vars) * init_std_gate)
+        else:
+            self.G = nn.Parameter(torch.randn(self.n_vars, self.n_vars) * init_std_gate)
+        
+        # Antisymmetric direction: W_upper such that φ = W_upper - W_upper.T
+        if n_heads > 1:
+            self.W = nn.Parameter(torch.randn(n_heads, self.n_vars, self.n_vars) * init_std_dir)
+        else:
+            self.W = nn.Parameter(torch.randn(self.n_vars, self.n_vars) * init_std_dir)
+        
+        # Upper triangular mask (for antisymmetric part)
+        triu_mask = torch.triu(torch.ones(self.n_vars, self.n_vars), diagonal=1)
+        self.register_buffer('triu_mask', triu_mask)
+        
+        # Upper triangular + diagonal mask (for symmetric part)
+        triu_diag_mask = torch.triu(torch.ones(self.n_vars, self.n_vars), diagonal=0)
+        self.register_buffer('triu_diag_mask', triu_diag_mask)
+    
+    @property
+    def gamma(self) -> torch.Tensor:
+        """
+        Symmetric gate logits: γ_ij = γ_ji
+        Controls whether an edge exists between i and j (in either direction).
+        """
+        if self.n_heads > 1:
+            G_upper = self.G * self.triu_diag_mask.unsqueeze(0)
+            gamma = G_upper + G_upper.transpose(-2, -1)
+            # Zero diagonal (no self-loops)
+            diag_mask = torch.eye(self.n_vars, device=gamma.device, dtype=torch.bool)
+            gamma = gamma.masked_fill(diag_mask.unsqueeze(0), -1e9)
+        else:
+            G_upper = self.G * self.triu_diag_mask
+            gamma = G_upper + G_upper.T
+            # Zero diagonal
+            diag_mask = torch.eye(self.n_vars, device=gamma.device, dtype=torch.bool)
+            gamma = gamma.masked_fill(diag_mask, -1e9)
+        return gamma
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """
+        Antisymmetric direction logits: φ_ij = -φ_ji
+        Controls the direction of flow given an edge exists.
+        """
+        if self.n_heads > 1:
+            W_upper = self.W * self.triu_mask.unsqueeze(0)
+            phi = W_upper - W_upper.transpose(-2, -1)
+        else:
+            W_upper = self.W * self.triu_mask
+            phi = W_upper - W_upper.T
+        return phi
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns P(i→j) = σ(γ_ij) × σ(φ_ij)
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S).
+                         Diagonal entries are forced to 0.
+        """
+        gate_probs = torch.sigmoid(self.gamma)  # σ(γ): edge exists?
+        dir_probs = torch.sigmoid(self.phi)      # σ(φ): direction
+        probs = gate_probs * dir_probs
+        
+        # Force diagonal to 0 (redundant due to gamma, but explicit)
+        if probs.dim() == 2:
+            diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+            probs = probs.masked_fill(diag_mask, 0.0)
+        elif probs.dim() == 3:
+            diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+            probs = probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        return probs
+    
+    def get_gate_probabilities(self) -> torch.Tensor:
+        """Returns just the gate probabilities σ(γ) for sparsity regularization."""
+        return torch.sigmoid(self.gamma)
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """Returns the antisymmetric direction logits (phi) for compatibility."""
+        return self.phi
+    
+    def forward(self, attention_scores: torch.Tensor, mask: torch.Tensor = None, mask_val=-float("inf")):
+        """For compatibility with mask_layer interface."""
         return attention_scores
 
 

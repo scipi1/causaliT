@@ -157,7 +157,7 @@ class SingleCausalPredictor(BasePredictor):
         return dm
     
     def _forward(self, S: torch.Tensor, X: torch.Tensor, Y: torch.Tensor = None,
-                 toggle_off_hard_masks: bool = False, **kwargs) -> Any:
+                 use_hard_masks: bool = None, **kwargs) -> Any:
         """
         Perform forward pass through SingleCausalForecaster model.
         
@@ -170,9 +170,9 @@ class SingleCausalPredictor(BasePredictor):
             S: Source tensor (B x L_s x F)
             X: Intermediate tensor (B x L_x x F) - will be blanked internally
             Y: Target tensor (B x L_y x F) - ignored for SingleCausalForecaster
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained
-                                   with them. Useful for testing causality retention.
-                                   Default False = use masks if model was trained with them.
+            use_hard_masks: Override for hard mask usage. If None (default), uses
+                           the value from config (model.use_hard_masks).
+                           Set to False to disable hard masks for ablation studies.
             **kwargs: Additional arguments
             
         Returns:
@@ -182,7 +182,7 @@ class SingleCausalPredictor(BasePredictor):
         output = self.model.forward(
             data_source=S,
             data_intermediate=X,
-            toggle_off_hard_masks=toggle_off_hard_masks,
+            use_hard_masks=use_hard_masks,
             **kwargs
         )
         return output
@@ -223,7 +223,7 @@ class SingleCausalPredictor(BasePredictor):
         dataset_label: str = "test",
         debug_flag: bool = False,
         input_conditioning_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        toggle_off_hard_masks: bool = False,
+        use_hard_masks: bool = None,
         **kwargs
     ) -> PredictionResult:
         """
@@ -242,9 +242,9 @@ class SingleCausalPredictor(BasePredictor):
             dataset_label: One of ["train", "test", "all"]
             debug_flag: If True, predict only one batch
             input_conditioning_fn: Optional function to condition S inputs before forward pass
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained
-                                   with them. Useful for testing causality retention.
-                                   Default False = use masks if model was trained with them.
+            use_hard_masks: Override for hard mask usage. If None (default), uses
+                           the value from config (model.use_hard_masks).
+                           Set to False to disable hard masks for ablation studies.
             **kwargs: Additional arguments passed to forward
             
         Returns:
@@ -300,7 +300,7 @@ class SingleCausalPredictor(BasePredictor):
             
             # Forward pass - model handles blanking of X internally
             with torch.no_grad():
-                output = self._forward(S, X, toggle_off_hard_masks=toggle_off_hard_masks, **kwargs)
+                output = self._forward(S, X, use_hard_masks=use_hard_masks, **kwargs)
             
             # Process output
             processed = self._process_forward_output(output)

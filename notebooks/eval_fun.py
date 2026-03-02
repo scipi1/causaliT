@@ -2615,6 +2615,113 @@ def eval_interventions(
 # Post-Training Evaluation Wrapper
 # =============================================================================
 
+def run_evaluations_from_config(
+    experiment: str,
+    datadir_path: str = None,
+    show_plots: bool = False,
+    functions: List[str] = None,
+) -> dict:
+    """
+    Run evaluation functions specified in the config file.
+    
+    This dispatcher function allows choosing which evaluation functions to run
+    based on the config file's evaluation.functions list.
+    
+    Args:
+        experiment: Path to the experiment folder
+        datadir_path: Path to data directory. If None, uses default.
+        show_plots: If True, display plots. If False, only save to files.
+        functions: List of function names to run. Available functions:
+            - "eval_train_metrics": Training curves and loss analysis
+            - "eval_attention_scores": DAG recovery metrics
+            - "eval_embed": Embedding evolution analysis
+            - "eval_interventions": Causal intervention tests
+            - "eval_embedding_dag_correlation": Embedding-DAG correlation
+            - "eval_dyconex_predictions": Dyconex-specific prediction evaluation
+            - "eval_metrics": Flexible metric plotting
+            
+    Returns:
+        dict: Summary of evaluation results
+        
+    Example:
+        >>> results = run_evaluations_from_config(
+        ...     experiment="../experiments/stage/dyconex_exp",
+        ...     functions=["eval_train_metrics", "eval_dyconex_predictions", "eval_metrics"]
+        ... )
+    """
+    import traceback
+    
+    print(f"\n{'='*60}")
+    print(f"Running config-specified evaluations")
+    print(f"Experiment: {experiment}")
+    print(f"Functions: {functions}")
+    print('='*60)
+    
+    results = {
+        "experiment": experiment,
+        "evaluations": {},
+    }
+    
+    if functions is None:
+        print("No functions specified, running default evaluations...")
+        return run_all_evaluations(experiment, datadir_path, show_plots)
+    
+    # Function registry - maps function names to callables
+    # Import dyconex functions only when needed
+    FUNCTION_REGISTRY = {
+        "eval_train_metrics": lambda exp: eval_train_metrics(exp, show_plots=show_plots),
+        "eval_attention_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
+        "eval_embed": lambda exp: eval_embed(exp, show_plots=show_plots),
+        "eval_interventions": lambda exp: eval_interventions(exp, show_plots=show_plots),
+        "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),
+        "fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
+        "enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
+    }
+    
+    # Dyconex-specific functions (lazy import)
+    def _get_dyconex_predictions(exp):
+        from notebooks.eval_funs.eval_dyconex import eval_dyconex_predictions
+        return eval_dyconex_predictions(exp, datadir_path=datadir_path, show_plots=show_plots)
+    
+    def _get_dyconex_metrics(exp):
+        from notebooks.eval_funs.eval_dyconex import eval_metrics
+        return eval_metrics(exp, show_plots=show_plots)
+    
+    FUNCTION_REGISTRY["eval_dyconex_predictions"] = _get_dyconex_predictions
+    FUNCTION_REGISTRY["eval_metrics"] = _get_dyconex_metrics
+    
+    # Run specified functions
+    for idx, func_name in enumerate(functions, start=1):
+        print(f"\n--- Step {idx}: Running {func_name} ---")
+        
+        if func_name not in FUNCTION_REGISTRY:
+            print(f"  ✗ Unknown function: {func_name}")
+            results["evaluations"][func_name] = f"failed: Unknown function"
+            continue
+        
+        try:
+            FUNCTION_REGISTRY[func_name](experiment)
+            results["evaluations"][func_name] = "success"
+            print(f"  ✓ {func_name} completed successfully")
+        except Exception as e:
+            print(f"  ✗ {func_name} failed: {e}")
+            traceback.print_exc()
+            results["evaluations"][func_name] = f"failed: {e}"
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("Evaluation Summary:")
+    print('='*60)
+    success_count = sum(1 for v in results["evaluations"].values() if v == "success")
+    total_count = len(results["evaluations"])
+    print(f"  Completed: {success_count}/{total_count}")
+    for name, status in results["evaluations"].items():
+        status_icon = "✓" if status == "success" else "✗"
+        print(f"    {status_icon} {name}: {status}")
+    
+    return results
+
+
 def run_all_evaluations(
     experiment: str,
     datadir_path: str = None,
@@ -3185,8 +3292,7 @@ if __name__ == "__main__":
     # CONFIGURE: Folders containing experiments (all subdirectories will be added)
     # -------------------------------------------------------------------------
     experiments_folders: List[str] = [
-        # join(exp_dir, "single/euler"),  # Uncomment to add all experiments in this folder
-        # join(exp_dir, "stage/euler"),   # Uncomment to add all experiments in this folder
+        join(exp_dir, "single/euler"),  # Uncomment to add all experiments in this folder
     ]
     
     # -------------------------------------------------------------------------

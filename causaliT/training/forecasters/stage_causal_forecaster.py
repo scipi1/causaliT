@@ -16,6 +16,7 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.stage_causal import StageCausaliT
 from causaliT.core.utils import load_dag_masks
+from causaliT.proj_specific import build_dyconex_in_context_masks, merge_masks
 
 
 class StageCausalForecaster(pl.LightningModule):
@@ -48,7 +49,14 @@ class StageCausalForecaster(pl.LightningModule):
             self.loss_fn = nn.MSELoss(reduction="none")
         
         # Data indices for blanking values
-        self.val_idx = config["data"]["val_idx"]
+        # Support both shared val_idx (backward compatible) and separate indices for S/X and Y
+        self.val_idx = config["data"].get("val_idx", None)
+        self.val_idx_X = config["data"].get("val_idx_X", self.val_idx)  # For S and X (same structure)
+        self.val_idx_Y = config["data"].get("val_idx_Y", self.val_idx)  # For Y
+        
+        # Ensure at least one valid index is set
+        if self.val_idx_X is None or self.val_idx_Y is None:
+            raise ValueError("Must specify either 'val_idx' or both 'val_idx_X' and 'val_idx_Y' in config['data']")
         
         # Teacher forcing configuration
         self.teacher_forcing = config["training"].get("teacher_forcing", False)
@@ -77,6 +85,17 @@ class StageCausalForecaster(pl.LightningModule):
         # Logging for sparsity
         self.log_sparsity = config["training"].get("log_sparsity", False)
         
+        # In-context mask configuration (computed per-batch from data features)
+        self.use_in_context_masks = config["training"].get("use_in_context_masks", False)
+        self.in_context_mask_config = config["training"].get("in_context_mask_config", None)
+        
+        if self.use_in_context_masks:
+            if self.in_context_mask_config is None:
+                raise ValueError(
+                    "use_in_context_masks=True but no in_context_mask_config specified in config['training']"
+                )
+            print(f"✓ In-context masks enabled with config: {list(self.in_context_mask_config.keys())}")
+        
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
@@ -95,18 +114,15 @@ class StageCausalForecaster(pl.LightningModule):
         self.save_hyperparameters(config)
         
         # Metrics for X reconstruction
-        self.mae_x = tm.MeanAbsoluteError()
-        self.rmse_x = tm.MeanSquaredError(squared=False)
-        self.r2_x = tm.R2Score()
+        self.mae_X = tm.MeanAbsoluteError()
+        self.r2_X = tm.R2Score()
         
         # Metrics for Y prediction
-        self.mae_y = tm.MeanAbsoluteError()
-        self.rmse_y = tm.MeanSquaredError(squared=False)
-        self.r2_y = tm.R2Score()
+        self.mae_Y = tm.MeanAbsoluteError()
+        self.r2_Y = tm.R2Score()
         
-        # Optionally freeze embeddings
-        if config["training"].get("freeze_embeddings", False):
-            self.freeze_embeddings()
+        # Total metrics (combined X and Y)
+        self.mae_total = tm.MeanAbsoluteError()
     
     def _register_hard_mask_placeholders(self):
         """
@@ -192,18 +208,9 @@ class StageCausalForecaster(pl.LightningModule):
         
         return masks if masks else None
     
-    def freeze_embeddings(self):
-        """
-        Freeze the shared embedding layer to train only attention mechanisms.
-        This sets requires_grad=False for the shared embedding system.
-        """
-        for param in self.model.shared_embedding.parameters():
-            param.requires_grad = False
-        
-        print("✓ Shared embeddings frozen. Training only attention and feedforward layers.")
-    
     def forward(self, data_source: torch.Tensor, data_intermediate: torch.Tensor, 
-                data_target: torch.Tensor, toggle_off_hard_masks: bool = False) -> Any:
+                data_target: torch.Tensor, use_hard_masks: bool = None,
+                use_in_context_masks: bool = None) -> Any:
         """
         Forward pass through the model.
         
@@ -211,9 +218,12 @@ class StageCausalForecaster(pl.LightningModule):
             data_source: Source nodes (S)
             data_intermediate: Intermediate variables (X)
             data_target: Target variables (Y)
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained
-                                   with them. Useful for testing causality retention.
-                                   Default False = use masks if model was trained with them.
+            use_hard_masks: Override for hard mask usage. If None (default), uses
+                           the value from config (self.use_hard_masks).
+                           Set to False to disable hard masks for ablation studies.
+            use_in_context_masks: Override for in-context mask usage. If None (default),
+                                  uses the value from config (self.use_in_context_masks).
+                                  Set to False to disable in-context masks for ablation studies.
             
         Returns:
             pred_x: Predicted X from decoder 1
@@ -225,20 +235,37 @@ class StageCausalForecaster(pl.LightningModule):
         
         # Prepare intermediate input (blank X values for decoder 1)
         x_blanked = data_intermediate.clone()
-        x_blanked[:, :, self.val_idx] = 0.0
+        x_blanked[:, :, self.val_idx_X] = 0.0
         
         # Prepare target input (blank Y values for decoder 2)
         y_blanked = data_target.clone()
-        y_blanked[:, :, self.val_idx] = 0.0
+        y_blanked[:, :, self.val_idx_Y] = 0.0
         
         # Determine whether to use teacher forcing
         # Only use teacher forcing during training, never during validation/testing
         use_tf = self.teacher_forcing and self.training
         
-        # Determine whether to use hard masks
-        # Apply masks if: model was trained with masks AND toggle is not set to disable them
-        apply_hard_masks = self.use_hard_masks and not toggle_off_hard_masks
-        hard_masks = self.get_hard_masks() if apply_hard_masks else None
+        # Determine whether to use hard masks (static, from files)
+        # Use config value if not explicitly overridden
+        apply_hard_masks = use_hard_masks if use_hard_masks is not None else self.use_hard_masks
+        static_masks = self.get_hard_masks() if apply_hard_masks else None
+        
+        # Compute in-context masks (dynamic, computed from batch data)
+        # Use config value if not explicitly overridden
+        apply_in_context = use_in_context_masks if use_in_context_masks is not None else self.use_in_context_masks
+        if apply_in_context:
+            in_context_masks = build_dyconex_in_context_masks(
+                S=data_source,
+                X=data_intermediate,
+                Y=data_target,
+                config=self.in_context_mask_config
+            )
+        else:
+            in_context_masks = None
+        
+        # Merge static and in-context masks
+        # If both are present for the same layer, they are combined (element-wise AND)
+        final_masks = merge_masks(static_masks, in_context_masks)
         
         # Model forward pass
         # Pass BOTH blanked (for decoder 1) and actual (for decoder 2 with teacher forcing)
@@ -248,7 +275,7 @@ class StageCausalForecaster(pl.LightningModule):
             intermediate_tensor_actual=data_intermediate,
             target_tensor=y_blanked,
             use_teacher_forcing=use_tf,
-            hard_masks=hard_masks,
+            hard_masks=final_masks,
         )
         
         return pred_x, pred_y, attention_weights, masks, entropies
@@ -272,8 +299,8 @@ class StageCausalForecaster(pl.LightningModule):
         S, X, Y = batch
         
         # Extract actual values for loss computation
-        x_val = X[:, :, self.val_idx]
-        y_val = Y[:, :, self.val_idx]
+        x_val = X[:, :, self.val_idx_X]
+        y_val = Y[:, :, self.val_idx_Y]
         
         # Forward pass
         pred_x, pred_y, attention_weights, masks, entropies = self.forward(
@@ -455,19 +482,37 @@ class StageCausalForecaster(pl.LightningModule):
                      prior_regularizer +
                      sparsity_regularizer)
         
-        # Log individual losses
-        self.log(f"{stage}_loss_x", loss_x, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
-        self.log(f"{stage}_loss_y", loss_y, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        # =====================================================================
+        # LOGGING - Coherent naming: {stage}_{metric}_{target}
+        # =====================================================================
         
-        # Log metrics for X reconstruction
-        for name, metric in [("mae", self.mae_x), ("rmse", self.rmse_x), ("r2", self.r2_x)]:
-            metric_eval = metric(pred_x.reshape(-1), x_target.reshape(-1))
-            self.log(f"{stage}_x_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=False)
+        # Flatten predictions and targets for metric computation
+        pred_x_flat = pred_x.reshape(-1)
+        pred_y_flat = pred_y.reshape(-1)
+        x_target_flat = x_target.reshape(-1)
+        y_target_flat = y_target.reshape(-1)
         
-        # Log metrics for Y prediction
-        for name, metric in [("mae", self.mae_y), ("rmse", self.rmse_y), ("r2", self.r2_y)]:
-            metric_eval = metric(pred_y.reshape(-1), y_target.reshape(-1))
-            self.log(f"{stage}_y_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        # Log losses (MSE)
+        self.log(f"{stage}_loss_X", loss_x, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_loss_Y", loss_y, on_step=False, on_epoch=True, prog_bar=False)
+        
+        # Log MAE for X and Y
+        mae_x_val = self.mae_X(pred_x_flat, x_target_flat)
+        mae_y_val = self.mae_Y(pred_y_flat, y_target_flat)
+        self.log(f"{stage}_mae_X", mae_x_val, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_mae_Y", mae_y_val, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        
+        # Log R2 for X and Y
+        r2_x_val = self.r2_X(pred_x_flat, x_target_flat)
+        r2_y_val = self.r2_Y(pred_y_flat, y_target_flat)
+        self.log(f"{stage}_r2_X", r2_x_val, on_step=False, on_epoch=True, prog_bar=False)
+        self.log(f"{stage}_r2_Y", r2_y_val, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+        
+        # Log total MAE (combined X and Y predictions)
+        all_preds = torch.cat([pred_x_flat, pred_y_flat], dim=0)
+        all_targets = torch.cat([x_target_flat, y_target_flat], dim=0)
+        mae_total_val = self.mae_total(all_preds, all_targets)
+        self.log(f"{stage}_mae", mae_total_val, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
         
         # Log entropies if requested
         if self.log_entropy:

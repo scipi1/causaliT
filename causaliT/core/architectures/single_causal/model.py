@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer,ToeplitzLieAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -101,9 +101,14 @@ class SingleCausalLayer(nn.Module):
         # SVFA: factorization mode ("standard" or "svfa")
         factorization: str = "standard",
         
-        # DAG parameterization: "independent" (default) or "antisymmetric"
+        # DAG parameterization for self-attention: "independent", "antisymmetric", or "gated"
         # "antisymmetric" enforces P(i→j) + P(j→i) = 1, preventing bidirectional edges
-        dag_parameterization: str = "independent",
+        # "gated" adds symmetric gate + antisymmetric direction (requires square attention)
+        dag_parameterization_self: str = "independent",
+        
+        # DAG parameterization for cross-attention: must be "independent"
+        # Cross-attention is non-square (X queries, S keys), so only "independent" is valid
+        dag_parameterization_cross: str = "independent",
     ):
         super().__init__()
         
@@ -112,7 +117,8 @@ class SingleCausalLayer(nn.Module):
         self.dec_causal_mask = dec_causal_mask
         self.d_model = d_model
         self.factorization = factorization
-        self.dag_parameterization = dag_parameterization
+        self.dag_parameterization_self = dag_parameterization_self
+        self.dag_parameterization_cross = dag_parameterization_cross
         
         # =====================================================================
         # EMBEDDINGS
@@ -158,7 +164,8 @@ class SingleCausalLayer(nn.Module):
             "register_entropy": True,
             "layer_name": "dec_cross_att",
             "query_seq_len": X_seq_len,
-            "key_seq_len": S_seq_len
+            "key_seq_len": S_seq_len,
+            "dag_parameterization": dag_parameterization_cross  # Non-square: must be "independent"
         }
         
         # Decoder self-attention configuration (X ← X)
@@ -173,7 +180,8 @@ class SingleCausalLayer(nn.Module):
             "register_entropy": True,
             "layer_name": "dec_self_att",
             "query_seq_len": X_seq_len,
-            "key_seq_len": X_seq_len
+            "key_seq_len": X_seq_len,
+            "dag_parameterization": dag_parameterization_self  # Square: can use any
         }
         
         # =====================================================================
@@ -291,11 +299,12 @@ class SingleCausalLayer(nn.Module):
         register_entropy: bool,
         layer_name: str,
         query_seq_len: int,
-        key_seq_len: int
+        key_seq_len: int,
+        dag_parameterization: str = "independent"
     ):
         """Create an attention layer with specified configuration."""
         
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
@@ -305,6 +314,8 @@ class SingleCausalLayer(nn.Module):
             attention_module = CausalCrossAttention
         elif attention_type == "PhiSoftMax":
             attention_module = PhiSoftMax
+        elif attention_type == "ToeplitzLieAttention":
+            attention_module = ToeplitzLieAttention
         
         mask_layer = None
         if mask_type is not None:
@@ -325,7 +336,7 @@ class SingleCausalLayer(nn.Module):
             layer_name=layer_name,
             query_seq_len=query_seq_len,
             key_seq_len=key_seq_len,
-            dag_parameterization=self.dag_parameterization
+            dag_parameterization=dag_parameterization
         )
         
         return att

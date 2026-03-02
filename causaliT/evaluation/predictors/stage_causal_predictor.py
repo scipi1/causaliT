@@ -156,7 +156,7 @@ class StageCausalPredictor(BasePredictor):
         return dm
     
     def _forward(self, S: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, 
-                 toggle_off_hard_masks: bool = False, **kwargs) -> Any:
+                 use_hard_masks: bool = None, use_in_context_masks: bool = None, **kwargs) -> Any:
         """
         Perform forward pass through StageCausalForecaster model.
         
@@ -170,9 +170,11 @@ class StageCausalPredictor(BasePredictor):
             S: Source tensor (B x L_s x F)
             X: Intermediate tensor (B x L_x x F) - will be blanked internally
             Y: Target tensor (B x L_y x F) - will be blanked internally
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained
-                                   with them. Useful for testing causality retention.
-                                   Default False = use masks if model was trained with them.
+            use_hard_masks: Override for hard mask usage. If None (default), uses
+                           the value from config (model.use_hard_masks).
+                           Set to False to disable hard masks for ablation studies.
+            use_in_context_masks: Override for in-context mask usage. If None (default),
+                                  uses the value from config.
             **kwargs: Additional arguments
             
         Returns:
@@ -186,7 +188,8 @@ class StageCausalPredictor(BasePredictor):
             data_source=S,
             data_intermediate=X,
             data_target=Y,
-            toggle_off_hard_masks=toggle_off_hard_masks,
+            use_hard_masks=use_hard_masks,
+            use_in_context_masks=use_in_context_masks,
             **kwargs
         )
         return output
@@ -231,7 +234,8 @@ class StageCausalPredictor(BasePredictor):
         dataset_label: str = "test",
         debug_flag: bool = False,
         input_conditioning_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        toggle_off_hard_masks: bool = False,
+        use_hard_masks: bool = None,
+        use_in_context_masks: bool = None,
         **kwargs
     ) -> PredictionResult:
         """
@@ -250,9 +254,11 @@ class StageCausalPredictor(BasePredictor):
             dataset_label: One of ["train", "test", "all"]
             debug_flag: If True, predict only one batch
             input_conditioning_fn: Optional function to condition S inputs before forward pass
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained
-                                   with them. Useful for testing causality retention.
-                                   Default False = use masks if model was trained with them.
+            use_hard_masks: Override for hard mask usage. If None (default), uses
+                           the value from config (model.use_hard_masks).
+                           Set to False to disable hard masks for ablation studies.
+            use_in_context_masks: Override for in-context mask usage. If None (default),
+                                  uses the value from config.
             **kwargs: Additional arguments passed to forward
             
         Returns:
@@ -312,7 +318,8 @@ class StageCausalPredictor(BasePredictor):
             
             # Forward pass - model handles blanking of X and Y internally
             with torch.no_grad():
-                output = self._forward(S, X, Y, toggle_off_hard_masks=toggle_off_hard_masks, **kwargs)
+                output = self._forward(S, X, Y, use_hard_masks=use_hard_masks, 
+                                       use_in_context_masks=use_in_context_masks, **kwargs)
             
             # Process output
             processed = self._process_forward_output(output)

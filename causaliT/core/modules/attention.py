@@ -1,19 +1,19 @@
 from os.path import dirname, abspath
 import sys
-# ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-# sys.path.append(ROOT_DIR)
 from math import sqrt, log
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from causaliT.core.modules.extra_layers import UniformAttentionMask
+from causaliT.core.modules.extra_layers import (
+    UniformAttentionMask, DAGLearningMixin,
+    DAGMask, DAGMaskAntisym, DAGMaskGated
+)
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
-from typing import List
+from typing import List, Optional
 
 
-
-class LieAttention(nn.Module):
+class LieAttention(DAGLearningMixin, nn.Module):
     """
     Lie Attention mechanism with DAG mask learning.
     
@@ -24,117 +24,33 @@ class LieAttention(nn.Module):
     The causal DAG is learned through a learnable tensor (phi) that models edge probabilities.
     A Gumbel-Softmax trick enables differentiable sampling from Bernoulli(sigmoid(phi)).
     Running averages of attention statistics are used as priors for KL regularization.
+    
+    Args:
+        dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None (passed from AttentionLayer)
+        attention_dropout: Dropout rate for attention weights
+        register_entropy: Whether to register entropy for logging
+        layer_name: Name for logging purposes
     """
-    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(LieAttention, self).__init__()
         
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
-        
-        # Store DAGMask as submodule to ensure proper parameter registration
-        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
-        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
-        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
-            self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
-            # We need to get the current value for buffer initialization
-            phi_value = self.dag_mask.phi
-            
-            # Initialize running averages as buffers (not optimized, but saved in state_dict)
-            # These track EMA statistics for monitoring and prior regularization
-            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
-            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
-        else:
-            self.dag_mask = None
-            self.runav_att_mean = None
-            self.runav_att_snr = None
-    
-        # Gumbel-Softmax temperature - learnable with annealing
-        # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
-        # Named log_tau_gs to distinguish from other temperature parameters (e.g., log_tau_comm)
-        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
-        self.tau_gs_min = 0.1  # Minimum temperature
-        self.tau_gs_max = 5.0  # Maximum temperature
-
         self.entropy_enabled = True
         
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
+        # Initialize DAG learning via mixin (handles all DAGMask types)
+        self._init_dag_learning(dag_mask)
         
-        # --- Lie commutator amplification (new) ---
+        # --- Lie commutator amplification ---
         self.log_gain = nn.Parameter(torch.tensor(log(10.0)))   # start strong; set to 0.0 if you want gain=1
         self.log_tau_comm = nn.Parameter(torch.tensor(log(0.2)))  # tanh temperature (linear slope = gain/tau)
         self.max_gain = 1e3
         self.enforce_nonneg_flow = True  # set False if you want to allow negative flow
-    
-    @property
-    def phi(self) -> torch.Tensor:
-        """Access phi through dag_mask to support both DAGMask and DAGMaskAntisym."""
-        if self.dag_mask is not None:
-            return self.dag_mask.phi
-        return None
-    
-    def get_dag_probabilities(self) -> torch.Tensor:
-        """
-        Returns the posterior probability of each edge being active in the learned DAG.
-        
-        This is useful for:
-        - Inference: Extract the learned causal structure
-        - Visualization: Plot the learned DAG
-        - Evaluation: Compare against ground-truth DAG
-        
-        Returns:
-            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
-                         Returns None if no DAG is being learned (phi is None).
-        """
-        if self.phi is not None:
-            return torch.sigmoid(self.phi)
-        return None
-    
-    def get_dag_logits(self) -> torch.Tensor:
-        """
-        Returns the raw logits (phi) of the learned DAG.
-        
-        Returns:
-            torch.Tensor: Raw logits, shape (L, S) or (H, L, S) for multi-head.
-                         Returns None if no DAG is being learned.
-        """
-        return self.phi
-        
-    def _update_running_average(self, att):
-        """
-        Update running averages of attention statistics.
-        
-        Args:
-            att: Attention evidence tensor (batch_size, ...)
-            
-        Returns:
-            tuple: (batch_mean, batch_snr) with gradients attached for regularization
-        """
-        alpha = 0.9
-        
-        # Compute batch statistics (keep gradients for regularization)
-        batch_mean = torch.mean(att, dim=0)
-        batch_std = torch.std(att, dim=0)
-        batch_snr = batch_mean / (batch_std + 1e-6)
-        
-        # Update running averages (no gradients, in-place operations on buffers)
-        if self.runav_att_mean is not None:
-            with torch.no_grad():
-                if (self.runav_att_mean != 0).any():
-                    # EMA update using in-place operations
-                    self.runav_att_mean.mul_(alpha).add_(batch_mean, alpha=1-alpha)
-                    self.runav_att_snr.mul_(alpha).add_(batch_snr, alpha=1-alpha)
-                else:
-                    # First update: initialize with batch statistics
-                    self.runav_att_mean.copy_(batch_mean)
-                    self.runav_att_snr.copy_(batch_snr)
-        
-        # Return batch statistics with gradients for immediate use in regularization
-        return batch_mean, batch_snr
         
         
     def forward(
@@ -282,7 +198,7 @@ class LieAttention(nn.Module):
 
 
 
-class CausalCrossAttention(nn.Module):
+class CausalCrossAttention(DAGLearningMixin, nn.Module):
     """
     Causal Cross-Attention with DAG mask learning.
     
@@ -301,8 +217,14 @@ class CausalCrossAttention(nn.Module):
     
     Note: Cross-attention DAGs are bipartite (query → key), inherently acyclic,
           so NOTEARS regularization is not needed.
+    
+    Args:
+        dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None (passed from AttentionLayer)
+        attention_dropout: Dropout rate for attention weights
+        register_entropy: Whether to register entropy for logging
+        layer_name: Name for logging purposes
     """
-    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(CausalCrossAttention, self).__init__()
         
@@ -314,29 +236,8 @@ class CausalCrossAttention(nn.Module):
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
-        # Store DAGMask as submodule to ensure proper parameter registration
-        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
-        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
-        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
-            self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
-            # We need to get the current value for buffer initialization
-            phi_value = self.dag_mask.phi
-            
-            # Initialize running averages as buffers (not optimized, but saved in state_dict)
-            # These track EMA statistics for monitoring and prior regularization
-            self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
-            self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
-        else:
-            self.dag_mask = None
-            self.runav_att_mean = None
-            self.runav_att_snr = None
-        
-        # Gumbel-Softmax temperature - learnable with annealing
-        # Starts high (τ=2.0) for exploration, anneals toward low values for sharper masks
-        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
-        self.tau_gs_min = 0.1  # Minimum temperature
-        self.tau_gs_max = 5.0  # Maximum temperature
+        # Initialize DAG learning via mixin (handles all DAGMask types)
+        self._init_dag_learning(dag_mask)
         
         # Gain/temperature parameters for GeLU(Tanh) activation
         # log_tau_act controls the sharpness of the tanh activation (not the DAG mask)
@@ -409,20 +310,6 @@ class CausalCrossAttention(nn.Module):
         
         # Return batch statistics with gradients for immediate use in regularization
         return batch_mean, batch_snr
-    
-    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
-        """Expand hard_mask to match scores shape and convert to additive mask."""
-        if is_multihead:
-            if hard_mask.dim() == 2:
-                # Single mask for all heads: (L, S) -> (1, 1, L, S)
-                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
-            else:
-                # Per-head mask: (H, L, S) -> (1, H, L, S)
-                hard_mask = hard_mask.unsqueeze(0)
-        else:
-            # hard_mask: (L, S) -> (1, L, S)
-            hard_mask = hard_mask.unsqueeze(0)
-        return hard_mask
         
     def forward(
         self, 
@@ -511,7 +398,7 @@ class CausalCrossAttention(nn.Module):
         
         # Apply hard mask if provided (ground-truth DAG structure)
         if hard_mask is not None:
-            hard_mask_expanded = self._expand_hard_mask(hard_mask, is_multihead)
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
             att = att * hard_mask_expanded
         
         # Calculate entropy before dropout
@@ -533,6 +420,260 @@ class CausalCrossAttention(nn.Module):
 
 
 
+class ToeplitzLieAttention(nn.Module):
+    """
+    Toeplitz-Lie Attention with symmetric gate + antisymmetric direction.
+    
+    This attention mechanism decomposes QK^T into symmetric and antisymmetric
+    parts for DAG learning:
+    
+        S = (QK^T + KQ^T) / 2  # Symmetric: edge existence
+        A = (QK^T - KQ^T) / 2  # Antisymmetric: flow direction (Lie commutator)
+    
+    Final edge probability:
+        P(i→j) = σ(γ_ij) × σ(φ_ij)
+    
+    Where:
+        γ_ij = gain_gate * tanh(S_ij / tau_gate) + γ_bias_ij  # symmetric gate
+        φ_ij = gain_dir * tanh(A_ij / tau_dir) + φ_bias_ij    # antisymmetric direction
+    
+    Properties:
+    - P(i→j) = 0 and P(j→i) = 0 is possible (when gate is closed)
+    - P(i→j) + P(j→i) ≤ 1 (always, by construction)
+    - P(i→i) = 0 (diagonal forced to 0)
+    - Attention-derived: uses QK^T structure, not just learnable parameters
+    - Optional learnable biases for fine-tuning
+    
+    See docs/TOEPLITZ_DECOMPOSITION.md for theoretical background.
+    """
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
+        
+        super(ToeplitzLieAttention, self).__init__()
+        
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+        # Store dag_mask directly (can be DAGMask, DAGMaskAntisym, DAGMaskGated, or None)
+        self.dag_mask = dag_mask
+        
+        # Symmetric gate parameters (for S = (QK^T + KQ^T) / 2)
+        self.log_gain_gate = nn.Parameter(torch.tensor(log(5.0)))
+        self.log_tau_gate = nn.Parameter(torch.tensor(log(0.5)))
+        self.max_gain = 100.0
+        
+        # Antisymmetric direction parameters (for A = (QK^T - KQ^T) / 2)
+        self.log_gain_dir = nn.Parameter(torch.tensor(log(10.0)))
+        self.log_tau_dir = nn.Parameter(torch.tensor(log(0.2)))
+        
+        # Gumbel-Softmax temperature for sampling
+        self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
+        self.tau_gs_min = 0.1
+        self.tau_gs_max = 5.0
+        
+        # Whether to use learnable biases from dag_mask
+        self.use_learnable_bias = True
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi (direction logits) through dag_mask if available."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
+    
+    @property
+    def gamma(self) -> torch.Tensor:
+        """Access gamma (gate logits) through dag_mask if available (only DAGMaskGated has gamma)."""
+        if self.dag_mask is not None and hasattr(self.dag_mask, 'gamma'):
+            return self.dag_mask.gamma
+        return None
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns P(i→j) = σ(γ_ij) × σ(φ_ij)
+        
+        Note: This returns the learnable bias-only DAG if no attention has been computed.
+        For the attention-derived DAG, access self.last_dag_probs after forward().
+        """
+        # TODO check that diag is zero
+        if self.dag_mask is not None:
+            return self.dag_mask.get_dag_probabilities()
+        return None
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """Returns the antisymmetric direction logits (phi) for compatibility."""
+        return self.phi
+    
+    def _compute_toeplitz_decomposition(self, scores: torch.Tensor) -> tuple:
+        """
+        Decompose attention scores into symmetric and antisymmetric parts.
+        
+        Args:
+            scores: Raw QK^T scores, shape (B, L, S) or (B, H, L, S)
+            
+        Returns:
+            tuple: (S_symmetric, A_antisymmetric)
+        """
+        # S = (QK^T + KQ^T) / 2
+        S = (scores + scores.transpose(-1, -2)) / 2
+        
+        # A = (QK^T - KQ^T) / 2 (this is the Lie commutator / 2)
+        A = (scores - scores.transpose(-1, -2)) / 2
+        
+        return S, A
+    
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+        ):
+        """
+        Forward pass for Toeplitz-Lie Attention.
+        
+        Args:
+            query: Query tensor (B, L, E) or (B, L, H, E)
+            key: Key tensor (B, S, E) or (B, S, H, E)
+            value: Value tensor (B, S, E) or (B, S, H, E)
+            mask_miss_k: Missing key mask (unused)
+            mask_miss_q: Missing query mask (unused)
+            pos: Positional encoding for causal masking
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor
+        """
+        is_multihead = query.dim() == 4
+        
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S_len, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S_len, _ = key.shape
+            H = 1
+        
+        scale = 1.0 / sqrt(E)
+        
+        # Compute raw attention scores
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        # Scale scores
+        scores = scale * scores
+        
+        # Toeplitz decomposition
+        S_sym, A_antisym = self._compute_toeplitz_decomposition(scores)
+        
+        # Get gains and temperatures
+        gain_gate = torch.exp(self.log_gain_gate).clamp(1e-3, self.max_gain)
+        tau_gate = torch.exp(self.log_tau_gate).clamp(1e-3, 10.0)
+        gain_dir = torch.exp(self.log_gain_dir).clamp(1e-3, self.max_gain)
+        tau_dir = torch.exp(self.log_tau_dir).clamp(1e-3, 10.0)
+        
+        # Compute gate logits from symmetric part
+        gamma_att = gain_gate * torch.tanh(S_sym / tau_gate)  # (B, *, L, S)
+        
+        # Compute direction logits from antisymmetric part
+        phi_att = gain_dir * torch.tanh(A_antisym / tau_dir)  # (B, *, L, S)
+        
+        # Add learnable biases if available
+        if self.dag_mask is not None and self.use_learnable_bias:
+            # Only add gamma bias if dag_mask has gamma (only DAGMaskGated has gamma)
+            gamma_bias = self.gamma  # (L, S) or (H, L, S), or None
+            if gamma_bias is not None:
+                gamma_att = gamma_att + gamma_bias.unsqueeze(0)
+            
+            # Only add phi bias if dag_mask has phi (DAGMask, DAGMaskAntisym, DAGMaskGated all have phi)
+            phi_bias = self.phi  # (L, S) or (H, L, S), or None
+            if phi_bias is not None:
+                phi_att = phi_att + phi_bias.unsqueeze(0)
+        
+        # Compute DAG probabilities: P(i→j) = σ(γ) × σ(φ)
+        gate_probs = torch.sigmoid(gamma_att)
+        dir_probs = torch.sigmoid(phi_att)
+        dag_probs = gate_probs * dir_probs
+        
+        # Zero out diagonal (no self-loops)
+        if is_multihead:
+            diag_mask = torch.eye(L, S_len, device=dag_probs.device, dtype=torch.bool)
+            dag_probs = dag_probs.masked_fill(diag_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        else:
+            diag_mask = torch.eye(L, S_len, device=dag_probs.device, dtype=torch.bool)
+            dag_probs = dag_probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        # Store for inspection/evaluation
+        self.last_dag_probs = dag_probs.detach()
+        
+        # Apply Gumbel-Softmax for differentiable sampling during training
+        tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
+        if self.training:
+            # Gumbel noise for gate
+            u_gate = torch.rand_like(gamma_att)
+            gumbel_gate = torch.log(u_gate + 1e-8) - torch.log(1 - u_gate + 1e-8)
+            gate_sample = torch.sigmoid((gumbel_gate + gamma_att) / tau_gs)
+            
+            # Gumbel noise for direction
+            u_dir = torch.rand_like(phi_att)
+            gumbel_dir = torch.log(u_dir + 1e-8) - torch.log(1 - u_dir + 1e-8)
+            dir_sample = torch.sigmoid((gumbel_dir + phi_att) / tau_gs)
+            
+            M = gate_sample * dir_sample
+        else:
+            M = dag_probs
+        
+        # Zero out diagonal in mask
+        if is_multihead:
+            M = M.masked_fill(diag_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        else:
+            M = M.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        # Compute GeLU attention from direction (Lie-style)
+        att = F.gelu(torch.tanh(A_antisym * gain_dir / tau_dir))
+        att = torch.relu(att)  # Enforce non-negative flow
+        
+        # Apply DAG mask
+        att = att * M
+        
+        # Apply hard mask if provided
+        if hard_mask is not None:
+            if is_multihead:
+                if hard_mask.dim() == 2:
+                    hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+                else:
+                    hard_mask = hard_mask.unsqueeze(0)
+            else:
+                hard_mask = hard_mask.unsqueeze(0)
+            att = att * hard_mask
+        
+        # Calculate entropy
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+        
+        # Apply dropout
+        A = self.dropout(att)
+        A = torch.nan_to_num(A)
+        
+        # Compute output values
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+        
+        return V.contiguous(), A, entropy
+
+
 class PhiSoftMax(nn.Module):
     """
     Softmax Attention with learnable DAG mask (phi).
@@ -552,7 +693,7 @@ class PhiSoftMax(nn.Module):
     The causal DAG is learned through a learnable tensor (phi) that models edge probabilities.
     A Gumbel-Softmax trick enables differentiable sampling from Bernoulli(sigmoid(phi)).
     """
-    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(PhiSoftMax, self).__init__()
         
@@ -564,21 +705,13 @@ class PhiSoftMax(nn.Module):
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
-        # Store DAGMask as submodule to ensure proper parameter registration
-        # Support both DAGMask (independent) and DAGMaskAntisym (antisymmetric)
-        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
-        if isinstance(mask_layer, (DAGMask, DAGMaskAntisym)):
-            self.dag_mask = mask_layer  # Store as submodule for proper state_dict handling
-            # Note: For DAGMaskAntisym, phi is a property that computes antisymmetric logits
-            # We need to get the current value for buffer initialization
-            phi_value = self.dag_mask.phi
-            
-            # Initialize running averages as buffers (not optimized, but saved in state_dict)
-            # These track EMA statistics for monitoring and prior regularization
+        # Store dag_mask directly
+        self.dag_mask = dag_mask
+        if dag_mask is not None:
+            phi_value = dag_mask.phi
             self.register_buffer('runav_att_mean', torch.zeros_like(phi_value))
             self.register_buffer('runav_att_snr', torch.zeros_like(phi_value))
         else:
-            self.dag_mask = None
             self.runav_att_mean = None
             self.runav_att_snr = None
         
@@ -614,12 +747,28 @@ class PhiSoftMax(nn.Module):
         - Visualization: Plot the learned DAG
         - Evaluation: Compare against ground-truth DAG
         
+        For DAGMaskAntisym, the diagonal is forced to 0 (no self-loops) since
+        sigmoid(0) = 0.5 would otherwise appear on the diagonal.
+        
         Returns:
             torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
                          Returns None if no DAG is being learned (phi is None).
+                         Diagonal is 0 for antisymmetric parameterization.
         """
         if self.phi is not None:
-            return torch.sigmoid(self.phi)
+            probs = torch.sigmoid(self.phi)
+            
+            # For antisymmetric DAG, zero out diagonal (no self-loops)
+            from causaliT.core.modules.extra_layers import DAGMaskAntisym
+            if isinstance(self.dag_mask, DAGMaskAntisym):
+                if probs.dim() == 2:
+                    diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+                    probs = probs.masked_fill(diag_mask, 0.0)
+                elif probs.dim() == 3:
+                    diag_mask = torch.eye(probs.shape[-2], probs.shape[-1], device=probs.device, dtype=torch.bool)
+                    probs = probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
+            
+            return probs
         return None
     
     def get_dag_logits(self) -> torch.Tensor:
@@ -663,20 +812,6 @@ class PhiSoftMax(nn.Module):
         
         # Return batch statistics with gradients for immediate use in regularization
         return batch_mean, batch_snr
-    
-    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
-        """Expand hard_mask to match scores shape and convert to additive mask."""
-        if is_multihead:
-            if hard_mask.dim() == 2:
-                # Single mask for all heads: (L, S) -> (1, 1, L, S)
-                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
-            else:
-                # Per-head mask: (H, L, S) -> (1, H, L, S)
-                hard_mask = hard_mask.unsqueeze(0)
-        else:
-            # hard_mask: (L, S) -> (1, L, S)
-            hard_mask = hard_mask.unsqueeze(0)
-        return hard_mask
     
     def forward(
         self, 
@@ -782,7 +917,7 @@ class PhiSoftMax(nn.Module):
         # Apply hard mask BEFORE softmax (additive, -inf for masked positions)
         # This ensures masked positions don't influence softmax normalization
         if hard_mask is not None:
-            hard_mask_expanded = self._expand_hard_mask(hard_mask, is_multihead)
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
             
             # Detect all-masked rows (where entire row is 0 in the mask)
             # These rows would cause softmax([-inf, -inf, ...]) = NaN
@@ -845,12 +980,15 @@ class ScaledDotAttention(nn.Module):
     
     Hard mask is applied BEFORE softmax to ensure masked positions don't
     influence the softmax normalization (preventing information leakage).
+    
+    Note: This class does not use DAG learning, but accepts dag_mask parameter
+    for interface consistency with AttentionLayer.
     """
-    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(ScaledDotAttention, self).__init__()
         
-        self.mask_layer = mask_layer
+        self.dag_mask = dag_mask  # Not used, but kept for interface consistency
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
@@ -858,20 +996,6 @@ class ScaledDotAttention(nn.Module):
         
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
-    
-    def _expand_hard_mask(self, hard_mask: torch.Tensor, is_multihead: bool) -> torch.Tensor:
-        """Expand hard_mask to match scores shape and convert to additive mask."""
-        if is_multihead:
-            if hard_mask.dim() == 2:
-                # Single mask for all heads: (L, S) -> (1, 1, L, S)
-                hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
-            else:
-                # Per-head mask: (H, L, S) -> (1, H, L, S)
-                hard_mask = hard_mask.unsqueeze(0)
-        else:
-            # hard_mask: (L, S) -> (1, L, S)
-            hard_mask = hard_mask.unsqueeze(0)
-        return hard_mask
         
     def forward(
         self, 
@@ -928,7 +1052,7 @@ class ScaledDotAttention(nn.Module):
         # Apply hard mask BEFORE softmax (additive, -inf for masked positions)
         # This ensures masked positions don't influence softmax normalization
         if hard_mask is not None:
-            hard_mask_expanded = self._expand_hard_mask(hard_mask, is_multihead)
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
             
             # Detect all-masked rows (where entire row is 0 in the mask)
             # These rows would cause softmax([-inf, -inf, ...]) = NaN
@@ -988,12 +1112,15 @@ class ScaledDotAttentionNAIM(nn.Module):
     
     NOTE: The hard_mask in this version is applied AFTER softmax, which can cause
     information leakage. Use ScaledDotAttention for proper causal masking.
+    
+    Note: This class does not use DAG learning, but accepts dag_mask parameter
+    for interface consistency with AttentionLayer.
     """
-    def __init__(self, mask_layer: nn.Module, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
         
         super(ScaledDotAttentionNAIM, self).__init__()
         
-        self.mask_layer = mask_layer
+        self.dag_mask = dag_mask  # Not used, but kept for interface consistency
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
@@ -1120,6 +1247,46 @@ class ScaledDotAttentionNAIM(nn.Module):
         return V.contiguous(), A, entropy
 
 
+def expand_hard_mask(hard_mask: torch.Tensor, is_multihead: bool, batch_size: int) -> torch.Tensor:
+    """
+    Expand hard_mask to match attention scores shape.
+    
+    Handles both static masks (no batch dim) and in-context masks (with batch dim).
+    This is a centralized utility function used by all attention classes.
+    
+    Args:
+        hard_mask: Mask tensor. Can be:
+            - (L, S): static mask for all samples and heads
+            - (H, L, S): per-head static mask (multihead only)
+            - (B, L, S): per-sample in-context mask
+            - (B, H, L, S): per-sample per-head mask (multihead only)
+        is_multihead: Whether attention is multi-head
+        batch_size: Batch size to detect if first dim is batch or heads
+        
+    Returns:
+        Expanded mask matching scores shape: (B, L, S) or (B, H, L, S)
+    """
+    if is_multihead:
+        if hard_mask.dim() == 2:
+            # (L, S) -> (1, 1, L, S) - static mask for all samples/heads
+            hard_mask = hard_mask.unsqueeze(0).unsqueeze(0)
+        elif hard_mask.dim() == 3:
+            # Could be (H, L, S) or (B, L, S) - check first dim
+            if hard_mask.shape[0] == batch_size:
+                # (B, L, S) -> (B, 1, L, S) - in-context mask, broadcast to all heads
+                hard_mask = hard_mask.unsqueeze(1)
+            else:
+                # (H, L, S) -> (1, H, L, S) - per-head static mask
+                hard_mask = hard_mask.unsqueeze(0)
+        # elif dim == 4: already (B, H, L, S) - no change needed
+    else:
+        if hard_mask.dim() == 2:
+            # (L, S) -> (1, L, S) - static mask
+            hard_mask = hard_mask.unsqueeze(0)
+        # elif dim == 3: already (B, L, S) - no change needed (in-context mask)
+    return hard_mask
+
+
 def build_causal_mask(p: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
     """
     Args:
@@ -1178,22 +1345,23 @@ def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) ->
         
 class AttentionLayer(nn.Module):
     """
-    Multi-head attention layer.
+    Multi-head attention layer with centralized DAG mask creation.
+    
+    This layer centralizes DAGMask creation and passes dag_mask (or None) directly 
+    to the inner attention module, eliminating the need for isinstance checks 
+    in each attention class.
     
     For SVFA (Structure-Value Factorized Attention), the caller (encoder/decoder)
     should pass the appropriate tensors:
         - query, key: Structure embeddings (for Q, K projections)
         - value: Value embeddings (for V projection)
     
-    This keeps the attention layer simple and agnostic to the factorization strategy.
-    
     Args:
+        attention: Attention class (LieAttention, CausalCrossAttention, PhiSoftMax, etc.)
         dag_parameterization: str, one of:
-            - "independent": Original parameterization where each edge (i,j) is independent.
-                            Allows bidirectional edges. (default)
-            - "antisymmetric": Uses antisymmetric constraint so P(i→j) + P(j→i) = 1.
-                              Enforces competition between edge directions.
-                              Only works for self-attention (query_seq_len == key_seq_len).
+            - "independent": Each edge (i,j) is independent. Allows bidirectional edges. (default)
+            - "antisymmetric": P(i→j) + P(j→i) = 1. Requires square attention (self-attention only).
+            - "gated": Symmetric gate + antisymmetric direction. Requires square attention.
     """
     def __init__(
         self,
@@ -1203,7 +1371,7 @@ class AttentionLayer(nn.Module):
         d_model_values: int,
         d_queries_keys: int,
         n_heads: int,
-        mask_layer: nn.Module,
+        mask_layer: nn.Module,  # Legacy parameter, may be ignored for DAG-learning attention
         attention_dropout: float,
         dropout_qkv: float,
         register_entropy: bool = False, 
@@ -1216,34 +1384,112 @@ class AttentionLayer(nn.Module):
         
         super(AttentionLayer, self).__init__()
         
-        # Create DAGMask for attention types that support DAG learning
-        from causaliT.core.modules.extra_layers import DAGMask, DAGMaskAntisym
+        # Attention types that require square attention (self-attention only)
+        SELF_ATTENTION_ONLY = (LieAttention, ToeplitzLieAttention)
         
-        # LieAttention, CausalCrossAttention, and PhiSoftMax all support DAG learning
-        if attention in (LieAttention, CausalCrossAttention, PhiSoftMax) and query_seq_len is not None and key_seq_len is not None:
-            if dag_parameterization == "antisymmetric":
-                # Antisymmetric only works for self-attention (square attention)
-                if query_seq_len != key_seq_len:
-                    print(f"Warning: dag_parameterization='antisymmetric' requested but query_seq_len ({query_seq_len}) != key_seq_len ({key_seq_len}). Falling back to 'independent'.")
-                    mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
-                else:
-                    mask_layer = DAGMaskAntisym(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
-            else:
-                # Default: independent parameterization
-                mask_layer = DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
+        # Check square attention requirement for self-attention-only modules
+        if attention in SELF_ATTENTION_ONLY and query_seq_len is not None and key_seq_len is not None:
+            if query_seq_len != key_seq_len:
+                raise ValueError(
+                    f"{attention.__name__} requires square attention (self-attention) but got "
+                    f"query_seq_len={query_seq_len} != key_seq_len={key_seq_len}. "
+                    f"Use CausalCrossAttention or ScaledDotAttention for cross-attention instead."
+                )
         
+        # Attention types that support DAG learning
+        DAG_LEARNING_ATTENTION = (LieAttention, CausalCrossAttention, PhiSoftMax, ToeplitzLieAttention)
+        
+        # Centralized DAGMask creation
+        dag_mask = None
+        if attention in DAG_LEARNING_ATTENTION and query_seq_len is not None and key_seq_len is not None:
+            dag_mask = self._create_dag_mask(
+                dag_parameterization=dag_parameterization,
+                n_heads=n_heads,
+                query_seq_len=query_seq_len,
+                key_seq_len=key_seq_len,
+                phi_init_std=phi_init_std
+            )
+        
+        # Create inner attention - pass dag_mask directly (not mask_layer)
         self.inner_attention = attention(
-            mask_layer=mask_layer,
+            dag_mask=dag_mask,
             attention_dropout=attention_dropout,
             register_entropy=register_entropy,
             layer_name=layer_name
             )
+        
+        # Projection layers
         self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
         self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
         self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
+    
+    def _create_dag_mask(
+        self,
+        dag_parameterization: str,
+        n_heads: int,
+        query_seq_len: int,
+        key_seq_len: int,
+        phi_init_std: float
+    ) -> Optional[nn.Module]:
+        """
+        Create the appropriate DAGMask based on parameterization and attention shape.
+        
+        Args:
+            dag_parameterization: One of "independent", "antisymmetric", "gated", or None
+            n_heads: Number of attention heads
+            query_seq_len: Length of query sequence
+            key_seq_len: Length of key sequence
+            phi_init_std: Standard deviation for phi initialization
+            
+        Returns:
+            DAGMask, DAGMaskAntisym, DAGMaskGated, or None (if dag_parameterization is None)
+        """
+        # Handle "no learnable phi" case - return None (no DAGMask)
+        if dag_parameterization is None:
+            return None
+        
+        is_square = (query_seq_len == key_seq_len)
+        
+        # Validate parameterization
+        valid_parameterizations = ("independent", "antisymmetric", "gated")
+        if dag_parameterization not in valid_parameterizations:
+            raise ValueError(
+                f"Invalid dag_parameterization='{dag_parameterization}'. "
+                f"Must be one of: {valid_parameterizations} or None"
+            )
+        
+        if dag_parameterization == "gated":
+            # Gated: symmetric gate + antisymmetric direction (requires square attention)
+            if not is_square:
+                raise ValueError(
+                    f"dag_parameterization='gated' requires square attention (self-attention) but got "
+                    f"query_seq_len={query_seq_len} != key_seq_len={key_seq_len}. "
+                    f"For cross-attention, use dag_parameterization='independent' instead."
+                )
+            return DAGMaskGated(
+                n_heads=n_heads, 
+                query_seq_len=query_seq_len, 
+                key_seq_len=key_seq_len,
+                init_std_gate=0.0,
+                init_std_dir=phi_init_std
+            )
+        
+        elif dag_parameterization == "antisymmetric":
+            # Antisymmetric: P(i→j) + P(j→i) = 1 (requires square attention)
+            if not is_square:
+                raise ValueError(
+                    f"dag_parameterization='antisymmetric' requires square attention (self-attention) but got "
+                    f"query_seq_len={query_seq_len} != key_seq_len={key_seq_len}. "
+                    f"For cross-attention, use dag_parameterization='independent' instead."
+                )
+            return DAGMaskAntisym(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
+        
+        else:
+            # Default: independent parameterization (works for any shape)
+            return DAGMask(n_heads=n_heads, query_seq_len=query_seq_len, key_seq_len=key_seq_len, init_std=phi_init_std)
 
     def forward(
         self, 

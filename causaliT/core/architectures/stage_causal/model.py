@@ -7,7 +7,7 @@ Architecture:
 
 Key features:
 - Reversed attention order (cross → self → FF)
-- Shared embedding/de-embedding across all variables
+- Supports both shared and independent embeddings
 - Teacher forcing support
 - Cascaded loss computation
 """
@@ -39,17 +39,19 @@ class StageCausaliT(nn.Module):
     2. Stage 2: Intermediate (X) → Target (Y) prediction
     
     Each decoder uses reversed attention order (cross-attention before self-attention).
-    All variables share the same embedding and de-embedding transformations for consistency.
+    
+    Embedding modes:
+    - Shared embeddings (use_independent_embeddings=False): All variables share the same 
+      embedding and de-embedding transformations for consistency. Use when S, X, Y 
+      variables come from the same pool (same variable indices = same entities).
+    - Independent embeddings (use_independent_embeddings=True): Separate embedding tables 
+      for S, X, and Y. Use when variables are indexed independently (same index ≠ same entity).
     
     Required data shapes: (BATCH_SIZE, sequence_length, variables)
     """
     def __init__(
         self,
         model: str,
-        
-        # Shared embedding configuration
-        ds_embed_shared,
-        comps_embed_shared,
         
         # Attention configuration for both decoders
         dec1_cross_attention_type,
@@ -97,6 +99,22 @@ class StageCausaliT(nn.Module):
         S_seq_len: int = None,
         X_seq_len: int = None,
         Y_seq_len: int = None,
+        
+        # Shared embedding configuration (used when use_independent_embeddings=False)
+        ds_embed_shared=None,
+        comps_embed_shared=None,
+        
+        # Independent embedding configuration (used when use_independent_embeddings=True)
+        use_independent_embeddings: bool = False,
+        ds_embed_S=None,
+        ds_embed_X=None,
+        ds_embed_Y=None,
+        comps_embed_S=None,
+        comps_embed_X=None,
+        comps_embed_Y=None,
+        
+        # Value index for teacher forcing (which column contains the value to fill in)
+        val_idx_X: int = 0,
     ):
         super().__init__()
         
@@ -104,15 +122,60 @@ class StageCausaliT(nn.Module):
         self.model_name = model
         self.dec1_causal_mask = dec1_causal_mask
         self.dec2_causal_mask = dec2_causal_mask
+        self.use_independent_embeddings = use_independent_embeddings
+        self.val_idx_X = val_idx_X
         
-        # Shared embedding system for all variables (S, X, Y)
-        self.shared_embedding = ModularEmbedding(
-            ds_embed=ds_embed_shared,
-            comps=comps_embed_shared,
-            device=device
-        )
+        # =====================================================================
+        # EMBEDDINGS
+        # =====================================================================
         
-        # Shared attention configuration
+        if use_independent_embeddings:
+            # Independent embeddings for S, X, Y
+            assert ds_embed_S is not None, "ds_embed_S must be provided when use_independent_embeddings=True"
+            assert ds_embed_X is not None, "ds_embed_X must be provided when use_independent_embeddings=True"
+            assert ds_embed_Y is not None, "ds_embed_Y must be provided when use_independent_embeddings=True"
+            assert comps_embed_S is not None, "comps_embed_S must be provided when use_independent_embeddings=True"
+            assert comps_embed_X is not None, "comps_embed_X must be provided when use_independent_embeddings=True"
+            assert comps_embed_Y is not None, "comps_embed_Y must be provided when use_independent_embeddings=True"
+            
+            self.embedding_S = ModularEmbedding(
+                ds_embed=ds_embed_S,
+                comps=comps_embed_S,
+                device=device
+            )
+            self.embedding_X = ModularEmbedding(
+                ds_embed=ds_embed_X,
+                comps=comps_embed_X,
+                device=device
+            )
+            self.embedding_Y = ModularEmbedding(
+                ds_embed=ds_embed_Y,
+                comps=comps_embed_Y,
+                device=device
+            )
+            # Set shared_embedding to None so we can check which mode is active
+            self.shared_embedding = None
+            print("✓ StageCausaliT initialized with INDEPENDENT embeddings for S, X, Y")
+        else:
+            # Shared embedding system for all variables (S, X, Y)
+            assert ds_embed_shared is not None, "ds_embed_shared must be provided when use_independent_embeddings=False"
+            assert comps_embed_shared is not None, "comps_embed_shared must be provided when use_independent_embeddings=False"
+            
+            self.shared_embedding = ModularEmbedding(
+                ds_embed=ds_embed_shared,
+                comps=comps_embed_shared,
+                device=device
+            )
+            # Set individual embeddings to None
+            self.embedding_S = None
+            self.embedding_X = None
+            self.embedding_Y = None
+            print("✓ StageCausaliT initialized with SHARED embeddings for S, X, Y")
+        
+        # =====================================================================
+        # ATTENTION CONFIGURATION
+        # =====================================================================
+        
         attn_shared_kwargs = {
             "n_heads": n_heads,
             "d_queries_keys": d_qk,
@@ -176,6 +239,10 @@ class StageCausaliT(nn.Module):
             "key_seq_len": Y_seq_len
         }
         
+        # =====================================================================
+        # DECODERS
+        # =====================================================================
+        
         # Build Decoder 1 (S → X)
         self.decoder1 = ReversedDecoder(
             decoder_layers=[
@@ -214,6 +281,37 @@ class StageCausaliT(nn.Module):
         
         # Shared de-embedding head (forecaster)
         self.forecaster = nn.Linear(d_model, out_dim, bias=False)
+    
+    def _get_embedding(self, tensor, tensor_type: str):
+        """
+        Get embedded tensor using the appropriate embedding system.
+        
+        Args:
+            tensor: Input tensor to embed
+            tensor_type: One of 'S', 'X', or 'Y'
+            
+        Returns:
+            embedded: Embedded tensor
+            input_pos: Position information (if available)
+            mask: Missing value mask
+        """
+        if self.use_independent_embeddings:
+            if tensor_type == 'S':
+                emb_module = self.embedding_S
+            elif tensor_type == 'X':
+                emb_module = self.embedding_X
+            elif tensor_type == 'Y':
+                emb_module = self.embedding_Y
+            else:
+                raise ValueError(f"Unknown tensor_type: {tensor_type}")
+        else:
+            emb_module = self.shared_embedding
+        
+        embedded = emb_module(X=tensor)
+        input_pos = emb_module.pass_var(X=tensor)
+        mask = emb_module.get_mask(X=tensor)
+        
+        return embedded, input_pos, mask
     
     def forward(
         self,
@@ -265,14 +363,10 @@ class StageCausaliT(nn.Module):
         # ===== Stage 1: Source → Intermediate (S → X) =====
         
         # Embed source nodes
-        s_embedded = self.shared_embedding(X=source_tensor)
-        s_input_pos = self.shared_embedding.pass_var(X=source_tensor)
-        s_mask = self.shared_embedding.get_mask(X=source_tensor)
+        s_embedded, s_input_pos, s_mask = self._get_embedding(source_tensor, 'S')
         
         # Embed intermediate (always use blanked X for decoder 1)
-        x_embedded = self.shared_embedding(X=intermediate_tensor_blanked)
-        x_input_pos = self.shared_embedding.pass_var(X=intermediate_tensor_blanked)
-        x_mask = self.shared_embedding.get_mask(X=intermediate_tensor_blanked)
+        x_embedded, x_input_pos, x_mask = self._get_embedding(intermediate_tensor_blanked, 'X')
         
         # Pass through Decoder 1: X queries, S keys/values
         dec1_out, dec1_cross_att, dec1_self_att, dec1_cross_ent, dec1_self_ent = self.decoder1(
@@ -301,17 +395,13 @@ class StageCausaliT(nn.Module):
             # Use predicted X from decoder 1 for decoder 2
             # Start from blanked tensor and fill in predicted values
             x_for_dec2 = intermediate_tensor_blanked.clone()
-            x_for_dec2[:, :, 0] = pred_x.squeeze(-1)
+            x_for_dec2[:, :, self.val_idx_X] = pred_x.squeeze(-1)
         
-        # Re-embed X for decoder 2 (using shared embedding)
-        x_for_dec2_embedded = self.shared_embedding(X=x_for_dec2)
-        x_for_dec2_pos = self.shared_embedding.pass_var(X=x_for_dec2)
-        x_for_dec2_mask = self.shared_embedding.get_mask(X=x_for_dec2)
+        # Re-embed X for decoder 2
+        x_for_dec2_embedded, x_for_dec2_pos, x_for_dec2_mask = self._get_embedding(x_for_dec2, 'X')
         
         # Embed target (blanked Y)
-        y_embedded = self.shared_embedding(X=target_tensor)
-        y_input_pos = self.shared_embedding.pass_var(X=target_tensor)
-        y_mask = self.shared_embedding.get_mask(X=target_tensor)
+        y_embedded, y_input_pos, y_mask = self._get_embedding(target_tensor, 'Y')
         
         # Pass through Decoder 2: Y queries, X keys/values
         dec2_out, dec2_cross_att, dec2_self_att, dec2_cross_ent, dec2_self_ent = self.decoder2(

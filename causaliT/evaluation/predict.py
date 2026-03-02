@@ -199,7 +199,7 @@ def predict_test_from_ckpt(
     dataset_label: str = "test",
     cluster: bool = False,
     input_conditioning_fn: Callable[[torch.Tensor], torch.Tensor] = None,
-    toggle_off_hard_masks: bool = False,
+    use_hard_masks: bool = None,
 ) -> PredictionResult:
     """
     Run standard prediction on specified dataset using a trained model checkpoint.
@@ -256,7 +256,7 @@ def predict_test_from_ckpt(
         dm=dm,
         dataset_label=dataset_label,
         input_conditioning_fn=input_conditioning_fn,
-        toggle_off_hard_masks=toggle_off_hard_masks,
+        use_hard_masks=use_hard_masks,
     )
     
     return results

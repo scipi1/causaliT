@@ -58,6 +58,13 @@ model:
     dec_self_attention_type: "ScaledDotProduct"  # X self-attention
     dec_self_mask_type: "Uniform"
     
+    # DAG parameterization for attention layers
+    # Options: "independent" (default), "antisymmetric", "gated"
+    # Note: "antisymmetric" and "gated" require square attention (self-attention only)
+    #       For cross-attention (S → X), only "independent" is supported
+    dag_parameterization_self: "independent"   # For X self-attention (square, can use any)
+    dag_parameterization_cross: "independent"  # For S → X cross-attention (must be "independent")
+    
     n_heads: 1  # Single head for interpretable attention patterns
     
     # Causal masking

@@ -258,24 +258,47 @@ def trainer(
     # =========================================================================
     # Post-Training Evaluations
     # =========================================================================
-    # Run all evaluation functions after training completes.
+    # Run evaluation functions after training completes.
     # This is wrapped in try-except to ensure training results are not lost
-    # if evaluation fails. Evaluations include:
+    # if evaluation fails.
+    #
+    # Evaluation strategy is controlled by config["evaluation"]["functions"]:
+    # - If not specified: runs default evaluations (run_all_evaluations)
+    # - If specified: runs only the listed functions (run_evaluations_from_config)
+    #
+    # Available functions:
     # - eval_train_metrics: Training curves and loss analysis
     # - eval_attention_scores: DAG recovery metrics
     # - eval_embed: Embedding evolution analysis
     # - eval_interventions: Causal intervention tests
     # - eval_embedding_dag_correlation: Embedding-DAG correlation
+    # - eval_dyconex_predictions: Dyconex-specific prediction evaluation
+    # - eval_metrics: Flexible metric plotting
     try:
-        from notebooks.eval_fun import run_all_evaluations
+        from notebooks.eval_fun import run_all_evaluations, run_evaluations_from_config
         print("\n" + "="*60)
         print("Running post-training evaluations...")
         print("="*60)
-        eval_results = run_all_evaluations(
-            experiment=save_dir,
-            datadir_path=data_dir,
-            show_plots=False,  # Always False
-        )
+        
+        # Check for evaluation config
+        eval_functions = config.get("evaluation", {}).get("functions", None)
+        
+        if eval_functions is not None:
+            # Use config-specified functions
+            print(f"Using config-specified evaluation functions: {eval_functions}")
+            eval_results = run_evaluations_from_config(
+                experiment=save_dir,
+                datadir_path=data_dir,
+                show_plots=False,  # Always False for cluster
+                functions=eval_functions,
+            )
+        else:
+            # Default behavior: run all standard evaluations
+            eval_results = run_all_evaluations(
+                experiment=save_dir,
+                datadir_path=data_dir,
+                show_plots=False,  # Always False for cluster
+            )
         print("\nPost-training evaluations completed!")
     except Exception as e:
         print(f"\nWarning: Post-training evaluation failed: {e}")
