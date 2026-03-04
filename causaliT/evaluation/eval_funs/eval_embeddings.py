@@ -1,0 +1,653 @@
+"""
+Embedding evaluation functions for CausaliT experiments.
+
+This module provides functions for analyzing learned embeddings:
+- eval_embed: Analyze embedding evolution and cosine similarities
+- eval_embedding_dag_correlation: Correlate embedding similarity with DAG structure
+"""
+
+import json
+from functools import partial
+from os.path import join, exists
+from os import listdir
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from omegaconf import OmegaConf
+from matplotlib.patches import Patch
+
+# Import shared utilities
+from .eval_utils import (
+    root_path,
+    _setup_eval_directories,
+    _save_readme,
+    _save_variable_labels,
+    _create_cline_template,
+    _get_learned_dag,
+    _load_true_dag_mask,
+)
+
+# Import from local eval_funs modules (self-contained)
+from .eval_lib import (
+    load_embeddings_evolution,
+    load_attention_data_from_file,
+)
+
+
+# =============================================================================
+# Evaluation Functions
+# =============================================================================
+
+def eval_embed(experiment: str, show_plots: bool = True) -> None:
+    """
+    Evaluate embedding evolution during training.
+    
+    Analyzes how source (S) and intermediate (X) embeddings evolve during training
+    by computing cosine similarities between embedding vectors across epochs.
+    This is specific to SingleCausalForecaster architecture with orthogonal embeddings.
+    
+    Args:
+        experiment: Path to the experiment folder containing k_* subdirectories
+        show_plots: If True (default), display plots interactively. If False, only save to files.
+        
+    Returns:
+        None (results are saved to files and displayed)
+        
+    Output Files:
+        - fig/cosine_similarities_kfold_{k}_{exp_id}.pdf: Cosine similarity evolution per fold
+        - fig/final_cosine_similarities_{exp_id}.pdf: Final epoch similarities across folds
+        - fig/cosine_similarities_correlation_matrix_{exp_id}.pdf: Correlation heatmap
+        - files/emb_df.csv: Embedding data (cached for subsequent runs)
+        - files/emb_sim_corr.csv: Cosine similarity correlation matrix
+        
+    Notes:
+        - Computes cosine similarities between S1, S2, S3 (sources) and X1, X2 (intermediates)
+        - Results are cached in files/ directory; delete to recompute
+        
+    Example:
+        >>> eval_embed("../experiments/single/local/my_experiment")
+    """
+    # Setup directories
+    eval_path_root, eval_path_fig, eval_path_files, eval_path_cline, exp_id = \
+        _setup_eval_directories(experiment, "eval_embedding_evolution")
+    
+    emb_dataframe_filename = "emb_df.csv"
+    emb_sim_corr_filename = "emb_sim_corr.csv"
+    embedding_labels_filename = "embedding_labels.json"
+
+    # =========================================================================
+    # Embedding labels for AI interpretation
+    # =========================================================================
+    
+    # TODO: Dataset-specific variable mappings are hard-coded below.
+    # TODO: When adding new datasets, create a new entry in DATASET_EMBEDDING_MAPPINGS.
+    # TODO: Consider loading these from the dataset folder (e.g., data/{dataset}/variable_labels.json)
+    # Note: scm6 (non-linear) and scm7 (linear) share the same causal structure
+    _SCM6_FAMILY_EMBEDDING_MAPPING = {
+        "source_variables": ["S1", "S2", "S3"],
+        "intermediate_variables": ["X1", "X2"],
+        "output_variables": ["Y1", "Y2"],
+        "cosine_similarity_pairs": {
+            "cos_S1_X1": "Cosine similarity between S1 and X1 embeddings",
+            "cos_S1_X2": "Cosine similarity between S1 and X2 embeddings",
+            "cos_S2_X1": "Cosine similarity between S2 and X1 embeddings",
+            "cos_S2_X2": "Cosine similarity between S2 and X2 embeddings",
+            "cos_S3_X1": "Cosine similarity between S3 and X1 embeddings",
+            "cos_S3_X2": "Cosine similarity between S3 and X2 embeddings",
+            "cos_X1_X2": "Cosine similarity between X1 and X2 embeddings",
+        },
+        "expected_causal_relations": {
+            "cos_S1_X1": "Should be high (S1 → X1 in true DAG)",
+            "cos_S2_X2": "Should be high (S2 → X2 in true DAG)",
+            "cos_S3_X2": "Should be high (S3 → X2 in true DAG)",
+            "cos_S1_X2": "Should be low (no direct edge S1 → X2)",
+            "cos_S2_X1": "Should be low (no direct edge S2 → X1)",
+            "cos_S3_X1": "Should be low (no direct edge S3 → X1)",
+        },
+    }
+    DATASET_EMBEDDING_MAPPINGS = {
+        "scm6": _SCM6_FAMILY_EMBEDDING_MAPPING,  # Non-linear SCM
+        "scm7": _SCM6_FAMILY_EMBEDDING_MAPPING,  # Linear SCM (same causal structure)
+        # TODO: Add more datasets here as they are created
+    }
+    
+    embedding_labels = {
+        "description": "Embedding evolution analysis - tracking cosine similarities between variable embeddings during training",
+        "interpretation": {
+            "high_cosine_similarity": "Variables with similar embeddings are expected to have causal relationships",
+            "low_cosine_similarity": "Variables with orthogonal embeddings should not have direct causal edges",
+            "evolution_over_epochs": "Embeddings typically start random and converge to reflect causal structure",
+        },
+        "embedding_types": {
+            "embedding_S": "Source variable embeddings (OrthogonalMaskEmbedding for SingleCausal)",
+            "embedding_X": "Intermediate variable embeddings (ModularEmbedding)",
+        },
+        "column_documentation": {
+            "kfold": "Cross-validation fold identifier (k_0, k_1, ...)",
+            "epoch": "Training epoch number",
+            "S1, S2, S3": "Embedding vectors for source variables (flattened)",
+            "X1, X2": "Embedding vectors for intermediate variables (flattened)",
+            "cos_*_*": "Cosine similarity between two variable embeddings",
+        },
+    }
+    
+    # Try to get dataset from config to add dataset-specific labels
+    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
+    dataset_name = None
+    if config_files:
+        try:
+            config = OmegaConf.load(join(experiment, config_files[0]))
+            dataset_name = config.get("data", {}).get("dataset")
+        except Exception:
+            pass
+    
+    # Add dataset-specific mapping if available
+    if dataset_name and dataset_name in DATASET_EMBEDDING_MAPPINGS:
+        embedding_labels["variable_mapping"] = DATASET_EMBEDDING_MAPPINGS[dataset_name]
+        embedding_labels["dataset"] = dataset_name
+    else:
+        # TODO: Unknown dataset - using generic placeholder
+        embedding_labels["variable_mapping"] = {
+            "note": f"No variable mapping defined for dataset '{dataset_name}'. Add to DATASET_EMBEDDING_MAPPINGS.",
+        }
+        embedding_labels["dataset"] = dataset_name or "unknown"
+    
+    _save_variable_labels(eval_path_files, embedding_labels, embedding_labels_filename)
+
+    # Save README with column documentation
+    _save_readme(
+        eval_path_root, eval_path_cline, eval_path_files, eval_path_fig,
+        description="This evaluation folder contains evaluations of the learned embeddings.",
+        files_info={
+            emb_dataframe_filename: "Embedding data with cosine similarities (CSV)",
+            emb_sim_corr_filename: "Correlation matrix of cosine similarities (CSV)",
+            embedding_labels_filename: "Variable descriptions and interpretation guide (JSON)",
+        },
+        column_documentation=embedding_labels["column_documentation"]
+    )
+    
+    # Create cline notes template
+    _create_cline_template(eval_path_cline, "eval_embedding_evolution", exp_id)
+
+    print(f"Experiment ID: {exp_id}")
+
+    # Helper functions for embedding processing
+    # TODO: Hard-coded for SCM with 3 source variables (S1, S2, S3) and 2 intermediate variables (X1, X2)
+    # TODO: Make num_vars configurable based on dataset/experiment config
+    def _compute_srow(row):
+        """Compute source embedding vectors from orthogonal mask embedding components."""
+        num_vars = 3  # TODO: Hard-coded number of source variables
+        ab = np.asarray(row["embedding_S_value_embedding_weight"]) + \
+             np.asarray(row["embedding_S_value_embedding_bias"])
+        c = np.asarray(row["embedding_S_binary_masks"])
+        L = ab.shape[0]
+
+        if c.size != num_vars * L:
+            raise ValueError(f"Expected c length {num_vars*L}, got {c.size}")
+
+        c3 = c.reshape(num_vars, L)
+        return c3
+
+    def _unpack(row, label, num_vars):
+        """Unpack flattened weight array into per-variable vectors."""
+        arr = np.asarray(row[label])
+        L = arr.size // num_vars
+        return tuple(arr.reshape(num_vars, L))
+
+    def _rowwise_cosine(df, col1, col2, eps=1e-12):
+        """Compute row-wise cosine similarity between two vector columns."""
+        X = np.stack(df[col1].to_numpy())
+        Y = np.stack(df[col2].to_numpy())
+        num = np.einsum("ij,ij->i", X, Y)
+        den = (np.linalg.norm(X, axis=1) * np.linalg.norm(Y, axis=1)).clip(min=eps)
+        return num / den
+
+    # Load or compute embedding data
+    if exists(join(eval_path_files, emb_dataframe_filename)):
+        df_scm = pd.read_csv(join(eval_path_files, emb_dataframe_filename))
+    else:
+        df = load_embeddings_evolution(experiment)
+
+        group_cols = ["kfold", "epoch"]
+        source_emb_name_single = [
+            "embedding_S_value_embedding_weight",
+            "embedding_S_value_embedding_bias",
+            "embedding_S_binary_masks"
+        ]
+        source_emb = df.set_index("embedding_name").loc[source_emb_name_single].reset_index()
+
+        # Process source embeddings
+        gS = (
+            source_emb
+            .groupby(group_cols + ["embedding_name"])["weight"]
+            .first()
+            .unstack("embedding_name")
+        )
+        gS["temp_res"] = gS.apply(_compute_srow, axis=1)
+        # TODO: Hard-coded variable names S1, S2, S3 - should be dynamically generated
+        gS[["S1", "S2", "S3"]] = gS.apply(
+            partial(_unpack, label="temp_res", num_vars=3), 
+            axis=1, 
+            result_type="expand"
+        )
+        gS = gS.drop(columns=source_emb_name_single + ["temp_res"])
+        df_S = gS.reset_index()
+
+        # Process intermediate X embeddings
+        # TODO: Hard-coded embedding name 'embedding_X_var1_nn_embedding_embedding_weight'
+        # TODO: Hard-coded num_vars=8 and indices [4, 5] for X1, X2 extraction
+        df_X = df.set_index("embedding_name").loc['embedding_X_var1_nn_embedding_embedding_weight'].reset_index()
+        df_X[["X1", "X2"]] = df_X.apply(
+            partial(_unpack, label="weight", num_vars=8), 
+            axis=1, 
+            result_type="expand"
+        )[[4, 5]]
+        df_X = df_X.drop(columns=["embedding_name", "weight", "type", "shape", "component"])
+
+        df_scm = pd.concat([df_S.set_index(group_cols), df_X.set_index(group_cols)], axis=1).reset_index()
+
+    # Calculate cosine similarities
+    # TODO: Hard-coded cosine similarity pairs for S1, S2, S3 and X1, X2
+    # TODO: Should dynamically generate pairs based on number of source/intermediate variables
+    df_scm["cos_S1_X1"] = _rowwise_cosine(df_scm, "S1", "X1")
+    df_scm["cos_S1_X2"] = _rowwise_cosine(df_scm, "S1", "X2")
+    df_scm["cos_S2_X1"] = _rowwise_cosine(df_scm, "S2", "X1")
+    df_scm["cos_S2_X2"] = _rowwise_cosine(df_scm, "S2", "X2")
+    df_scm["cos_S3_X1"] = _rowwise_cosine(df_scm, "S3", "X1")
+    df_scm["cos_S3_X2"] = _rowwise_cosine(df_scm, "S3", "X2")
+    df_scm["cos_X1_X2"] = _rowwise_cosine(df_scm, "X1", "X2")
+
+    # TODO: Hard-coded list of variable pairs
+    var_pairs = ["cos_S1_X1", "cos_S1_X2", "cos_S2_X1", "cos_S2_X2", 
+                 "cos_S3_X1", "cos_S3_X2", "cos_X1_X2"]
+    
+    # Save correlation matrix
+    df_corr = df_scm[var_pairs].corr().abs()
+    ranked = df_corr.unstack().sort_values(ascending=False)
+    ranked[ranked < 1].to_csv(join(eval_path_files, emb_sim_corr_filename))
+    
+    # Plot: Cosine similarity evolution per fold
+    group_cols = ["kfold", "epoch"]
+    df_sim_plot = df_scm.melt(
+        id_vars=group_cols, 
+        value_vars=var_pairs, 
+        var_name="variables", 
+        value_name="cosine_similarity"
+    )
+    
+    for k in df_sim_plot["kfold"].unique():
+        fig, ax = plt.subplots()
+        sns.lineplot(
+            df_sim_plot.set_index("kfold").loc[k], 
+            x="epoch", 
+            y="cosine_similarity", 
+            hue="variables", 
+            ax=ax
+        )
+        plt.title(f"Fold: {k}")
+        plt.savefig(join(eval_path_fig, f"cosine_similarities_kfold_{k}_{exp_id}.pdf"))
+        if show_plots:
+            plt.show()
+        else:
+            plt.close()
+    
+    # Plot: Final epoch similarities
+    fig, ax = plt.subplots()
+    max_epoch = max(df_sim_plot["epoch"].unique())
+    sns.scatterplot(
+        df_sim_plot[df_sim_plot["epoch"] == max_epoch], 
+        y="variables", 
+        x="cosine_similarity", 
+        hue="kfold", 
+        s=200, 
+        alpha=0.6, 
+        ax=ax
+    )
+    plt.savefig(join(eval_path_fig, f"final_cosine_similarities_{exp_id}.pdf"))
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+    
+    # Plot: Correlation matrix heatmap
+    fig, ax = plt.subplots()
+    sns.heatmap(df_corr, ax=ax)
+    plt.savefig(join(eval_path_fig, f"cosine_similarities_correlation_matrix_{exp_id}.pdf"))
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+        
+        
+        
+        
+def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> dict:
+    """
+    Evaluate correlation between embedding similarity and learned DAG structure.
+    
+    This function tests H6: whether causally-linked variables have more similar
+    embeddings than non-linked variables. It combines data from:
+    - eval_embed: cosine similarities between variable embeddings
+    - eval_attention_scores: learned DAG structure (phi or attention)
+    
+    For each variable pair (e.g., S1-X1), it correlates:
+    - Embedding cosine similarity (from eval_embed)
+    - Learned edge probability (from eval_attention_scores phi tensor)
+    - True edge indicator (from dataset DAG masks)
+    
+    Args:
+        experiment: Path to the experiment folder containing k_* subdirectories
+        show_plots: If True (default), display plots interactively. If False, only save to files.
+        
+    Returns:
+        dict: Correlation results with keys:
+            - embedding_dag_correlation: Pearson correlation between embedding sim and learned DAG
+            - embedding_true_dag_correlation: Correlation between embedding sim and true DAG
+            - separation_score: Difference in mean embedding sim (causal vs non-causal pairs)
+            
+    Output Files:
+        - fig/embedding_dag_scatter_{exp_id}.pdf: Scatter plot of embedding sim vs DAG prob
+        - fig/embedding_separation_{exp_id}.pdf: Box plot comparing causal vs non-causal pairs
+        - files/embedding_dag_correlation.json: Detailed correlation results
+        - files/embedding_dag_data.csv: Raw data for further analysis
+        
+    Notes:
+        - Requires eval_embed and eval_attention_scores to be run first
+        - Currently supports SingleCausalForecaster with scm6 dataset
+        
+    Example:
+        >>> results = eval_embedding_dag_correlation("../experiments/single/local/my_experiment")
+        >>> print(f"Embedding-DAG correlation: {results['embedding_dag_correlation']:.3f}")
+    """
+    # Setup directories
+    eval_path_root, eval_path_fig, eval_path_files, eval_path_cline, exp_id = \
+        _setup_eval_directories(experiment, "eval_embedding_dag_correlation")
+    
+    correlation_filename = "embedding_dag_correlation.json"
+    data_filename = "embedding_dag_data.csv"
+    
+    # =========================================================================
+    # Load prerequisite data
+    # =========================================================================
+    
+    # Check if eval_embed was run
+    emb_data_path = join(experiment, "eval", "eval_embedding_evolution", "files", "emb_df.csv")
+    if not exists(emb_data_path):
+        print(f"Error: eval_embed must be run first. Missing: {emb_data_path}")
+        print("Run: eval_embed(experiment)")
+        return {}
+    
+    # Check if eval_attention_scores was run
+    dag_metrics_path = join(experiment, "eval", "eval_attention_scores", "files", "dag_metrics.json")
+    att_data_path = join(experiment, "eval", "eval_attention_scores", "files", "final_scores")
+    if not exists(dag_metrics_path):
+        print(f"Error: eval_attention_scores must be run first. Missing: {dag_metrics_path}")
+        print("Run: eval_attention_scores(experiment)")
+        return {}
+    
+    # Load embedding cosine similarities (final epoch, mean across folds)
+    df_emb = pd.read_csv(emb_data_path)
+    
+    # Get final epoch data
+    final_epoch = df_emb["epoch"].max()
+    df_final = df_emb[df_emb["epoch"] == final_epoch]
+    
+    # Compute mean cosine similarities across folds for final epoch
+    # TODO: Hard-coded cosine similarity column names for scm6
+    cos_cols = ["cos_S1_X1", "cos_S1_X2", "cos_S2_X1", "cos_S2_X2", "cos_S3_X1", "cos_S3_X2"]
+    mean_cos_sims = {}
+    for col in cos_cols:
+        if col in df_final.columns:
+            mean_cos_sims[col] = df_final[col].mean()
+    
+    if not mean_cos_sims:
+        print("Error: No cosine similarity columns found in embedding data")
+        return {}
+    
+    print(f"Loaded embedding similarities from final epoch {final_epoch}")
+    
+    # Load learned DAG from attention scores
+    with open(dag_metrics_path, 'r') as f:
+        dag_metrics = json.load(f)
+    
+    # Load attention data to get phi values
+    attention_data = load_attention_data_from_file(att_data_path)
+    
+    # Get architecture type
+    architecture = attention_data.architecture_type
+    
+    # Extract learned DAG (phi or attention) - mean across folds
+    # TODO: Hard-coded for SingleCausalForecaster dec_cross (S→X)
+    if architecture == "SingleCausalForecaster":
+        phi_key = "decoder_cross"
+        att_key = "dec_cross"
+    else:
+        print(f"Warning: eval_embedding_dag_correlation not yet implemented for {architecture}")
+        return {}
+    
+    learned_dag, source = _get_learned_dag(attention_data, att_key, phi_key)
+    
+    if learned_dag is None:
+        print("Error: Could not extract learned DAG from attention data")
+        return {}
+    
+    print(f"Loaded learned DAG from {source}: shape={learned_dag.shape}")
+    
+    # Load true DAG mask
+    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
+    if not config_files:
+        print("Error: No config file found")
+        return {}
+    
+    config = OmegaConf.load(join(experiment, config_files[0]))
+    dataset = config.get("data", {}).get("dataset")
+    
+    datadir_path = join(root_path, "data")
+    true_dag = _load_true_dag_mask(datadir_path, dataset, "dec_cross")
+    
+    if true_dag is None:
+        print("Error: Could not load true DAG mask")
+        return {}
+    
+    print(f"Loaded true DAG: shape={true_dag.shape}")
+    
+    # =========================================================================
+    # Map cosine similarities to DAG edges
+    # =========================================================================
+    
+    # TODO: Hard-coded mapping for scm6 (S1, S2, S3) → (X1, X2)
+    # Format: cos_col → (target_idx, source_idx) in the DAG matrix
+    # DAG matrix is (n_targets=2, n_sources=3) where rows=X, cols=S
+    COS_TO_DAG_MAP = {
+        "cos_S1_X1": (0, 0),  # X1 ← S1
+        "cos_S2_X1": (0, 1),  # X1 ← S2
+        "cos_S3_X1": (0, 2),  # X1 ← S3
+        "cos_S1_X2": (1, 0),  # X2 ← S1
+        "cos_S2_X2": (1, 1),  # X2 ← S2
+        "cos_S3_X2": (1, 2),  # X2 ← S3
+    }
+    
+    # Build data for correlation
+    records = []
+    for cos_col, (target_idx, source_idx) in COS_TO_DAG_MAP.items():
+        if cos_col not in mean_cos_sims:
+            continue
+        
+        cos_sim = mean_cos_sims[cos_col]
+        learned_edge = learned_dag[target_idx, source_idx]
+        true_edge = true_dag[target_idx, source_idx]
+        
+        records.append({
+            "pair": cos_col.replace("cos_", ""),
+            "source_var": cos_col.split("_")[1],  # e.g., "S1"
+            "target_var": cos_col.split("_")[2],  # e.g., "X1"
+            "embedding_cosine_sim": cos_sim,
+            "learned_dag_prob": learned_edge,
+            "true_dag_edge": int(true_edge),
+            "is_causal": bool(true_edge > 0.5),
+        })
+    
+    df_data = pd.DataFrame(records)
+    df_data.to_csv(join(eval_path_files, data_filename), index=False)
+    print(f"Saved: {data_filename}")
+    
+    # =========================================================================
+    # Compute correlations
+    # =========================================================================
+    
+    # Correlation: embedding similarity vs learned DAG probability
+    corr_emb_learned, pval_emb_learned = stats.pearsonr(
+        df_data["embedding_cosine_sim"], 
+        df_data["learned_dag_prob"]
+    )
+    
+    # Correlation: embedding similarity vs true DAG (binary)
+    corr_emb_true, pval_emb_true = stats.pearsonr(
+        df_data["embedding_cosine_sim"], 
+        df_data["true_dag_edge"]
+    )
+    
+    # Separation score: mean embedding sim for causal pairs - mean for non-causal
+    causal_pairs = df_data[df_data["is_causal"]]
+    non_causal_pairs = df_data[~df_data["is_causal"]]
+    
+    mean_causal = causal_pairs["embedding_cosine_sim"].mean() if len(causal_pairs) > 0 else 0
+    mean_non_causal = non_causal_pairs["embedding_cosine_sim"].mean() if len(non_causal_pairs) > 0 else 0
+    separation_score = mean_causal - mean_non_causal
+    
+    # Statistical test: are causal pairs significantly more similar?
+    if len(causal_pairs) > 0 and len(non_causal_pairs) > 0:
+        t_stat, t_pval = stats.ttest_ind(
+            causal_pairs["embedding_cosine_sim"],
+            non_causal_pairs["embedding_cosine_sim"]
+        )
+    else:
+        t_stat, t_pval = None, None
+    
+    # =========================================================================
+    # Save results
+    # =========================================================================
+    
+    results = {
+        "dataset": dataset,
+        "architecture": architecture,
+        "dag_source": source,
+        "n_pairs": len(df_data),
+        "n_causal_pairs": len(causal_pairs),
+        "n_non_causal_pairs": len(non_causal_pairs),
+        "embedding_dag_correlation": float(corr_emb_learned),
+        "embedding_dag_correlation_pval": float(pval_emb_learned),
+        "embedding_true_dag_correlation": float(corr_emb_true),
+        "embedding_true_dag_correlation_pval": float(pval_emb_true),
+        "mean_embedding_sim_causal": float(mean_causal),
+        "mean_embedding_sim_non_causal": float(mean_non_causal),
+        "separation_score": float(separation_score),
+        "separation_ttest_stat": float(t_stat) if t_stat is not None else None,
+        "separation_ttest_pval": float(t_pval) if t_pval is not None else None,
+        "pair_details": records,
+    }
+    
+    with open(join(eval_path_files, correlation_filename), 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved: {correlation_filename}")
+    
+    # =========================================================================
+    # Plots
+    # =========================================================================
+    
+    # Plot 1: Scatter of embedding similarity vs learned DAG probability
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = df_data["is_causal"].map({True: "green", False: "red"})
+    ax.scatter(df_data["learned_dag_prob"], df_data["embedding_cosine_sim"], 
+               c=colors, s=200, alpha=0.7)
+    
+    # Add pair labels
+    for _, row in df_data.iterrows():
+        ax.annotate(row["pair"], (row["learned_dag_prob"], row["embedding_cosine_sim"]),
+                   fontsize=10, ha='center', va='bottom')
+    
+    ax.set_xlabel("Learned DAG Probability (phi)")
+    ax.set_ylabel("Embedding Cosine Similarity")
+    ax.set_title(f"Embedding vs DAG Correlation\nr={corr_emb_learned:.3f}, p={pval_emb_learned:.3f}")
+    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.5)
+    
+    # Legend
+    legend_elements = [
+        Patch(facecolor='green', alpha=0.7, label='Causal pair'),
+        Patch(facecolor='red', alpha=0.7, label='Non-causal pair'),
+    ]
+    ax.legend(handles=legend_elements)
+    
+    plt.tight_layout()
+    plt.savefig(join(eval_path_fig, f"embedding_dag_scatter_{exp_id}.pdf"))
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+    
+    # Plot 2: Box plot comparing causal vs non-causal pairs
+    fig, ax = plt.subplots(figsize=(6, 6))
+    
+    box_data = [
+        non_causal_pairs["embedding_cosine_sim"].values,
+        causal_pairs["embedding_cosine_sim"].values,
+    ]
+    bp = ax.boxplot(box_data, labels=["Non-causal", "Causal"], patch_artist=True)
+    bp["boxes"][0].set_facecolor("red")
+    bp["boxes"][0].set_alpha(0.5)
+    bp["boxes"][1].set_facecolor("green")
+    bp["boxes"][1].set_alpha(0.5)
+    
+    # Overlay individual points
+    for i, (data, color) in enumerate([(non_causal_pairs, "red"), (causal_pairs, "green")]):
+        x = np.ones(len(data)) * (i + 1) + np.random.normal(0, 0.05, len(data))
+        ax.scatter(x, data["embedding_cosine_sim"], c=color, alpha=0.7, s=100)
+    
+    ax.set_ylabel("Embedding Cosine Similarity")
+    ax.set_title(f"Embedding Separation by Causality\nSeparation={separation_score:.3f}, p={t_pval:.3f}" if t_pval else "Embedding Separation by Causality")
+    
+    plt.tight_layout()
+    plt.savefig(join(eval_path_fig, f"embedding_separation_{exp_id}.pdf"))
+    if show_plots:
+        plt.show()
+    else:
+        plt.close()
+        
+    # =========================================================================
+    # Save README and cline template
+    # =========================================================================
+    
+    _save_readme(
+        eval_path_root, eval_path_cline, eval_path_files, eval_path_fig,
+        description="This evaluation analyzes correlation between embedding similarity and DAG structure (H6).",
+        files_info={
+            correlation_filename: "Correlation statistics and summary results (JSON)",
+            data_filename: "Raw data: embedding similarity, learned DAG, true DAG per pair (CSV)",
+        },
+        column_documentation={
+            "pair": "Variable pair name (e.g., 'S1_X1')",
+            "embedding_cosine_sim": "Cosine similarity between variable embeddings (from eval_embed)",
+            "learned_dag_prob": "Learned edge probability from phi tensor",
+            "true_dag_edge": "True DAG edge indicator (0 or 1)",
+            "is_causal": "Whether this is a true causal pair",
+        }
+    )
+    
+    _create_cline_template(eval_path_cline, "eval_embedding_dag_correlation", exp_id)
+    
+    # Print summary
+    print(f"\n=== Embedding-DAG Correlation Summary ===")
+    print(f"Embedding vs Learned DAG: r={corr_emb_learned:.3f} (p={pval_emb_learned:.3f})")
+    print(f"Embedding vs True DAG:    r={corr_emb_true:.3f} (p={pval_emb_true:.3f})")
+    print(f"Mean embedding sim (causal):     {mean_causal:.3f}")
+    print(f"Mean embedding sim (non-causal): {mean_non_causal:.3f}")
+    print(f"Separation score:                {separation_score:.3f}")
+    if t_pval is not None:
+        print(f"Separation t-test p-value:       {t_pval:.3f}")
+    
+    return results

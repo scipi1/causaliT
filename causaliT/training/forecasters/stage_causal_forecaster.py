@@ -209,8 +209,8 @@ class StageCausalForecaster(pl.LightningModule):
         return masks if masks else None
     
     def forward(self, data_source: torch.Tensor, data_intermediate: torch.Tensor, 
-                data_target: torch.Tensor, use_hard_masks: bool = None,
-                use_in_context_masks: bool = None) -> Any:
+                data_target: torch.Tensor, disable_hard_masks: bool = False,
+                disable_in_context_masks: bool = False) -> Any:
         """
         Forward pass through the model.
         
@@ -218,12 +218,12 @@ class StageCausalForecaster(pl.LightningModule):
             data_source: Source nodes (S)
             data_intermediate: Intermediate variables (X)
             data_target: Target variables (Y)
-            use_hard_masks: Override for hard mask usage. If None (default), uses
-                           the value from config (self.use_hard_masks).
-                           Set to False to disable hard masks for ablation studies.
-            use_in_context_masks: Override for in-context mask usage. If None (default),
-                                  uses the value from config (self.use_in_context_masks).
-                                  Set to False to disable in-context masks for ablation studies.
+            disable_hard_masks: If True, disables hard masks even if model was trained with them.
+                               Useful for ablation studies during inference. Default False = use
+                               masks if model was trained with them (self.use_hard_masks).
+            disable_in_context_masks: If True, disables in-context masks even if model was trained
+                                      with them. Default False = use masks if model was trained
+                                      with them (self.use_in_context_masks).
             
         Returns:
             pred_x: Predicted X from decoder 1
@@ -246,13 +246,11 @@ class StageCausalForecaster(pl.LightningModule):
         use_tf = self.teacher_forcing and self.training
         
         # Determine whether to use hard masks (static, from files)
-        # Use config value if not explicitly overridden
-        apply_hard_masks = use_hard_masks if use_hard_masks is not None else self.use_hard_masks
+        apply_hard_masks = self.use_hard_masks and not disable_hard_masks
         static_masks = self.get_hard_masks() if apply_hard_masks else None
         
         # Compute in-context masks (dynamic, computed from batch data)
-        # Use config value if not explicitly overridden
-        apply_in_context = use_in_context_masks if use_in_context_masks is not None else self.use_in_context_masks
+        apply_in_context = self.use_in_context_masks and not disable_in_context_masks
         if apply_in_context:
             in_context_masks = build_dyconex_in_context_masks(
                 S=data_source,

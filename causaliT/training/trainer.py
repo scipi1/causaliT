@@ -275,7 +275,7 @@ def trainer(
     # - eval_dyconex_predictions: Dyconex-specific prediction evaluation
     # - eval_metrics: Flexible metric plotting
     try:
-        from notebooks.eval_fun import run_all_evaluations, run_evaluations_from_config
+        from causaliT.evaluation.eval_funs import run_all_evaluations, run_evaluations_from_config
         print("\n" + "="*60)
         print("Running post-training evaluations...")
         print("="*60)

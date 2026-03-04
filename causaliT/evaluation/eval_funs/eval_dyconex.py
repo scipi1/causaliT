@@ -3,7 +3,9 @@ Evaluation Functions for Dyconex Dataset (ds_dyconex_SX_MuMi_*).
 
 This module provides evaluation functions specific to the dyconex industrial dataset:
 - eval_dyconex_predictions: Prediction quality analysis with best/worst sample plots
-- eval_metrics: Flexible metric plotting for any logged columns
+
+Note: For training metrics plotting, use eval_train_metrics from eval_training.py,
+      which provides generalized metric plotting for any experiment.
 
 The dyconex dataset has:
 - S (source): 52 unique variables, 106 sequence length
@@ -13,13 +15,14 @@ The dyconex dataset has:
   - Last 200 timesteps: delta_B_norm
 
 Example:
-    >>> from notebooks.eval_funs.eval_dyconex import eval_dyconex_predictions, eval_metrics
+    >>> from notebooks.eval_funs.eval_dyconex import eval_dyconex_predictions
+    >>> from notebooks.eval_funs.eval_training import eval_train_metrics
     >>> 
     >>> # Evaluate predictions on test set
     >>> results = eval_dyconex_predictions("../experiments/stage/stage_SM_SM_dyconex")
     >>> 
-    >>> # Flexible metric plotting
-    >>> df = eval_metrics("../experiments/stage/stage_SM_SM_dyconex")
+    >>> # Flexible metric plotting (use generalized function)
+    >>> df = eval_train_metrics("../experiments/stage/stage_SM_SM_dyconex")
 """
 
 import re
@@ -40,7 +43,13 @@ import sys
 sys.path.append(root_path)
 
 from causaliT.evaluation.predict import predict_test_from_ckpt
-from notebooks.lib import find_config_file, find_best_or_last_checkpoint, load_training_metrics
+
+# Import from local eval_funs modules (self-contained)
+from .eval_lib import (
+    find_config_file,
+    find_best_or_last_checkpoint,
+    load_training_metrics,
+)
 
 
 # =============================================================================
@@ -406,205 +415,6 @@ def eval_dyconex_predictions(
     return mae_statistics
 
 
-def eval_metrics(
-    experiment: str, 
-    show_plots: bool = True,
-    metric_patterns: List[str] = None,
-) -> pd.DataFrame:
-    """
-    Flexible metric plotting for any logged columns in StageCausaliT.
-    
-    Auto-discovers and plots any numeric columns from the training metrics CSV.
-    Groups related metrics (train/val pairs) together for easy comparison.
-    
-    StageCausaliT logs the following metrics (stage = train/val/test):
-    
-    **Core Metrics (always logged):**
-    - {stage}_loss: Total loss (MSE + regularizers)
-    - {stage}_loss_X: MSE loss for X reconstruction
-    - {stage}_loss_Y: MSE loss for Y prediction
-    - {stage}_mae_X: Mean Absolute Error for X
-    - {stage}_mae_Y: Mean Absolute Error for Y
-    - {stage}_mae: Combined MAE (X and Y)
-    - {stage}_r2_X: R² score for X
-    - {stage}_r2_Y: R² score for Y
-    
-    **Conditional Metrics (based on config):**
-    
-    If log_entropy=True:
-    - {stage}_dec1_cross_entropy: Decoder 1 cross-attention entropy (S→X)
-    - {stage}_dec1_self_entropy: Decoder 1 self-attention entropy (X→X)
-    - {stage}_dec2_cross_entropy: Decoder 2 cross-attention entropy (X→Y)
-    - {stage}_dec2_self_entropy: Decoder 2 self-attention entropy (Y→Y)
-    
-    If log_acyclicity=True:
-    - {stage}_notears: NOTEARS acyclicity constraint value
-    
-    If log_sparsity=True:
-    - {stage}_sparsity_self: Self-attention L1 sparsity penalty
-    - {stage}_sparsity_cross: Cross-attention L1 sparsity penalty
-    - {stage}_sparsity_total: Total sparsity regularization
-    
-    Args:
-        experiment: Path to the experiment folder containing k_* subdirectories
-        show_plots: If True, display plots. If False (for cluster), only save to files.
-        metric_patterns: Optional list of patterns to filter columns.
-                        If None, discovers and plots all numeric columns with train/val pairs.
-                        E.g., ["mae", "loss", "r2", "entropy", "sparsity", "notears"]
-        
-    Returns:
-        pd.DataFrame: Combined training metrics from all k-folds
-        
-    Output Files:
-        - fig/{metric_name}_{exp_id}.pdf: Plot for each discovered metric
-        - files/available_metrics.json: List of all discovered metrics
-        - files/metrics_labels.json: Description of StageCausaliT metrics
-        
-    Example:
-        >>> # Plot all metrics
-        >>> df = eval_metrics("../experiments/stage/my_experiment")
-        >>> 
-        >>> # Plot only loss and MAE metrics
-        >>> df = eval_metrics("../experiments/stage/my_experiment", metric_patterns=["loss", "mae"])
-    """
-    # Setup directories
-    eval_path_root, eval_path_fig, eval_path_files, eval_path_cline, exp_id = \
-        _setup_eval_directories(experiment, "eval_metrics")
-    
-    print(f"Experiment ID: {exp_id}")
-    
-    # Save README
-    _save_readme(
-        eval_path_root, eval_path_cline, eval_path_files, eval_path_fig,
-        description="Flexible metric plotting for all logged training metrics",
-        files_info={
-            "available_metrics.json": "List of all discovered metric columns",
-            "{metric}_{exp_id}.pdf": "Individual plots for each metric",
-        }
-    )
-    
-    # Load training metrics
-    df = load_training_metrics(experiment)
-    df = df.groupby(["kfold", "epoch"]).first().reset_index()
-    
-    # Get all numeric columns
-    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    
-    # Filter by patterns if provided
-    if metric_patterns is not None:
-        filtered_cols = []
-        for col in numeric_cols:
-            for pattern in metric_patterns:
-                if pattern.lower() in col.lower():
-                    filtered_cols.append(col)
-                    break
-        numeric_cols = filtered_cols
-    
-    # Exclude common non-metric columns
-    exclude_cols = ['epoch', 'step']
-    numeric_cols = [c for c in numeric_cols if c not in exclude_cols]
-    
-    # Group metrics into train/val pairs
-    metric_pairs = {}  # base_name -> {"train": col, "val": col}
-    standalone_metrics = []
-    
-    for col in numeric_cols:
-        if col.startswith("train_"):
-            base_name = col[6:]  # Remove "train_" prefix
-            if base_name not in metric_pairs:
-                metric_pairs[base_name] = {}
-            metric_pairs[base_name]["train"] = col
-        elif col.startswith("val_"):
-            base_name = col[4:]  # Remove "val_" prefix
-            if base_name not in metric_pairs:
-                metric_pairs[base_name] = {}
-            metric_pairs[base_name]["val"] = col
-        elif col.startswith("test_"):
-            # Skip test metrics (evaluated once)
-            pass
-        else:
-            standalone_metrics.append(col)
-    
-    # Save available metrics
-    available_metrics = {
-        "paired_metrics": list(metric_pairs.keys()),
-        "standalone_metrics": standalone_metrics,
-        "total_columns": len(numeric_cols),
-    }
-    with open(join(eval_path_files, "available_metrics.json"), 'w') as f:
-        json.dump(available_metrics, f, indent=2)
-    
-    print(f"Found {len(metric_pairs)} paired metrics and {len(standalone_metrics)} standalone metrics")
-    
-    # Plot paired metrics
-    for base_name, cols in metric_pairs.items():
-        train_col = cols.get("train")
-        val_col = cols.get("val")
-        
-        # Skip if we don't have both train and val
-        if train_col is None or val_col is None:
-            continue
-        
-        # Skip if columns don't exist or are all NaN
-        if train_col not in df.columns or val_col not in df.columns:
-            continue
-        if df[train_col].isna().all() or df[val_col].isna().all():
-            continue
-        
-        fig, ax = plt.subplots(figsize=(8, 5))
-        
-        # Plot validation (solid) and training (dashed)
-        sns.lineplot(data=df, x="epoch", y=val_col, hue="kfold", ax=ax)
-        sns.lineplot(data=df, x="epoch", y=train_col, hue="kfold", ax=ax, 
-                    legend=False, linestyle=":")
-        
-        # Determine if log scale is appropriate
-        min_val = min(df[val_col].min(), df[train_col].min())
-        max_val = max(df[val_col].max(), df[train_col].max())
-        if min_val > 0 and max_val / min_val > 100:
-            ax.set_yscale("log")
-        
-        ax.set_ylabel(base_name)
-        ax.set_title(f"{base_name}\nval (solid) | train (dashed)")
-        plt.tight_layout()
-        plt.savefig(join(eval_path_fig, f"{base_name}_{exp_id}.pdf"))
-        if show_plots:
-            plt.show()
-        else:
-            plt.close()
-        
-        print(f"  ✓ Plotted: {base_name}")
-    
-    # Plot standalone metrics
-    for col in standalone_metrics:
-        if col not in df.columns or df[col].isna().all():
-            continue
-        
-        fig, ax = plt.subplots(figsize=(8, 5))
-        sns.lineplot(data=df, x="epoch", y=col, hue="kfold", ax=ax)
-        
-        # Log scale if appropriate
-        min_val = df[col].min()
-        max_val = df[col].max()
-        if min_val > 0 and max_val / min_val > 100:
-            ax.set_yscale("log")
-        
-        ax.set_ylabel(col)
-        ax.set_title(col)
-        plt.tight_layout()
-        plt.savefig(join(eval_path_fig, f"{col}_{exp_id}.pdf"))
-        if show_plots:
-            plt.show()
-        else:
-            plt.close()
-        
-        print(f"  ✓ Plotted: {col}")
-    
-    print(f"\nEvaluation complete! Results saved to: {eval_path_root}")
-    
-    return df
-
-
 # =============================================================================
 # Main Entry Point
 # =============================================================================
@@ -612,6 +422,10 @@ def eval_metrics(
 if __name__ == "__main__":
     """
     Example usage for dyconex evaluation functions.
+    
+    For training metrics plotting, use eval_train_metrics from eval_training.py:
+        from notebooks.eval_funs.eval_training import eval_train_metrics
+        df = eval_train_metrics(experiment, show_plots=show_plots)
     """
     import argparse
     
@@ -634,6 +448,8 @@ if __name__ == "__main__":
     
     if args.function in ["metrics", "all"]:
         print("\n" + "="*60)
-        print("Running eval_metrics...")
+        print("Running eval_train_metrics (generalized)...")
         print("="*60)
-        eval_metrics(args.experiment, show_plots=show_plots)
+        # Import the generalized function from eval_training
+        from .eval_training import eval_train_metrics
+        eval_train_metrics(args.experiment, show_plots=show_plots)

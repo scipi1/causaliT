@@ -265,14 +265,14 @@ class SingleCausalForecaster(pl.LightningModule):
         print("✓ Forecaster unfrozen.")
     
     def forward(self, data_source: torch.Tensor, data_intermediate: torch.Tensor,
-                toggle_off_hard_masks: bool = False) -> Any:
+                disable_hard_masks: bool = False) -> Any:
         """
         Forward pass through the model.
         
         Args:
             data_source: Source nodes (S)
             data_intermediate: Intermediate variables (X)
-            toggle_off_hard_masks: If True, disables hard masks even if model was trained with them.
+            disable_hard_masks: If True, disables hard masks even if model was trained with them.
             
         Returns:
             pred_x: Predicted X from decoder
@@ -286,7 +286,7 @@ class SingleCausalForecaster(pl.LightningModule):
         x_blanked[:, :, self.val_idx] = 0.0
         
         # Determine whether to use hard masks
-        apply_hard_masks = self.use_hard_masks and not toggle_off_hard_masks
+        apply_hard_masks = self.use_hard_masks and not disable_hard_masks
         hard_masks = self.get_hard_masks() if apply_hard_masks else None
         
         # Model forward pass

@@ -118,15 +118,23 @@ The `StageCausalForecaster` automatically handles in-context masks:
 You can also override mask usage at inference time:
 
 ```python
-# Use default (from config)
+# Use default (from config) - masks enabled if trained with them
 pred_x, pred_y, *_ = forecaster.forward(S, X, Y)
 
-# Explicitly disable in-context masks for ablation
-pred_x, pred_y, *_ = forecaster.forward(S, X, Y, use_in_context_masks=False)
+# Disable hard masks for ablation studies (useful during inference)
+pred_x, pred_y, *_ = forecaster.forward(S, X, Y, disable_hard_masks=True)
 
-# Explicitly enable both mask types
-pred_x, pred_y, *_ = forecaster.forward(S, X, Y, use_hard_masks=True, use_in_context_masks=True)
+# Disable in-context masks for ablation studies
+pred_x, pred_y, *_ = forecaster.forward(S, X, Y, disable_in_context_masks=True)
+
+# Disable both mask types for full ablation
+pred_x, pred_y, *_ = forecaster.forward(S, X, Y, disable_hard_masks=True, disable_in_context_masks=True)
 ```
+
+**Note on parameter naming**: The `disable_hard_masks` and `disable_in_context_masks` parameters
+are used during **inference** to optionally disable masks that the model was trained with. 
+The class attributes `self.use_hard_masks` and `self.use_in_context_masks` (set from config)
+control whether masks are used during **training**.
 
 ### Mask Semantics
 

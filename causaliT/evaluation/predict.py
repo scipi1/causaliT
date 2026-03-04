@@ -199,7 +199,7 @@ def predict_test_from_ckpt(
     dataset_label: str = "test",
     cluster: bool = False,
     input_conditioning_fn: Callable[[torch.Tensor], torch.Tensor] = None,
-    use_hard_masks: bool = None,
+    disable_hard_masks: bool = False,
 ) -> PredictionResult:
     """
     Run standard prediction on specified dataset using a trained model checkpoint.
@@ -219,9 +219,9 @@ def predict_test_from_ckpt(
         dataset_label: One of ["train", "test", "all"]
         cluster: Whether running on cluster
         input_conditioning_fn: Optional function to condition inputs before forward pass
-        toggle_off_hard_masks: If True, disables hard masks even if model was trained with them.
-                              Useful for testing causality retention. Default False = use masks
-                              if model was trained with them. (StageCausaliT only)
+        disable_hard_masks: If True, disables hard masks even if model was trained with them.
+                           Useful for ablation studies during inference. Default False = use
+                           masks if model was trained with them.
         
     Returns:
         PredictionResult: Object containing:
@@ -251,12 +251,12 @@ def predict_test_from_ckpt(
         cluster=cluster
     )
     
-    # Run prediction - pass toggle_off_hard_masks for StageCausaliT models
+    # Run prediction - pass disable_hard_masks to disable masks for ablation studies
     results = predictor.predict(
         dm=dm,
         dataset_label=dataset_label,
         input_conditioning_fn=input_conditioning_fn,
-        use_hard_masks=use_hard_masks,
+        disable_hard_masks=disable_hard_masks,
     )
     
     return results
