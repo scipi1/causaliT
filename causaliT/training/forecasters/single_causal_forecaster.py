@@ -66,6 +66,12 @@ class SingleCausalForecaster(pl.LightningModule):
         # Logging for sparsity
         self.log_sparsity = config["training"].get("log_sparsity", False)
         
+        # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotAttention)
+        # These are independent parameters for fine-grained control over sparsity
+        self.lambda_l1_self_scores = config["training"].get("lambda_l1_self_scores", 0.0)
+        self.lambda_l1_cross_scores = config["training"].get("lambda_l1_cross_scores", 0.0)
+        self.log_l1_scores = config["training"].get("log_l1_scores", False)
+        
         # HSIC regularization - encourages independence between S and residuals
         # Lower HSIC values indicate better causal structure learning
         self.lambda_hsic = config["training"].get("lambda_hsic", 0)
@@ -112,18 +118,6 @@ class SingleCausalForecaster(pl.LightningModule):
         self.mae_x = tm.MeanAbsoluteError()
         self.rmse_x = tm.MeanSquaredError(squared=False)
         self.r2_x = tm.R2Score()
-        
-        # Optionally freeze embeddings
-        if config["training"].get("freeze_embeddings", False):
-            self.freeze_embeddings()
-        
-        # Optionally freeze decoder (for training only forecaster)
-        if config["training"].get("freeze_decoder", False):
-            self.freeze_decoder()
-        
-        # Optionally freeze forecaster (for training only attention)
-        if config["training"].get("freeze_forecaster", False):
-            self.freeze_forecaster()
     
     def _register_hard_mask_placeholders(self):
         """Register placeholder buffers for hard masks."""
@@ -171,98 +165,6 @@ class SingleCausalForecaster(pl.LightningModule):
                 masks[name] = getattr(self, buffer_name)
         
         return masks if masks else None
-    
-    def freeze_embedding_S(self):
-        """Freeze the S embedding (orthogonal, should already be frozen)."""
-        self.model.freeze_embedding_S()
-        print("✓ S embedding frozen.")
-    
-    def unfreeze_embedding_S(self):
-        """Unfreeze the S embedding."""
-        self.model.unfreeze_embedding_S()
-        print("✓ S embedding unfrozen.")
-    
-    def freeze_embedding_X(self):
-        """Freeze the X embedding (learnable)."""
-        self.model.freeze_embedding_X()
-        print("✓ X embedding frozen.")
-    
-    def unfreeze_embedding_X(self):
-        """Unfreeze the X embedding."""
-        self.model.unfreeze_embedding_X()
-        print("✓ X embedding unfrozen.")
-    
-    def freeze_embeddings(self):
-        """Freeze both S and X embeddings."""
-        self.freeze_embedding_S()
-        self.freeze_embedding_X()
-        print("✓ Both embeddings frozen.")
-    
-    def unfreeze_embeddings(self):
-        """Unfreeze both S and X embeddings (S will unfreeze value layer only)."""
-        self.unfreeze_embedding_S()
-        self.unfreeze_embedding_X()
-        print("✓ Both embeddings unfrozen.")
-    
-    def freeze_decoder(self):
-        """Freeze the entire decoder (attention + FFN)."""
-        for param in self.model.decoder.parameters():
-            param.requires_grad = False
-        print("✓ Decoder frozen.")
-    
-    def unfreeze_decoder(self):
-        """Unfreeze the entire decoder."""
-        for param in self.model.decoder.parameters():
-            param.requires_grad = True
-        print("✓ Decoder unfrozen.")
-    
-    def freeze_decoder_attention(self):
-        """Freeze only the attention layers in the decoder."""
-        for layer in self.model.decoder.layers:
-            for param in layer.global_cross_attention.parameters():
-                param.requires_grad = False
-            for param in layer.global_self_attention.parameters():
-                param.requires_grad = False
-        print("✓ Decoder attention layers frozen.")
-    
-    def unfreeze_decoder_attention(self):
-        """Unfreeze only the attention layers in the decoder."""
-        for layer in self.model.decoder.layers:
-            for param in layer.global_cross_attention.parameters():
-                param.requires_grad = True
-            for param in layer.global_self_attention.parameters():
-                param.requires_grad = True
-        print("✓ Decoder attention layers unfrozen.")
-    
-    def freeze_decoder_ffn(self):
-        """Freeze only the feedforward layers in the decoder."""
-        for layer in self.model.decoder.layers:
-            for param in layer.linear1.parameters():
-                param.requires_grad = False
-            for param in layer.linear2.parameters():
-                param.requires_grad = False
-        print("✓ Decoder FFN layers frozen.")
-    
-    def unfreeze_decoder_ffn(self):
-        """Unfreeze only the feedforward layers in the decoder."""
-        for layer in self.model.decoder.layers:
-            for param in layer.linear1.parameters():
-                param.requires_grad = True
-            for param in layer.linear2.parameters():
-                param.requires_grad = True
-        print("✓ Decoder FFN layers unfrozen.")
-    
-    def freeze_forecaster(self):
-        """Freeze the forecaster (de-embedding) layer."""
-        for param in self.model.forecaster.parameters():
-            param.requires_grad = False
-        print("✓ Forecaster frozen.")
-    
-    def unfreeze_forecaster(self):
-        """Unfreeze the forecaster (de-embedding) layer."""
-        for param in self.model.forecaster.parameters():
-            param.requires_grad = True
-        print("✓ Forecaster unfrozen.")
     
     def forward(self, data_source: torch.Tensor, data_intermediate: torch.Tensor,
                 disable_hard_masks: bool = False) -> Any:
@@ -422,6 +324,35 @@ class SingleCausalForecaster(pl.LightningModule):
             self.lambda_sparse_cross * cross_attention_sparsity
         )
         
+        # L1 regularization on attention SCORES (works for ANY attention type)
+        # This penalizes the attention weights directly, encouraging sparse attention patterns
+        def _get_att_scores_l1(att_weights_list):
+            """L1 penalty on attention weights (post-softmax/activation).
+            
+            Args:
+                att_weights_list: List of attention weight tensors from each layer
+                
+            Returns:
+                Mean L1 penalty across all layers
+            """
+            if not att_weights_list:
+                return 0.0
+            # Use the last layer's attention weights (most relevant for output)
+            # att_weights: (B, L, S) or (B, H, L, S)
+            return att_weights_list[-1].mean()
+        
+        # L1 on self-attention scores (dec_self)
+        l1_self_scores = _get_att_scores_l1(dec_self_att)
+        
+        # L1 on cross-attention scores (dec_cross)
+        l1_cross_scores = _get_att_scores_l1(dec_cross_att)
+        
+        # Total L1 scores regularizer
+        l1_scores_regularizer = (
+            self.lambda_l1_self_scores * l1_self_scores +
+            self.lambda_l1_cross_scores * l1_cross_scores
+        )
+        
         # Compute loss for X
         x_target = torch.nan_to_num(x_val)
         mse_x_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
@@ -501,6 +432,7 @@ class SingleCausalForecaster(pl.LightningModule):
                      acyclic_regularizer +
                      prior_regularizer +
                      sparsity_regularizer +
+                     l1_scores_regularizer +
                      hsic_regularizer +
                      decisiveness_regularizer)
         
@@ -526,6 +458,11 @@ class SingleCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
             self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
             self.log(f"{stage}_sparsity_total", sparsity_regularizer, on_step=False, on_epoch=True)
+        
+        # Log L1 scores regularization if requested
+        if self.log_l1_scores:
+            self.log(f"{stage}_l1_self_scores", l1_self_scores, on_step=False, on_epoch=True)
+            self.log(f"{stage}_l1_cross_scores", l1_cross_scores, on_step=False, on_epoch=True)
         
         # Log HSIC if requested
         if self.log_hsic and hsic_value is not None:

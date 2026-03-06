@@ -73,7 +73,7 @@ class StageCausalForecaster(pl.LightningModule):
         self.gamma = config["training"].get("gamma", 0)   # Entropy regularization
         self.kappa = config["training"].get("kappa", 0)   # Acyclicity regularization
         
-        # Sparsity regularization - L1 penalty on edge probabilities
+        # Sparsity regularization - L1 penalty on edge probabilities (phi)
         # Separate coefficients for self-attention and cross-attention (cross typically needs more)
         self.lambda_sparse = config["training"].get("lambda_sparse", 0)  # Uniform sparsity coefficient
         self.lambda_sparse_cross = config["training"].get("lambda_sparse_cross", None)  # Override for cross-attention
@@ -84,6 +84,12 @@ class StageCausalForecaster(pl.LightningModule):
         
         # Logging for sparsity
         self.log_sparsity = config["training"].get("log_sparsity", False)
+        
+        # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotAttention)
+        # These are independent parameters for fine-grained control over sparsity
+        self.lambda_l1_self_scores = config["training"].get("lambda_l1_self_scores", 0.0)
+        self.lambda_l1_cross_scores = config["training"].get("lambda_l1_cross_scores", 0.0)
+        self.log_l1_scores = config["training"].get("log_l1_scores", False)
         
         # In-context mask configuration (computed per-batch from data features)
         self.use_in_context_masks = config["training"].get("use_in_context_masks", False)
@@ -462,6 +468,41 @@ class StageCausalForecaster(pl.LightningModule):
             self.lambda_sparse_cross * cross_attention_sparsity
         )
         
+        # L1 regularization on attention SCORES (works for ANY attention type)
+        # This penalizes the attention weights directly, encouraging sparse attention patterns
+        def _get_att_scores_l1(att_weights_list):
+            """L1 penalty on attention weights (post-softmax/activation).
+            
+            Args:
+                att_weights_list: List of attention weight tensors from each layer
+                
+            Returns:
+                Mean L1 penalty across all layers
+            """
+            if not att_weights_list:
+                return 0.0
+            # Use the last layer's attention weights (most relevant for output)
+            # att_weights: (B, L, S) or (B, H, L, S)
+            return att_weights_list[-1].mean()
+        
+        # L1 on self-attention scores (dec1_self + dec2_self)
+        l1_self_scores = (
+            _get_att_scores_l1(dec1_self_att) + 
+            _get_att_scores_l1(dec2_self_att)
+        )
+        
+        # L1 on cross-attention scores (dec1_cross + dec2_cross)
+        l1_cross_scores = (
+            _get_att_scores_l1(dec1_cross_att) + 
+            _get_att_scores_l1(dec2_cross_att)
+        )
+        
+        # Total L1 scores regularizer
+        l1_scores_regularizer = (
+            self.lambda_l1_self_scores * l1_self_scores +
+            self.lambda_l1_cross_scores * l1_cross_scores
+        )
+        
         # Compute losses for X and Y
         x_target = torch.nan_to_num(x_val)
         y_target = torch.nan_to_num(y_val)
@@ -478,7 +519,8 @@ class StageCausalForecaster(pl.LightningModule):
                      entropy_regularizer + 
                      acyclic_regularizer +
                      prior_regularizer +
-                     sparsity_regularizer)
+                     sparsity_regularizer +
+                     l1_scores_regularizer)
         
         # =====================================================================
         # LOGGING - Coherent naming: {stage}_{metric}_{target}
@@ -528,6 +570,11 @@ class StageCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
             self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
             self.log(f"{stage}_sparsity_total", sparsity_regularizer, on_step=False, on_epoch=True)
+        
+        # Log L1 scores regularization if requested
+        if self.log_l1_scores:
+            self.log(f"{stage}_l1_self_scores", l1_self_scores, on_step=False, on_epoch=True)
+            self.log(f"{stage}_l1_cross_scores", l1_cross_scores, on_step=False, on_epoch=True)
         
         return total_loss, pred_x, pred_y, X, Y
     

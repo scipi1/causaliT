@@ -75,7 +75,8 @@ NAMING_RULES = {
     # Optional parts (may not be present in name)
     "PhiParametrization": {
         "config_key": "model.kwargs.dag_parameterization_self",  # Only self-attention!
-        "default": None,  # If not in name, config should be null (don't check)
+        "default": None,  # If not in name, config should be None (validated!)
+        "valid_values": ["independent", "gated", "antisymmetric"],  # Valid non-None values
         "options": {
             "antisym": "antisymmetric",
             "gated": "gated",
@@ -100,6 +101,63 @@ NAMING_RULES = {
 
 # All possible optional suffixes (order matters for parsing)
 OPTIONAL_SUFFIXES = ["antisym", "gated", "indep", "SVFA", "hard"]
+
+
+# ============================================================================
+# Standard Values Configuration
+# ============================================================================
+# These are values that should be consistent across experiments for fair comparison.
+# The test will WARN (not fail) if these values don't match the expected standards.
+
+STANDARD_VALUES = {
+    
+    # Experimental parameters - architecture
+    "experiment.d_model_set": 12,
+    "experiment.dec_layers": 1,
+    "experiment.n_heads": 1,
+    "experiment.d_ff": 24,
+    "experiment.d_qk": 6,
+    "experiment.dropout": 0.0,
+    
+    # Experimental parameters - training
+    "experiment.lr": 0.001,          # Learning rate
+    "experiment.batch_size": 64,
+    "experiment.max_epochs": 100,
+    
+    # Logging flags - all should be True for proper comparison and analysis
+    "training.log_entropy": True,
+    "training.log_acyclicity": True,
+    "training.log_sparsity": True,
+    "training.log_hsic": True,
+    "training.log_decisiveness": True,
+    
+    # Regularization lambdas - baseline values (HSIC off for architecture comparison)
+    "training.gamma": 0.0,              # Entropy regularization weight
+    "training.kappa": 0.0,              # Acyclicity regularization (NOTEARS)
+    "training.lambda_sparse": 0.0,      # Sparsity for self-attention
+    "training.lambda_sparse_cross": 0.0,  # Sparsity for cross-attention
+    "training.lambda_hsic": 0.0,        # HSIC OFF for baseline architecture comparison
+    "training.hsic_sigma": 1.0,         # RBF kernel bandwidth for HSIC
+    "training.lambda_decisive": 0.0,    # Decisiveness (binary entropy) loss
+    "training.lambda_decisive_cross": 0.,  # Decisiveness for cross-attention
+    "training.lambda_tau": 0.0,        # Temperature penalty
+    "training.target_tau": 0.0,         # Target Gumbel-Softmax temperature
+    
+    # Cross-attention consistency - for isolating self-attention effects
+    "model.kwargs.dec_cross_attention_type": "ScaledDotProduct",
+}
+
+
+@dataclass
+class StandardValueWarning:
+    """Represents a non-standard value that differs from expected."""
+    config_key: str
+    expected_value: Any
+    actual_value: Any
+    
+    def __str__(self):
+        return (f"  ⚠ {self.config_key}: "
+                f"expected '{self.expected_value}' but found '{self.actual_value}'")
 
 
 # ============================================================================
@@ -276,16 +334,29 @@ def validate_experiment(name: str, config: OmegaConf) -> List[Inconsistency]:
             "dataset", parsed.dataset, actual_value, rule["config_key"]
         ))
     
-    # Check PhiParametrization (only if specified in name)
+    # Check PhiParametrization
+    rule = NAMING_RULES["PhiParametrization"]
+    actual_value = get_config_value(config, rule["config_key"])
+    
     if parsed.phi_param is not None:
-        rule = NAMING_RULES["PhiParametrization"]
+        # Suffix present: config should match the specified value
         expected_value = rule["options"].get(parsed.phi_param)
-        if expected_value:
-            actual_value = get_config_value(config, rule["config_key"])
-            if actual_value != expected_value:
-                inconsistencies.append(Inconsistency(
-                    "PhiParametrization", parsed.phi_param, actual_value, rule["config_key"]
-                ))
+        if expected_value and actual_value != expected_value:
+            inconsistencies.append(Inconsistency(
+                "PhiParametrization", parsed.phi_param, actual_value, rule["config_key"]
+            ))
+    else:
+        # No suffix: config should be None (not in valid_values)
+        # If the self-attention type doesn't support learnable phi, config should be None
+        valid_phi_values = rule.get("valid_values", [])
+        if actual_value is not None and actual_value in valid_phi_values:
+            # Config has a valid phi parametrization but name doesn't indicate it
+            inconsistencies.append(Inconsistency(
+                "PhiParametrization", 
+                "None (no suffix in name)", 
+                actual_value, 
+                rule["config_key"]
+            ))
     
     # Check embeddingsComposition
     rule = NAMING_RULES["embeddingsComposition"]
@@ -318,6 +389,42 @@ def validate_experiment(name: str, config: OmegaConf) -> List[Inconsistency]:
         ))
     
     return inconsistencies
+
+
+# ============================================================================
+# Standard Values Validation
+# ============================================================================
+
+def check_standard_values(config: OmegaConf) -> List[StandardValueWarning]:
+    """
+    Check if config values match the expected standard values.
+    
+    This is for ensuring consistent experimental conditions across experiments.
+    Returns warnings (not errors) for non-standard values.
+    
+    Args:
+        config: Loaded config file
+        
+    Returns:
+        List of StandardValueWarning objects (empty if all match standards)
+    """
+    warnings = []
+    
+    for key_path, expected_value in STANDARD_VALUES.items():
+        actual_value = get_config_value(config, key_path)
+        
+        # Skip if key doesn't exist (might be optional)
+        if actual_value is None:
+            continue
+        
+        if actual_value != expected_value:
+            warnings.append(StandardValueWarning(
+                config_key=key_path,
+                expected_value=expected_value,
+                actual_value=actual_value
+            ))
+    
+    return warnings
 
 
 # ============================================================================
@@ -455,6 +562,65 @@ class TestAllExperimentsConsistency:
         assert len(all_inconsistencies) == 0, (
             f"{len(all_inconsistencies)} experiments have naming inconsistencies"
         )
+
+
+class TestStandardValues:
+    """Check if experiments use standard values for fair comparison."""
+    
+    def test_all_experiments_standard_values(self):
+        """
+        Check all experiments for non-standard values.
+        
+        This test WARNS but does not fail for non-standard values.
+        It helps identify experiments that may not be directly comparable.
+        """
+        experiments = discover_experiments(DEFAULT_MODELS_DIR)
+        
+        if not experiments:
+            pytest.skip(f"No experiments found in {DEFAULT_MODELS_DIR}")
+        
+        all_warnings = {}
+        standard_count = 0
+        
+        for name, config_path in experiments:
+            try:
+                config = OmegaConf.load(config_path)
+                warnings = check_standard_values(config)
+                
+                if warnings:
+                    all_warnings[name] = warnings
+                else:
+                    standard_count += 1
+                    
+            except Exception as e:
+                all_warnings[name] = [
+                    StandardValueWarning("config_load", "valid config", str(e))
+                ]
+        
+        # Report summary
+        print(f"\n{'='*70}")
+        print(f"Standard Values Report")
+        print(f"{'='*70}")
+        print(f"Total experiments: {len(experiments)}")
+        print(f"Using standard values: {standard_count}")
+        print(f"Non-standard values: {len(all_warnings)}")
+        
+        if all_warnings:
+            print(f"\n{'='*70}")
+            print("NON-STANDARD VALUES (warnings):")
+            print(f"{'='*70}")
+            for name, warnings in all_warnings.items():
+                print(f"\n{name}:")
+                for warning in warnings:
+                    print(str(warning))
+        
+        # FAIL if any experiment has non-standard values
+        # This ensures consistent experimental conditions for fair comparison
+        assert len(all_warnings) == 0, (
+            f"{len(all_warnings)} experiments have non-standard values. "
+            f"Update configs to match STANDARD_VALUES or adjust STANDARD_VALUES in test file."
+        )
+        print("\n✓ All experiments use standard values!")
 
 
 # ============================================================================

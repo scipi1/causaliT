@@ -357,6 +357,12 @@ training:
   gamma: 0.0              # Entropy regularization weight (0 = disabled)
   kappa: 0.0              # Acyclicity regularization weight (NOTEARS)
   
+  # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotProduct)
+  # These are independent parameters - each can be controlled separately
+  lambda_l1_self_scores: 0.0   # L1 penalty on self-attention scores (X→X and Y→Y)
+  lambda_l1_cross_scores: 0.0  # L1 penalty on cross-attention scores (S→X and X→Y)
+  log_l1_scores: false         # Log L1 scores regularization values
+  
   # Jacobian logging
   log_jacobian: false
   jacobian_every_n_epochs: 1

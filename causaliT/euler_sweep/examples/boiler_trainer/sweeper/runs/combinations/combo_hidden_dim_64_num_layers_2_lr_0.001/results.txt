@@ -1,3 +1,0 @@
-Training completed
-Final val loss: 0.6899
-Final train loss: 0.5958

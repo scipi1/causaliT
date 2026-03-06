@@ -474,6 +474,9 @@ class DAGMask(nn.Module):
     is parameterized independently. This allows bidirectional edges and 
     doesn't enforce DAG structure constraints.
     
+    Note: For square matrices (self-attention), the diagonal is zeroed out
+    to prevent self-loops, consistent with DAGMaskAntisym and DAGMaskGated.
+    
     Args:
         n_heads: Number of attention heads
         query_seq_len: Length of query sequence
@@ -494,11 +497,28 @@ class DAGMask(nn.Module):
         Returns the posterior probability of each edge being active in the learned DAG.
         
         For independent parameterization, this is simply sigmoid(phi).
+        For square matrices (self-attention), the diagonal is zeroed out to
+        prevent self-loops, consistent with DAGMaskAntisym and DAGMaskGated.
         
         Returns:
             torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
+                         Diagonal is 0 for square matrices.
         """
-        return torch.sigmoid(self.phi)
+        probs = torch.sigmoid(self.phi)
+        
+        # Zero out diagonal for square matrices (no self-loops in DAG)
+        if probs.dim() == 2:
+            # Single-head: (L, S)
+            if probs.shape[0] == probs.shape[1]:
+                diag_mask = torch.eye(probs.shape[0], probs.shape[1], device=probs.device, dtype=torch.bool)
+                probs = probs.masked_fill(diag_mask, 0.0)
+        elif probs.dim() == 3:
+            # Multi-head: (H, L, S)
+            if probs.shape[1] == probs.shape[2]:
+                diag_mask = torch.eye(probs.shape[1], probs.shape[2], device=probs.device, dtype=torch.bool)
+                probs = probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        return probs
     
     def get_dag_logits(self) -> torch.Tensor:
         """
