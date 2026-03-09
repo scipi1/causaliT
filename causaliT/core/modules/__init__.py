@@ -15,6 +15,7 @@ from .embedding import ModularEmbedding
 from .orthogonal_embedding import OrthogonalMaskEmbedding
 from .embedding_layers import *
 from .extra_layers import Normalization, UniformAttentionMask, DAGMask
+from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
 
 __all__ = [
     'LieAttention',
@@ -32,4 +33,9 @@ __all__ = [
     'Normalization',
     'UniformAttentionMask',
     'DAGMask',
+    # Noise-aware modules
+    'AmbientNoiseLayer',
+    'ReadingNoiseHead',
+    'GaussianNLLLoss',
+    'VariancePropagationTracker',
 ]

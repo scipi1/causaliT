@@ -24,7 +24,7 @@ from causaliT.training.callbacks import (
     BestCheckpointCallback, DataIndexTracker, 
     KFoldResultsTracker, GradientJacobianLogger
 )
-from causaliT.training.forecasters import TransformerForecaster, StageCausalForecaster, SingleCausalForecaster
+from causaliT.training.forecasters import TransformerForecaster, StageCausalForecaster, SingleCausalForecaster, NoiseAwareCausalForecaster
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
 from causaliT.training.experiment_control import update_config
@@ -321,7 +321,7 @@ def get_model_class(config: dict):
         Model class (Lightning Module class, not instance)
     """
     model_obj = config["model"]["model_object"]
-    available_models = ["proT", "StageCausaliT", "SingleCausalLayer", "LSTM", "GRU", "TCN", "MLP"]
+    available_models = ["proT", "StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer", "LSTM", "GRU", "TCN", "MLP"]
     
     assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
 
@@ -329,6 +329,7 @@ def get_model_class(config: dict):
         "proT": TransformerForecaster,
         "StageCausaliT": StageCausalForecaster,
         "SingleCausalLayer": SingleCausalForecaster,
+        "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
         # "GRU": RNNForecaster,
         # "LSTM": RNNForecaster,
         # "TCN": RNNForecaster,
@@ -343,18 +344,20 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
     
     Args:
         config: Configuration dictionary
-        data_dir: Data directory path (needed for StageCausaliT/SingleCausalLayer hard masks)
+        data_dir: Data directory path (needed for StageCausaliT/SingleCausalLayer/NoiseAwareSingleCausalLayer hard masks)
         
     Returns:
         Model instance (Lightning Module)
     """
     model_obj = config["model"]["model_object"]
     
-    # StageCausaliT and SingleCausalLayer need data_dir for hard mask loading
+    # StageCausaliT, SingleCausalLayer, and NoiseAwareSingleCausalLayer need data_dir for hard mask loading
     if model_obj == "StageCausaliT":
         return StageCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "SingleCausalLayer":
         return SingleCausalForecaster(config, data_dir=data_dir)
+    elif model_obj == "NoiseAwareSingleCausalLayer":
+        return NoiseAwareCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
         return TransformerForecaster(config)
     else:
@@ -369,7 +372,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     
     Different models may require different data formats:
     - Standard models (ProT, LSTM, etc.): (X, Y) format
-    - StageCausaliT, SingleCausalLayer: (S, X, Y) format
+    - StageCausaliT, SingleCausalLayer, NoiseAwareSingleCausalLayer: (S, X, Y) format
     
     Args:
         config: Configuration dictionary
@@ -386,6 +389,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "proT": ProcessDataModule,
         "StageCausaliT": StageCausalDataModule,
         "SingleCausalLayer": StageCausalDataModule,  # Uses same (S, X, Y) format
+        "NoiseAwareSingleCausalLayer": StageCausalDataModule,  # Uses same (S, X, Y) format
         "LSTM": ProcessDataModule,
         "GRU": ProcessDataModule,
         "TCN": ProcessDataModule,
@@ -394,8 +398,8 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
     
-    # StageCausaliT and SingleCausalLayer use a single file with (s, x, y) arrays
-    if model_obj in ["StageCausaliT", "SingleCausalLayer"]:
+    # StageCausaliT, SingleCausalLayer, and NoiseAwareSingleCausalLayer use a single file with (s, x, y) arrays
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer"]:
         dm = DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],  # Single .npz file with s, x, y
