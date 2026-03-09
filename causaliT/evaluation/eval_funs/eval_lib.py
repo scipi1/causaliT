@@ -29,6 +29,7 @@ from causaliT.evaluation.predict import predict_test_from_ckpt
 from causaliT.training.forecasters.transformer_forecaster import TransformerForecaster
 from causaliT.training.forecasters.stage_causal_forecaster import StageCausalForecaster
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
+from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
 
 # Import root_path from eval_utils (relative import)
 from .eval_utils import root_path
@@ -213,7 +214,7 @@ def get_architecture_type(config: dict) -> str:
         config: OmegaConf configuration
         
     Returns:
-        str: "TransformerForecaster", "StageCausalForecaster", or "SingleCausalForecaster"
+        str: "TransformerForecaster", "StageCausalForecaster", "SingleCausalForecaster", or "NoiseAwareCausalForecaster"
     """
     model_obj = config["model"]["model_object"]
     
@@ -223,6 +224,8 @@ def get_architecture_type(config: dict) -> str:
         return "StageCausalForecaster"
     elif model_obj == "SingleCausalLayer":
         return "SingleCausalForecaster"
+    elif model_obj == "NoiseAwareSingleCausalLayer":
+        return "NoiseAwareCausalForecaster"
     else:
         raise ValueError(f"Unknown model type: {model_obj}")
 
@@ -305,6 +308,20 @@ def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[
         
         # Compatibility keys
         phi_dict["encoder"] = None  # No encoder in SingleCausal
+        phi_dict["cross"] = phi_dict["decoder_cross"]  # Alias for compatibility
+    
+    elif architecture_type == "NoiseAwareCausalForecaster":
+        # Same structure as SingleCausalForecaster
+        # Decoder self-attention DAG (X -> X structure)
+        dec_self_inner = model.model.decoder.layers[0].global_self_attention.inner_attention
+        phi_dict["decoder"] = _get_dag_probs(dec_self_inner)
+        
+        # Decoder cross-attention DAG (S -> X structure)
+        dec_cross_inner = model.model.decoder.layers[0].global_cross_attention.inner_attention
+        phi_dict["decoder_cross"] = _get_dag_probs(dec_cross_inner)
+        
+        # Compatibility keys
+        phi_dict["encoder"] = None  # No encoder in NoiseAware
         phi_dict["cross"] = phi_dict["decoder_cross"]  # Alias for compatibility
     
     return phi_dict
@@ -476,6 +493,50 @@ def extract_embeddings_from_model(model, architecture_type: str) -> Dict[str, Di
         if hasattr(model.model, 'forecaster'):
             _extract_forecaster(model.model.forecaster, "forecaster")
     
+    elif architecture_type == "NoiseAwareCausalForecaster":
+        # Same structure as SingleCausalForecaster
+        # S embedding (orthogonal)
+        if hasattr(model.model, 'embedding_S'):
+            _extract_orthogonal_embedding(model.model.embedding_S, "embedding_S")
+        
+        # X embedding (modular)
+        if hasattr(model.model, 'embedding_X'):
+            _extract_modular_embedding(model.model.embedding_X, "embedding_X")
+        
+        # Output head (replaces forecaster, includes mean and variance projections)
+        if hasattr(model.model, 'output_head'):
+            # Mean projection
+            if hasattr(model.model.output_head, 'mean_projection'):
+                weight = model.model.output_head.mean_projection.weight.detach().cpu().numpy()
+                embeddings["output_head_mean_weight"] = {
+                    "weight": weight,
+                    "type": "Linear.weight",
+                    "shape": weight.shape,
+                    "component": "output_head",
+                    "var_idx": None,
+                }
+            
+            # Noise parameters (sigma_A, sigma_R)
+            if hasattr(model.model, 'ambient_noise') and hasattr(model.model.ambient_noise, 'log_sigma_A'):
+                sigma_A = model.model.ambient_noise.sigma_A.detach().cpu().numpy()
+                embeddings["noise_sigma_A"] = {
+                    "weight": sigma_A,
+                    "type": "noise_param",
+                    "shape": sigma_A.shape,
+                    "component": "ambient_noise",
+                    "var_idx": None,
+                }
+            
+            if hasattr(model.model.output_head, 'log_sigma_R'):
+                sigma_R = model.model.output_head.sigma_R.detach().cpu().numpy()
+                embeddings["noise_sigma_R"] = {
+                    "weight": sigma_R,
+                    "type": "noise_param",
+                    "shape": sigma_R.shape,
+                    "component": "output_head",
+                    "var_idx": None,
+                }
+    
     return embeddings
 
 
@@ -601,6 +662,21 @@ def load_attention_data(
             "decoder_cross": [],  # Cross-attention DAG (S -> X)
             "cross": [],  # Alias for decoder_cross
         }
+    elif architecture_type == "NoiseAwareCausalForecaster":
+        # Same structure as SingleCausalForecaster
+        result.attention_weights = {
+            "encoder": [],  # Empty for compatibility
+            "decoder": [],  # Mapped to dec_self for compatibility
+            "cross": [],    # Mapped to dec_cross for compatibility
+            "dec_self": [],
+            "dec_cross": [],
+        }
+        result.phi_tensors = {
+            "encoder": [],
+            "decoder": [],
+            "decoder_cross": [],  # Cross-attention DAG (S -> X)
+            "cross": [],  # Alias for decoder_cross
+        }
     
     # Process each k-fold
     for kfold_dir in kfold_dirs:
@@ -663,6 +739,14 @@ def load_attention_data(
                 result.attention_weights["encoder"].append(None)
                 result.attention_weights["decoder"].append(att_weights.get("dec_self"))
                 result.attention_weights["cross"].append(att_weights.get("dec_cross"))
+            elif architecture_type == "NoiseAwareCausalForecaster":
+                # NoiseAwareCausalPredictor returns keys: dec_cross, dec_self (same as SingleCausal)
+                result.attention_weights["dec_self"].append(att_weights.get("dec_self"))
+                result.attention_weights["dec_cross"].append(att_weights.get("dec_cross"))
+                # For compatibility with notebook code expecting encoder/decoder/cross
+                result.attention_weights["encoder"].append(None)
+                result.attention_weights["decoder"].append(att_weights.get("dec_self"))
+                result.attention_weights["cross"].append(att_weights.get("dec_cross"))
             
             # Load model and extract phi tensors
             if architecture_type == "TransformerForecaster":
@@ -671,6 +755,8 @@ def load_attention_data(
                 model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
             elif architecture_type == "SingleCausalForecaster":
                 model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+            elif architecture_type == "NoiseAwareCausalForecaster":
+                model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
             
             phi_dict = extract_phi_from_model(model, architecture_type)
             
@@ -1105,6 +1191,8 @@ def load_embeddings_evolution(
                         model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
                     elif architecture_type == "SingleCausalForecaster":
                         model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+                    elif architecture_type == "NoiseAwareCausalForecaster":
+                        model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
                     
                     # Extract embeddings
                     embeddings = extract_embeddings_from_model(model, architecture_type)
