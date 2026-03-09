@@ -70,7 +70,10 @@ class StageCausalForecaster(pl.LightningModule):
         self.log_acyclicity = config["training"].get("log_acyclicity", False)
         
         # Regularizers
-        self.gamma = config["training"].get("gamma", 0)   # Entropy regularization
+        # Entropy regularization - encourages focused attention (low entropy)
+        # Higher lambda = more penalty for high entropy = more focused attention
+        self.lambda_entropy_self = config["training"].get("lambda_entropy_self", 0.0)
+        self.lambda_entropy_cross = config["training"].get("lambda_entropy_cross", 0.0)
         self.kappa = config["training"].get("kappa", 0)   # Acyclicity regularization
         
         # Sparsity regularization - L1 penalty on edge probabilities (phi)
@@ -318,7 +321,7 @@ class StageCausalForecaster(pl.LightningModule):
         dec1_cross_ent, dec1_self_ent, dec2_cross_ent, dec2_self_ent = entropies
         
         # Compute entropy regularization if needed
-        if self.gamma > 0 or self.log_entropy:
+        if self.lambda_entropy_self > 0 or self.lambda_entropy_cross > 0 or self.log_entropy:
             # Average entropy across all layers
             dec1_cross_ent_batch = torch.concat(dec1_cross_ent, dim=0).mean()
             dec1_self_ent_batch = torch.concat(dec1_self_ent, dim=0).mean()
@@ -366,13 +369,13 @@ class StageCausalForecaster(pl.LightningModule):
         dec2_cross_runav_mean = getattr(dec2_cross_inner, 'runav_att_mean', None)
         dec2_cross_runav_snr = getattr(dec2_cross_inner, 'runav_att_snr', None)
         
-        # Entropy regularizer
-        if self.gamma > 0:
-            entropy_regularizer = self.gamma * (
-                1.0 / dec1_cross_ent_batch + 
-                1.0 / dec1_self_ent_batch + 
-                1.0 / dec2_cross_ent_batch + 
-                1.0 / dec2_self_ent_batch
+        # Entropy regularizer - encourages focused attention (low entropy)
+        # Higher entropy = more uniform attention = more exploration
+        # Lower entropy = more focused attention = more decisive
+        if self.lambda_entropy_self > 0 or self.lambda_entropy_cross > 0:
+            entropy_regularizer = (
+                self.lambda_entropy_self * (dec1_self_ent_batch + dec2_self_ent_batch) +
+                self.lambda_entropy_cross * (dec1_cross_ent_batch + dec2_cross_ent_batch)
             )
         else:
             entropy_regularizer = 0.0
@@ -468,10 +471,15 @@ class StageCausalForecaster(pl.LightningModule):
             self.lambda_sparse_cross * cross_attention_sparsity
         )
         
-        # L1 regularization on attention SCORES (works for ANY attention type)
-        # This penalizes the attention weights directly, encouraging sparse attention patterns
+        # L1 regularization on attention SCORES
+        # NOTE: This is INEFFECTIVE for ScaledDotProduct attention because post-softmax
+        # weights always sum to 1, making the mean approximately constant (1/seq_len).
+        # For ScaledDotProduct, use lambda_entropy_* instead for sparsity.
+        # This regularizer is kept for attention types with learnable phi parameters.
         def _get_att_scores_l1(att_weights_list):
             """L1 penalty on attention weights (post-softmax/activation).
+            
+            NOTE: Ineffective for ScaledDotProduct attention - use entropy regularization instead.
             
             Args:
                 att_weights_list: List of attention weight tensors from each layer

@@ -68,14 +68,19 @@ def main(exp_dir, combinations_file, task_id):
     combination = metadata['combinations'][task_id]
     print(f"[Worker] Running combination: {combination['description']}")
     
-    # Load base config
+    # Load base config (unresolved - contains interpolation references like ${experiment.param})
     base_config = OmegaConf.create(metadata['base_config'])
     
-    # Apply parameter changes for this combination
-    config = OmegaConf.create(OmegaConf.to_container(base_config, resolve=True))
+    # Apply parameter changes for this combination BEFORE resolving interpolations
+    # This ensures that references like model.kwargs.param: ${experiment.param}
+    # will pick up the updated sweep values when resolved later.
+    config = OmegaConf.create(OmegaConf.to_container(base_config, resolve=False))
     for param_name, param_value in combination['params'].items():
         category = combination['categories'][param_name]
         config[category][param_name] = param_value
+    
+    # Now resolve interpolations - references will use the updated parameter values
+    config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     
     # Import training function dynamically
     try:

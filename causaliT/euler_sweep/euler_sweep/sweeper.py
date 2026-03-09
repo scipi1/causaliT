@@ -324,10 +324,16 @@ def run_sequential_sweep(
         logger.info(f"[{idx+1}/{len(combinations)}] Running: {combo['description']}")
         
         # Create modified config for this combination
-        config_copy = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+        # IMPORTANT: Don't resolve interpolations yet! We need to update parameters first
+        # so that any references (e.g., model.kwargs.param: ${experiment.param}) will
+        # pick up the updated values when resolved later.
+        config_copy = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
         for param_name, param_value in combo['params'].items():
             category = combo['categories'][param_name]
             config_copy[category][param_name] = param_value
+        
+        # Now resolve interpolations - references will use the updated parameter values
+        config_copy = OmegaConf.create(OmegaConf.to_container(config_copy, resolve=True))
         
         # Determine save directory
         if sweep_mode == "independent":
@@ -474,8 +480,11 @@ def run_parallel_sweep(
         makedirs(combinations_dir)
     
     # Prepare combinations metadata
+    # IMPORTANT: Save base_config WITHOUT resolving interpolations so that
+    # the worker can apply parameter changes before resolution.
+    # This ensures references like ${experiment.param} pick up updated values.
     combinations_data = {
-        'base_config': OmegaConf.to_container(config, resolve=True),
+        'base_config': OmegaConf.to_container(config, resolve=False),
         'combinations': combinations,
         'sweep_mode': sweep_mode,
         'data_dir': data_dir,

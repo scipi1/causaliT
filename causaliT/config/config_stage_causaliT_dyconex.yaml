@@ -354,7 +354,12 @@ training:
   # Regularization
   log_entropy: False
   log_acyclicity: True
-  gamma: 0.0              # Entropy regularization weight (0 = disabled)
+  
+  # Entropy regularization - encourages FOCUSED attention (low entropy)
+  # Higher lambda = more penalty for high entropy = sharper attention
+  lambda_entropy_self: 0.0   # Entropy penalty on self-attention (X→X and Y→Y)
+  lambda_entropy_cross: 0.0  # Entropy penalty on cross-attention (S→X and X→Y)
+  
   kappa: 0.0              # Acyclicity regularization weight (NOTEARS)
   
   # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotProduct)
