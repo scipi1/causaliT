@@ -39,9 +39,9 @@ from .eval_lib import load_training_metrics
 
 # Default plot options for common metrics
 DEFAULT_PLOT_OPTIONS = {
-    "loss": {"ylabel": "Loss (MSE)", "use_log_scale": "always"},
-    "loss_X": {"ylabel": "Loss X (MSE)", "use_log_scale": "always"},
-    "loss_Y": {"ylabel": "Loss Y (MSE)", "use_log_scale": "always"},
+    "loss": {"ylabel": "Loss (MSE)", "use_log_scale": "auto"},
+    "loss_X": {"ylabel": "Loss X (MSE)", "use_log_scale": "auto"},
+    "loss_Y": {"ylabel": "Loss Y (MSE)", "use_log_scale": "auto"},
     "mae": {"ylabel": "MAE", "use_log_scale": "auto"},
     "mae_X": {"ylabel": "MAE X", "use_log_scale": "auto"},
     "mae_Y": {"ylabel": "MAE Y", "use_log_scale": "auto"},

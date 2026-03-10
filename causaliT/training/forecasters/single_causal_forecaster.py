@@ -39,7 +39,15 @@ class SingleCausalForecaster(pl.LightningModule):
         super().__init__()
         
         self.config = config
-        self.model = SingleCausalLayer(**config["model"]["kwargs"])
+        
+        # Build model kwargs, adding attention_bypass from top-level config if present
+        # This allows sweeping attention_bypass at the model.attention_bypass level
+        # (sweeper requires 2-level nesting: category.parameter)
+        model_kwargs = dict(config["model"]["kwargs"])
+        if "attention_bypass" in config.get("model", {}):
+            model_kwargs["attention_bypass"] = config["model"]["attention_bypass"]
+        
+        self.model = SingleCausalLayer(**model_kwargs)
         
         # Loss function
         if config["training"]["loss_fn"] == "mse":
@@ -98,6 +106,12 @@ class SingleCausalForecaster(pl.LightningModule):
         self.lambda_tau = config["training"].get("lambda_tau", 0)
         self.target_tau = config["training"].get("target_tau", 0.1)
         self.log_decisiveness = config["training"].get("log_decisiveness", False)
+        
+        # Embedding L1 regularization - limits embedding capacity for causal capacity assessment
+        # Higher lambda_embed_l1 → sparser/lower-capacity embeddings
+        # Used in ANS (Attention Necessity Score) evaluation to determine if attention is necessary
+        self.lambda_embed_l1 = config["training"].get("lambda_embed_l1", 0.0)
+        self.log_embed_l1 = config["training"].get("log_embed_l1", False)
         
         if self.lambda_decisive_cross is None:
             self.lambda_decisive_cross = self.lambda_decisive
@@ -436,6 +450,15 @@ class SingleCausalForecaster(pl.LightningModule):
             self.lambda_tau * (tau_self_loss + tau_cross_loss)
         )
         
+        # Embedding L1 regularizer - limits embedding capacity
+        # Used for Attention Necessity Score (ANS) evaluation
+        if self.lambda_embed_l1 > 0 or self.log_embed_l1:
+            embed_l1_loss = self._compute_embedding_l1()
+            embed_l1_regularizer = self.lambda_embed_l1 * embed_l1_loss
+        else:
+            embed_l1_loss = torch.tensor(0.0, device=x_target.device)
+            embed_l1_regularizer = 0.0
+        
         # Total loss
         total_loss = (loss_x + 
                      entropy_regularizer + 
@@ -444,7 +467,8 @@ class SingleCausalForecaster(pl.LightningModule):
                      sparsity_regularizer +
                      l1_scores_regularizer +
                      hsic_regularizer +
-                     decisiveness_regularizer)
+                     decisiveness_regularizer +
+                     embed_l1_regularizer)
         
         # Log loss
         self.log(f"{stage}_loss_x", loss_x, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
@@ -496,6 +520,11 @@ class SingleCausalForecaster(pl.LightningModule):
                 log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
                 if log_tau_gs_cross is not None:
                     self.log(f"{stage}_tau_gs_cross_value", torch.exp(log_tau_gs_cross), on_step=False, on_epoch=True)
+        
+        # Log embedding L1 if requested
+        if self.log_embed_l1:
+            self.log(f"{stage}_embed_l1", embed_l1_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_embed_l1_reg", embed_l1_regularizer, on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     
@@ -573,3 +602,31 @@ class SingleCausalForecaster(pl.LightningModule):
         d = A.shape[0]
         expm_A = torch.matrix_exp(torch.relu(A))
         return torch.trace(expm_A) - d
+    
+    def _compute_embedding_l1(self) -> torch.Tensor:
+        """
+        Compute L1 norm of X embedding parameters.
+        
+        This is used for capacity control in Attention Necessity Score (ANS) evaluation.
+        Higher L1 penalty → sparser embeddings → reduced capacity → forces attention to be useful.
+        
+        Only applies to learnable X embeddings (embedding_X), not to orthogonal S embeddings
+        which are frozen by design.
+        
+        Returns:
+            torch.Tensor: Sum of absolute values of all X embedding parameters, 
+                         normalized by the number of parameters.
+        """
+        l1_sum = torch.tensor(0.0, device=next(self.model.embedding_X.parameters()).device)
+        n_params = 0
+        
+        for p in self.model.embedding_X.parameters():
+            if p.requires_grad:  # Only count trainable parameters
+                l1_sum = l1_sum + p.abs().sum()
+                n_params += p.numel()
+        
+        # Normalize by number of parameters to make λ scale-independent
+        if n_params > 0:
+            l1_sum = l1_sum / n_params
+        
+        return l1_sum

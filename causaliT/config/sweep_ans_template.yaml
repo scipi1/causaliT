@@ -1,0 +1,50 @@
+# =============================================================================
+# ANS (Attention Necessity Score) Sweep Configuration
+# =============================================================================
+#
+# This sweep file is designed to evaluate whether attention is necessary for
+# the model to fit the data. It sweeps over:
+#
+# 1. lambda_embed_l1: Controls embedding capacity via L1 regularization
+#    - Higher values → sparser embeddings → reduced capacity
+#    - Lower values → full capacity embeddings
+#
+# 2. attention_bypass: Controls whether attention is learned or uniform
+#    - false: Normal model with learned attention
+#    - true: Attention replaced with uniform weights (ablated model)
+#
+# The Attention Necessity Score (ANS) is computed as:
+#   ANS(λ) = Loss(ablated, λ) - Loss(full, λ)
+#
+# Interpretation:
+#   - ANS > 0: Attention improves performance → attention is useful
+#   - ANS ≈ 0: Attention doesn't help → embeddings alone suffice (overcapacity)
+#   - λ_critical: Smallest λ where ANS becomes significantly positive
+#
+# =============================================================================
+
+# Embedding capacity control (L1 regularization)
+training:
+  lambda_embed_l1: [0.0, 0.0001, 0.001, 0.01, 0.1, 1.0]
+
+# Attention bypass mode
+# false = normal learned attention
+# true = uniform attention (ablation)
+model:
+  attention_bypass: [false, true]
+
+# =============================================================================
+# Generated combinations (12 total):
+#
+#   λ=0.0     × bypass=false  → Full model, no L1
+#   λ=0.0     × bypass=true   → Ablated model, no L1
+#   λ=0.0001  × bypass=false  → Full model, light L1
+#   λ=0.0001  × bypass=true   → Ablated model, light L1
+#   ...
+#   λ=1.0     × bypass=false  → Full model, heavy L1
+#   λ=1.0     × bypass=true   → Ablated model, heavy L1
+#
+# For each λ, compute:
+#   ANS(λ) = val_loss_x(bypass=true, λ) - val_loss_x(bypass=false, λ)
+#
+# =============================================================================

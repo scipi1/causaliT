@@ -1,0 +1,198 @@
+# =============================================================================
+# Attention Necessity Score (ANS) Sweep - Template Configuration
+# =============================================================================
+#
+# This template is designed for ANS evaluation experiments:
+# - Sweep over lambda_embed_l1 (embedding capacity) × attention_bypass (True/False)
+# - Disables heavy post-training evaluations for faster sweeps
+# - Uses paired comparison: same λ for both full and ablated models
+#
+# Usage:
+# 1. Copy this template to your experiment folder
+# 2. Create sweeper/sweep.yaml with:
+#    
+#    training:
+#      lambda_embed_l1: [0.0, 0.0001, 0.001, 0.01, 0.1, 1.0]
+#    
+#    model:
+#      attention_bypass: [false, true]
+#
+# 3. Run sweep:
+#    python -m causaliT.euler_sweep.euler_sweep.cli sweep \
+#        --exp_id <your_exp_id> \
+#        --sweep_mode combination
+#
+# This will generate 12 runs (6 λ values × 2 attention modes)
+# =============================================================================
+
+experiment:
+  d_model_set: 12
+  dec_layers: 1
+  n_heads: 1
+  d_ff: 24
+  d_qk: 6
+  dropout: 0.0
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 100
+
+model:
+  model_object: "SingleCausalLayer"
+  
+  # ANS: attention_bypass at top level for sweep compatibility
+  # When true: replaces learned attention with uniform attention
+  # This tests if embeddings + MLP alone can fit the data
+  attention_bypass: false
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+  
+  kwargs:
+    model: ${model.model_object}
+    
+    # SVFA factorization mode
+    factorization: "svfa"
+    
+    # S Embedding (Orthogonal)
+    ds_embed_S:
+      num_variables: ${data.S_seq_len}
+      value_input_dim: 1
+      value_idx: ${data.features.shared.value}
+      var_idx: ${data.features.shared.variable}
+      freeze: true
+    
+    # X Embedding (SVFA)
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: False
+      modules:
+        - idx: ${data.features.shared.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.features.shared.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: 8
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.features.shared.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+    
+    comps_embed_X: "svfa"
+    
+    # Attention
+    dec_cross_attention_type: "ScaledDotProduct"
+    dec_cross_mask_type: "Uniform"
+    dec_self_attention_type: "PhiSoftMax"
+    dec_self_mask_type: "Uniform"
+    
+    n_heads: ${experiment.n_heads}
+    dec_causal_mask: False
+    dec_layers: ${experiment.dec_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: True
+    device: "cuda"
+    
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+    
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dec_cross_dropout_qkv: ${experiment.dropout}
+    dec_cross_attention_dropout: ${experiment.dropout}
+    dec_self_dropout_qkv: ${experiment.dropout}
+    dec_self_attention_dropout: ${experiment.dropout}
+    
+    # DAG Parameterization
+    dag_parameterization_self: null
+    dag_parameterization_cross: null
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: False
+  loss_fn: "mse"
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 50  # Less frequent saves for sweeps
+  
+  # === ANS Evaluation ===
+  # Embedding L1 regularization - limits embedding capacity
+  # Sweep this to find lambda_critical where ANS becomes significant
+  lambda_embed_l1: 0.0
+  log_embed_l1: true  # Always log for analysis
+  
+  # Minimal logging for sweeps (disable expensive logging)
+  log_entropy: false
+  log_acyclicity: false
+  log_sparsity: false
+  log_hsic: false
+  log_decisiveness: false
+  log_l1_scores: false
+  
+  # Regularization (ALL OFF for ANS baseline - only vary lambda_embed_l1)
+  gamma: 0.0
+  kappa: 0.0
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  lambda_decisive: 0.0
+  lambda_decisive_cross: 0.0
+  lambda_tau: 0.0
+  target_tau: 0.0
+  lambda_l1_self_scores: 0.0
+  lambda_l1_cross_scores: 0.0
+  
+  use_hard_masks: false
+  hard_mask_files:
+    dec_cross: "dec1_cross_att_mask.csv"
+    dec_self: "dec1_self_att_mask.csv"
+
+
+data:
+  dataset: "scm6"  # Change this to your dataset
+  filename_input: "ds.npz"
+  val_idx: ${data.features.shared.value}
+  test_ds_ixd: null
+  max_data_size: null
+  S_seq_len: 3
+  X_seq_len: 2
+  Y_seq_len: 2
+  features:
+    shared:
+      value: 0
+      variable: 1
+
+
+# === CRITICAL: Disable heavy evaluations for sweeps ===
+evaluation:
+  functions: ["eval_train_metrics"]  # Only basic training metrics
+
+
+special:
+  mode: []

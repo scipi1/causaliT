@@ -109,6 +109,11 @@ class SingleCausalLayer(nn.Module):
         # DAG parameterization for cross-attention: must be "independent"
         # Cross-attention is non-square (X queries, S keys), so only "independent" is valid
         dag_parameterization_cross: str = "independent",
+        
+        # Attention bypass mode for Attention Necessity Score (ANS) evaluation
+        # When True, replaces learned attention with uniform attention
+        # This tests if the model can fit data using only embeddings + MLP
+        attention_bypass: bool = False,
     ):
         super().__init__()
         
@@ -119,6 +124,11 @@ class SingleCausalLayer(nn.Module):
         self.factorization = factorization
         self.dag_parameterization_self = dag_parameterization_self
         self.dag_parameterization_cross = dag_parameterization_cross
+        self.attention_bypass = attention_bypass
+        
+        # Store sequence lengths for attention bypass
+        self.S_seq_len = S_seq_len
+        self.X_seq_len = X_seq_len
         
         # =====================================================================
         # EMBEDDINGS
@@ -253,22 +263,34 @@ class SingleCausalLayer(nn.Module):
         x_input_pos = self.embedding_X.pass_var(X=intermediate_tensor_blanked)
         x_mask = self.embedding_X.get_mask(X=intermediate_tensor_blanked)
         
-        # ===== DECODER: Source → Intermediate (S → X) =====
-        # In SVFA mode: x_embedded is tuple (X_struct, X_val), s_embedded is single tensor
-        # Decoder will return tuple in SVFA mode
-        
-        dec_out, dec_cross_att, dec_self_att, dec_cross_ent, dec_self_ent = self.decoder(
-            X=x_embedded,
-            external_context=s_embedded,
-            self_mask_miss_k=x_mask,
-            self_mask_miss_q=x_mask,
-            cross_mask_miss_k=s_mask,
-            cross_mask_miss_q=x_mask,
-            dec_input_pos=x_input_pos,
-            causal_mask=self.dec_causal_mask,
-            cross_hard_mask=dec_cross_hard,
-            self_hard_mask=dec_self_hard,
-        )
+        # ===== ATTENTION BYPASS MODE =====
+        # When attention_bypass=True, replace learned attention with uniform attention
+        # This is used for ANS (Attention Necessity Score) evaluation to test if
+        # the model can fit data using only embeddings + MLP (no learned attention)
+        if self.attention_bypass:
+            dec_out, dec_cross_att, dec_self_att, dec_cross_ent, dec_self_ent = self._forward_bypass(
+                x_embedded=x_embedded,
+                s_embedded=s_embedded,
+                x_mask=x_mask,
+                s_mask=s_mask,
+            )
+        else:
+            # ===== DECODER: Source → Intermediate (S → X) =====
+            # In SVFA mode: x_embedded is tuple (X_struct, X_val), s_embedded is single tensor
+            # Decoder will return tuple in SVFA mode
+            
+            dec_out, dec_cross_att, dec_self_att, dec_cross_ent, dec_self_ent = self.decoder(
+                X=x_embedded,
+                external_context=s_embedded,
+                self_mask_miss_k=x_mask,
+                self_mask_miss_q=x_mask,
+                cross_mask_miss_k=s_mask,
+                cross_mask_miss_q=x_mask,
+                dec_input_pos=x_input_pos,
+                causal_mask=self.dec_causal_mask,
+                cross_hard_mask=dec_cross_hard,
+                self_hard_mask=dec_self_hard,
+            )
         
         # De-embed to get predicted X
         # In SVFA mode: extract value embedding from tuple for forecasting
@@ -284,6 +306,105 @@ class SingleCausalLayer(nn.Module):
         entropies = (dec_cross_ent, dec_self_ent)
         
         return pred_x, attention_weights, masks, entropies
+    
+    def _forward_bypass(
+        self,
+        x_embedded,
+        s_embedded,
+        x_mask,
+        s_mask,
+    ):
+        """
+        Forward pass with attention bypass (uniform attention).
+        
+        This method replaces learned attention with uniform attention for ANS evaluation.
+        It preserves the same architecture (embeddings → attention aggregation → FF → forecaster)
+        but uses uniform attention weights instead of learned ones.
+        
+        Uniform attention means each query attends equally to all keys:
+        - Cross-attention: each X token attends equally to all S tokens
+        - Self-attention: each X token attends equally to all other X tokens
+        
+        Args:
+            x_embedded: X embeddings (B, X_len, d_model) or tuple for SVFA
+            s_embedded: S embeddings (B, S_len, d_model)
+            x_mask: Missing mask for X
+            s_mask: Missing mask for S
+            
+        Returns:
+            Same outputs as normal forward pass
+        """
+        batch_size = s_embedded.shape[0]
+        device = s_embedded.device
+        
+        # Handle SVFA mode
+        if self.factorization == "svfa":
+            x_struct, x_val = x_embedded
+        else:
+            x_struct = x_embedded
+            x_val = x_embedded
+        
+        # Create uniform attention weights
+        # Cross-attention: X queries (X_seq_len) attend to S keys (S_seq_len)
+        uniform_cross = torch.ones(batch_size, self.X_seq_len, self.S_seq_len, device=device) / self.S_seq_len
+        
+        # Self-attention: X queries attend to X keys
+        uniform_self = torch.ones(batch_size, self.X_seq_len, self.X_seq_len, device=device) / self.X_seq_len
+        
+        # Apply cross-attention with uniform weights (average over S)
+        # cross_out = uniform_cross @ s_embedded -> (B, X_len, d_model)
+        cross_out = torch.bmm(uniform_cross, s_embedded)
+        
+        # For bypass mode, we combine cross-attention output with X embeddings
+        # This mimics the residual connection structure of the decoder
+        if self.factorization == "svfa":
+            # In SVFA: value embedding is what gets updated
+            x_val = x_val + cross_out
+        else:
+            x_struct = x_struct + cross_out
+            x_val = x_struct
+        
+        # Apply self-attention with uniform weights (average over X)
+        # self_out = uniform_self @ x_val -> (B, X_len, d_model)
+        self_out = torch.bmm(uniform_self, x_val)
+        
+        # Residual connection
+        if self.factorization == "svfa":
+            x_val = x_val + self_out
+        else:
+            x_val = x_val + self_out
+        
+        # Apply feed-forward from first decoder layer (reuse existing FF weights)
+        # This ensures the MLP capacity is the same as in normal forward pass
+        decoder_layer = self.decoder.layers[0]
+        x_ff = decoder_layer.norm3(x_val, ~x_mask if x_mask is not None else None)
+        x_ff = decoder_layer.dropout_ff(decoder_layer.activation(decoder_layer.linear1(x_ff)))
+        x_ff = decoder_layer.dropout_ff(decoder_layer.linear2(x_ff))
+        x_val = x_val + x_ff
+        
+        # Apply final normalization if present
+        if self.decoder.norm_layer is not None:
+            x_val = self.decoder.norm_layer(x_val, ~x_mask if x_mask is not None else None)
+        
+        # Prepare outputs in same format as normal forward
+        if self.factorization == "svfa":
+            dec_out = (x_struct, x_val)
+        else:
+            dec_out = x_val
+        
+        # Return uniform attention weights (as lists to match decoder output format)
+        # Note: entropy is 0 for uniform attention (maximum entropy = log(seq_len))
+        dec_cross_att = [uniform_cross]
+        dec_self_att = [uniform_self]
+        
+        # Compute entropy for uniform attention (should be maximum = log(seq_len))
+        cross_entropy = torch.log(torch.tensor(self.S_seq_len, dtype=torch.float32, device=device))
+        self_entropy = torch.log(torch.tensor(self.X_seq_len, dtype=torch.float32, device=device))
+        
+        dec_cross_ent = [cross_entropy.expand(batch_size, self.X_seq_len)]
+        dec_self_ent = [self_entropy.expand(batch_size, self.X_seq_len)]
+        
+        return dec_out, dec_cross_att, dec_self_att, dec_cross_ent, dec_self_ent
     
     def _attn(
         self,
