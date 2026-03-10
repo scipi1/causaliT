@@ -14,7 +14,7 @@ def pytest_addoption(parser):
         "--models-dir",
         action="store",
         default=None,
-        help="Directory containing model configurations to test (default: experiments/single/scm6)"
+        help="Directory containing model configurations to test (default: experiments)"
     )
     parser.addoption(
         "--data-dir",

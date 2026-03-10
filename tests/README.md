@@ -7,24 +7,41 @@ Quick test suite to verify all model configurations can train successfully.
 ### Quick Start
 
 ```bash
-# List available models
+# List available models (default: experiments/)
 python tests/test_training_models.py --list
 
 # Test a single model (fast)
-python tests/test_training_models.py --model single_Lie_CC_scm6
+python tests/test_training_models.py --models-dir experiments/single/scm6 --model single_Lie_CC_scm6
 
 # Run all training tests with pytest
 pytest tests/test_training_models.py -v
 ```
 
-### Custom Models Directory
+### Specifying Models Directory
+
+The default models directory is `experiments/`. You can specify a subdirectory:
 
 ```bash
-# Specify a different models directory
+# Test models in a specific subdirectory
 python tests/test_training_models.py --models-dir experiments/single/scm6 --list
 
 # Or with pytest
 pytest tests/test_training_models.py --models-dir=experiments/single/scm6 -v
+
+# Or via environment variable
+CAUSALT_MODELS_DIR=experiments/single/scm6 pytest tests/test_training_models.py -v
+```
+
+### Recursive Search
+
+Use the `-r` flag to search recursively through all subdirectories:
+
+```bash
+# List all models recursively from experiments root
+python tests/test_training_models.py --list -r
+
+# List all models recursively from a specific subdirectory
+python tests/test_training_models.py --models-dir experiments/single --list -r
 ```
 
 ### Test Configuration

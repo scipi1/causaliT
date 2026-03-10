@@ -36,6 +36,7 @@ from causaliT.evaluation.predict import predict_test_from_ckpt
 from causaliT.training.forecasters.transformer_forecaster import TransformerForecaster
 from causaliT.training.forecasters.stage_causal_forecaster import StageCausalForecaster
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
+from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import (
@@ -126,6 +127,10 @@ def load_attention_evolution(
     elif architecture_type == "SingleCausalForecaster":
         attention_keys = ["dec_self", "dec_cross"]
         phi_keys = ["decoder", "decoder_cross"]
+    elif architecture_type == "NoiseAwareCausalForecaster":
+        # Same structure as SingleCausalForecaster
+        attention_keys = ["dec_self", "dec_cross"]
+        phi_keys = ["decoder", "decoder_cross"]
     else:
         raise ValueError(f"Unknown architecture type: {architecture_type}")
     
@@ -200,6 +205,8 @@ def load_attention_evolution(
                         model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
                     elif architecture_type == "SingleCausalForecaster":
                         model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+                    elif architecture_type == "NoiseAwareCausalForecaster":
+                        model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
                     
                     phi_dict = extract_phi_from_model(model, architecture_type)
                     
@@ -362,6 +369,10 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "dec_cross": "Cross-attention: S → X (source variables influence intermediate variables)",
                 "dec_self": "Self-attention: X → X (intermediate variables influence each other)",
             },
+            "NoiseAwareCausalForecaster": {
+                "dec_cross": "Cross-attention: S → X (source variables influence intermediate variables)",
+                "dec_self": "Self-attention: X → X (intermediate variables influence each other)",
+            },
             "StageCausalForecaster": {
                 "dec1_cross": "Stage 1 Cross-attention: S → X (source to intermediate)",
                 "dec1_self": "Stage 1 Self-attention: X → X (intermediate to intermediate)",
@@ -516,6 +527,12 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     architecture = final_scores_dict.architecture_type
     
     if architecture == "SingleCausalForecaster":
+        blocks_to_eval = [
+            ("dec_cross", "decoder_cross", "dec_cross"),
+            ("dec_self", "decoder", "dec_self"),
+        ]
+    elif architecture == "NoiseAwareCausalForecaster":
+        # Same structure as SingleCausalForecaster
         blocks_to_eval = [
             ("dec_cross", "decoder_cross", "dec_cross"),
             ("dec_self", "decoder", "dec_self"),

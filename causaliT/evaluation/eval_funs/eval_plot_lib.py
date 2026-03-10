@@ -88,8 +88,8 @@ def plot_attention_scores(
         if any(x is not None for x in data.attention_weights.get("dec2_cross", [])):
             attention_blocks.append("dec2_cross")
             phi_mapping["dec2_cross"] = "decoder2_cross"  # Cross-attention DAG (X -> Y)
-    elif data.architecture_type == "SingleCausalForecaster":
-        # SingleCausalForecaster has single decoder: S → X
+    elif data.architecture_type in ["SingleCausalForecaster", "NoiseAwareCausalForecaster"]:
+        # SingleCausalForecaster and NoiseAwareCausalForecaster have single decoder: S → X
         if any(x is not None for x in data.attention_weights.get("dec_self", [])):
             attention_blocks.append("dec_self")
             phi_mapping["dec_self"] = "decoder"  # X self-attention DAG

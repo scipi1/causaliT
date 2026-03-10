@@ -54,7 +54,7 @@ DEBUG_TRAINING_OVERRIDES = {
 # Default paths (can be overridden via env var, pytest option, or CLI argument)
 DEFAULT_MODELS_DIR = Path(os.environ.get(
     "CAUSALT_MODELS_DIR", 
-    str(project_root / "experiments" / "single" / "scm6")
+    str(project_root / "experiments")
 ))
 DEFAULT_DATA_DIR = Path(os.environ.get(
     "CAUSALT_DATA_DIR",
@@ -92,12 +92,13 @@ def data_directory() -> Path:
     return DEFAULT_DATA_DIR
 
 
-def discover_model_configs(models_dir: Path) -> List[Tuple[str, Path]]:
+def discover_model_configs(models_dir: Path, recursive: bool = False) -> List[Tuple[str, Path]]:
     """
     Discover all model configuration directories in the given directory.
     
     Args:
         models_dir: Base directory containing model subdirectories
+        recursive: If True, search recursively through all subdirectories
         
     Returns:
         List of tuples: (model_name, config_dir_path)
@@ -107,16 +108,34 @@ def discover_model_configs(models_dir: Path) -> List[Tuple[str, Path]]:
     if not models_dir.exists():
         return configs
     
-    for item in models_dir.iterdir():
-        if item.is_dir():
-            # Skip non-model directories (like 'euler', '__pycache__', etc.)
-            if item.name.startswith('__') or item.name in ['euler', 'sweeps', 'combinations']:
+    # Directories to skip
+    skip_dirs = {'euler', 'sweeps', 'combinations', 'report', 'tests', 'stage'}
+    
+    if recursive:
+        # Recursive search: find all directories containing config files
+        for config_file in models_dir.rglob("config*.yaml"):
+            config_dir = config_file.parent
+            # Skip if in a skip directory
+            if any(skip_dir in config_dir.parts for skip_dir in skip_dirs):
                 continue
-            
-            # Check if directory contains a config file
-            config_files = list(item.glob("config*.yaml"))
-            if config_files:
-                configs.append((item.name, item))
+            if config_dir.name.startswith('__'):
+                continue
+            # Use relative path from models_dir as identifier
+            rel_path = config_dir.relative_to(models_dir)
+            model_name = str(rel_path).replace(os.sep, '/')
+            configs.append((model_name, config_dir))
+    else:
+        # Non-recursive: only look one level deep
+        for item in models_dir.iterdir():
+            if item.is_dir():
+                # Skip non-model directories (like 'euler', '__pycache__', etc.)
+                if item.name.startswith('__') or item.name in skip_dirs:
+                    continue
+                
+                # Check if directory contains a config file
+                config_files = list(item.glob("config*.yaml"))
+                if config_files:
+                    configs.append((item.name, item))
     
     return sorted(configs, key=lambda x: x[0])
 
@@ -220,6 +239,10 @@ class TestTrainingModels:
         save_dir = tmp_path / model_name
         save_dir.mkdir(parents=True, exist_ok=True)
         
+        # Copy config file to save directory (needed for post-training evaluations)
+        config_dest = save_dir / original_config_path.name
+        shutil.copy(original_config_path, config_dest)
+        
         # Run training
         try:
             df_metrics = trainer(
@@ -298,6 +321,10 @@ class TestTrainingAllModels:
                 # Setup save directory
                 save_dir = tmp_path / model_name
                 save_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Copy config file to save directory (needed for post-training evaluations)
+                config_dest = save_dir / original_config_path.name
+                shutil.copy(original_config_path, config_dest)
                 
                 # Run training
                 df_metrics = trainer(
@@ -415,6 +442,10 @@ def run_single_model_test(
             save_dir = tmp_path / model_name
             save_dir.mkdir(parents=True, exist_ok=True)
             
+            # Copy config file to save directory (needed for post-training evaluations)
+            config_dest = save_dir / original_config_path.name
+            shutil.copy(original_config_path, config_dest)
+            
             df_metrics = trainer(
                 config=config,
                 data_dir=str(data_dir),
@@ -461,7 +492,7 @@ if __name__ == "__main__":
         "--models-dir",
         type=str,
         default=None,
-        help="Directory containing model configurations (default: experiments/single/scm6)"
+        help="Directory containing model configurations (default: experiments)"
     )
     parser.add_argument(
         "--data-dir",
@@ -473,6 +504,11 @@ if __name__ == "__main__":
         "--list", 
         action="store_true",
         help="List available models"
+    )
+    parser.add_argument(
+        "-r", "--recursive",
+        action="store_true",
+        help="Search recursively for model configurations in subdirectories"
     )
     
     args = parser.parse_args()
@@ -494,8 +530,8 @@ if __name__ == "__main__":
         data_dir = DEFAULT_DATA_DIR
     
     if args.list:
-        configs = discover_model_configs(models_dir)
-        print(f"Available models in {models_dir}:")
+        configs = discover_model_configs(models_dir, recursive=args.recursive)
+        print(f"Available models in {models_dir}{' (recursive)' if args.recursive else ''}:")
         for name, path in configs:
             print(f"  - {name}")
     elif args.model:
