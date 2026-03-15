@@ -292,7 +292,12 @@ class SingleCausalPredictor(BasePredictor):
             else:
                 raise ValueError("Expected batch to be a tuple of (S, X, Y)")
             
-            S, X, Y = batch  # Y is loaded but ignored
+            # Handle both 2-element (S, X) and 3-element (S, X, Y) batches
+            if len(batch) == 3:
+                S, X, Y = batch  # Y is loaded but ignored
+            else:
+                S, X = batch
+                Y = None  # No target data
             
             # Apply input conditioning to S if provided
             if input_conditioning_fn is not None:

@@ -493,6 +493,7 @@ class SCMDataset:
     ) -> None:
         
         self.noise_model = NoiseModel(singles=singles, groups=groups)
+        self.specs = specs  # Store original specs for metadata generation
         specs_scm = Spec(
             name=name,
             nodes=specs,
@@ -503,6 +504,9 @@ class SCMDataset:
         self.input_labels = input_labels
         self.target_labels = target_labels
         self.source_labels = source_labels
+        self.name = name
+        self.description = description
+        self.tags = tags
         
         # meta
         created = datetime.date.today().isoformat()
@@ -515,6 +519,133 @@ class SCMDataset:
         
     def sample(self, n, seed=42):
         return self.scm.sample(n, seed)
+    
+    def _compute_transitive_closure(self) -> Dict[str, List[str]]:
+        """
+        Compute the transitive closure (reachability) from each source node.
+        
+        Returns a dict mapping each source variable to a list of all variables 
+        it can reach (directly or indirectly).
+        """
+        # Build adjacency list from specs: parent -> [children]
+        children_of: Dict[str, List[str]] = defaultdict(list)
+        for spec in self.specs:
+            for parent in spec.parents:
+                children_of[parent].append(spec.name)
+        
+        # Compute reachability using BFS from each source
+        all_sources = self.source_labels if self.source_labels else []
+        transitive_closure: Dict[str, List[str]] = {}
+        
+        for source in all_sources:
+            reachable = set()
+            queue = deque([source])
+            visited = {source}
+            
+            while queue:
+                node = queue.popleft()
+                for child in children_of.get(node, []):
+                    reachable.add(child)
+                    if child not in visited:
+                        visited.add(child)
+                        queue.append(child)
+            
+            transitive_closure[source] = sorted(list(reachable))
+        
+        return transitive_closure
+    
+    def _compute_expected_effects(self) -> Dict[str, Dict[str, bool]]:
+        """
+        Compute expected causal effects from each source to each input/target variable.
+        
+        Based on transitive closure: if source S can reach variable X, then 
+        do(S=x) should affect X.
+        """
+        transitive_closure = self._compute_transitive_closure()
+        
+        # Get all target variables for intervention effects
+        all_targets = list(self.input_labels) + list(self.target_labels)
+        all_sources = self.source_labels if self.source_labels else []
+        
+        expected_effects: Dict[str, Dict[str, bool]] = {}
+        
+        for source in all_sources:
+            reachable = set(transitive_closure.get(source, []))
+            expected_effects[source] = {
+                target: (target in reachable)
+                for target in all_targets
+            }
+        
+        return expected_effects
+    
+    def _generate_dataset_metadata(self, shared_vars_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        """
+        Generate comprehensive dataset metadata for evaluation functions.
+        
+        This metadata enables evaluation functions to be dataset-agnostic by providing:
+        - Variable information (labels, counts, index mappings)
+        - Causal structure (edges, transitive closure, expected effects)
+        
+        Returns:
+            Dict containing all metadata needed by evaluation functions.
+        """
+        # Compute direct edges from specs
+        direct_edges = []
+        for spec in self.specs:
+            for parent in spec.parents:
+                direct_edges.append([parent, spec.name])
+        
+        # Compute transitive closure and expected effects
+        transitive_closure = self._compute_transitive_closure()
+        expected_effects = self._compute_expected_effects()
+        
+        # Build variable index map
+        if shared_vars_map is not None:
+            variable_index_map = shared_vars_map
+        else:
+            # Build from individual label lists
+            variable_index_map = {}
+            idx = 1
+            if self.source_labels:
+                for var in self.source_labels:
+                    variable_index_map[var] = idx
+                    idx += 1
+            for var in self.input_labels:
+                variable_index_map[var] = idx
+                idx += 1
+            for var in self.target_labels:
+                variable_index_map[var] = idx
+                idx += 1
+        
+        metadata = {
+            "name": self.name,
+            "description": self.description,
+            "tags": self.tags,
+            "variable_info": {
+                "source_labels": self.source_labels if self.source_labels else [],
+                "input_labels": list(self.input_labels),
+                "target_labels": list(self.target_labels),
+                "n_source": len(self.source_labels) if self.source_labels else 0,
+                "n_input": len(self.input_labels),
+                "n_target": len(self.target_labels),
+            },
+            "causal_structure": {
+                "direct_edges": direct_edges,
+                "transitive_closure": transitive_closure,
+                "expected_effects": expected_effects,
+            },
+            "variable_index_map": variable_index_map,
+            # Feature indices define which column in the data tensor corresponds to which feature
+            # These are used for embedding configuration (value_idx, var_idx in OrthogonalMaskEmbedding)
+            # For SCM datasets: always {value: 0, variable: 1}
+            # For real-world datasets: may vary (e.g., dyconex has additional descriptive features)
+            "feature_indices": {
+                "value": 0,
+                "variable": 1,
+            },
+        }
+        
+        return metadata
     
     def _normalize(self, data: np.ndarray, method: str = "standardize"):
         """Normalize only the value features (feature index 0) using sklearn scalers."""
@@ -554,12 +685,16 @@ class SCMDataset:
                 if self.source_labels is not None:
                     all_labels.extend(self.source_labels)
                 all_labels.extend(self.input_labels)
-                all_labels.extend(self.target_labels)
+                if self.target_labels:  # Only add if non-empty
+                    all_labels.extend(self.target_labels)
                 shared_vars_map = {var: i+1 for i, var in enumerate(all_labels)}
             else:
                 shared_vars_map = None
             
             def to_numpy_(label, vars_map_override=None):
+                # Handle empty label list - return None values
+                if not label:
+                    return None, {}, {}, np.array([])
                 
                 df_ = pd.melt(df[label], id_vars=None, ignore_index=False)
                 unique_vars = df_["variable"].unique()
@@ -625,21 +760,27 @@ class SCMDataset:
         norm_stats = {}
         if normalize:
             input_np, input_stats = self._normalize(input_np, method=normalize_method)
-            target_np, target_stats = self._normalize(target_np, method=normalize_method)
-            norm_stats = {"input": input_stats, "target": target_stats}
+            norm_stats = {"input": input_stats}
+            
+            # Normalize target data if present (non-empty target_labels)
+            if target_np is not None:
+                target_np, target_stats = self._normalize(target_np, method=normalize_method)
+                norm_stats["target"] = target_stats
             
             # Normalize source data if present
             if source_np is not None:
                 source_np, source_stats = self._normalize(source_np, method=normalize_method)
                 norm_stats["source"] = source_stats
-                print(f"Data normalized using {normalize_method}")
-                print(f"  Input - mean: {input_stats.get('mean', 'N/A')}, std: {input_stats.get('std', 'N/A')}")
-                print(f"  Target - mean: {target_stats.get('mean', 'N/A')}, std: {target_stats.get('std', 'N/A')}")
-                print(f"  Source - mean: {source_stats.get('mean', 'N/A')}, std: {source_stats.get('std', 'N/A')}")
+            
+            # Print normalization stats
+            print(f"Data normalized using {normalize_method}")
+            print(f"  Input - mean: {input_stats.get('mean', 'N/A')}, std: {input_stats.get('std', 'N/A')}")
+            if target_np is not None:
+                print(f"  Target - mean: {norm_stats['target'].get('mean', 'N/A')}, std: {norm_stats['target'].get('std', 'N/A')}")
             else:
-                print(f"Data normalized using {normalize_method}")
-                print(f"  Input - mean: {input_stats.get('mean', 'N/A')}, std: {input_stats.get('std', 'N/A')}")
-                print(f"  Target - mean: {target_stats.get('mean', 'N/A')}, std: {target_stats.get('std', 'N/A')}")
+                print(f"  Target - (no target variables)")
+            if source_np is not None:
+                print(f"  Source - mean: {norm_stats['source'].get('mean', 'N/A')}, std: {norm_stats['source'].get('std', 'N/A')}")
         
         # todo train/test split
         
@@ -676,7 +817,7 @@ class SCMDataset:
             else:
                 df_adj = self.scm.adjacency(positive_child=True, as_dataframe=True)
             
-            # Create 4 sliced attention masks for transformer
+            # Create attention masks for transformer
             # Rows are queries, columns are keys
             
             # Decoder 1 cross-attention: X attends to S (rows=input, cols=source)
@@ -689,15 +830,19 @@ class SCMDataset:
             assert np.array_equal(df_d1sa.index.to_numpy(), df_d1sa.columns.to_numpy()) # self-attention: rows == cols
             assert np.array_equal(df_d1sa.index.map(iv_map).to_numpy(), iv_order)       # rows == input variable sequential order
             
-            # Decoder 2 cross-attention: Y attends to X (rows=target, cols=input)
-            df_d2ca = df_adj.loc[self.target_labels, self.input_labels]
-            assert np.array_equal(df_d2ca.index.map(tv_map).to_numpy(), tv_order)       # rows == target variable sequential order
-            assert np.array_equal(df_d2ca.columns.map(iv_map).to_numpy(), iv_order)     # cols == input variable sequential order
-            
-            # Decoder 2 self-attention: Y attends to Y (rows=target, cols=target)
-            df_d2sa = df_adj.loc[self.target_labels, self.target_labels]
-            assert np.array_equal(df_d2sa.index.to_numpy(), df_d2sa.columns.to_numpy()) # self-attention: rows == cols
-            assert np.array_equal(df_d2sa.index.map(tv_map).to_numpy(), tv_order)       # rows == target variable sequential order
+            # Decoder 2 masks only if target_labels is non-empty
+            df_d2ca = None
+            df_d2sa = None
+            if self.target_labels:
+                # Decoder 2 cross-attention: Y attends to X (rows=target, cols=input)
+                df_d2ca = df_adj.loc[self.target_labels, self.input_labels]
+                assert np.array_equal(df_d2ca.index.map(tv_map).to_numpy(), tv_order)       # rows == target variable sequential order
+                assert np.array_equal(df_d2ca.columns.map(iv_map).to_numpy(), iv_order)     # cols == input variable sequential order
+                
+                # Decoder 2 self-attention: Y attends to Y (rows=target, cols=target)
+                df_d2sa = df_adj.loc[self.target_labels, self.target_labels]
+                assert np.array_equal(df_d2sa.index.to_numpy(), df_d2sa.columns.to_numpy()) # self-attention: rows == cols
+                assert np.array_equal(df_d2sa.index.map(tv_map).to_numpy(), tv_order)       # rows == target variable sequential order
         
         
         # ------------ get SCM graph visualization --------------------
@@ -713,11 +858,17 @@ class SCMDataset:
         # ---------------------- export -------------------------------
         makedirs(save_dir, exist_ok=True)
         
-        # Export data arrays
+        # Export data arrays - handle case where target_np may be None
         if source_np is not None:
-            np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np, s=source_np)
+            if target_np is not None:
+                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np, s=source_np)
+            else:
+                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, s=source_np)
         else:
-            np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np)
+            if target_np is not None:
+                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np)
+            else:
+                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np)
         
         # Export attention masks based on source_labels presence
         if self.source_labels is None:
@@ -729,12 +880,16 @@ class SCMDataset:
             # Export full DAG adjacency matrix
             df_adj.to_csv(join(save_dir, "dag_adj_mask.csv"))
             
-            # Export 4 sliced attention masks for transformer
+            # Export attention masks for transformer (2 or 4 depending on target_labels)
             df_d1ca.to_csv(join(save_dir, "dec1_cross_att_mask.csv"))  # X attends to S
             df_d1sa.to_csv(join(save_dir, "dec1_self_att_mask.csv"))   # X attends to X
-            df_d2ca.to_csv(join(save_dir, "dec2_cross_att_mask.csv"))  # Y attends to X
-            df_d2sa.to_csv(join(save_dir, "dec2_self_att_mask.csv"))   # Y attends to Y
-            print("Exported 4 sliced attention masks: dec1_cross, dec1_self, dec2_cross, dec2_self")
+            
+            if df_d2ca is not None and df_d2sa is not None:
+                df_d2ca.to_csv(join(save_dir, "dec2_cross_att_mask.csv"))  # Y attends to X
+                df_d2sa.to_csv(join(save_dir, "dec2_self_att_mask.csv"))   # Y attends to Y
+                print("Exported 4 sliced attention masks: dec1_cross, dec1_self, dec2_cross, dec2_self")
+            else:
+                print("Exported 2 sliced attention masks: dec1_cross, dec1_self (no target variables)")
         
         # Export metadata
         with open(join(save_dir, 'meta.json'),'w', encoding="utf-8")  as file:
@@ -774,6 +929,12 @@ class SCMDataset:
         if norm_stats:
             with open(join(save_dir, 'normalization.json'),'w', encoding="utf-8")  as file:
                 json.dump(norm_stats, file, indent=2, sort_keys=True, ensure_ascii=False)
+
+        # Export dataset metadata for evaluation functions (NEW)
+        dataset_metadata = self._generate_dataset_metadata(shared_vars_map)
+        with open(join(save_dir, 'dataset_metadata.json'),'w', encoding="utf-8") as file:
+            json.dump(dataset_metadata, file, indent=2, sort_keys=True, ensure_ascii=False)
+        print(f"Exported dataset_metadata.json with causal structure and variable info")
 
         graph.render(str(join(save_dir, 'graph')), format="pdf", cleanup=True)
 

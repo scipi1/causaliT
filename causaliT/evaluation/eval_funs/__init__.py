@@ -12,6 +12,7 @@ Modules:
     eval_embeddings: Embedding evaluation (eval_embed, eval_embedding_dag_correlation)
     eval_attention: Attention scores and DAG recovery (eval_attention_scores, load_attention_evolution)
     eval_interventions: Intervention evaluation (eval_interventions)
+    eval_ans: Attention Necessity Score (ANS) evaluation for sweep experiments
     update_manifest: Manifest update functions (update_experiments_manifest, etc.)
     eval_funs_wraps: Evaluation wrappers (run_all_evaluations, run_evaluations_from_config)
     eval_dyconex: Dyconex-specific evaluation functions
@@ -28,6 +29,7 @@ from .eval_utils import (
     _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
     _load_true_dag_mask,
+    load_dataset_metadata,  # NEW: Load dataset metadata for dataset-agnostic evaluation
     _get_learned_dag,
     _compute_dag_confidence,
     _get_learned_dag_per_fold,
@@ -37,6 +39,14 @@ from .eval_utils import (
     _plot_metric_pair,
     _discover_metric_pairs,
     _filter_metric_pairs,
+    # Training instability metrics
+    _compute_spike_ratio,
+    _compute_coefficient_of_variation,
+    _compute_max_jump,
+    _compute_trend_instability,
+    compute_instability_metrics,
+    # Plot format configuration
+    DEFAULT_PLOT_FORMAT,
 )
 
 # Data loading and model utilities (self-contained library)
@@ -63,7 +73,7 @@ from .eval_plot_lib import (
 )
 
 # Training metrics evaluation
-from .eval_training import eval_train_metrics
+from .eval_training import eval_train_metrics, compute_training_instability
 
 # Embedding evaluation
 from .eval_embeddings import (
@@ -79,6 +89,9 @@ from .eval_attention import (
 
 # Intervention evaluation
 from .eval_interventions import eval_interventions
+
+# ANS evaluation (sweep experiments only)
+from .eval_ans import eval_ans
 
 # Manifest functions
 from .update_manifest import (
@@ -113,6 +126,7 @@ __all__ = [
     "_select_evenly_spaced_checkpoints",
     "_compute_soft_hamming",
     "_load_true_dag_mask",
+    "load_dataset_metadata",
     "_get_learned_dag",
     "_compute_dag_confidence",
     "_get_learned_dag_per_fold",
@@ -139,6 +153,13 @@ __all__ = [
     "plot_attention_scores",
     "plot_attention_evolution",
     "plot_phi_evolution",
+    # Training instability metrics
+    "_compute_spike_ratio",
+    "_compute_coefficient_of_variation",
+    "_compute_max_jump",
+    "_compute_trend_instability",
+    "compute_instability_metrics",
+    "compute_training_instability",
     # Training
     "eval_train_metrics",
     # Embeddings
@@ -149,6 +170,8 @@ __all__ = [
     "eval_attention_scores",
     # Interventions
     "eval_interventions",
+    # ANS (sweep experiments only)
+    "eval_ans",
     # Manifest
     "fix_kfold_summary",
     "enrich_kfold_summary",
@@ -161,4 +184,6 @@ __all__ = [
     "run_evaluations_from_config",
     # Dyconex
     "eval_dyconex_predictions",
+    # Plot format configuration
+    "DEFAULT_PLOT_FORMAT",
 ]

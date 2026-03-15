@@ -27,6 +27,8 @@ from .eval_utils import (
     _discover_metric_pairs,
     _filter_metric_pairs,
     _is_column_plottable,
+    compute_instability_metrics,
+    DEFAULT_PLOT_FORMAT,
 )
 
 # Import from local eval_funs modules (self-contained)
@@ -70,7 +72,7 @@ def eval_train_metrics(
     show_plots: bool = False,
     metric_patterns: List[str] = None,
     plot_options: Dict[str, dict] = None,
-    log_scale_threshold: float = 10.0,
+    order_of_magnitude_threshold: float = 2.0,
     figsize: tuple = (8, 5),
 ) -> pd.DataFrame:
     """
@@ -116,7 +118,9 @@ def eval_train_metrics(
         plot_options: Optional dict mapping metric base names to plot options.
                      Each value is a dict with keys like {"ylabel": "Label", "use_log_scale": "auto"}.
                      Overrides DEFAULT_PLOT_OPTIONS.
-        log_scale_threshold: For "auto" log scale mode, use log if max-min > threshold (default: 10.0)
+        order_of_magnitude_threshold: For "auto" log scale mode, use log if max/min > 10^threshold 
+                     (default: 2.0 = 100x span). Allows log scale even with some negative values
+                     (up to 50%), clipping negatives to a safe minimum.
         figsize: Figure size for each plot (default: (8, 5))
         
     Returns:
@@ -296,12 +300,12 @@ def eval_train_metrics(
             ylabel=ylabel,
             title=title,
             use_log_scale=use_log_scale,
-            log_scale_threshold=log_scale_threshold,
+            order_of_magnitude_threshold=order_of_magnitude_threshold,
         )
         
         if success:
             plt.tight_layout()
-            plt.savefig(join(eval_path_fig, f"{base_name}_{exp_id}.pdf"))
+            plt.savefig(join(eval_path_fig, f"{base_name}_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
             if show_plots:
                 plt.show()
             else:
@@ -326,15 +330,141 @@ def eval_train_metrics(
         sns.heatmap(df_corr, ax=ax, cmap="coolwarm", vmin=0, vmax=1)
         ax.set_title("Metric Correlation Matrix")
         plt.tight_layout()
-        plt.savefig(join(eval_path_fig, f"metrics_corr_{exp_id}.pdf"))
+        plt.savefig(join(eval_path_fig, f"metrics_corr_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
         if show_plots:
             plt.show()
         else:
             plt.close()
         print(f"  ✓ Plotted: correlation heatmap")
     
+    # =========================================================================
+    # Compute Training Instability Metrics
+    # =========================================================================
+    print("\n--- Computing Training Instability Metrics ---")
+    
+    instability_results = compute_training_instability(
+        df=df,
+        metric_col="val_loss",
+        window=5,
+    )
+    
+    # Save instability metrics to JSON
+    instability_filename = "training_instability.json"
+    with open(join(eval_path_files, instability_filename), 'w') as f:
+        json.dump(instability_results, f, indent=2)
+    print(f"  ✓ Saved: {instability_filename}")
+    
+    # Print summary
+    print(f"\n  Instability Metrics Summary (val_loss):")
+    for metric_name, metric_data in instability_results["metrics"].items():
+        mean_val = metric_data["mean"]
+        std_val = metric_data["std"]
+        print(f"    {metric_name}: {mean_val:.6f} ± {std_val:.6f}")
+    
     print(f"\nEvaluation complete!")
     print(f"  Plotted {plotted_count} metric pairs")
     print(f"  Results saved to: {eval_path_root}")
     
     return df
+
+
+def compute_training_instability(
+    df: pd.DataFrame,
+    metric_col: str = "val_loss",
+    window: int = 5,
+) -> dict:
+    """
+    Compute training instability metrics from training curves.
+    
+    Computes per-fold instability metrics (spike ratio, CV, max jump, trend instability)
+    and aggregates them across k-folds.
+    
+    Args:
+        df: DataFrame with columns ['kfold', 'epoch', metric_col]
+        metric_col: Column name to compute instability for (default: 'val_loss')
+        window: Moving average window for trend instability (default: 5)
+        
+    Returns:
+        dict with structure:
+            {
+                "metric_col": "val_loss",
+                "window": 5,
+                "n_folds": 5,
+                "metrics": {
+                    "spike_ratio": {"mean": X, "std": Y, "per_fold": {...}},
+                    "cv": {"mean": X, "std": Y, "per_fold": {...}},
+                    "max_jump": {"mean": X, "std": Y, "per_fold": {...}},
+                    "trend_instability": {"mean": X, "std": Y, "per_fold": {...}},
+                }
+            }
+            
+    Example:
+        >>> df = load_training_metrics("../experiments/my_experiment")
+        >>> df = df.groupby(["kfold", "epoch"]).first().reset_index()
+        >>> results = compute_training_instability(df, metric_col="val_loss")
+        >>> print(f"Spike ratio: {results['metrics']['spike_ratio']['mean']:.3f}")
+    """
+    if metric_col not in df.columns:
+        print(f"Warning: Metric column '{metric_col}' not found in DataFrame")
+        return {
+            "metric_col": metric_col,
+            "window": window,
+            "n_folds": 0,
+            "metrics": {},
+            "error": f"Column '{metric_col}' not found",
+        }
+    
+    # Get unique k-folds
+    kfolds = df["kfold"].unique()
+    n_folds = len(kfolds)
+    
+    # Compute instability metrics for each fold
+    fold_metrics = {
+        "spike_ratio": {},
+        "cv": {},
+        "max_jump": {},
+        "trend_instability": {},
+    }
+    
+    for kfold in kfolds:
+        # Get loss values sorted by epoch for this fold
+        fold_df = df[df["kfold"] == kfold].sort_values("epoch")
+        loss_values = fold_df[metric_col].values
+        
+        # Filter out NaN values
+        clean_values = loss_values[np.isfinite(loss_values)]
+        
+        if len(clean_values) < 2:
+            print(f"  Warning: {kfold} has insufficient data points ({len(clean_values)})")
+            continue
+        
+        # Compute instability metrics for this fold
+        fold_instability = compute_instability_metrics(clean_values, window=window)
+        
+        for metric_name, value in fold_instability.items():
+            fold_metrics[metric_name][kfold] = value
+    
+    # Aggregate across folds
+    aggregated_metrics = {}
+    for metric_name, per_fold_dict in fold_metrics.items():
+        if not per_fold_dict:
+            aggregated_metrics[metric_name] = {
+                "mean": None,
+                "std": None,
+                "per_fold": {},
+            }
+            continue
+        
+        values = np.array(list(per_fold_dict.values()))
+        aggregated_metrics[metric_name] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "per_fold": per_fold_dict,
+        }
+    
+    return {
+        "metric_col": metric_col,
+        "window": window,
+        "n_folds": n_folds,
+        "metrics": aggregated_metrics,
+    }

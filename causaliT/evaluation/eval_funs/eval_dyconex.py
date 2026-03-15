@@ -43,6 +43,7 @@ import sys
 sys.path.append(root_path)
 
 from causaliT.evaluation.predict import predict_test_from_ckpt
+from .eval_utils import DEFAULT_PLOT_FORMAT
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import (
@@ -341,7 +342,7 @@ def eval_dyconex_predictions(
     axes[2].legend()
     
     plt.tight_layout()
-    plt.savefig(join(eval_path_fig, f"mae_distribution_{exp_id}.pdf"))
+    plt.savefig(join(eval_path_fig, f"mae_distribution_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
     if show_plots:
         plt.show()
     else:
@@ -394,7 +395,7 @@ def eval_dyconex_predictions(
             mae_A=mae_delta_A[idx],
             mae_B=mae_delta_B[idx],
             label=f"BEST #{i+1}",
-            filename=join(eval_path_fig, f"best_sample_{i+1}_{exp_id}.pdf")
+            filename=join(eval_path_fig, f"best_sample_{i+1}_{exp_id}.{DEFAULT_PLOT_FORMAT}")
         )
     
     # Plot worst samples
@@ -407,7 +408,7 @@ def eval_dyconex_predictions(
             mae_A=mae_delta_A[idx],
             mae_B=mae_delta_B[idx],
             label=f"WORST #{i+1}",
-            filename=join(eval_path_fig, f"worst_sample_{i+1}_{exp_id}.pdf")
+            filename=join(eval_path_fig, f"worst_sample_{i+1}_{exp_id}.{DEFAULT_PLOT_FORMAT}")
         )
     
     print(f"\nEvaluation complete! Results saved to: {eval_path_root}")

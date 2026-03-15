@@ -6,15 +6,17 @@
 
 ## Run All Evaluations on Experiment(s)
 
+Don't forget the `--no-show` option to avoid pop-up windows. 
+
 ```bash
 # Single experiment
-python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_exp
+python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_exp --no-show
 
 # Multiple experiments
-python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/exp1 -e experiments/exp2
+python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/exp1 -e experiments/exp2 --no-show
 
 # All experiments in a folder (auto-discovers subdirectories)
-python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -f experiments/euler
+python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -f experiments/euler --no-show
 ```
 
 ---
@@ -23,14 +25,14 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -f experiments/eul
 
 ```bash
 python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_exp \
-  --functions eval_train_metrics eval_attention_scores
+  --functions eval_train_metrics eval_attention_scores --no-show
 ```
 
 **Available functions:**
 
 | Function | Description |
 |----------|-------------|
-| `eval_train_metrics` | Training curves and loss analysis |
+| `eval_train_metrics` | Training curves, loss analysis, and instability metrics |
 | `eval_attention_scores` | DAG recovery metrics (phi, attention) |
 | `eval_embed` | Embedding evolution analysis |
 | `eval_interventions` | Causal intervention tests |
@@ -64,6 +66,14 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli manifest -f experiments/eul
 | `--no-show` | Don't display plots (save to files only) |
 | `--update-manifest` | Update manifest after running evaluations |
 | `--functions` | Specific functions to run (default: all) |
+
+---
+
+## Evaluate Attention Necessity Score (ANS)
+
+```bash
+python -m causaliT.evaluation.eval_funs.eval_ans experiments/ANS_sweep_exp --no-show
+```
 
 ---
 

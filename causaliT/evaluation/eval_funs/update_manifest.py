@@ -276,10 +276,26 @@ def update_experiments_manifest(
         "kappa_acyclic": None,
         "lambda_sparse": None,
         "lambda_sparse_cross": None,
+        "lambda_hsic": None,
+        "lambda_decisive": None,
+        "lambda_decisive_cross": None,
+        "lambda_tau": None,
+        "lambda_l1_self_scores": None,
+        "lambda_l1_cross_scores": None,
+        "lambda_embed_l1": None,
+        "lambda_entropy_self": None,
+        "lambda_entropy_cross": None,
+        "lambda_kl": None,
+        "lambda_noise_prior": None,
         # Results
         "best_val_loss": None,
         "best_test_r2": None,
         "num_folds": None,
+        # Test loss statistics across k-folds
+        "test_loss_mean": None,
+        "test_loss_std": None,
+        "test_loss_best": None,
+        "test_loss_worst": None,
         # DAG recovery metrics (statistics only - per-fold details are in dag_metrics.json)
         "soft_hamming_cross_best": None,
         "soft_hamming_cross_mean": None,
@@ -293,6 +309,15 @@ def update_experiments_manifest(
         # HSIC (independence regularization)
         "final_hsic_mean": None,  # Mean HSIC across folds at final epoch
         "final_hsic_std": None,   # Std HSIC across folds
+        # Training instability metrics (from eval_train_metrics)
+        "val_loss_spike_ratio_mean": None,
+        "val_loss_spike_ratio_std": None,
+        "val_loss_cv_mean": None,
+        "val_loss_cv_std": None,
+        "val_loss_max_jump_mean": None,
+        "val_loss_max_jump_std": None,
+        "val_loss_trend_instability_mean": None,
+        "val_loss_trend_instability_std": None,
         # Metadata
         "last_evaluated": datetime.now().isoformat(timespec="seconds"),
         "available_evals": "[]",
@@ -340,6 +365,17 @@ def update_experiments_manifest(
             metadata["kappa_acyclic"] = training_config.get("kappa")
             metadata["lambda_sparse"] = training_config.get("lambda_sparse")
             metadata["lambda_sparse_cross"] = training_config.get("lambda_sparse_cross")
+            metadata["lambda_hsic"] = training_config.get("lambda_hsic")
+            metadata["lambda_decisive"] = training_config.get("lambda_decisive")
+            metadata["lambda_decisive_cross"] = training_config.get("lambda_decisive_cross")
+            metadata["lambda_tau"] = training_config.get("lambda_tau")
+            metadata["lambda_l1_self_scores"] = training_config.get("lambda_l1_self_scores")
+            metadata["lambda_l1_cross_scores"] = training_config.get("lambda_l1_cross_scores")
+            metadata["lambda_embed_l1"] = training_config.get("lambda_embed_l1")
+            metadata["lambda_entropy_self"] = training_config.get("lambda_entropy_self")
+            metadata["lambda_entropy_cross"] = training_config.get("lambda_entropy_cross")
+            metadata["lambda_kl"] = training_config.get("lambda_kl")
+            metadata["lambda_noise_prior"] = training_config.get("lambda_noise_prior")
             
             # Model architecture details
             embed_dim = model_config.get("embed_dim", {})
@@ -373,6 +409,14 @@ def update_experiments_manifest(
                 metadata["best_test_r2"] = stats["test_r2"].get("max")
             elif "test_x_r2" in stats:
                 metadata["best_test_r2"] = stats["test_x_r2"].get("max")
+            
+            # Load test loss statistics across k-folds
+            if "test_loss" in stats:
+                metadata["test_loss_mean"] = stats["test_loss"].get("mean")
+                metadata["test_loss_std"] = stats["test_loss"].get("std")
+                metadata["test_loss_best"] = stats["test_loss"].get("min")
+                metadata["test_loss_worst"] = stats["test_loss"].get("max")
+                print(f"Loaded test loss stats from kfold_summary")
                 
         except Exception as e:
             print(f"Warning: Could not load kfold_summary: {e}")
@@ -469,6 +513,31 @@ def update_experiments_manifest(
                 print(f"Loaded HSIC from training metrics CSV: mean={metadata['final_hsic_mean']:.6f}")
         except Exception as e:
             print(f"Warning: Could not load HSIC from training metrics: {e}")
+    
+    # Load training instability metrics from eval_train_metrics output
+    instability_path = join(experiment, "eval", "eval_train_metrics", "files", "training_instability.json")
+    if exists(instability_path):
+        try:
+            with open(instability_path, 'r') as f:
+                instability_data = json.load(f)
+            
+            metrics = instability_data.get("metrics", {})
+            
+            # Extract instability metrics
+            for metric_name in ["spike_ratio", "cv", "max_jump", "trend_instability"]:
+                if metric_name in metrics:
+                    metric_data = metrics[metric_name]
+                    mean_val = metric_data.get("mean")
+                    std_val = metric_data.get("std")
+                    
+                    if mean_val is not None:
+                        metadata[f"val_loss_{metric_name}_mean"] = mean_val
+                    if std_val is not None:
+                        metadata[f"val_loss_{metric_name}_std"] = std_val
+            
+            print(f"Loaded training instability from {instability_path}")
+        except Exception as e:
+            print(f"Warning: Could not load training instability: {e}")
     
     # Load existing manifest or create new one
     if exists(manifest_path):

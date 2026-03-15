@@ -28,6 +28,7 @@ from causaliT.training.forecasters import TransformerForecaster, StageCausalFore
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
 from causaliT.training.experiment_control import update_config
+from causaliT.training.config_utils import populate_seq_lengths_from_dataset
 #from causaliT.predict import mk_quick_pred_plot
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -70,6 +71,10 @@ def trainer(
     seed = config["training"]["seed"]
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
+    
+    # Populate sequence lengths from dataset metadata
+    # This reads S_seq_len, X_seq_len, Y_seq_len from dataset_metadata.json
+    config = populate_seq_lengths_from_dataset(config, data_dir)
     
     # get model class and dataloader from configuration
     model_class = get_model_class(config)

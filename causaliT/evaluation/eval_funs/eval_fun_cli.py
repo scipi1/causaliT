@@ -23,6 +23,7 @@ Available evaluation functions:
     - eval_interventions: Causal intervention tests
     - eval_embedding_dag_correlation: Embedding-DAG correlation
     - eval_dyconex_predictions: Dyconex-specific prediction evaluation
+    - eval_ans: Attention Necessity Score (ANS) for sweep experiments
 """
 
 import sys
@@ -50,6 +51,7 @@ AVAILABLE_FUNCTIONS = [
     "eval_interventions",
     "eval_embedding_dag_correlation",
     "eval_dyconex_predictions",
+    "eval_ans",  # ANS evaluation for sweep experiments
     "fix_kfold_summary",
     "enrich_kfold_summary",
 ]

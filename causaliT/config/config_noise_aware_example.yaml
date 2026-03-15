@@ -45,8 +45,8 @@ model:
     ds_embed_S:
       num_variables: ${data.S_seq_len}
       value_input_dim: 1
-      value_idx: ${data.features.shared.value}
-      var_idx: ${data.features.shared.variable}
+      value_idx: ${data.feature_indices.value}
+      var_idx: ${data.feature_indices.variable}
       freeze: true  # S variables are deterministic (SET), not measurements
     
     # X Embedding (Learnable - SVFA mode returns tuple (X_struct, X_val))
@@ -55,22 +55,22 @@ model:
         d_model: ${model.embed_dim.d_model_set}
         sparse_grad: False
       modules:
-        - idx: ${data.features.shared.value}
+        - idx: ${data.feature_indices.value}
           embed: "linear"
           label: "value"
           kwargs:
             input_dim: 1
             embedding_dim: ${model.embed_dim.val_emb_hidden}
-        - idx: ${data.features.shared.variable}
+        - idx: ${data.feature_indices.variable}
           embed: "nn_embedding"
           label: "variable"
           kwargs:
-            num_embeddings: 8
+            num_embeddings: ${data.num_embeddings_X}  # Auto-populated: n_input + 1 (non-shared)
             embedding_dim: ${model.embed_dim.var_emb_hidden}
             padding_idx: 0
             sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
             max_norm: 1
-        - idx: ${data.features.shared.value}
+        - idx: ${data.feature_indices.value}
           embed: "mask"
           label: "value_missing"
           kwargs: {}
@@ -226,16 +226,25 @@ training:
 data:
   dataset: "scm6"
   filename_input: "ds.npz"
-  val_idx: ${data.features.shared.value}
+  val_idx: ${data.feature_indices.value}
   test_ds_ixd: null
   max_data_size: null
-  S_seq_len: 3
-  X_seq_len: 2
-  Y_seq_len: 2
-  features:
-    shared:
-      value: 0
-      variable: 1
+  # NOTE: All fields below are AUTO-POPULATED from dataset_metadata.json
+  # These placeholder values are overwritten at runtime by populate_seq_lengths_from_dataset()
+  # See docs/DATASET_METADATA.md for details
+  S_seq_len: null  # Auto-populated from dataset_metadata.json
+  X_seq_len: null  # Auto-populated from dataset_metadata.json
+  Y_seq_len: null  # Auto-populated from dataset_metadata.json
+  # Embedding dimensions (auto-populated):
+  num_embeddings_X: null     # n_input + 1 (non-shared X stage, includes padding)
+  num_embeddings_Y: null     # n_target + 1 (non-shared Y stage)
+  num_embeddings_shared: null  # n_source + n_input + n_target + 1 (shared embedding)
+  # Feature indices (auto-populated from dataset_metadata.json):
+  # For SCM datasets: {value: 0, variable: 1}
+  # For real-world datasets: may vary (e.g., dyconex has additional features)
+  feature_indices:
+    value: 0     # Column index for observation values
+    variable: 1  # Column index for variable IDs
 
 
 special:

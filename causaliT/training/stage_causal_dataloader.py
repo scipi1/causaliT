@@ -1,8 +1,10 @@
 """
 StageCausalDataModule: DataLoader for StageCausaliT architecture.
 
-Handles loading three data streams (S, X, Y) from a single .npz file
+Handles loading two or three data streams (S, X, [Y]) from a single .npz file
 and provides DataLoaders compatible with the dual-decoder architecture.
+
+Supports datasets without Y (target variables) for S→X only training.
 """
 
 import numpy as np
@@ -17,24 +19,26 @@ class StageCausalDataModule(pl.LightningDataModule):
     """
     PyTorch Lightning DataModule for StageCausaliT.
     
-    Loads three data streams from a single .npz file:
-    - S: Source nodes
-    - X: Intermediate variables
-    - Y: Target variables
+    Loads two or three data streams from a single .npz file:
+    - S: Source nodes (required)
+    - X: Intermediate variables (required)
+    - Y: Target variables (optional)
     
     Expected file format:
-        np.savez('data.npz', s=S_array, x=X_array, y=Y_array)
+        np.savez('data.npz', s=S_array, x=X_array, y=Y_array)  # with targets
+        np.savez('data.npz', s=S_array, x=X_array)              # without targets
     
     Supports:
     - Automatic train/val/test splitting
     - K-fold cross-validation with manual indices
     - Pre-split train/test files
     - Data size limiting for debugging
+    - Datasets without Y (target variables)
     """
     def __init__(
         self,
         data_dir: str,
-        input_file: str,  # Single .npz file containing s, x, y
+        input_file: str,  # Single .npz file containing s, x, [y]
         batch_size: int,
         num_workers: int,
         data_format: str,
@@ -57,6 +61,9 @@ class StageCausalDataModule(pl.LightningDataModule):
         self.train_file = train_file
         self.test_file = test_file
         self.use_val_split = use_val_split
+        
+        # Flag to track if Y (targets) exist
+        self.has_targets = None
         
         # Store data as tensors
         self.S_tensor = None
@@ -81,6 +88,18 @@ class StageCausalDataModule(pl.LightningDataModule):
         self.all_ds = None
         self.ds_length = None
     
+    def _create_dataset(self, S_tensor, X_tensor, Y_tensor=None):
+        """
+        Create a TensorDataset with 2 or 3 tensors depending on whether Y exists.
+        
+        Returns:
+            TensorDataset: (S, X) or (S, X, Y)
+        """
+        if Y_tensor is not None:
+            return TensorDataset(S_tensor, X_tensor, Y_tensor)
+        else:
+            return TensorDataset(S_tensor, X_tensor)
+    
     def prepare_data(self) -> None:
         """
         Load data from .npz file and convert to PyTorch tensors.
@@ -88,10 +107,12 @@ class StageCausalDataModule(pl.LightningDataModule):
         Supports two modes:
         - Pre-split data: Load separate train/test files
         - Normal data: Load single dataset file for later splitting
+        
+        Also supports datasets without Y (target variables).
         """
         # Check if pre-split data is provided
         if self.train_file is not None or self.test_file is not None:
-            print("Loading pre-split data (S, X, Y format).")
+            print("Loading pre-split data (S, X, [Y] format).")
             
             # Reset indices to prevent further splitting
             self.train_idx = None
@@ -104,87 +125,134 @@ class StageCausalDataModule(pl.LightningDataModule):
                 train_loaded = np.load(join(self.data_dir, self.train_file), allow_pickle=True, mmap_mode='r')
                 S_train_np = train_loaded['s']
                 X_train_np = train_loaded['x']
-                Y_train_np = train_loaded['y']
                 
-                print(f"Train shapes - S: {S_train_np.shape}, X: {X_train_np.shape}, Y: {Y_train_np.shape}")
-                
-                # Validate dimensions
-                assert S_train_np.shape[0] == X_train_np.shape[0] == Y_train_np.shape[0], \
-                    f"Batch size mismatch in train data: S={S_train_np.shape[0]}, X={X_train_np.shape[0]}, Y={Y_train_np.shape[0]}"
+                # Check if Y exists in train data
+                if 'y' in train_loaded.files:
+                    Y_train_np = train_loaded['y']
+                    self.has_targets = True
+                    print(f"Train shapes - S: {S_train_np.shape}, X: {X_train_np.shape}, Y: {Y_train_np.shape}")
+                    
+                    # Validate dimensions
+                    assert S_train_np.shape[0] == X_train_np.shape[0] == Y_train_np.shape[0], \
+                        f"Batch size mismatch in train data: S={S_train_np.shape[0]}, X={X_train_np.shape[0]}, Y={Y_train_np.shape[0]}"
+                else:
+                    Y_train_np = None
+                    self.has_targets = False
+                    print(f"Train shapes - S: {S_train_np.shape}, X: {X_train_np.shape} (no Y)")
+                    
+                    # Validate dimensions
+                    assert S_train_np.shape[0] == X_train_np.shape[0], \
+                        f"Batch size mismatch in train data: S={S_train_np.shape[0]}, X={X_train_np.shape[0]}"
                 
                 if self.max_data_size is not None:
                     S_train_np = S_train_np[:self.max_data_size]
                     X_train_np = X_train_np[:self.max_data_size]
-                    Y_train_np = Y_train_np[:self.max_data_size]
+                    if Y_train_np is not None:
+                        Y_train_np = Y_train_np[:self.max_data_size]
                 
                 # Convert to tensors
                 self.S_train_tensor = torch.Tensor(S_train_np.astype(self.data_format))
                 self.X_train_tensor = torch.Tensor(X_train_np.astype(self.data_format))
-                self.Y_train_tensor = torch.Tensor(Y_train_np.astype(self.data_format))
+                if Y_train_np is not None:
+                    self.Y_train_tensor = torch.Tensor(Y_train_np.astype(self.data_format))
+                else:
+                    self.Y_train_tensor = None
                 
                 # Create datasets
-                self.train_ds = TensorDataset(self.S_train_tensor, self.X_train_tensor, self.Y_train_tensor)
+                self.train_ds = self._create_dataset(self.S_train_tensor, self.X_train_tensor, self.Y_train_tensor)
                 self.val_ds = self.train_ds
                 
                 # TEST
                 test_loaded = np.load(join(self.data_dir, self.test_file), allow_pickle=True, mmap_mode='r')
                 S_test_np = test_loaded['s']
                 X_test_np = test_loaded['x']
-                Y_test_np = test_loaded['y']
                 
-                print(f"Test shapes - S: {S_test_np.shape}, X: {X_test_np.shape}, Y: {Y_test_np.shape}")
-                
-                # Validate dimensions
-                assert S_test_np.shape[0] == X_test_np.shape[0] == Y_test_np.shape[0], \
-                    f"Batch size mismatch in test data: S={S_test_np.shape[0]}, X={X_test_np.shape[0]}, Y={Y_test_np.shape[0]}"
+                # Check if Y exists in test data (should match train)
+                if 'y' in test_loaded.files:
+                    Y_test_np = test_loaded['y']
+                    print(f"Test shapes - S: {S_test_np.shape}, X: {X_test_np.shape}, Y: {Y_test_np.shape}")
+                    
+                    # Validate dimensions
+                    assert S_test_np.shape[0] == X_test_np.shape[0] == Y_test_np.shape[0], \
+                        f"Batch size mismatch in test data: S={S_test_np.shape[0]}, X={X_test_np.shape[0]}, Y={Y_test_np.shape[0]}"
+                else:
+                    Y_test_np = None
+                    print(f"Test shapes - S: {S_test_np.shape}, X: {X_test_np.shape} (no Y)")
+                    
+                    # Validate dimensions
+                    assert S_test_np.shape[0] == X_test_np.shape[0], \
+                        f"Batch size mismatch in test data: S={S_test_np.shape[0]}, X={X_test_np.shape[0]}"
                 
                 if self.max_data_size is not None:
                     S_test_np = S_test_np[:self.max_data_size]
                     X_test_np = X_test_np[:self.max_data_size]
-                    Y_test_np = Y_test_np[:self.max_data_size]
+                    if Y_test_np is not None:
+                        Y_test_np = Y_test_np[:self.max_data_size]
                 
                 # Convert to tensors
                 self.S_test_tensor = torch.Tensor(S_test_np.astype(self.data_format))
                 self.X_test_tensor = torch.Tensor(X_test_np.astype(self.data_format))
-                self.Y_test_tensor = torch.Tensor(Y_test_np.astype(self.data_format))
+                if Y_test_np is not None:
+                    self.Y_test_tensor = torch.Tensor(Y_test_np.astype(self.data_format))
+                else:
+                    self.Y_test_tensor = None
                 
-                self.test_ds = TensorDataset(self.S_test_tensor, self.X_test_tensor, self.Y_test_tensor)
+                self.test_ds = self._create_dataset(self.S_test_tensor, self.X_test_tensor, self.Y_test_tensor)
                 
                 # Concatenate for all_ds
                 self.S_all = torch.cat([self.S_train_tensor, self.S_test_tensor], dim=0)
                 self.X_all = torch.cat([self.X_train_tensor, self.X_test_tensor], dim=0)
-                self.Y_all = torch.cat([self.Y_train_tensor, self.Y_test_tensor], dim=0)
-                self.all_ds = TensorDataset(self.S_all, self.X_all, self.Y_all)
+                if self.has_targets:
+                    self.Y_all = torch.cat([self.Y_train_tensor, self.Y_test_tensor], dim=0)
+                    self.all_ds = TensorDataset(self.S_all, self.X_all, self.Y_all)
+                else:
+                    self.Y_all = None
+                    self.all_ds = TensorDataset(self.S_all, self.X_all)
             
             self.ds_length = len(self.S_train_tensor)
             return
         
         # Normal data loading (not pre-split)
         else:
-            print("Loading single data file (S, X, Y format).")
+            print("Loading single data file (S, X, [Y] format).")
             loaded = np.load(join(self.data_dir, self.input_file), allow_pickle=True, mmap_mode='r')
             
             S_np: np.ndarray = loaded['s']
             X_np: np.ndarray = loaded['x']
-            Y_np: np.ndarray = loaded['y']
             
-            print(f"Data shapes - S: {S_np.shape}, X: {X_np.shape}, Y: {Y_np.shape}")
-            
-            # Validate dimensions
-            assert S_np.shape[0] == X_np.shape[0] == Y_np.shape[0], \
-                f"Batch size mismatch: S={S_np.shape[0]}, X={X_np.shape[0]}, Y={Y_np.shape[0]}"
+            # Check if Y exists
+            if 'y' in loaded.files:
+                Y_np: np.ndarray = loaded['y']
+                self.has_targets = True
+                print(f"Data shapes - S: {S_np.shape}, X: {X_np.shape}, Y: {Y_np.shape}")
+                
+                # Validate dimensions
+                assert S_np.shape[0] == X_np.shape[0] == Y_np.shape[0], \
+                    f"Batch size mismatch: S={S_np.shape[0]}, X={X_np.shape[0]}, Y={Y_np.shape[0]}"
+            else:
+                Y_np = None
+                self.has_targets = False
+                print(f"Data shapes - S: {S_np.shape}, X: {X_np.shape} (no Y)")
+                
+                # Validate dimensions
+                assert S_np.shape[0] == X_np.shape[0], \
+                    f"Batch size mismatch: S={S_np.shape[0]}, X={X_np.shape[0]}"
             
             if self.max_data_size is not None:
                 S_np = S_np[:self.max_data_size]
                 X_np = X_np[:self.max_data_size]
-                Y_np = Y_np[:self.max_data_size]
+                if Y_np is not None:
+                    Y_np = Y_np[:self.max_data_size]
             
             # Convert to tensors
             self.S_tensor = torch.Tensor(S_np.astype(self.data_format))
             self.X_tensor = torch.Tensor(X_np.astype(self.data_format))
-            self.Y_tensor = torch.Tensor(Y_np.astype(self.data_format))
+            if Y_np is not None:
+                self.Y_tensor = torch.Tensor(Y_np.astype(self.data_format))
+            else:
+                self.Y_tensor = None
             
-            self.all_ds = TensorDataset(self.S_tensor, self.X_tensor, self.Y_tensor)
+            self.all_ds = self._create_dataset(self.S_tensor, self.X_tensor, self.Y_tensor)
             
             # Store dataset length
             self.ds_length = len(self.S_tensor)
@@ -228,25 +296,43 @@ class StageCausalDataModule(pl.LightningDataModule):
         Y_tensor = self.Y_train_tensor if self.Y_train_tensor is not None else self.Y_tensor
         
         if self.test_idx is not None:
-            self.test_ds = TensorDataset(
-                S_tensor[self.test_idx],
-                X_tensor[self.test_idx],
-                Y_tensor[self.test_idx]
-            )
+            if Y_tensor is not None:
+                self.test_ds = TensorDataset(
+                    S_tensor[self.test_idx],
+                    X_tensor[self.test_idx],
+                    Y_tensor[self.test_idx]
+                )
+            else:
+                self.test_ds = TensorDataset(
+                    S_tensor[self.test_idx],
+                    X_tensor[self.test_idx]
+                )
         
         if self.val_idx is not None:
-            self.val_ds = TensorDataset(
-                S_tensor[self.val_idx],
-                X_tensor[self.val_idx],
-                Y_tensor[self.val_idx]
-            )
+            if Y_tensor is not None:
+                self.val_ds = TensorDataset(
+                    S_tensor[self.val_idx],
+                    X_tensor[self.val_idx],
+                    Y_tensor[self.val_idx]
+                )
+            else:
+                self.val_ds = TensorDataset(
+                    S_tensor[self.val_idx],
+                    X_tensor[self.val_idx]
+                )
         
         if self.train_idx is not None:
-            self.train_ds = TensorDataset(
-                S_tensor[self.train_idx],
-                X_tensor[self.train_idx],
-                Y_tensor[self.train_idx]
-            )
+            if Y_tensor is not None:
+                self.train_ds = TensorDataset(
+                    S_tensor[self.train_idx],
+                    X_tensor[self.train_idx],
+                    Y_tensor[self.train_idx]
+                )
+            else:
+                self.train_ds = TensorDataset(
+                    S_tensor[self.train_idx],
+                    X_tensor[self.train_idx]
+                )
     
     def split_ds(self) -> None:
         """Split dataset into train/val/test sets."""

@@ -29,6 +29,8 @@ from .eval_utils import (
     _load_true_dag_mask,
     _compute_dag_confidence,
     _get_learned_dag_per_fold,
+    load_dataset_metadata,
+    DEFAULT_PLOT_FORMAT,
 )
 
 # Import from project modules
@@ -400,23 +402,9 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         },
     }
     
-    # TODO: Dataset-specific variable mappings are hard-coded below.
-    _SCM6_FAMILY_MAPPING = {
-        "S1": "Source variable 1 (index 0 in S) - exogenous",
-        "S2": "Source variable 2 (index 1 in S) - exogenous", 
-        "S3": "Source variable 3 (index 2 in S) - exogenous",
-        "X1": "Intermediate variable 1 (index 0 in X) - X1 ← S1",
-        "X2": "Intermediate variable 2 (index 1 in X) - X2 ← S2, S3, X1",
-        "Y1": "Output variable 1 (index 0 in Y)",
-        "Y2": "Output variable 2 (index 1 in Y)",
-        "dag_structure": "S1→X1, S2→X2, S3→X2, X1→X2 (true causal DAG)",
-    }
-    DATASET_VARIABLE_MAPPINGS = {
-        "scm6": _SCM6_FAMILY_MAPPING,
-        "scm7": _SCM6_FAMILY_MAPPING,
-    }
-    
-    # Try to get dataset from config to add dataset-specific labels
+    # =========================================================================
+    # Load dataset metadata for variable mappings (NO FALLBACK - requires metadata)
+    # =========================================================================
     config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
     dataset_name = None
     if config_files:
@@ -426,15 +414,37 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         except Exception:
             pass
     
-    # Add dataset-specific mapping if available
-    if dataset_name and dataset_name in DATASET_VARIABLE_MAPPINGS:
-        attention_labels["variable_mapping"] = DATASET_VARIABLE_MAPPINGS[dataset_name]
-        attention_labels["dataset"] = dataset_name
+    if dataset_name:
+        datadir_path = join(root_path, "data")
+        metadata = load_dataset_metadata(datadir_path, dataset_name)
+        
+        if metadata:
+            # Build variable mapping from metadata
+            variable_mapping = {}
+            
+            # Add variable descriptions
+            if "variable_descriptions" in metadata:
+                variable_mapping.update(metadata["variable_descriptions"])
+            
+            # Add DAG structure description from edges
+            if "causal_structure" in metadata and "edges" in metadata["causal_structure"]:
+                edges = metadata["causal_structure"]["edges"]
+                edge_strs = [f"{src}→{tgt}" for src, tgt in edges]
+                variable_mapping["dag_structure"] = ", ".join(edge_strs) + " (true causal DAG)"
+            
+            attention_labels["variable_mapping"] = variable_mapping
+            attention_labels["dataset"] = dataset_name
+            print(f"  Loaded variable mappings from metadata for dataset: {dataset_name}")
+        else:
+            raise ValueError(
+                f"Dataset metadata not found for '{dataset_name}'. "
+                f"Ensure dataset_metadata.json exists in data/{dataset_name}/"
+            )
     else:
-        attention_labels["variable_mapping"] = {
-            "note": f"No variable mapping defined for dataset '{dataset_name}'. Add to DATASET_VARIABLE_MAPPINGS.",
-        }
-        attention_labels["dataset"] = dataset_name or "unknown"
+        raise ValueError(
+            f"No dataset specified in experiment config. "
+            f"Cannot load variable mappings."
+        )
     
     _save_variable_labels(eval_path_files, attention_labels, attention_labels_filename)
 
@@ -473,7 +483,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     
     # Plot: Attention score heatmaps
     fig = plot_attention_scores(final_scores_dict, cmap='viridis', annotation_fontsize=8, scale_mode="row")
-    plt.savefig(join(eval_path_fig, f"attention_scores_{exp_id}.pdf"))
+    plt.savefig(join(eval_path_fig, f"attention_scores_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
     if show_plots:
         plt.show()
     else:
@@ -490,7 +500,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     
     # Plot: Attention evolution
     fig = plot_attention_evolution(df, aggregate_folds=False, include_phi=True)
-    plt.savefig(join(eval_path_fig, f"attention_drift_{exp_id}.pdf"))
+    plt.savefig(join(eval_path_fig, f"attention_drift_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
     if show_plots:
         plt.show()
     else:
@@ -682,7 +692,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             
             plt.suptitle(f"Fold: {fold_name}", fontsize=14, fontweight='bold')
             plt.tight_layout()
-            plt.savefig(join(eval_path_fig, f"dag_comparison_{fold_name}_{exp_id}.pdf"))
+            plt.savefig(join(eval_path_fig, f"dag_comparison_{fold_name}_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
             if show_plots:
                 plt.show()
             else:

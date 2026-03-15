@@ -19,9 +19,12 @@ from typing import List, Tuple, Optional
 
 # Import shared utilities
 from .eval_utils import (
+    root_path,
     _setup_eval_directories,
     _save_readme,
     _create_cline_template,
+    load_dataset_metadata,
+    DEFAULT_PLOT_FORMAT,
 )
 
 # Import from project modules
@@ -88,21 +91,61 @@ def eval_interventions(
     match = re.search(r'([^/\\]+)$', experiment)
     exp_id = match.group(1) if match else "unknown"
     
-    # Setup default interventions if not provided
-    # TODO: Hard-coded default interventions for 3 source variables (S1, S2, S3)
-    # TODO: Should read number of source variables from experiment config
+    # =========================================================================
+    # Load dataset metadata for dynamic configuration
+    # =========================================================================
+    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
+    dataset_name = None
+    metadata = None
+    
+    if config_files:
+        try:
+            config = OmegaConf.load(join(experiment, config_files[0]))
+            dataset_name = config.get("data", {}).get("dataset")
+        except Exception:
+            pass
+    
+    if dataset_name:
+        datadir_path = join(root_path, "data")
+        metadata = load_dataset_metadata(datadir_path, dataset_name)
+        if metadata:
+            print(f"Loaded metadata for dataset: {dataset_name}")
+    
+    # =========================================================================
+    # Build trg_feat_1_map from metadata (NO FALLBACK - requires metadata)
+    # =========================================================================
+    if not metadata or "variable_index_map" not in metadata:
+        raise ValueError(
+            f"Dataset metadata not found for '{dataset_name}'. "
+            f"Ensure dataset_metadata.json exists in data/{dataset_name}/"
+        )
+    
+    # Invert the map: {name: idx} -> {idx: name}
+    trg_feat_1_map = {v: k for k, v in metadata["variable_index_map"].items()}
+    print(f"  Variable map loaded from metadata: {list(trg_feat_1_map.values())}")
+    
+    # =========================================================================
+    # Setup default interventions from metadata or fallback
+    # =========================================================================
     if interventions is None:
-        interventions = [
-            (create_intervention_fn(interventions={1: 0}), "S1=0"),
-            (create_intervention_fn(interventions={2: 0}), "S2=0"),
-            (create_intervention_fn(interventions={3: 0}), "S3=0"),
-            (create_intervention_fn(interventions={1: 1}), "S1=1"),
-            (create_intervention_fn(interventions={2: 1}), "S2=1"),
-            (create_intervention_fn(interventions={3: 1}), "S3=1"),
-            (create_intervention_fn(interventions={1: -1}), "S1=-1"),
-            (create_intervention_fn(interventions={2: -1}), "S2=-1"),
-            (create_intervention_fn(interventions={3: -1}), "S3=-1"),
-        ]
+        if not metadata or "variable_info" not in metadata:
+            raise ValueError(
+                f"Cannot generate interventions: metadata missing for '{dataset_name}'. "
+                f"Ensure dataset_metadata.json exists in data/{dataset_name}/"
+            )
+        
+        # Generate interventions dynamically from source_labels
+        source_labels = metadata["variable_info"].get("source_labels", [])
+        var_idx_map = metadata.get("variable_index_map", {})
+        interventions = []
+        for src_var in source_labels:
+            src_idx = var_idx_map.get(src_var)
+            if src_idx is not None:
+                for val in [0, 1, -1]:
+                    interventions.append(
+                        (create_intervention_fn(interventions={src_idx: val}), f"{src_var}={val}")
+                    )
+        print(f"  Generated {len(interventions)} interventions from metadata")
         label_dir = "default"
     else:
         do_labels = [tup[-1] for tup in interventions]
@@ -122,34 +165,9 @@ def eval_interventions(
     summary_filename = "do_summary.csv"
     variable_labels_filename = "variable_labels.json"
     
-    # Variable label mapping
-    # TODO: Hard-coded variable label mapping for SCM with S1-S3, X1-X2, Y1-Y2
-    # TODO: Should be dynamically generated based on dataset/experiment config
-    trg_feat_1_map = {
-        1: "S1",
-        2: "S2",
-        3: "S3",
-        4: "X1",
-        5: "X2",
-        6: "Y1",
-        7: "Y2",
-    }
-    
-    # LaTeX labels for plots
-    trg_feat_1_latex = {
-        1: "$S_1$",
-        2: "$S_2$",
-        3: "$S_3$",
-        4: "$X_1$",
-        5: "$X_2$",
-        6: "$Y_1$",
-        7: "$Y_2$",
-    }
-    
     # Save variable labels to JSON for AI/programmatic access
     variable_labels = {
         "trg_feat_1_to_name": trg_feat_1_map,
-        "trg_feat_1_to_latex": trg_feat_1_latex,
         "description": "Maps numeric trg_feat_1 values to variable names",
     }
     with open(join(eval_path_files, variable_labels_filename), 'w') as f:
@@ -248,50 +266,22 @@ def eval_interventions(
     # =========================================================================
     # Intervention Invariance Test (H1: non-causal interventions should have ~0 effect)
     # =========================================================================
-    # TODO: Hard-coded expected effects for scm6 dataset
-    # TODO: When adding new datasets, add their expected_effects to DATASET_EXPECTED_EFFECTS
-    # Note: scm6 (non-linear) and scm7 (linear) share the same causal structure
-    _SCM6_FAMILY_EXPECTED_EFFECTS = {
-        # Format: (intervention_var, target_var): expected_to_have_effect (True/False)
-        # True DAG: S1→X1, S2→X2, S3→X2, X1→X2
-        ("S1", "X1"): True,   # S1 causes X1
-        ("S1", "X2"): True,   # S1 → X1 → X2 (indirect)
-        ("S2", "X1"): False,  # S2 does not cause X1
-        ("S2", "X2"): True,   # S2 causes X2
-        ("S3", "X1"): False,  # S3 does not cause X1
-        ("S3", "X2"): True,   # S3 causes X2
-        # S variables don't affect themselves
-        ("S1", "S1"): False,  # Intervention doesn't affect own prediction
-        ("S1", "S2"): False,
-        ("S1", "S3"): False,
-        ("S2", "S1"): False,
-        ("S2", "S2"): False,
-        ("S2", "S3"): False,
-        ("S3", "S1"): False,
-        ("S3", "S2"): False,
-        ("S3", "S3"): False,
-    }
-    DATASET_EXPECTED_EFFECTS = {
-        "scm6": _SCM6_FAMILY_EXPECTED_EFFECTS,  # Non-linear SCM
-        "scm7": _SCM6_FAMILY_EXPECTED_EFFECTS,  # Linear SCM (same causal structure)
-        # TODO: Add more datasets here as they are created
-    }
-    
-    # Try to determine dataset from config
-    config_files_int = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
-    dataset_int = None
-    if config_files_int:
-        try:
-            config_int = OmegaConf.load(join(experiment, config_files_int[0]))
-            dataset_int = config_int.get("data", {}).get("dataset")
-        except Exception:
-            pass
-    
     invariance_filename = "intervention_invariance.json"
     invariance_threshold = 0.05  # Threshold for "no effect" (mean abs deviation)
     
-    if dataset_int and dataset_int in DATASET_EXPECTED_EFFECTS:
-        expected_effects = DATASET_EXPECTED_EFFECTS[dataset_int]
+    # Build expected_effects from metadata or use fallback
+    expected_effects = None
+    
+    if metadata and "causal_structure" in metadata and "expected_effects" in metadata["causal_structure"]:
+        # Convert metadata format: {src: {tgt: bool}} -> {(src, tgt): bool}
+        expected_effects_raw = metadata["causal_structure"]["expected_effects"]
+        expected_effects = {}
+        for src_var, targets in expected_effects_raw.items():
+            for tgt_var, has_effect in targets.items():
+                expected_effects[(src_var, tgt_var)] = has_effect
+        print(f"  Loaded expected effects from metadata: {len(expected_effects)} pairs")
+    
+    if expected_effects:
         
         # Compute invariance test results
         invariance_tests = []
@@ -344,7 +334,7 @@ def eval_interventions(
             invariance_pass_rate = invariance_only["passed"].mean() if len(invariance_only) > 0 else None
             
             invariance_summary = {
-                "dataset": dataset_int,
+                "dataset": dataset_name,
                 "threshold": invariance_threshold,
                 "total_tests": total_tests,
                 "passed_tests": int(passed_tests),
@@ -359,7 +349,7 @@ def eval_interventions(
             print(f"Saved intervention invariance: {invariance_filename}")
             print(f"  Invariance pass rate: {invariance_pass_rate:.2%}" if invariance_pass_rate else "  No invariance tests")
     else:
-        print(f"  Skipping invariance test: no expected effects defined for dataset '{dataset_int}'")
+        print(f"  Skipping invariance test: no expected effects defined for dataset '{dataset_name}'")
 
     # Generate plots
     for k in df_dev["kfold"].unique():
@@ -381,7 +371,7 @@ def eval_interventions(
             ax.set_title(r"Variable $\mathcal{Y}= $" + f"{var_label}, fold={k}")
             ax.set_xlabel(r"$\mathbb{E}[\mathcal{Y} | S:=s]$")
 
-            plt.savefig(join(eval_path_fig, f"dev_{var_label}_{k}_{exp_id}.pdf"))
+            plt.savefig(join(eval_path_fig, f"dev_{var_label}_{k}_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
             
             if show_plots:
                 plt.show()

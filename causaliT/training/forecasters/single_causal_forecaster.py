@@ -93,7 +93,7 @@ class SingleCausalForecaster(pl.LightningModule):
         # lambda_kl: scalar weight for the KL prior term
         # adaptive_z_scaling: if True, use SNR-based adaptive confidence (alpha)
         #                     if False, set alpha=1 (uniform confidence)
-        self.lambda_kl = config["training"].get("lambda_kl", 1.0)
+        self.lambda_kl = config["training"].get("lambda_kl", 0.0)
         self.adaptive_z_scaling = config["training"].get("adaptive_z_scaling", True)
         
         # DAG decisiveness regularization - encourages decisive edge probabilities (away from 0.5)
@@ -222,7 +222,7 @@ class SingleCausalForecaster(pl.LightningModule):
         Common step logic for train/val/test.
         
         Args:
-            batch: Tuple of (S, X, Y) tensors - Y is ignored
+            batch: Tuple of (S, X) or (S, X, Y) tensors - Y is ignored if present
             stage: One of "train", "val", or "test"
             
         Returns:
@@ -230,8 +230,12 @@ class SingleCausalForecaster(pl.LightningModule):
             pred_x: Predicted X values
             X: Actual X values
         """
-        # Unpack batch (ignore Y)
-        S, X, Y = batch
+        # Unpack batch - handle both 2-element (S, X) and 3-element (S, X, Y) batches
+        if len(batch) == 3:
+            S, X, Y = batch  # Y is unused but captured for compatibility
+        else:
+            S, X = batch
+            Y = None  # No target data
         
         # Extract actual values for loss computation
         x_val = X[:, :, self.val_idx]
