@@ -611,8 +611,14 @@ class ToeplitzLieAttention(nn.Module):
             diag_mask = torch.eye(L, S_len, device=dag_probs.device, dtype=torch.bool)
             dag_probs = dag_probs.masked_fill(diag_mask.unsqueeze(0), 0.0)
         
-        # Store for inspection/evaluation
+        # Store for inspection/evaluation and regularization
         self.last_dag_probs = dag_probs.detach()
+        self.last_gate_probs = gate_probs.detach()  # For L1 regularization on symmetric gate
+        self.last_S_sym = S_sym.detach()  # Symmetric part for analysis
+        
+        # Store gate_probs with gradients for L1 regularization in forecaster
+        # (mean across batch dimension to get per-edge gate probability)
+        self.gate_probs_for_reg = gate_probs.mean(dim=0)  # (L, S) or (H, L, S)
         
         # Apply Gumbel-Softmax for differentiable sampling during training
         tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
@@ -637,9 +643,10 @@ class ToeplitzLieAttention(nn.Module):
         else:
             M = M.masked_fill(diag_mask.unsqueeze(0), 0.0)
         
-        # Compute GeLU attention from direction (Lie-style)
-        att = F.gelu(torch.tanh(A_antisym * gain_dir / tau_dir))
-        att = torch.relu(att)  # Enforce non-negative flow
+        # Compute ReLU attention from direction (Lie-style)
+        # Comment: why ReLU? 
+        # ReLu(1) = 1 --> good probabilistic limit, GeLU(1)= 0.84
+        att = F.relu(torch.tanh(A_antisym * gain_dir / tau_dir))
         
         # Apply DAG mask
         att = att * M

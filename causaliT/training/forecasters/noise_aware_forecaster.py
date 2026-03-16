@@ -123,6 +123,37 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.prior_sigma_A = config["training"].get("prior_sigma_A", 0.01)
         self.prior_sigma_R = config["training"].get("prior_sigma_R", 0.05)
         
+        # =====================================================================
+        # ANNEALING CONFIGURATION
+        # =====================================================================
+        
+        # 1. Gumbel-Softmax Temperature Annealing (tau_gs)
+        self.use_tau_gs_annealing = config["training"].get("use_tau_gs_annealing", False)
+        self.tau_gs_start = config["training"].get("tau_gs_start", 2.0)
+        self.tau_gs_end = config["training"].get("tau_gs_end", 0.2)
+        self.tau_gs_anneal_epochs = config["training"].get("tau_gs_anneal_epochs", None)
+        
+        # 2. Toeplitz Activation Temperature Annealing (tau_gate, tau_dir)
+        self.use_tau_act_annealing = config["training"].get("use_tau_act_annealing", False)
+        self.tau_gate_start = config["training"].get("tau_gate_start", 1.0)
+        self.tau_gate_end = config["training"].get("tau_gate_end", 0.2)
+        self.tau_dir_start = config["training"].get("tau_dir_start", 0.5)
+        self.tau_dir_end = config["training"].get("tau_dir_end", 0.1)
+        self.tau_act_anneal_epochs = config["training"].get("tau_act_anneal_epochs", None)
+        
+        # 3. HSIC Annealing (lambda_hsic decreases over training)
+        self.use_hsic_annealing = config["training"].get("use_hsic_annealing", False)
+        self.hsic_lambda_start = config["training"].get("hsic_lambda_start", 1.0)
+        self.hsic_lambda_end = config["training"].get("hsic_lambda_end", 0.0)
+        self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
+        
+        # L1 regularization on Toeplitz gate probabilities
+        self.lambda_l1_toeplitz_gate = config["training"].get("lambda_l1_toeplitz_gate", 0.0)
+        
+        # Logging for annealing (disabled by default)
+        self.log_tau_annealing = config["training"].get("log_tau_annealing", False)
+        self.log_hsic_annealing = config["training"].get("log_hsic_annealing", False)
+        
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
@@ -418,6 +449,14 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             self.lambda_tau * (tau_self_loss + tau_cross_loss)
         )
         
+        # L1 regularization on Toeplitz gate probabilities
+        l1_toeplitz_gate = torch.tensor(0.0, device=x_target.device)
+        if self.lambda_l1_toeplitz_gate > 0:
+            gate_probs = getattr(dec_self_inner, 'gate_probs_for_reg', None)
+            if gate_probs is not None:
+                l1_toeplitz_gate = gate_probs.mean()
+        l1_toeplitz_gate_reg = self.lambda_l1_toeplitz_gate * l1_toeplitz_gate
+        
         # =====================================================================
         # NOISE PRIOR REGULARIZER (optional, for identifiability)
         # KL divergence from prior: encourages σ_A, σ_R to stay near initial values
@@ -447,6 +486,7 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                      l1_scores_regularizer +
                      hsic_regularizer +
                      decisiveness_regularizer +
+                     l1_toeplitz_gate_reg +
                      noise_prior_regularizer)
         
         # =====================================================================
@@ -504,6 +544,61 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
         
         return total_loss, mu, log_var, X
+    
+    def on_train_epoch_start(self):
+        """Apply annealing schedules at the start of each training epoch."""
+        epoch = self.current_epoch
+        max_epochs = self.trainer.max_epochs if self.trainer else 100
+        
+        dec_self_inner = self.model.decoder.layers[0].global_self_attention.inner_attention
+        
+        # 1. Gumbel-Softmax temperature annealing
+        if self.use_tau_gs_annealing:
+            anneal_epochs = self.tau_gs_anneal_epochs or max_epochs
+            progress = min(1.0, epoch / anneal_epochs)
+            # Exponential annealing: tau = start * (end/start)^progress
+            new_tau_gs = self.tau_gs_start * (self.tau_gs_end / self.tau_gs_start) ** progress
+            new_log_tau_gs = torch.log(torch.tensor(new_tau_gs))
+            
+            log_tau_gs = getattr(dec_self_inner, 'log_tau_gs', None)
+            if log_tau_gs is not None:
+                with torch.no_grad():
+                    log_tau_gs.copy_(new_log_tau_gs)
+            
+            if self.log_tau_annealing:
+                self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
+        
+        # 2. Toeplitz activation temperature annealing
+        if self.use_tau_act_annealing:
+            anneal_epochs = self.tau_act_anneal_epochs or max_epochs
+            progress = min(1.0, epoch / anneal_epochs)
+            
+            new_tau_gate = self.tau_gate_start * (self.tau_gate_end / self.tau_gate_start) ** progress
+            new_tau_dir = self.tau_dir_start * (self.tau_dir_end / self.tau_dir_start) ** progress
+            
+            log_tau_gate = getattr(dec_self_inner, 'log_tau_gate', None)
+            log_tau_dir = getattr(dec_self_inner, 'log_tau_dir', None)
+            
+            if log_tau_gate is not None:
+                with torch.no_grad():
+                    log_tau_gate.copy_(torch.log(torch.tensor(new_tau_gate)))
+            if log_tau_dir is not None:
+                with torch.no_grad():
+                    log_tau_dir.copy_(torch.log(torch.tensor(new_tau_dir)))
+            
+            if self.log_tau_annealing:
+                self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
+                self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
+        
+        # 3. HSIC annealing (decreasing lambda)
+        if self.use_hsic_annealing:
+            anneal_epochs = self.hsic_anneal_epochs or max_epochs
+            progress = min(1.0, epoch / anneal_epochs)
+            # Linear annealing from start to end
+            self.lambda_hsic = self.hsic_lambda_start + progress * (self.hsic_lambda_end - self.hsic_lambda_start)
+            
+            if self.log_hsic_annealing:
+                self.log("annealed_lambda_hsic", self.lambda_hsic, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
         """Training step."""

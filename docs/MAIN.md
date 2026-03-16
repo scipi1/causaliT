@@ -12,4 +12,12 @@
 
 # TODOs in priority order
 
+
+
+- Toeplitz L1-regularization at the symmetric part. It promotes sparse representations.
+
+- Add the following regularization **annealing**
+    - Toeplitz/Lie tau, defines how steep is the tanh, i.e. how decisive the edge should be. It naturally promotes binary edges towards the training end.
+    - HSIC: start with a very high regularization, to avoid learning very wrong DAGs and anneal it to zero
+
 ### Cross-validation inconsistency

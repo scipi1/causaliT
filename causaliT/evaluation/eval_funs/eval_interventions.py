@@ -32,6 +32,231 @@ from causaliT.evaluation.predict import create_intervention_fn
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import predict_from_experiment
+import warnings
+
+
+# =============================================================================
+# ATE Ground Truth Loading and De-normalization Utilities
+# =============================================================================
+
+def load_ate_ground_truth(datadir_path: str, dataset_name: str) -> Optional[dict]:
+    """
+    Load ATE ground truth from dataset directory.
+    
+    Args:
+        datadir_path: Path to data directory (e.g., "data/")
+        dataset_name: Name of dataset (e.g., "scm1_linear_gaussian")
+        
+    Returns:
+        Dict containing ATE ground truth, or None if not found
+    """
+    ate_path = join(datadir_path, dataset_name, "ate_ground_truth.json")
+    if exists(ate_path):
+        with open(ate_path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def load_normalization_stats(datadir_path: str, dataset_name: str) -> Optional[dict]:
+    """
+    Load normalization statistics from dataset directory.
+    
+    Args:
+        datadir_path: Path to data directory
+        dataset_name: Name of dataset
+        
+    Returns:
+        Dict containing normalization stats, or None if not found
+    """
+    norm_path = join(datadir_path, dataset_name, "normalization.json")
+    if exists(norm_path):
+        with open(norm_path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def denormalize_value(
+    normalized_value: float,
+    norm_stats: dict,
+    category: str = "input"
+) -> float:
+    """
+    De-normalize a value using the normalization statistics.
+    
+    Args:
+        normalized_value: The normalized value to convert back
+        norm_stats: Dict containing normalization parameters
+        category: "input", "source", or "target"
+        
+    Returns:
+        De-normalized value in original scale
+    """
+    if category not in norm_stats:
+        return normalized_value
+    
+    stats = norm_stats[category]
+    method = stats.get("method", "minmax")
+    
+    if method == "minmax":
+        # MinMax: normalized = (x - min) / (max - min)
+        # => x = normalized * (max - min) + min
+        min_val = stats.get("min", 0)
+        max_val = stats.get("max", 1)
+        return normalized_value * (max_val - min_val) + min_val
+    elif method == "standardize":
+        # Standard: normalized = (x - mean) / std
+        # => x = normalized * std + mean
+        mean_val = stats.get("mean", 0)
+        std_val = stats.get("std", 1)
+        return normalized_value * std_val + mean_val
+    else:
+        return normalized_value
+
+
+def compute_ate_deviation(
+    df: pd.DataFrame,
+    ate_ground_truth: dict,
+    norm_stats: dict,
+    trg_feat_1_map: dict,
+    input_labels: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Compute ATE deviation: |E_model[X | do(S=s)] - E_SCM[X | do(S=s)]|
+    
+    This computes the error between the model's predicted interventional effect
+    and the ground-truth causal effect from the SCM.
+    
+    Args:
+        df: DataFrame with predictions (must have 'intervention', 'pred_feat_0', 
+            'trg_feat_1', 'kfold' columns)
+        ate_ground_truth: Dict from ate_ground_truth.json
+        norm_stats: Dict from normalization.json
+        trg_feat_1_map: Dict mapping variable indices to names
+        input_labels: List of input variable names (e.g., ["X1", "X2"]) - used to
+                     correctly map prediction positions to ground truth variables
+        
+    Returns:
+        DataFrame with columns:
+            - intervention: e.g., "S1=0"
+            - variable: target variable name (e.g., "X1")
+            - kfold: cross-validation fold
+            - model_ate_normalized: model's mean prediction (normalized scale)
+            - model_ate_raw: model's mean prediction (de-normalized to raw scale)
+            - true_ate: ground-truth E[X | do(S=s)] from SCM
+            - abs_error: |model_ate_raw - true_ate|
+            - n_samples: number of samples used
+    """
+    # Use analytical ground truth by default
+    gt_method = "analytical"
+    if gt_method not in ate_ground_truth:
+        gt_method = list(ate_ground_truth.keys())[0]
+        if gt_method in ["description", "do_values_used", "computation_methods"]:
+            gt_method = "analytical" if "analytical" in ate_ground_truth else "monte_carlo"
+    
+    ground_truth = ate_ground_truth.get(gt_method, {})
+    
+    ate_records = []
+    
+    # Get unique interventions (excluding baseline)
+    interventions = [i for i in df["intervention"].unique() if i != "baseline"]
+    
+    # Build position-to-input_label mapping
+    # The model predicts input variables (X) in sequence order
+    # pos_idx 0 -> input_labels[0] (e.g., "X1")
+    # pos_idx 1 -> input_labels[1] (e.g., "X2")
+    pos_to_input_label = {}
+    if input_labels:
+        for pos_idx, label in enumerate(input_labels):
+            pos_to_input_label[pos_idx] = label
+    
+    for intervention in interventions:
+        # Filter for this intervention
+        df_interv = df[df["intervention"] == intervention]
+        
+        # Get unique positions (pos_idx) to iterate over
+        # Use pos_idx if available, otherwise fall back to trg_feat_1
+        if "pos_idx" in df_interv.columns:
+            unique_positions = df_interv["pos_idx"].unique()
+            use_pos_idx = True
+        else:
+            unique_positions = df_interv["trg_feat_1"].unique()
+            use_pos_idx = False
+        
+        for pos_or_idx in unique_positions:
+            # Determine the variable name for ground truth lookup
+            if use_pos_idx and input_labels and int(pos_or_idx) < len(input_labels):
+                # Map position to input variable name
+                trg_var_name = input_labels[int(pos_or_idx)]
+            else:
+                # Fall back to trg_feat_1_map
+                if use_pos_idx:
+                    # Get corresponding trg_feat_1 value
+                    trg_feat_1_val = df_interv[df_interv["pos_idx"] == pos_or_idx]["trg_feat_1"].iloc[0]
+                else:
+                    trg_feat_1_val = pos_or_idx
+                trg_var_name = trg_feat_1_map.get(int(trg_feat_1_val), str(trg_feat_1_val))
+                
+                # If the variable name is a source variable (S1, S2, etc.) but ground truth 
+                # has input variables (X1, X2), try to map using input_labels by position
+                if input_labels and trg_var_name not in ground_truth.get(intervention, {}):
+                    pos = list(df_interv["trg_feat_1"].unique()).index(trg_feat_1_val) if trg_feat_1_val in df_interv["trg_feat_1"].unique() else -1
+                    if 0 <= pos < len(input_labels):
+                        trg_var_name = input_labels[pos]
+            
+            for kfold in df_interv["kfold"].unique():
+                if use_pos_idx:
+                    mask = (
+                        (df_interv["pos_idx"] == pos_or_idx) &
+                        (df_interv["kfold"] == kfold)
+                    )
+                else:
+                    mask = (
+                        (df_interv["trg_feat_1"] == pos_or_idx) &
+                        (df_interv["kfold"] == kfold)
+                    )
+                subset = df_interv[mask]["pred_feat_0"]
+                
+                if len(subset) == 0:
+                    continue
+                
+                # Model's mean prediction (normalized)
+                model_ate_normalized = float(subset.mean())
+                
+                # De-normalize to raw scale
+                model_ate_raw = denormalize_value(
+                    model_ate_normalized, 
+                    norm_stats, 
+                    category="input"
+                )
+                
+                # Look up ground truth
+                # intervention key format: "S1=0" matches ground_truth["S1=0"]["X1"]
+                true_ate = None
+                if intervention in ground_truth:
+                    true_ate = ground_truth[intervention].get(trg_var_name)
+                
+                # Compute error
+                if true_ate is not None:
+                    abs_error = abs(model_ate_raw - true_ate)
+                    rel_error = abs_error / abs(true_ate) if abs(true_ate) > 1e-10 else None
+                else:
+                    abs_error = None
+                    rel_error = None
+                
+                ate_records.append({
+                    "intervention": intervention,
+                    "variable": trg_var_name,
+                    "pos_idx": int(pos_or_idx) if use_pos_idx else None,
+                    "kfold": kfold,
+                    "model_ate_normalized": model_ate_normalized,
+                    "model_ate_raw": model_ate_raw,
+                    "true_ate": true_ate,
+                    "abs_error": abs_error,
+                    "rel_error": rel_error,
+                    "n_samples": len(subset),
+                })
+    
+    return pd.DataFrame(ate_records)
 
 
 # =============================================================================
@@ -350,6 +575,108 @@ def eval_interventions(
             print(f"  Invariance pass rate: {invariance_pass_rate:.2%}" if invariance_pass_rate else "  No invariance tests")
     else:
         print(f"  Skipping invariance test: no expected effects defined for dataset '{dataset_name}'")
+
+    # =========================================================================
+    # ATE Ground Truth Comparison (Publication-Ready Metric)
+    # =========================================================================
+    ate_metrics_filename = "ate_metrics.csv"
+    ate_metrics_json_filename = "ate_metrics.json"
+    
+    # Load ATE ground truth and normalization stats
+    datadir_path = join(root_path, "data")
+    ate_ground_truth = load_ate_ground_truth(datadir_path, dataset_name)
+    norm_stats = load_normalization_stats(datadir_path, dataset_name)
+    
+    if ate_ground_truth is None:
+        warnings.warn(
+            f"ATE ground truth not found for dataset '{dataset_name}'. "
+            f"Please regenerate the dataset to include ate_ground_truth.json. "
+            f"Run: SCMDataset.generate_ds() to create the ground truth file.",
+            UserWarning
+        )
+        print(f"  Skipping ATE metrics: ate_ground_truth.json not found for '{dataset_name}'")
+    elif norm_stats is None:
+        warnings.warn(
+            f"Normalization stats not found for dataset '{dataset_name}'. "
+            f"ATE comparison requires normalization.json to de-normalize predictions.",
+            UserWarning
+        )
+        print(f"  Skipping ATE metrics: normalization.json not found for '{dataset_name}'")
+    else:
+        # Get input_labels from metadata for correct variable mapping
+        input_labels = metadata.get("variable_info", {}).get("input_labels", []) if metadata else []
+        
+        # Compute ATE deviation metrics
+        df_ate = compute_ate_deviation(
+            df=df,
+            ate_ground_truth=ate_ground_truth,
+            norm_stats=norm_stats,
+            trg_feat_1_map=trg_feat_1_map,
+            input_labels=input_labels,
+        )
+        
+        if len(df_ate) > 0:
+            # Save to CSV (detailed per-fold, per-intervention, per-variable)
+            df_ate.to_csv(join(eval_path_files, ate_metrics_filename), index=False)
+            
+            # Compute summary statistics for JSON export
+            ate_summary_records = []
+            for intervention in df_ate["intervention"].unique():
+                for variable in df_ate["variable"].unique():
+                    mask = (
+                        (df_ate["intervention"] == intervention) &
+                        (df_ate["variable"] == variable)
+                    )
+                    subset = df_ate[mask]
+                    
+                    if len(subset) == 0:
+                        continue
+                    
+                    # Aggregate across folds
+                    abs_errors = subset["abs_error"].dropna()
+                    rel_errors = subset["rel_error"].dropna()
+                    
+                    ate_summary_records.append({
+                        "intervention": intervention,
+                        "variable": variable,
+                        "true_ate": float(subset["true_ate"].iloc[0]) if subset["true_ate"].notna().any() else None,
+                        "model_ate_raw_mean": float(subset["model_ate_raw"].mean()),
+                        "model_ate_raw_std": float(subset["model_ate_raw"].std()),
+                        "abs_error_mean": float(abs_errors.mean()) if len(abs_errors) > 0 else None,
+                        "abs_error_std": float(abs_errors.std()) if len(abs_errors) > 0 else None,
+                        "rel_error_mean": float(rel_errors.mean()) if len(rel_errors) > 0 else None,
+                        "n_folds": len(subset),
+                    })
+            
+            # Overall summary metrics (averaged across all interventions and variables)
+            all_abs_errors = df_ate["abs_error"].dropna()
+            all_rel_errors = df_ate["rel_error"].dropna()
+            
+            ate_json = {
+                "description": "ATE (Average Treatment Effect) deviation metrics comparing model predictions to SCM ground truth",
+                "dataset": dataset_name,
+                "computation_method": "Model predictions de-normalized and compared to analytical SCM E[X | do(S=s)]",
+                "summary": {
+                    "mean_absolute_error": float(all_abs_errors.mean()) if len(all_abs_errors) > 0 else None,
+                    "std_absolute_error": float(all_abs_errors.std()) if len(all_abs_errors) > 0 else None,
+                    "median_absolute_error": float(all_abs_errors.median()) if len(all_abs_errors) > 0 else None,
+                    "mean_relative_error": float(all_rel_errors.mean()) if len(all_rel_errors) > 0 else None,
+                    "n_intervention_variable_pairs": len(ate_summary_records),
+                    "n_total_comparisons": len(df_ate),
+                },
+                "per_intervention_variable": ate_summary_records,
+            }
+            
+            with open(join(eval_path_files, ate_metrics_json_filename), 'w') as f:
+                json.dump(ate_json, f, indent=2)
+            
+            print(f"Saved ATE metrics: {ate_metrics_filename}")
+            if all_abs_errors.notna().any():
+                print(f"  Mean Absolute Error: {all_abs_errors.mean():.4f} ± {all_abs_errors.std():.4f}")
+                if all_rel_errors.notna().any():
+                    print(f"  Mean Relative Error: {all_rel_errors.mean():.2%}")
+        else:
+            print("  No ATE metrics computed (empty results)")
 
     # Generate plots
     for k in df_dev["kfold"].unique():
