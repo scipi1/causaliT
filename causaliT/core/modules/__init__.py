@@ -13,6 +13,7 @@ from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
 from .embedding import ModularEmbedding
 from .orthogonal_embedding import OrthogonalMaskEmbedding
+from .orthogonal_linear import OrthogonalLinear
 from .embedding_layers import *
 from .extra_layers import Normalization, UniformAttentionMask, DAGMask
 from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
@@ -30,6 +31,7 @@ __all__ = [
     'DecoderLayer',
     'ModularEmbedding',
     'OrthogonalMaskEmbedding',
+    'OrthogonalLinear',
     'Normalization',
     'UniformAttentionMask',
     'DAGMask',

@@ -162,6 +162,24 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         # DAG parameterization
         dag_parameterization_self: str = "independent",
         dag_parameterization_cross: str = "independent",
+        
+        # ToeplitzLieAttention parameters (for controlling DAG decisiveness)
+        # Lower gains and higher temperatures = more uncertain edge probabilities
+        toeplitz_init_gain_gate: float = 2.0,   # Symmetric gate gain (was 5.0)
+        toeplitz_init_gain_dir: float = 3.0,    # Direction gain (was 10.0)
+        toeplitz_init_tau_gate: float = 0.5,    # Gate temperature
+        toeplitz_init_tau_dir: float = 0.3,     # Direction temperature (was 0.2)
+        toeplitz_max_gain: float = 20.0,        # Max gain during training (was 100.0)
+        
+        # Key projection type for preserving embedding orthogonality
+        # - "linear": Standard unconstrained linear projection (default)
+        # - "orthogonal": Orthogonal projection (rotation + optional scaling)
+        # For cross-attention (S keys): use "orthogonal" to preserve S orthogonality
+        # For self-attention (X keys): use "linear" (X is not orthogonal)
+        key_projection_type_cross: str = "linear",
+        key_projection_type_self: str = "linear",
+        orthogonal_scale: bool = True,
+        orthogonal_init_scale: float = 1.0,
     ):
         super().__init__()
         
@@ -177,6 +195,21 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         self.factorization = "svfa"
         self.dag_parameterization_self = dag_parameterization_self
         self.dag_parameterization_cross = dag_parameterization_cross
+        
+        # Store Toeplitz parameters for _attn method
+        self._toeplitz_params = {
+            "toeplitz_init_gain_gate": toeplitz_init_gain_gate,
+            "toeplitz_init_gain_dir": toeplitz_init_gain_dir,
+            "toeplitz_init_tau_gate": toeplitz_init_tau_gate,
+            "toeplitz_init_tau_dir": toeplitz_init_tau_dir,
+            "toeplitz_max_gain": toeplitz_max_gain,
+        }
+        
+        # Store key projection parameters
+        self.key_projection_type_cross = key_projection_type_cross
+        self.key_projection_type_self = key_projection_type_self
+        self.orthogonal_scale = orthogonal_scale
+        self.orthogonal_init_scale = orthogonal_init_scale
         
         # =====================================================================
         # EMBEDDINGS
@@ -229,6 +262,7 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         }
         
         # Decoder cross-attention configuration (S → X)
+        # S keys are orthogonal, so use key_projection_type_cross (can be "orthogonal")
         attn_dec_cross_kwargs = {
             "d_model_queries": d_model,
             "d_model_keys": d_model,
@@ -241,10 +275,14 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             "layer_name": "dec_cross_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": S_seq_len,
-            "dag_parameterization": dag_parameterization_cross
+            "dag_parameterization": dag_parameterization_cross,
+            "key_projection_type": key_projection_type_cross,    # Orthogonal for S keys
+            "orthogonal_scale": orthogonal_scale,
+            "orthogonal_init_scale": orthogonal_init_scale,
         }
         
         # Decoder self-attention configuration (X ← X)
+        # X keys are not orthogonal, so use key_projection_type_self (typically "linear")
         attn_dec_self_kwargs = {
             "d_model_queries": d_model,
             "d_model_keys": d_model,
@@ -257,7 +295,10 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             "layer_name": "dec_self_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": X_seq_len,
-            "dag_parameterization": dag_parameterization_self
+            "dag_parameterization": dag_parameterization_self,
+            "key_projection_type": key_projection_type_self,     # Linear for X keys
+            "orthogonal_scale": orthogonal_scale,
+            "orthogonal_init_scale": orthogonal_init_scale,
         }
         
         # =====================================================================
@@ -467,7 +508,10 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         layer_name: str,
         query_seq_len: int,
         key_seq_len: int,
-        dag_parameterization: str = "independent"
+        dag_parameterization: str = "independent",
+        key_projection_type: str = "linear",
+        orthogonal_scale: bool = True,
+        orthogonal_init_scale: float = 1.0,
     ):
         """Create an attention layer with specified configuration."""
         
@@ -503,7 +547,12 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             layer_name=layer_name,
             query_seq_len=query_seq_len,
             key_seq_len=key_seq_len,
-            dag_parameterization=dag_parameterization
+            dag_parameterization=dag_parameterization,
+            key_projection_type=key_projection_type,
+            orthogonal_scale=orthogonal_scale,
+            orthogonal_init_scale=orthogonal_init_scale,
+            # Pass Toeplitz-specific parameters (used only when attention_type is ToeplitzLieAttention)
+            **self._toeplitz_params
         )
         
         return att

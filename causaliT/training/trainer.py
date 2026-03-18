@@ -126,6 +126,21 @@ def trainer(
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
+        # =====================================================================
+        # RESET SEED BEFORE MODEL CREATION FOR REPRODUCIBLE INITIALIZATION
+        # =====================================================================
+        # This ensures all folds start with identical model weights while still
+        # having different train/val data splits. The KFold split is controlled
+        # by random_state=seed (numpy RNG), which is separate from PyTorch's RNG.
+        #
+        # Why this matters:
+        # - nn.Embedding initializes weights from N(0,1) using PyTorch's RNG
+        # - Without reset, fold N's model has different initialization than fold 0
+        # - This causes different DAGs to be learned even with same seed
+        # - With reset, all folds have identical starting point for fair comparison
+        # =====================================================================
+        seed_everything(seed)
+        
         # re-initialize the model at any fold
         model = create_model_instance(config, data_dir)
         

@@ -114,6 +114,16 @@ class SingleCausalLayer(nn.Module):
         # When True, replaces learned attention with uniform attention
         # This tests if the model can fit data using only embeddings + MLP
         attention_bypass: bool = False,
+        
+        # Key projection type for preserving embedding orthogonality
+        # - "linear": Standard unconstrained linear projection (default)
+        # - "orthogonal": Orthogonal projection (rotation + optional scaling)
+        # For cross-attention (S keys): use "orthogonal" to preserve S orthogonality
+        # For self-attention (X keys): use "linear" (X is not orthogonal)
+        key_projection_type_cross: str = "linear",
+        key_projection_type_self: str = "linear",
+        orthogonal_scale: bool = True,
+        orthogonal_init_scale: float = 1.0,
     ):
         super().__init__()
         
@@ -129,6 +139,12 @@ class SingleCausalLayer(nn.Module):
         # Store sequence lengths for attention bypass
         self.S_seq_len = S_seq_len
         self.X_seq_len = X_seq_len
+        
+        # Store key projection parameters
+        self.key_projection_type_cross = key_projection_type_cross
+        self.key_projection_type_self = key_projection_type_self
+        self.orthogonal_scale = orthogonal_scale
+        self.orthogonal_init_scale = orthogonal_init_scale
         
         # =====================================================================
         # EMBEDDINGS
@@ -163,6 +179,7 @@ class SingleCausalLayer(nn.Module):
         }
         
         # Decoder cross-attention configuration (S → X)
+        # S keys are orthogonal, so use key_projection_type_cross (can be "orthogonal")
         attn_dec_cross_kwargs = {
             "d_model_queries": d_model,
             "d_model_keys": d_model,
@@ -175,10 +192,14 @@ class SingleCausalLayer(nn.Module):
             "layer_name": "dec_cross_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": S_seq_len,
-            "dag_parameterization": dag_parameterization_cross  # Non-square: must be "independent"
+            "dag_parameterization": dag_parameterization_cross,  # Non-square: must be "independent"
+            "key_projection_type": key_projection_type_cross,    # Orthogonal for S keys
+            "orthogonal_scale": orthogonal_scale,
+            "orthogonal_init_scale": orthogonal_init_scale,
         }
         
         # Decoder self-attention configuration (X ← X)
+        # X keys are not orthogonal, so use key_projection_type_self (typically "linear")
         attn_dec_self_kwargs = {
             "d_model_queries": d_model,
             "d_model_keys": d_model,
@@ -191,7 +212,10 @@ class SingleCausalLayer(nn.Module):
             "layer_name": "dec_self_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": X_seq_len,
-            "dag_parameterization": dag_parameterization_self  # Square: can use any
+            "dag_parameterization": dag_parameterization_self,  # Square: can use any
+            "key_projection_type": key_projection_type_self,    # Linear for X keys
+            "orthogonal_scale": orthogonal_scale,
+            "orthogonal_init_scale": orthogonal_init_scale,
         }
         
         # =====================================================================
@@ -421,7 +445,10 @@ class SingleCausalLayer(nn.Module):
         layer_name: str,
         query_seq_len: int,
         key_seq_len: int,
-        dag_parameterization: str = "independent"
+        dag_parameterization: str = "independent",
+        key_projection_type: str = "linear",
+        orthogonal_scale: bool = True,
+        orthogonal_init_scale: float = 1.0,
     ):
         """Create an attention layer with specified configuration."""
         
@@ -457,7 +484,10 @@ class SingleCausalLayer(nn.Module):
             layer_name=layer_name,
             query_seq_len=query_seq_len,
             key_seq_len=key_seq_len,
-            dag_parameterization=dag_parameterization
+            dag_parameterization=dag_parameterization,
+            key_projection_type=key_projection_type,
+            orthogonal_scale=orthogonal_scale,
+            orthogonal_init_scale=orthogonal_init_scale,
         )
         
         return att

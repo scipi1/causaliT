@@ -9,6 +9,7 @@ from causaliT.core.modules.extra_layers import (
     UniformAttentionMask, DAGLearningMixin,
     DAGMask, DAGMaskAntisym, DAGMaskGated
 )
+from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List, Optional
 
@@ -445,8 +446,30 @@ class ToeplitzLieAttention(nn.Module):
     - Optional learnable biases for fine-tuning
     
     See docs/TOEPLITZ_DECOMPOSITION.md for theoretical background.
+    
+    Args:
+        dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None
+        attention_dropout: Dropout rate for attention weights
+        register_entropy: Whether to register entropy for logging
+        layer_name: Name for logging purposes
+        init_gain_gate: Initial gain for symmetric gate (default: 2.0, was 5.0)
+        init_gain_dir: Initial gain for direction (default: 3.0, was 10.0)
+        init_tau_gate: Initial temperature for gate (default: 0.5)
+        init_tau_dir: Initial temperature for direction (default: 0.3, was 0.2)
+        max_gain: Maximum allowed gain during training (default: 20.0, was 100.0)
     """
-    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(
+        self, 
+        dag_mask: Optional[nn.Module], 
+        attention_dropout: float, 
+        register_entropy: bool, 
+        layer_name: str,
+        init_gain_gate: float = 2.0,
+        init_gain_dir: float = 3.0,
+        init_tau_gate: float = 0.5,
+        init_tau_dir: float = 0.3,
+        max_gain: float = 20.0,
+    ):
         
         super(ToeplitzLieAttention, self).__init__()
         
@@ -462,13 +485,14 @@ class ToeplitzLieAttention(nn.Module):
         self.dag_mask = dag_mask
         
         # Symmetric gate parameters (for S = (QK^T + KQ^T) / 2)
-        self.log_gain_gate = nn.Parameter(torch.tensor(log(5.0)))
-        self.log_tau_gate = nn.Parameter(torch.tensor(log(0.5)))
-        self.max_gain = 100.0
+        # Lower gains and higher temperatures lead to less decisive (more uncertain) probabilities
+        self.log_gain_gate = nn.Parameter(torch.tensor(log(init_gain_gate)))
+        self.log_tau_gate = nn.Parameter(torch.tensor(log(init_tau_gate)))
+        self.max_gain = max_gain
         
         # Antisymmetric direction parameters (for A = (QK^T - KQ^T) / 2)
-        self.log_gain_dir = nn.Parameter(torch.tensor(log(10.0)))
-        self.log_tau_dir = nn.Parameter(torch.tensor(log(0.2)))
+        self.log_gain_dir = nn.Parameter(torch.tensor(log(init_gain_dir)))
+        self.log_tau_dir = nn.Parameter(torch.tensor(log(init_tau_dir)))
         
         # Gumbel-Softmax temperature for sampling
         self.log_tau_gs = nn.Parameter(torch.tensor(log(2.0)))
@@ -1369,6 +1393,19 @@ class AttentionLayer(nn.Module):
             - "independent": Each edge (i,j) is independent. Allows bidirectional edges. (default)
             - "antisymmetric": P(i→j) + P(j→i) = 1. Requires square attention (self-attention only).
             - "gated": Symmetric gate + antisymmetric direction. Requires square attention.
+        key_projection_type: str, one of:
+            - "linear": Standard unconstrained linear projection (default)
+            - "orthogonal": Orthogonal projection (rotation + optional scaling)
+              Preserves inner products: if inputs are orthogonal, outputs remain orthogonal.
+              Useful when using orthogonal embeddings (e.g., OrthogonalMaskEmbedding).
+              Requires d_queries_keys >= d_model_keys.
+        orthogonal_scale: Whether to include learnable scale in orthogonal projection (default: True)
+        orthogonal_init_scale: Initial scale value for orthogonal projection (default: 1.0)
+        toeplitz_init_gain_gate: Initial gain for ToeplitzLieAttention symmetric gate (default: 2.0)
+        toeplitz_init_gain_dir: Initial gain for ToeplitzLieAttention direction (default: 3.0)
+        toeplitz_init_tau_gate: Initial temperature for ToeplitzLieAttention gate (default: 0.5)
+        toeplitz_init_tau_dir: Initial temperature for ToeplitzLieAttention direction (default: 0.3)
+        toeplitz_max_gain: Maximum allowed gain for ToeplitzLieAttention (default: 20.0)
     """
     def __init__(
         self,
@@ -1386,7 +1423,17 @@ class AttentionLayer(nn.Module):
         query_seq_len: int = None,
         key_seq_len: int = None,
         dag_parameterization: str = "independent",
-        phi_init_std: float = 0.1
+        phi_init_std: float = 0.1,
+        # Key projection type for preserving orthogonality
+        key_projection_type: str = "linear",
+        orthogonal_scale: bool = True,
+        orthogonal_init_scale: float = 1.0,
+        # ToeplitzLieAttention specific parameters (configurable)
+        toeplitz_init_gain_gate: float = 2.0,
+        toeplitz_init_gain_dir: float = 3.0,
+        toeplitz_init_tau_gate: float = 0.5,
+        toeplitz_init_tau_dir: float = 0.3,
+        toeplitz_max_gain: float = 20.0,
         ):
         
         super(AttentionLayer, self).__init__()
@@ -1417,17 +1464,58 @@ class AttentionLayer(nn.Module):
                 phi_init_std=phi_init_std
             )
         
-        # Create inner attention - pass dag_mask directly (not mask_layer)
-        self.inner_attention = attention(
-            dag_mask=dag_mask,
-            attention_dropout=attention_dropout,
-            register_entropy=register_entropy,
-            layer_name=layer_name
+        # Create inner attention - pass dag_mask and attention-specific parameters
+        if attention == ToeplitzLieAttention:
+            self.inner_attention = attention(
+                dag_mask=dag_mask,
+                attention_dropout=attention_dropout,
+                register_entropy=register_entropy,
+                layer_name=layer_name,
+                init_gain_gate=toeplitz_init_gain_gate,
+                init_gain_dir=toeplitz_init_gain_dir,
+                init_tau_gate=toeplitz_init_tau_gate,
+                init_tau_dir=toeplitz_init_tau_dir,
+                max_gain=toeplitz_max_gain,
+            )
+        else:
+            self.inner_attention = attention(
+                dag_mask=dag_mask,
+                attention_dropout=attention_dropout,
+                register_entropy=register_entropy,
+                layer_name=layer_name
             )
         
         # Projection layers
         self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
-        self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
+        
+        # Key projection: supports orthogonal projection for preserving embedding orthogonality
+        self.key_projection_type = key_projection_type
+        if key_projection_type == "linear":
+            self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
+        elif key_projection_type == "orthogonal":
+            # Orthogonal projection preserves inner products: ⟨W_k x, W_k y⟩ = ⟨x, y⟩
+            # Requires d_queries_keys >= d_model_keys (more output dims than input)
+            # For multi-head, we need d_queries_keys * n_heads >= d_model_keys
+            out_features = d_queries_keys * n_heads
+            in_features = d_model_keys
+            if out_features < in_features:
+                raise ValueError(
+                    f"Orthogonal key projection requires d_queries_keys * n_heads >= d_model_keys, "
+                    f"got {out_features} < {in_features}. "
+                    f"Either increase d_queries_keys or use key_projection_type='linear'."
+                )
+            self.key_projection = OrthogonalLinear(
+                in_features=in_features,
+                out_features=out_features,
+                use_scale=orthogonal_scale,
+                init_scale=orthogonal_init_scale
+            )
+        else:
+            raise ValueError(
+                f"Invalid key_projection_type='{key_projection_type}'. "
+                f"Must be one of: 'linear', 'orthogonal'"
+            )
+        
         self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
@@ -1728,6 +1816,96 @@ def main():
     print(f"  - Score shape: {score_phi_multi.shape}")
     print(f"  - phi shape: {attention_phi_multi.inner_attention.phi.shape}")
     print(f"  - Entropy shape: {ent_phi_multi.shape if ent_phi_multi is not None else 'None'}")
+    
+    # Test orthogonal key projection
+    print("\n" + "="*60)
+    print("Testing Orthogonal Key Projection:")
+    print("="*60)
+    
+    # Create orthogonal input embeddings (simulate OrthogonalMaskEmbedding output)
+    d_model_orth = 12  # Divisible by 3 variables
+    d_qk = 16  # d_qk >= d_model for orthogonal projection
+    
+    attention_orth = AttentionLayer(
+        attention=ScaledDotAttention, 
+        d_model_queries=d_model_orth,
+        d_model_keys=d_model_orth,
+        d_model_values=d_model_orth,
+        d_queries_keys=d_qk,
+        n_heads=1,
+        mask_layer=UniformAttentionMask(),
+        attention_dropout=0,
+        dropout_qkv=0,
+        key_projection_type="orthogonal",  # Use orthogonal projection
+        orthogonal_scale=True,
+        orthogonal_init_scale=1.0
+    )
+    
+    print(f"  Key projection type: {attention_orth.key_projection_type}")
+    print(f"  Key projection: {attention_orth.key_projection}")
+    print(f"  Orthonormal columns: {attention_orth.key_projection.verify_orthonormality()}")
+    
+    # Create orthogonal input embeddings (3 variables, 4 dims each)
+    x_orth = torch.zeros(bs, 3, d_model_orth)
+    x_orth[0, 0, :4] = torch.randn(4)   # Variable 1: dims 0-3
+    x_orth[0, 1, 4:8] = torch.randn(4)  # Variable 2: dims 4-7
+    x_orth[0, 2, 8:] = torch.randn(4)   # Variable 3: dims 8-11
+    
+    # Check input orthogonality
+    input_dot_01 = torch.dot(x_orth[0, 0], x_orth[0, 1]).item()
+    input_dot_02 = torch.dot(x_orth[0, 0], x_orth[0, 2]).item()
+    input_dot_12 = torch.dot(x_orth[0, 1], x_orth[0, 2]).item()
+    print(f"\n  Input dot products (should all be 0):")
+    print(f"    ⟨x[0], x[1]⟩ = {input_dot_01:.6f}")
+    print(f"    ⟨x[0], x[2]⟩ = {input_dot_02:.6f}")
+    print(f"    ⟨x[1], x[2]⟩ = {input_dot_12:.6f}")
+    
+    # Project keys through orthogonal projection
+    k_projected = attention_orth.key_projection(x_orth)
+    
+    # Check output orthogonality (should be preserved!)
+    output_dot_01 = torch.dot(k_projected[0, 0], k_projected[0, 1]).item()
+    output_dot_02 = torch.dot(k_projected[0, 0], k_projected[0, 2]).item()
+    output_dot_12 = torch.dot(k_projected[0, 1], k_projected[0, 2]).item()
+    print(f"\n  Output dot products (should all be ~0 for orthogonal projection):")
+    print(f"    ⟨k[0], k[1]⟩ = {output_dot_01:.6f}")
+    print(f"    ⟨k[0], k[2]⟩ = {output_dot_02:.6f}")
+    print(f"    ⟨k[1], k[2]⟩ = {output_dot_12:.6f}")
+    
+    # Compare with linear projection (orthogonality NOT preserved)
+    attention_linear = AttentionLayer(
+        attention=ScaledDotAttention, 
+        d_model_queries=d_model_orth,
+        d_model_keys=d_model_orth,
+        d_model_values=d_model_orth,
+        d_queries_keys=d_qk,
+        n_heads=1,
+        mask_layer=UniformAttentionMask(),
+        attention_dropout=0,
+        dropout_qkv=0,
+        key_projection_type="linear"  # Default linear projection
+    )
+    
+    k_linear = attention_linear.key_projection(x_orth)
+    linear_dot_01 = torch.dot(k_linear[0, 0], k_linear[0, 1]).item()
+    linear_dot_02 = torch.dot(k_linear[0, 0], k_linear[0, 2]).item()
+    linear_dot_12 = torch.dot(k_linear[0, 1], k_linear[0, 2]).item()
+    print(f"\n  Linear projection output dot products (likely NOT 0):")
+    print(f"    ⟨k[0], k[1]⟩ = {linear_dot_01:.6f}")
+    print(f"    ⟨k[0], k[2]⟩ = {linear_dot_02:.6f}")
+    print(f"    ⟨k[1], k[2]⟩ = {linear_dot_12:.6f}")
+    
+    # Run full forward pass with orthogonal key projection
+    out_orth, score_orth, ent_orth = attention_orth.forward(
+        query=x_orth, 
+        key=x_orth, 
+        value=x_orth,
+        mask_miss_k=None,
+        mask_miss_q=None,
+        pos=None,
+        causal_mask=False
+    )
+    print(f"\n  Full forward pass - Output shape: {out_orth.shape}")
     
     print("\n" + "="*60)
     print("All tests completed successfully!")

@@ -19,7 +19,7 @@ experiment:
   dec_layers: 1
   n_heads: 1
   d_ff: 48
-  d_qk: 12
+  d_qk: 32  # Must be >= d_model for orthogonal key projection (was 12)
   dropout: 0.0
   lr: 0.001
   batch_size: 64
@@ -114,6 +114,16 @@ model:
     # Options: "independent", "antisymmetric", "gated", or null
     dag_parameterization_self: "antisymmetric"  # P(i→j) + P(j→i) = 1 for self-attention
     dag_parameterization_cross: "independent"   # Cross-attention is non-square
+    
+    # Key Projection Type
+    # Orthogonal projection preserves inner products between embeddings.
+    # When S uses OrthogonalMaskEmbedding, use "orthogonal" for cross-attention
+    # to ensure orthogonal S embeddings produce orthogonal keys.
+    # Options: "linear" (standard), "orthogonal" (rotation + optional scaling)
+    key_projection_type_cross: "orthogonal"  # Preserve S orthogonality in cross-attention
+    key_projection_type_self: "linear"       # X is not orthogonal, use standard projection
+    orthogonal_scale: true                   # Include learnable scale in orthogonal projection
+    orthogonal_init_scale: 1.0               # Initial scale value
     
     # ==========================================
     # NOISE-AWARE SPECIFIC PARAMETERS

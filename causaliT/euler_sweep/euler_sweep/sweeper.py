@@ -40,6 +40,9 @@ from typing import Tuple, List, Dict, Callable, Optional, Any
 # Third-party imports
 from omegaconf import OmegaConf
 
+# Local imports (deferred to avoid circular imports - see functions that need it)
+# from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. COMBINATION GENERATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -331,6 +334,15 @@ def run_sequential_sweep(
         for param_name, param_value in combo['params'].items():
             category = combo['categories'][param_name]
             config_copy[category][param_name] = param_value
+        
+        # Populate sequence lengths from dataset metadata BEFORE resolving interpolations
+        # This ensures ${data.S_seq_len}, ${data.X_seq_len} etc. have actual values
+        # when interpolation references like ds_embed_S.num_variables: ${data.S_seq_len}
+        # are resolved. Without this, these would resolve to null.
+        if data_dir is not None:
+            from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+            logger.info(f"Populating dataset metadata from: {data_dir}")
+            config_copy = populate_seq_lengths_from_dataset(config_copy, data_dir)
         
         # Now resolve interpolations - references will use the updated parameter values
         config_copy = OmegaConf.create(OmegaConf.to_container(config_copy, resolve=True))
