@@ -98,6 +98,9 @@ class SingleCausalLayer(nn.Module):
         S_seq_len: int,
         X_seq_len: int,
         
+        # S embedding composition (optional - if provided, use ModularEmbedding for S)
+        comps_embed_S: str = None,
+        
         # SVFA: factorization mode ("standard" or "svfa")
         factorization: str = "standard",
         
@@ -150,17 +153,29 @@ class SingleCausalLayer(nn.Module):
         # EMBEDDINGS
         # =====================================================================
         
-        # Orthogonal embedding for S (frozen by default)
-        self.embedding_S = OrthogonalMaskEmbedding(
-            num_variables=ds_embed_S["num_variables"],
-            d_model=d_model,
-            value_input_dim=ds_embed_S.get("value_input_dim", 1),
-            value_idx=ds_embed_S["value_idx"],
-            var_idx=ds_embed_S["var_idx"],
-            var_id_offset=ds_embed_S.get("var_id_offset", 1),  # Default 1 (1-indexed var IDs)
-            freeze=ds_embed_S.get("freeze", True),
-            device=device
-        )
+        # Store comps_embed_S to determine embedding type
+        self.comps_embed_S = comps_embed_S
+        
+        # S embedding: use ModularEmbedding if comps_embed_S is provided, else OrthogonalMaskEmbedding
+        if comps_embed_S is not None:
+            # Learnable embedding for S (same style as X)
+            self.embedding_S = ModularEmbedding(
+                ds_embed=ds_embed_S,
+                comps=comps_embed_S,
+                device=device
+            )
+        else:
+            # Orthogonal embedding for S (frozen by default)
+            self.embedding_S = OrthogonalMaskEmbedding(
+                num_variables=ds_embed_S["num_variables"],
+                d_model=d_model,
+                value_input_dim=ds_embed_S.get("value_input_dim", 1),
+                value_idx=ds_embed_S["value_idx"],
+                var_idx=ds_embed_S["var_idx"],
+                var_id_offset=ds_embed_S.get("var_id_offset", 1),  # Default 1 (1-indexed var IDs)
+                freeze=ds_embed_S.get("freeze", True),
+                device=device
+            )
         
         # Standard embedding for X (learnable)
         self.embedding_X = ModularEmbedding(
@@ -278,9 +293,15 @@ class SingleCausalLayer(nn.Module):
         
         # ===== EMBEDDING =====
         
-        # Orthogonal embedding for S (frozen)
-        s_embedded = self.embedding_S(source_tensor)
-        s_mask = self.embedding_S.get_mask(source_tensor)
+        # S embedding - depends on comps_embed_S
+        if self.comps_embed_S is not None:
+            # ModularEmbedding for S (learnable, returns tuple when SVFA)
+            s_embedded = self.embedding_S(X=source_tensor)
+            s_mask = self.embedding_S.get_mask(X=source_tensor)
+        else:
+            # OrthogonalMaskEmbedding for S (frozen, returns single tensor)
+            s_embedded = self.embedding_S(source_tensor)
+            s_mask = self.embedding_S.get_mask(source_tensor)
         
         # Standard embedding for X (learnable)
         x_embedded = self.embedding_X(X=intermediate_tensor_blanked)

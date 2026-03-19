@@ -147,6 +147,8 @@ def populate_seq_lengths_from_dataset(
     # +1 accounts for padding_idx=0 (variable indices are 1-indexed: X1=1, X2=2, ...)
     
     # Per-stage embeddings (non-shared): each stage has its own enumeration 1,2,3,...
+    # +1 accounts for padding_idx=0 (variable indices are 1-indexed: S1=1, X1=1, ...)
+    config["data"]["num_embeddings_S"] = n_source + 1
     config["data"]["num_embeddings_X"] = n_input + 1
     config["data"]["num_embeddings_Y"] = n_target + 1 if n_target > 0 else 0
     
@@ -165,6 +167,7 @@ def populate_seq_lengths_from_dataset(
     print(f"  S_seq_len: {n_source}")
     print(f"  X_seq_len: {n_input}")
     print(f"  Y_seq_len: {n_target}")
+    print(f"  num_embeddings_S: {n_source + 1} (non-shared, includes padding)")
     print(f"  num_embeddings_X: {n_input + 1} (non-shared, includes padding)")
     print(f"  num_embeddings_Y: {n_target + 1 if n_target > 0 else 0}")
     print(f"  num_embeddings_shared: {n_source + n_input + n_target + 1} (for shared embedding)")
