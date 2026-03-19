@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -536,7 +536,7 @@ class NoiseAwareSingleCausalLayer(nn.Module):
     ):
         """Create an attention layer with specified configuration."""
         
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
@@ -548,6 +548,8 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             attention_module = PhiSoftMax
         elif attention_type == "ToeplitzLieAttention":
             attention_module = ToeplitzLieAttention
+        elif attention_type == "ToeplitzAttention":
+            attention_module = ToeplitzAttention
         
         mask_layer = None
         if mask_type is not None:

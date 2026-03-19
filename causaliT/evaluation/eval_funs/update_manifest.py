@@ -306,6 +306,12 @@ def update_experiments_manifest(
         "dag_confidence_cross": None,  # DAG consistency across folds (1=identical, 0=max disagreement)
         "dag_confidence_self": None,
         "dag_source": None,  # "phi" or "attention"
+        # ATE (Average Treatment Effect) metrics from eval_interventions
+        "ate_mean_abs_error": None,  # Mean absolute error: avg over interventions, variables, folds
+        "ate_std_abs_error": None,   # Std of absolute errors across all comparisons
+        "ate_median_abs_error": None,  # Median absolute error
+        "ate_mean_rel_error": None,  # Mean relative error (where defined)
+        "ate_n_comparisons": None,   # Number of intervention-variable-fold comparisons
         # HSIC (independence regularization)
         "final_hsic_mean": None,  # Mean HSIC across folds at final epoch
         "final_hsic_std": None,   # Std HSIC across folds
@@ -538,6 +544,30 @@ def update_experiments_manifest(
             print(f"Loaded training instability from {instability_path}")
         except Exception as e:
             print(f"Warning: Could not load training instability: {e}")
+    
+    # Load ATE (Average Treatment Effect) metrics from eval_interventions output
+    # First try the default intervention directory
+    ate_metrics_path = join(experiment, "eval", "eval_do", "default", "files", "ate_metrics.json")
+    if exists(ate_metrics_path):
+        try:
+            with open(ate_metrics_path, 'r') as f:
+                ate_data = json.load(f)
+            
+            # Extract summary statistics
+            summary = ate_data.get("summary", {})
+            
+            if summary:
+                metadata["ate_mean_abs_error"] = summary.get("mean_absolute_error")
+                metadata["ate_std_abs_error"] = summary.get("std_absolute_error")
+                metadata["ate_median_abs_error"] = summary.get("median_absolute_error")
+                metadata["ate_mean_rel_error"] = summary.get("mean_relative_error")
+                metadata["ate_n_comparisons"] = summary.get("n_total_comparisons")
+                
+                if metadata["ate_mean_abs_error"] is not None:
+                    print(f"Loaded ATE metrics from {ate_metrics_path}")
+                    print(f"  ATE Mean Abs Error: {metadata['ate_mean_abs_error']:.4f}")
+        except Exception as e:
+            print(f"Warning: Could not load ATE metrics: {e}")
     
     # Load existing manifest or create new one
     if exists(manifest_path):

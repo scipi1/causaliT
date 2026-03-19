@@ -8,7 +8,7 @@ This package contains the building blocks of the transformer architecture:
 - Extra utility layers
 """
 
-from .attention import LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention
+from .attention import LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzAttention, ToeplitzLieAttention
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
 from .embedding import ModularEmbedding
@@ -24,6 +24,7 @@ __all__ = [
     'CausalCrossAttention',
     'PhiSoftMax',
     'ToeplitzLieAttention',
+    'ToeplitzAttention',
     'AttentionLayer',
     'Encoder',
     'EncoderLayer',

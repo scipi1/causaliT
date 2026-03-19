@@ -421,6 +421,197 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
 
 
 
+class ToeplitzAttention(nn.Module):
+    """
+    Clean Toeplitz Attention for DAG learning.
+    
+    Decomposes attention scores into symmetric and antisymmetric parts:
+        S = (QK^T + KQ^T) / 2   # Symmetric: edge existence probability
+        A = (QK^T - KQ^T) / 2   # Antisymmetric: direction split
+    
+    Computes attention as:
+        att[i,j] = sigmoid(S[i,j] / τ) × sigmoid(A[i,j] / τ)
+    
+    Properties:
+        - att[i,j] + att[j,i] = sigmoid(S[i,j] / τ)  (budget constraint)
+        - att[i,i] = 0                                 (no self-loops)
+        - sigmoid(S[i,j]) = sigmoid(S[j,i])           (symmetric edge probability)
+        - sigmoid(A[i,j]) + sigmoid(A[j,i]) = 1       (complementary direction split)
+    
+    The budget constraint is mathematically guaranteed:
+        att[i,j] + att[j,i] = σ(S/τ) × σ(A/τ) + σ(S/τ) × σ(-A/τ)
+                            = σ(S/τ) × [σ(A/τ) + σ(-A/τ)]
+                            = σ(S/τ) × 1
+                            = σ(S/τ) = P_edge[i,j]
+    
+    Temperature τ controls exploration vs exploitation:
+        - High τ: Probabilities closer to 0.5 (exploration)
+        - Low τ: Probabilities closer to 0 or 1 (exploitation)
+    
+    Args:
+        dag_mask: Not used (kept for interface compatibility), should be None
+        attention_dropout: Dropout rate for attention weights
+        register_entropy: Whether to register entropy for logging
+        layer_name: Name for logging purposes
+        init_tau: Initial temperature (default: 1.0)
+        tau_min: Minimum temperature (default: 0.1)
+        tau_max: Maximum temperature (default: 5.0)
+    """
+    def __init__(
+        self, 
+        dag_mask: Optional[nn.Module], 
+        attention_dropout: float, 
+        register_entropy: bool, 
+        layer_name: str,
+        init_tau: float = 1.0,
+        tau_min: float = 0.1,
+        tau_max: float = 5.0,
+    ):
+        super(ToeplitzAttention, self).__init__()
+        
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+        # dag_mask is not used - kept for interface compatibility
+        self.dag_mask = None
+        
+        # Single temperature parameter for exploration → exploitation
+        self.log_tau = nn.Parameter(torch.tensor(log(init_tau)))
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+    
+    @property
+    def tau(self) -> torch.Tensor:
+        """Get the current temperature, clamped to valid range."""
+        return torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the edge probabilities from the last forward pass.
+        
+        Note: This requires forward() to have been called first.
+        Returns None if no forward pass has been computed yet.
+        """
+        if hasattr(self, 'last_att'):
+            return self.last_att
+        return None
+    
+    def get_edge_existence_probabilities(self) -> torch.Tensor:
+        """
+        Returns P_edge = sigmoid(S/τ), the symmetric edge existence probability.
+        
+        Note: This requires forward() to have been called first.
+        """
+        if hasattr(self, 'last_P_edge'):
+            return self.last_P_edge
+        return None
+    
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+    ):
+        """
+        Forward pass for Toeplitz Attention.
+        
+        Args:
+            query: Query tensor (B, L, E) or (B, L, H, E) for multi-head
+            key: Key tensor (B, S, E) or (B, S, H, E) for multi-head
+            value: Value tensor (B, S, E) or (B, S, H, E) for multi-head
+            mask_miss_k: Missing key mask (unused)
+            mask_miss_q: Missing query mask (unused)
+            pos: Positional encoding (unused - no causal masking in DAG attention)
+            causal_mask: Whether to apply causal masking (unused)
+            hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
+                       Values in [0, 1], where 1 = attention allowed.
+        """
+        is_multihead = query.dim() == 4
+        
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S_len, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S_len, _ = key.shape
+            H = 1
+        
+        # Compute raw attention scores (no scaling - rely on normalization)
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        # Toeplitz decomposition
+        S = (scores + scores.transpose(-1, -2)) / 2  # Symmetric: edge existence
+        A = (scores - scores.transpose(-1, -2)) / 2  # Antisymmetric: direction
+        
+        # Get temperature
+        tau = self.tau
+        
+        # Compute edge existence probability (symmetric)
+        P_edge = torch.sigmoid(S / tau)  # P_edge[i,j] = P_edge[j,i]
+        
+        # Compute direction split (antisymmetric)
+        d = torch.sigmoid(A / tau)  # d[i,j] + d[j,i] = 1
+        
+        # Final attention probabilities: att[i,j] = P_edge[i,j] × d[i,j]
+        # Budget constraint: att[i,j] + att[j,i] = P_edge[i,j] (automatically satisfied!)
+        att = P_edge * d
+        
+        # Zero out diagonal (no self-loops)
+        if is_multihead:
+            diag_mask = torch.eye(L, S_len, device=att.device, dtype=torch.bool)
+            att = att.masked_fill(diag_mask.unsqueeze(0).unsqueeze(0), 0.0)
+        else:
+            diag_mask = torch.eye(L, S_len, device=att.device, dtype=torch.bool)
+            att = att.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        
+        # Apply hard mask if provided
+        if hard_mask is not None:
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
+            att = att * hard_mask_expanded
+        
+        # Store for evaluation and inspection (detached, no gradients)
+        self.last_att = att.detach().mean(dim=0)  # Average over batch
+        self.last_P_edge = P_edge.detach().mean(dim=0)  # Average over batch
+        self.last_S = S.detach().mean(dim=0)  # For analysis
+        self.last_A = A.detach().mean(dim=0)  # For analysis
+        
+        # Store P_edge with gradients for L1 regularization in forecaster
+        # (mean across batch dimension to get per-edge probability)
+        # Usage: L1_loss = attention.inner_attention.P_edge_for_reg.mean()
+        self.P_edge_for_reg = P_edge.mean(dim=0)  # (L, S) or (H, L, S)
+        
+        # Calculate entropy
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+        
+        # Apply dropout
+        A_out = self.dropout(att)
+        A_out = torch.nan_to_num(A_out)
+        
+        # Compute output values
+        if is_multihead:
+            V_out = torch.einsum("bhls,bshd->blhd", A_out, value)
+        else:
+            V_out = torch.einsum("bls,bsd->bld", A_out, value)
+        
+        return V_out.contiguous(), A_out, entropy
+
+
 class ToeplitzLieAttention(nn.Module):
     """
     Toeplitz-Lie Attention with symmetric gate + antisymmetric direction.
@@ -1439,7 +1630,7 @@ class AttentionLayer(nn.Module):
         super(AttentionLayer, self).__init__()
         
         # Attention types that require square attention (self-attention only)
-        SELF_ATTENTION_ONLY = (LieAttention, ToeplitzLieAttention)
+        SELF_ATTENTION_ONLY = (LieAttention, ToeplitzLieAttention, ToeplitzAttention)
         
         # Check square attention requirement for self-attention-only modules
         if attention in SELF_ATTENTION_ONLY and query_seq_len is not None and key_seq_len is not None:
@@ -1476,6 +1667,18 @@ class AttentionLayer(nn.Module):
                 init_tau_gate=toeplitz_init_tau_gate,
                 init_tau_dir=toeplitz_init_tau_dir,
                 max_gain=toeplitz_max_gain,
+            )
+        elif attention == ToeplitzAttention:
+            # ToeplitzAttention: Clean Toeplitz decomposition with single temperature
+            # Does not use dag_mask - derives DAG directly from attention scores
+            self.inner_attention = attention(
+                dag_mask=None,  # Not used
+                attention_dropout=attention_dropout,
+                register_entropy=register_entropy,
+                layer_name=layer_name,
+                init_tau=toeplitz_init_tau_gate,  # Reuse gate tau as the single temperature
+                tau_min=0.1,
+                tau_max=5.0,
             )
         else:
             self.inner_attention = attention(
