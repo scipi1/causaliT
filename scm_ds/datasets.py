@@ -31,7 +31,7 @@ from scm_ds.scm import *
 # -----------------------------------------------------------------------------
 ds_scm1 = SCMDataset(
     name="linear_gaussian",
-    description="Linear SCM with Gaussian noise. Covers all S→X and X→X relation types.",
+    description="Linear SCM with Gaussian noise. Uniformly sampled S variables. Covers all S→X and X→X relation types.",
     tags=["linear", "gaussian", "paper"],
     specs=[
         # Source nodes (S)
@@ -63,6 +63,52 @@ ds_scm1 = SCMDataset(
         "S3": lambda rng, n: rng.uniform(-1, 1, n),
         "S4": lambda rng, n: rng.uniform(-1, 1, n),
         "S5": lambda rng, n: rng.uniform(-1, 1, n),
+        "X1": lambda rng, n: 0.1 * rng.standard_normal(n),
+        "X2": lambda rng, n: 0.1 * rng.standard_normal(n),
+        "X3": lambda rng, n: 0.1 * rng.standard_normal(n),
+        "X4": lambda rng, n: 0.1 * rng.standard_normal(n),
+        "X5": lambda rng, n: 0.1 * rng.standard_normal(n),
+    },
+    groups=None,
+    source_labels=["S1", "S2", "S3", "S4", "S5"],
+    input_labels=["X1", "X2", "X3", "X4", "X5"],
+    target_labels=[]
+)
+
+ds_scm1_discrete_sampling = SCMDataset(
+    name="linear_gaussian",
+    description="Linear SCM with Gaussian noise. Discrete sampling S variables. Covers all S→X and X→X relation types.",
+    tags=["linear", "gaussian", "paper"],
+    specs=[
+        # Source nodes (S)
+        NodeSpec("S1", [], "eps_S1"),                           # dangling (no children)
+        NodeSpec("S2", [], "eps_S2"),                           # one-to-one → X1
+        NodeSpec("S3", [], "eps_S3"),                           # one-to-many → X2, X3
+        NodeSpec("S4", [], "eps_S4"),                           # many-to-one (with S5) → X4
+        NodeSpec("S5", [], "eps_S5"),                           # many-to-one (with S4) → X4
+        # Feature nodes (X)
+        NodeSpec("X1", ["S2"],           "a*S2 + eps_X1"),                      # S: one-to-one, X: one-to-one → X5
+        NodeSpec("X2", ["S3"],           "b*S3 + eps_X2"),                      # S: one-to-many, X: one-to-many → X4, X5
+        NodeSpec("X3", ["S3"],           "c*S3 + eps_X3"),                      # S: one-to-many, X: dangling
+        NodeSpec("X4", ["S4", "S5", "X2"], "d*S4 + e*S5 + f*X2 + eps_X4"),      # S: many-to-one, X: many-to-one
+        NodeSpec("X5", ["X1", "X2"],     "g*X1 + h*X2 + eps_X5"),               # X: many-to-one
+    ],
+    params={
+        "a": 1.0,
+        "b": 1.0,
+        "c": 0.8,
+        "d": 0.7,
+        "e": 0.5,
+        "f": 1.2,
+        "g": 1.0,
+        "h": 0.6,
+    },
+    singles={
+        "S1": lambda rng, n: rng.choice([0.5, -1.2], n),                                            # 2 elements
+        "S2": lambda rng, n: rng.choice([-1.7, 3.0, -2.0], n),                                      # 3 elements
+        "S3": lambda rng, n: rng.choice([1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 10 elements
+        "S4": lambda rng, n: rng.choice([-0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 5 elements
+        "S5": lambda rng, n: rng.choice([0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 10 elements
         "X1": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X2": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X3": lambda rng, n: 0.1 * rng.standard_normal(n),
@@ -463,35 +509,60 @@ ds_scm8 = SCMDataset(
 
 if __name__ == "__main__":
     # Generate the three final datasets for the paper
-    ds_scm1.generate_ds(
+    # ds_scm1.generate_ds(
+    #     mode="flat", 
+    #     n=50_000, 
+    #     save_dir=join(ROOT_DIR, "data/scm1_linear_gaussian"), 
+    #     normalize_method="minmax", 
+    #     shared_embedding=False,
+    # )
+    
+    # ds_scm1_discrete_sampling.generate_ds(
+    #     mode="flat", 
+    #     n=50_000, 
+    #     save_dir=join(ROOT_DIR, "data/scm1_linear_gaussian_discrete"), 
+    #     normalize_method="minmax", 
+    #     shared_embedding=False,
+    # )
+    
+    ds_scm1_discrete_sampling.generate_ds(
         mode="flat", 
         n=50_000, 
-        save_dir=join(ROOT_DIR, "data/scm1_linear_gaussian"), 
+        save_dir=join(ROOT_DIR, "data/scm1_linear_gaussian_discrete_holdout"), 
         normalize_method="minmax", 
         shared_embedding=False,
+        test_split_method={
+            "method": "holdout",
+            "kwargs": {
+                "explicit_values": {
+                    "S3": [1.0],
+                    "S5": [2.5],
+                }
+            }
+        }
     )
     
-    ds_scm2.generate_ds(
-        mode="flat", 
-        n=50_000, 
-        save_dir=join(ROOT_DIR, "data/scm2_nonlinear_gaussian"), 
-        normalize_method="minmax", 
-        shared_embedding=False,
-    )
+    # ds_scm2.generate_ds(
+    #     mode="flat", 
+    #     n=50_000, 
+    #     save_dir=join(ROOT_DIR, "data/scm2_nonlinear_gaussian"), 
+    #     normalize_method="minmax", 
+    #     shared_embedding=False,
+    # )
     
-    ds_scm3.generate_ds(
-        mode="flat", 
-        n=50_000, 
-        save_dir=join(ROOT_DIR, "data/scm3_nonlinear_nongaussian"), 
-        normalize_method="minmax", 
-        shared_embedding=False,
-    )
+    # ds_scm3.generate_ds(
+    #     mode="flat", 
+    #     n=50_000, 
+    #     save_dir=join(ROOT_DIR, "data/scm3_nonlinear_nongaussian"), 
+    #     normalize_method="minmax", 
+    #     shared_embedding=False,
+    # )
     
-    ds_scm6.generate_ds(
-        mode="flat", 
-        n=50000, 
-        save_dir=join(ROOT_DIR,"data/scm6"),
-        normalize_method="minmax",  
-        shared_embedding=False,
-    )
+    # ds_scm6.generate_ds(
+    #     mode="flat", 
+    #     n=50000, 
+    #     save_dir=join(ROOT_DIR,"data/scm6"),
+    #     normalize_method="minmax",  
+    #     shared_embedding=False,
+    # )
 

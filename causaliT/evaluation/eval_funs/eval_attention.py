@@ -31,6 +31,13 @@ from .eval_utils import (
     _get_learned_dag_per_fold,
     load_dataset_metadata,
     DEFAULT_PLOT_FORMAT,
+    # MEC metrics
+    _combine_attention_to_full_dag,
+    _load_full_true_dag,
+    _compute_mec_distance,
+    _check_mec_membership,
+    _find_v_structures,
+    _dag_to_skeleton,
 )
 
 # Import from project modules
@@ -643,6 +650,134 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             confidence_key = f"dag_confidence_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
             dag_metrics[confidence_key] = 1.0
             print(f"    DAG Confidence: 1.0 (single fold)")
+    
+    # =========================================================================
+    # Markov Equivalence Class (MEC) Metrics
+    # =========================================================================
+    print("\n--- Computing MEC Metrics (Full DAG) ---")
+    
+    # MEC metrics require combining cross and self attention into full DAG
+    # to correctly detect v-structures (colliders) where parents may come from 
+    # different variable groups (S and X)
+    
+    if architecture in ["SingleCausalForecaster", "NoiseAwareCausalForecaster"]:
+        cross_att_key, cross_phi_key = "dec_cross", "decoder_cross"
+        self_att_key, self_phi_key = "dec_self", "decoder"
+    elif architecture == "StageCausalForecaster":
+        # For stage causal, focus on first decoder (S→X, X→X)
+        cross_att_key, cross_phi_key = "decoder1_cross", "decoder1_cross"
+        self_att_key, self_phi_key = "decoder1_self", "decoder1"
+    elif architecture == "TransformerForecaster":
+        cross_att_key, cross_phi_key = "cross", "cross"
+        self_att_key, self_phi_key = "decoder", "decoder"
+    else:
+        cross_att_key, cross_phi_key = None, None
+        self_att_key, self_phi_key = None, None
+    
+    if cross_att_key is not None:
+        # Get learned DAGs for cross and self attention per fold
+        cross_fold_dags, cross_source = _get_learned_dag_per_fold(
+            final_scores_dict, cross_att_key, cross_phi_key
+        )
+        self_fold_dags, self_source = _get_learned_dag_per_fold(
+            final_scores_dict, self_att_key, self_phi_key
+        )
+        
+        # Load true full DAG
+        true_full_dag = _load_full_true_dag(datadir_path, dataset)
+        
+        if true_full_dag is not None:
+            # Report true DAG structure info
+            true_skeleton = _dag_to_skeleton(true_full_dag)
+            true_v_structures = _find_v_structures(true_full_dag)
+            print(f"  True DAG: {len(true_skeleton)} edges, {len(true_v_structures)} v-structures")
+            if true_v_structures:
+                print(f"    V-structures: {list(true_v_structures)}")
+            
+            # Compute MEC metrics per fold
+            mec_per_fold = {}
+            mec_distances = []
+            mec_memberships = []
+            
+            for i, (fold_name, cross_dag) in enumerate(cross_fold_dags):
+                # Get corresponding self-attention DAG
+                if i < len(self_fold_dags):
+                    _, self_dag = self_fold_dags[i]
+                else:
+                    self_dag = None
+                
+                if cross_dag is None or self_dag is None:
+                    print(f"    {fold_name}: Missing data for MEC computation")
+                    mec_per_fold[fold_name] = None
+                    continue
+                
+                # Get dimensions
+                n_X, n_S = cross_dag.shape
+                
+                # Combine into full learned DAG
+                learned_full_dag = _combine_attention_to_full_dag(
+                    cross_adj=cross_dag,
+                    self_adj=self_dag,
+                    n_source=n_S,
+                    n_intermediate=n_X,
+                )
+                
+                # Check shape compatibility
+                if learned_full_dag.shape != true_full_dag.shape:
+                    print(f"    {fold_name}: Shape mismatch - learned {learned_full_dag.shape} vs true {true_full_dag.shape}")
+                    mec_per_fold[fold_name] = None
+                    continue
+                
+                # Compute MEC distance (continuous)
+                mec_dist, mec_details = _compute_mec_distance(learned_full_dag, true_full_dag)
+                
+                # Compute MEC membership (binary)
+                in_mec, membership_details = _check_mec_membership(learned_full_dag, true_full_dag)
+                
+                mec_distances.append(mec_dist)
+                mec_memberships.append(in_mec)
+                
+                mec_per_fold[fold_name] = {
+                    "mec_distance": mec_dist,
+                    "in_mec": in_mec,
+                    "skeleton_distance": mec_details["skeleton_distance"],
+                    "skeleton_recall": mec_details["skeleton_recall"],
+                    "skeleton_precision": mec_details["skeleton_precision"],
+                    "v_structure_distance": mec_details["v_structure_distance"],
+                    "v_structure_recall": mec_details["v_structure_recall"],
+                    "v_structure_precision": mec_details["v_structure_precision"],
+                    "n_missing_edges": membership_details["n_missing_edges"],
+                    "n_extra_edges": membership_details["n_extra_edges"],
+                    "n_missing_v_structures": membership_details["n_missing_v_structures"],
+                    "n_extra_v_structures": membership_details["n_extra_v_structures"],
+                }
+                
+                print(f"    {fold_name}: MEC distance = {mec_dist:.4f}, in MEC = {in_mec}")
+                print(f"      Skeleton: recall={mec_details['skeleton_recall']:.3f}, precision={mec_details['skeleton_precision']:.3f}")
+                print(f"      V-struct: recall={mec_details['v_structure_recall']:.3f}, precision={mec_details['v_structure_precision']:.3f}")
+            
+            # Aggregate MEC metrics across folds
+            if mec_distances:
+                mec_dist_array = np.array(mec_distances)
+                dag_metrics["mec_distance"] = {
+                    "best": float(np.min(mec_dist_array)),
+                    "mean": float(np.mean(mec_dist_array)),
+                    "worst": float(np.max(mec_dist_array)),
+                    "std": float(np.std(mec_dist_array)),
+                    "per_fold": mec_per_fold,
+                }
+                dag_metrics["mec_membership_rate"] = float(np.mean(mec_memberships))
+                dag_metrics["n_true_v_structures"] = len(true_v_structures)
+                dag_metrics["n_true_skeleton_edges"] = len(true_skeleton)
+                dag_metrics["true_v_structures"] = [list(v) for v in true_v_structures]
+                
+                print(f"\n  MEC Summary:")
+                print(f"    Distance: best={np.min(mec_dist_array):.4f}, mean={np.mean(mec_dist_array):.4f}, worst={np.max(mec_dist_array):.4f}")
+                print(f"    MEC membership rate: {np.mean(mec_memberships)*100:.1f}% of folds")
+        else:
+            print("  Could not load full true DAG for MEC computation")
+    else:
+        print("  MEC computation not supported for this architecture")
     
     # Save DAG metrics to JSON
     with open(join(eval_path_files, dag_metrics_filename), 'w') as f:

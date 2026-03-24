@@ -78,26 +78,39 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.val_idx = config["data"]["val_idx"]
         
         # Logging configuration
-        self.log_entropy = config["training"].get("log_entropy", False)
         self.log_acyclicity = config["training"].get("log_acyclicity", False)
         self.log_noise_params = config["training"].get("log_noise_params", True)
         
         # Regularizers (same as SingleCausalForecaster)
-        self.lambda_entropy_self = config["training"].get("lambda_entropy_self", 0.0)
-        self.lambda_entropy_cross = config["training"].get("lambda_entropy_cross", 0.0)
         self.kappa = config["training"].get("kappa", 0)  # Acyclicity regularization
         
-        # Sparsity regularization
+        # DAG Sparsity regularization - L1 penalty on edge probabilities (phi)
         self.lambda_sparse = config["training"].get("lambda_sparse", 0)
         self.lambda_sparse_cross = config["training"].get("lambda_sparse_cross", None)
         if self.lambda_sparse_cross is None:
             self.lambda_sparse_cross = self.lambda_sparse
         self.log_sparsity = config["training"].get("log_sparsity", False)
         
-        # L1 regularization on attention scores
-        self.lambda_l1_self_scores = config["training"].get("lambda_l1_self_scores", 0.0)
-        self.lambda_l1_cross_scores = config["training"].get("lambda_l1_cross_scores", 0.0)
-        self.log_l1_scores = config["training"].get("log_l1_scores", False)
+        # =====================================================================
+        # UNIFIED SCORE SPARSITY REGULARIZATION
+        # Combines L1 and entropy regularization with mode selection and fallback
+        # =====================================================================
+        self.lambda_self_score_sparse = config["training"].get("lambda_self_score_sparse", 0.0)
+        self.lambda_cross_score_sparse = config["training"].get("lambda_cross_score_sparse", 0.0)
+        
+        # Mode selection: "l1" or "entropy"
+        # - "l1": Uses score_tensor_for_sparsity property (effective for GeLU-based attention)
+        # - "entropy": Uses attention entropy (effective for all attention types)
+        # Default: "l1" for self (often GeLU-based), "entropy" for cross (often softmax)
+        self.self_sparsity_regularizer = config["training"].get("self_sparsity_regularizer", "l1")
+        self.cross_sparsity_regularizer = config["training"].get("cross_sparsity_regularizer", "entropy")
+        
+        # Logging for unified score sparsity
+        self.log_score_sparsity = config["training"].get("log_score_sparsity", False)
+        
+        # Track if fallback was triggered (for warning once)
+        self._self_sparsity_fallback_warned = False
+        self._cross_sparsity_fallback_warned = False
         
         # HSIC regularization
         self.lambda_hsic = config["training"].get("lambda_hsic", 0)
@@ -146,9 +159,6 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.hsic_lambda_start = config["training"].get("hsic_lambda_start", 1.0)
         self.hsic_lambda_end = config["training"].get("hsic_lambda_end", 0.0)
         self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
-        
-        # L1 regularization on Toeplitz gate probabilities
-        self.lambda_l1_toeplitz_gate = config["training"].get("lambda_l1_toeplitz_gate", 0.0)
         
         # Logging for annealing (disabled by default)
         self.log_tau_annealing = config["training"].get("log_tau_annealing", False)
@@ -294,10 +304,9 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         dec_cross_att, dec_self_att = attention_weights
         dec_cross_ent, dec_self_ent = entropies
         
-        # Compute entropy regularization if needed
-        if self.lambda_entropy_self > 0 or self.lambda_entropy_cross > 0 or self.log_entropy:
-            dec_cross_ent_batch = torch.concat(dec_cross_ent, dim=0).mean()
-            dec_self_ent_batch = torch.concat(dec_self_ent, dim=0).mean()
+        # Compute entropy values (always needed for potential sparsity regularization)
+        dec_cross_ent_batch = torch.concat(dec_cross_ent, dim=0).mean()
+        dec_self_ent_batch = torch.concat(dec_self_ent, dim=0).mean()
         
         # Get learned DAG parameters for acyclicity and prior regularization
         dec_self_inner = self.model.decoder.layers[0].global_self_attention.inner_attention
@@ -323,15 +332,6 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # =====================================================================
         # REGULARIZERS (same as SingleCausalForecaster)
         # =====================================================================
-        
-        # Entropy regularizer
-        if self.lambda_entropy_self > 0 or self.lambda_entropy_cross > 0:
-            entropy_regularizer = (
-                self.lambda_entropy_self * dec_self_ent_batch +
-                self.lambda_entropy_cross * dec_cross_ent_batch
-            )
-        else:
-            entropy_regularizer = 0.0
         
         # Acyclicity regularizer (only for self-attention DAGs)
         if self.kappa > 0:
@@ -370,32 +370,75 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                           self.adaptive_z_scaling, self.lambda_kl)
         )
         
-        # Sparsity regularizer
-        def _get_sparsity_reg(phi):
+        # DAG Sparsity regularizer via _get_reg_dag
+        def _get_reg_dag(phi):
+            """L1 regularization on learned DAG (phi).
+            
+            Returns L1 norm: mean over rows.
+            Shape: (L, S) -> mean()
+            """
             if phi is None:
                 return 0.0
             return torch.sigmoid(phi).mean()
         
-        self_attention_sparsity = _get_sparsity_reg(dec_self_phi)
-        cross_attention_sparsity = _get_sparsity_reg(dec_cross_phi)
+        self_attention_sparsity = _get_reg_dag(dec_self_phi)
+        cross_attention_sparsity = _get_reg_dag(dec_cross_phi)
         
         sparsity_regularizer = (
             self.lambda_sparse * self_attention_sparsity +
             self.lambda_sparse_cross * cross_attention_sparsity
         )
         
-        # L1 on attention scores
-        def _get_att_scores_l1(att_weights_list):
-            if not att_weights_list:
-                return 0.0
-            return att_weights_list[-1].mean()
+        # =====================================================================
+        # UNIFIED SCORE SPARSITY REGULARIZATION
+        # Mode selection: "l1" or "entropy", with automatic fallback for softmax attention
+        # =====================================================================
         
-        l1_self_scores = _get_att_scores_l1(dec_self_att)
-        l1_cross_scores = _get_att_scores_l1(dec_cross_att)
+        def _compute_score_sparsity(mode: str, inner_attention, entropy_value, device, is_self: bool):
+            """
+            Compute unified score sparsity regularization.
+            
+            Args:
+                mode: "l1" or "entropy"
+                inner_attention: Inner attention module with score_tensor_for_sparsity property
+                entropy_value: Pre-computed attention entropy
+                device: Device for tensors
+                is_self: True for self-attention, False for cross-attention
+                
+            Returns:
+                Tuple of (sparsity_value, actual_mode_used)
+            """
+            if mode == "l1":
+                # Try L1 first
+                score_tensor = getattr(inner_attention, 'score_tensor_for_sparsity', None)
+                if score_tensor is not None:
+                    return score_tensor.mean(), "l1"
+                else:
+                    # Fallback to entropy for softmax-based attention
+                    if is_self and not self._self_sparsity_fallback_warned:
+                        print("Warning: L1 sparsity unavailable for self-attention (softmax-based). Using entropy fallback.")
+                        self._self_sparsity_fallback_warned = True
+                    elif not is_self and not self._cross_sparsity_fallback_warned:
+                        print("Warning: L1 sparsity unavailable for cross-attention (softmax-based). Using entropy fallback.")
+                        self._cross_sparsity_fallback_warned = True
+                    return entropy_value, "entropy"
+            else:  # entropy
+                return entropy_value, "entropy"
         
-        l1_scores_regularizer = (
-            self.lambda_l1_self_scores * l1_self_scores +
-            self.lambda_l1_cross_scores * l1_cross_scores
+        # Self-attention score sparsity
+        self_score_sparse, self_mode_used = _compute_score_sparsity(
+            self.self_sparsity_regularizer, dec_self_inner, dec_self_ent_batch, X.device, is_self=True
+        )
+        
+        # Cross-attention score sparsity
+        cross_score_sparse, cross_mode_used = _compute_score_sparsity(
+            self.cross_sparsity_regularizer, dec_cross_inner, dec_cross_ent_batch, X.device, is_self=False
+        )
+        
+        # Total unified score sparsity regularizer
+        score_sparsity_regularizer = (
+            self.lambda_self_score_sparse * self_score_sparse +
+            self.lambda_cross_score_sparse * cross_score_sparse
         )
         
         # HSIC regularizer
@@ -449,14 +492,6 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             self.lambda_tau * (tau_self_loss + tau_cross_loss)
         )
         
-        # L1 regularization on Toeplitz gate probabilities
-        l1_toeplitz_gate = torch.tensor(0.0, device=x_target.device)
-        if self.lambda_l1_toeplitz_gate > 0:
-            gate_probs = getattr(dec_self_inner, 'gate_probs_for_reg', None)
-            if gate_probs is not None:
-                l1_toeplitz_gate = gate_probs.mean()
-        l1_toeplitz_gate_reg = self.lambda_l1_toeplitz_gate * l1_toeplitz_gate
-        
         # =====================================================================
         # NOISE PRIOR REGULARIZER (optional, for identifiability)
         # KL divergence from prior: encourages σ_A, σ_R to stay near initial values
@@ -479,14 +514,12 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # =====================================================================
         
         total_loss = (loss_nll + 
-                     entropy_regularizer + 
                      acyclic_regularizer +
                      prior_regularizer +
                      sparsity_regularizer +
-                     l1_scores_regularizer +
+                     score_sparsity_regularizer +
                      hsic_regularizer +
                      decisiveness_regularizer +
-                     l1_toeplitz_gate_reg +
                      noise_prior_regularizer)
         
         # =====================================================================
@@ -515,24 +548,21 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_sigma_R_mean", sigma_R.mean(), on_step=False, on_epoch=True)
             self.log(f"{stage}_sigma_R_std", sigma_R.std(), on_step=False, on_epoch=True)
         
-        # Log entropies if requested
-        if self.log_entropy:
-            self.log(f"{stage}_dec_cross_entropy", dec_cross_ent_batch, on_step=False, on_epoch=True)
-            self.log(f"{stage}_dec_self_entropy", dec_self_ent_batch, on_step=False, on_epoch=True)
-        
         # Log acyclicity if requested
         if self.log_acyclicity:
             self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
         
-        # Log sparsity if requested
+        # Log DAG sparsity (phi) if requested
         if self.log_sparsity:
             self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
             self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
         
-        # Log L1 scores if requested
-        if self.log_l1_scores:
-            self.log(f"{stage}_l1_self_scores", l1_self_scores, on_step=False, on_epoch=True)
-            self.log(f"{stage}_l1_cross_scores", l1_cross_scores, on_step=False, on_epoch=True)
+        # Log unified score sparsity if requested
+        if self.log_score_sparsity:
+            self.log(f"{stage}_self_score_sparse", self_score_sparse, on_step=False, on_epoch=True)
+            self.log(f"{stage}_cross_score_sparse", cross_score_sparse, on_step=False, on_epoch=True)
+            self.log(f"{stage}_self_sparsity_mode", 1.0 if self_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
+            self.log(f"{stage}_cross_sparsity_mode", 1.0 if cross_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
         
         # Log HSIC if requested
         if self.log_hsic and hsic_value is not None:

@@ -93,6 +93,9 @@ from .eval_interventions import eval_interventions
 # ANS evaluation (sweep experiments only)
 from .eval_ans import eval_ans
 
+# d_model sweep evaluation
+from .eval_d_model_sweep import eval_d_model_sweep
+
 # Manifest functions
 from .update_manifest import (
     fix_kfold_summary,
@@ -172,6 +175,8 @@ __all__ = [
     "eval_interventions",
     # ANS (sweep experiments only)
     "eval_ans",
+    # d_model sweep evaluation
+    "eval_d_model_sweep",
     # Manifest
     "fix_kfold_summary",
     "enrich_kfold_summary",

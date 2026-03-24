@@ -90,6 +90,13 @@ def run_evaluations_from_config(
     
     FUNCTION_REGISTRY["eval_dyconex_predictions"] = _get_dyconex_predictions
     
+    # d_model sweep evaluation (lazy import)
+    def _get_d_model_sweep(exp):
+        from .eval_d_model_sweep import eval_d_model_sweep
+        return eval_d_model_sweep(exp, show_plots=show_plots)
+    
+    FUNCTION_REGISTRY["eval_d_model_sweep"] = _get_d_model_sweep
+    
     # Run specified functions
     for idx, func_name in enumerate(functions, start=1):
         print(f"\n--- Step {idx}: Running {func_name} ---")

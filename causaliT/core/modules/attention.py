@@ -26,6 +26,11 @@ class LieAttention(DAGLearningMixin, nn.Module):
     A Gumbel-Softmax trick enables differentiable sampling from Bernoulli(sigmoid(phi)).
     Running averages of attention statistics are used as priors for KL regularization.
     
+    Sparsity Regularization:
+        - DAG sparsity: Use `phi` property and apply sigmoid for edge probabilities.
+        - Score sparsity: Use `score_tensor_for_sparsity` property which returns
+          the batch-averaged attention scores suitable for L1 regularization.
+    
     Args:
         dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None (passed from AttentionLayer)
         attention_dropout: Dropout rate for attention weights
@@ -188,6 +193,10 @@ class LieAttention(DAGLearningMixin, nn.Module):
             
         A = torch.nan_to_num(self.dropout(att))
         
+        # Store attention scores for L1 regularization (mean over batch)
+        # Shape: (L, S) for single-head, (H, L, S) for multi-head
+        self._score_tensor_for_sparsity = A.mean(dim=0)
+        
         # Compute output values
         if is_multihead:
             V = torch.einsum("bhls,bshd->blhd", A, value)
@@ -196,6 +205,18 @@ class LieAttention(DAGLearningMixin, nn.Module):
             
             
         return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns the attention scores suitable for L1 sparsity regularization.
+        
+        For LieAttention, this returns the batch-averaged attention scores
+        from the last forward pass. Shape: (L, S) or (H, L, S) for multi-head.
+        
+        Returns None if forward() has not been called yet.
+        """
+        return getattr(self, '_score_tensor_for_sparsity', None)
 
 
 
@@ -411,6 +432,10 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         # Apply dropout
         A = self.dropout(att)
         
+        # Store attention scores for L1 regularization (mean over batch)
+        # Shape: (L, S) for single-head, (H, L, S) for multi-head
+        self._score_tensor_for_sparsity = A.mean(dim=0)
+        
         # Compute output values
         if is_multihead:
             V = torch.einsum("bhls,bshd->blhd", A, value)
@@ -418,6 +443,18 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
             V = torch.einsum("bls,bsd->bld", A, value)
         
         return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns the attention scores suitable for L1 sparsity regularization.
+        
+        For CausalCrossAttention, this returns the batch-averaged attention scores
+        from the last forward pass. Shape: (L, S) or (H, L, S) for multi-head.
+        
+        Returns None if forward() has not been called yet.
+        """
+        return getattr(self, '_score_tensor_for_sparsity', None)
 
 
 
@@ -546,11 +583,16 @@ class ToeplitzAttention(nn.Module):
             _, S_len, _ = key.shape
             H = 1
         
+        scale = 1.0 / sqrt(E)
+        
         # Compute raw attention scores (no scaling - rely on normalization)
         if is_multihead:
             scores = torch.einsum("blhe,bshe->bhls", query, key)
         else:
             scores = torch.einsum("ble,bse->bls", query, key)
+        
+        # Scale scores
+        scores = scale * scores
         
         # Toeplitz decomposition
         S = (scores + scores.transpose(-1, -2)) / 2  # Symmetric: edge existence
@@ -590,7 +632,6 @@ class ToeplitzAttention(nn.Module):
         
         # Store P_edge with gradients for L1 regularization in forecaster
         # (mean across batch dimension to get per-edge probability)
-        # Usage: L1_loss = attention.inner_attention.P_edge_for_reg.mean()
         self.P_edge_for_reg = P_edge.mean(dim=0)  # (L, S) or (H, L, S)
         
         # Calculate entropy
@@ -610,6 +651,18 @@ class ToeplitzAttention(nn.Module):
             V_out = torch.einsum("bls,bsd->bld", A_out, value)
         
         return V_out.contiguous(), A_out, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns the edge existence probabilities for L1 sparsity regularization.
+        
+        For ToeplitzAttention, this returns P_edge (symmetric edge existence probability).
+        Shape: (L, S) or (H, L, S) for multi-head.
+        
+        Returns None if forward() has not been called yet.
+        """
+        return getattr(self, 'P_edge_for_reg', None)
 
 
 class ToeplitzLieAttention(nn.Module):
@@ -894,6 +947,18 @@ class ToeplitzLieAttention(nn.Module):
             V = torch.einsum("bls,bsd->bld", A, value)
         
         return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns the gate probabilities for L1 sparsity regularization.
+        
+        For ToeplitzLieAttention, this returns gate_probs (symmetric gate probability).
+        Shape: (L, S) or (H, L, S) for multi-head.
+        
+        Returns None if forward() has not been called yet.
+        """
+        return getattr(self, 'gate_probs_for_reg', None)
 
 
 class PhiSoftMax(nn.Module):
@@ -1194,6 +1259,15 @@ class PhiSoftMax(nn.Module):
             V = torch.einsum("bls,bsd->bld", A, value)
         
         return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns None for PhiSoftMax since L1 on softmax scores is ineffective.
+        
+        For softmax-based attention, use entropy regularization instead.
+        """
+        return None
 
 
 class ScaledDotAttention(nn.Module):
@@ -1322,6 +1396,15 @@ class ScaledDotAttention(nn.Module):
             V = torch.einsum("bls,bsd->bld", A, value)
         
         return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns None for ScaledDotAttention since L1 on softmax scores is ineffective.
+        
+        For softmax-based attention, use entropy regularization instead.
+        """
+        return None
 
 
 class ScaledDotAttentionNAIM(nn.Module):

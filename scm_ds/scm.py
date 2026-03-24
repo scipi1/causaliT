@@ -854,6 +854,155 @@ class SCMDataset:
         
         return metadata
     
+    def _apply_split(
+        self,
+        input_np: np.ndarray,
+        target_np: Optional[np.ndarray],
+        source_np: Optional[np.ndarray],
+        test_split_method: Dict[str, Any],
+        sv_map: Optional[Dict[str, int]] = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
+        """
+        Apply train/test split based on the specified method.
+        
+        Parameters
+        ----------
+        input_np : np.ndarray
+            Input data array of shape (n_samples, seq_len, features)
+        target_np : Optional[np.ndarray]
+            Target data array (can be None if no targets)
+        source_np : Optional[np.ndarray]
+            Source data array (can be None if no sources)
+        test_split_method : Dict[str, Any]
+            Split configuration with "method" and "kwargs" keys.
+            Methods: "ratio" or "holdout"
+        sv_map : Optional[Dict[str, int]]
+            Source variable name to index mapping (needed for holdout method)
+            
+        Returns
+        -------
+        train_data : Dict[str, np.ndarray]
+            Dictionary with "x", and optionally "y", "s" arrays for training
+        test_data : Dict[str, np.ndarray]
+            Dictionary with "x", and optionally "y", "s" arrays for testing
+        split_info : Dict[str, Any]
+            Metadata about the split (method, sizes, etc.)
+        """
+        method = test_split_method.get("method")
+        kwargs = test_split_method.get("kwargs", {})
+        n_total = input_np.shape[0]
+        
+        if method == "ratio":
+            # Random ratio-based split
+            train_ratio = kwargs.get("train_ratio", 0.8)
+            if train_ratio < 0.8:
+                raise ValueError(f"train_ratio must be >= 0.8 to ensure sufficient training data. Got {train_ratio}")
+            
+            n_train = int(n_total * train_ratio)
+            
+            # Create random permutation for shuffling
+            rng = np.random.default_rng(kwargs.get("seed", 42))
+            indices = rng.permutation(n_total)
+            train_idx = indices[:n_train]
+            test_idx = indices[n_train:]
+            
+            split_info = {
+                "method": "ratio",
+                "train_ratio": train_ratio,
+                "n_train": len(train_idx),
+                "n_test": len(test_idx),
+                "train_fraction": len(train_idx) / n_total,
+            }
+            
+        elif method == "holdout":
+            # Holdout split based on explicit S values
+            explicit_values = kwargs.get("explicit_values", {})
+            
+            if not explicit_values:
+                raise ValueError("holdout method requires 'explicit_values' in kwargs")
+            
+            if source_np is None or sv_map is None:
+                raise ValueError("holdout method requires source data and sv_map")
+            
+            # Reverse sv_map: index -> variable name
+            idx_to_var = {v: k for k, v in sv_map.items()}
+            
+            # Find samples that match ANY holdout value (OR logic)
+            holdout_mask = np.zeros(n_total, dtype=bool)
+            
+            for var_name, holdout_vals in explicit_values.items():
+                if var_name not in sv_map:
+                    raise ValueError(f"Variable '{var_name}' not found in source variables")
+                
+                # Find which position in source_np corresponds to this variable
+                var_idx = sv_map[var_name]
+                # Find the sequence position where this variable appears
+                # source_np shape: (n_samples, seq_len, features) where features[1] is variable index
+                seq_len = source_np.shape[1]
+                var_seq_pos = None
+                for pos in range(seq_len):
+                    if source_np[0, pos, 1] == var_idx:  # Check variable index in first sample
+                        var_seq_pos = pos
+                        break
+                
+                if var_seq_pos is None:
+                    raise ValueError(f"Could not find sequence position for variable '{var_name}'")
+                
+                # Get values of this variable for all samples
+                var_values = source_np[:, var_seq_pos, 0]  # Feature 0 is value
+                
+                # Mark samples that have any of the holdout values
+                for holdout_val in holdout_vals:
+                    # Use approximate matching due to floating point
+                    matches = np.isclose(var_values, holdout_val, rtol=1e-5, atol=1e-8)
+                    holdout_mask |= matches
+            
+            test_idx = np.where(holdout_mask)[0]
+            train_idx = np.where(~holdout_mask)[0]
+            
+            # Validate minimum training data requirement (80%)
+            train_fraction = len(train_idx) / n_total
+            if train_fraction < 0.8:
+                raise ValueError(
+                    f"Holdout configuration results in only {train_fraction:.1%} training data "
+                    f"({len(train_idx)} samples). Minimum required is 80%. "
+                    f"Please reduce the number of holdout values."
+                )
+            
+            split_info = {
+                "method": "holdout",
+                "explicit_values": explicit_values,
+                "n_train": len(train_idx),
+                "n_test": len(test_idx),
+                "train_fraction": train_fraction,
+            }
+            
+        else:
+            raise ValueError(f"Unknown split method: {method}. Use 'ratio' or 'holdout'.")
+        
+        # Apply split to all arrays
+        train_data = {"x": input_np[train_idx]}
+        test_data = {"x": input_np[test_idx]}
+        
+        if target_np is not None:
+            train_data["y"] = target_np[train_idx]
+            test_data["y"] = target_np[test_idx]
+        
+        if source_np is not None:
+            train_data["s"] = source_np[train_idx]
+            test_data["s"] = source_np[test_idx]
+        
+        # Print split info
+        print(f"\n=== Train/Test Split ===")
+        print(f"Method: {method}")
+        print(f"Train samples: {split_info['n_train']} ({split_info['train_fraction']:.1%})")
+        print(f"Test samples: {split_info['n_test']} ({1 - split_info['train_fraction']:.1%})")
+        if method == "holdout":
+            print(f"Holdout values: {explicit_values}")
+        print("========================\n")
+        
+        return train_data, test_data, split_info
+    
     def _normalize(self, data: np.ndarray, method: str = "standardize"):
         """Normalize only the value features (feature index 0) using sklearn scalers."""
         normalized_data = data.copy()
@@ -948,7 +1097,8 @@ class SCMDataset:
             
     def generate_ds(self, mode, n, save_dir: Union[str, Path]=None, meta_dict: dict=None, 
                     normalize: bool = True, normalize_method: str = "standardize", seed=42,
-                    shared_embedding: bool = False):
+                    shared_embedding: bool = False,
+                    test_split_method: Optional[Dict[str, Any]] = None):
         
         # get numpy array - handle both cases (with and without source_labels)
         get_numpy_result = self.get_numpy(mode, n, seed, shared_embedding=shared_embedding)
@@ -963,33 +1113,62 @@ class SCMDataset:
             source_np, sv_map, sf_map, sv_order = None, None, None, None
             print("numpy arrays generated")
         
-        # Normalize if requested
+        # --------------------- Train/Test Split -----------------------
+        # IMPORTANT: Apply split BEFORE normalization to match against original S values
+        split_info = None
+        train_data = None
+        test_data = None
+        
+        if test_split_method is not None and test_split_method.get("method") is not None:
+            train_data, test_data, split_info = self._apply_split(
+                input_np=input_np,
+                target_np=target_np,
+                source_np=source_np,
+                test_split_method=test_split_method,
+                sv_map=sv_map,
+            )
+        
+        # --------------------- Normalization -----------------------
+        # Normalize after split (applies to both split and non-split cases)
         norm_stats = {}
         if normalize:
-            input_np, input_stats = self._normalize(input_np, method=normalize_method)
-            norm_stats = {"input": input_stats}
-            
-            # Normalize target data if present (non-empty target_labels)
-            if target_np is not None:
-                target_np, target_stats = self._normalize(target_np, method=normalize_method)
-                norm_stats["target"] = target_stats
-            
-            # Normalize source data if present
-            if source_np is not None:
-                source_np, source_stats = self._normalize(source_np, method=normalize_method)
-                norm_stats["source"] = source_stats
+            if split_info is not None:
+                # Normalize train and test data separately
+                train_data["x"], input_stats = self._normalize(train_data["x"], method=normalize_method)
+                test_data["x"], _ = self._normalize(test_data["x"], method=normalize_method)
+                norm_stats = {"input": input_stats}
+                
+                if "y" in train_data:
+                    train_data["y"], target_stats = self._normalize(train_data["y"], method=normalize_method)
+                    test_data["y"], _ = self._normalize(test_data["y"], method=normalize_method)
+                    norm_stats["target"] = target_stats
+                
+                if "s" in train_data:
+                    train_data["s"], source_stats = self._normalize(train_data["s"], method=normalize_method)
+                    test_data["s"], _ = self._normalize(test_data["s"], method=normalize_method)
+                    norm_stats["source"] = source_stats
+            else:
+                # Original behavior: normalize full arrays
+                input_np, input_stats = self._normalize(input_np, method=normalize_method)
+                norm_stats = {"input": input_stats}
+                
+                if target_np is not None:
+                    target_np, target_stats = self._normalize(target_np, method=normalize_method)
+                    norm_stats["target"] = target_stats
+                
+                if source_np is not None:
+                    source_np, source_stats = self._normalize(source_np, method=normalize_method)
+                    norm_stats["source"] = source_stats
             
             # Print normalization stats
             print(f"Data normalized using {normalize_method}")
             print(f"  Input - mean: {input_stats.get('mean', 'N/A')}, std: {input_stats.get('std', 'N/A')}")
-            if target_np is not None:
-                print(f"  Target - mean: {norm_stats['target'].get('mean', 'N/A')}, std: {norm_stats['target'].get('std', 'N/A')}")
+            if target_np is not None or (split_info and "y" in train_data):
+                print(f"  Target - mean: {norm_stats.get('target', {}).get('mean', 'N/A')}, std: {norm_stats.get('target', {}).get('std', 'N/A')}")
             else:
                 print(f"  Target - (no target variables)")
-            if source_np is not None:
-                print(f"  Source - mean: {norm_stats['source'].get('mean', 'N/A')}, std: {norm_stats['source'].get('std', 'N/A')}")
-        
-        # todo train/test split
+            if source_np is not None or (split_info and "s" in train_data):
+                print(f"  Source - mean: {norm_stats.get('source', {}).get('mean', 'N/A')}, std: {norm_stats.get('source', {}).get('std', 'N/A')}")
         
         
         # ------------------ make attention masks -----------------------
@@ -1065,17 +1244,52 @@ class SCMDataset:
         # ---------------------- export -------------------------------
         makedirs(save_dir, exist_ok=True)
         
-        # Export data arrays - handle case where target_np may be None
-        if source_np is not None:
-            if target_np is not None:
-                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np, s=source_np)
+        # Export data arrays - handle split vs no-split cases
+        if split_info is not None:
+            # Export separate train and test files
+            # Train data
+            if "y" in train_data and "s" in train_data:
+                np.savez_compressed(join(save_dir, "ds_train.npz"), 
+                                    x=train_data["x"], y=train_data["y"], s=train_data["s"])
+            elif "s" in train_data:
+                np.savez_compressed(join(save_dir, "ds_train.npz"), 
+                                    x=train_data["x"], s=train_data["s"])
+            elif "y" in train_data:
+                np.savez_compressed(join(save_dir, "ds_train.npz"), 
+                                    x=train_data["x"], y=train_data["y"])
             else:
-                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, s=source_np)
+                np.savez_compressed(join(save_dir, "ds_train.npz"), x=train_data["x"])
+            
+            # Test data
+            if "y" in test_data and "s" in test_data:
+                np.savez_compressed(join(save_dir, "ds_test.npz"), 
+                                    x=test_data["x"], y=test_data["y"], s=test_data["s"])
+            elif "s" in test_data:
+                np.savez_compressed(join(save_dir, "ds_test.npz"), 
+                                    x=test_data["x"], s=test_data["s"])
+            elif "y" in test_data:
+                np.savez_compressed(join(save_dir, "ds_test.npz"), 
+                                    x=test_data["x"], y=test_data["y"])
+            else:
+                np.savez_compressed(join(save_dir, "ds_test.npz"), x=test_data["x"])
+            
+            # Export split info
+            with open(join(save_dir, 'split_info.json'), 'w', encoding="utf-8") as file:
+                json.dump(split_info, file, indent=2, sort_keys=True, ensure_ascii=False)
+            print(f"Exported ds_train.npz and ds_test.npz with split_info.json")
+            
         else:
-            if target_np is not None:
-                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np)
+            # Original behavior: single ds.npz file
+            if source_np is not None:
+                if target_np is not None:
+                    np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np, s=source_np)
+                else:
+                    np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, s=source_np)
             else:
-                np.savez_compressed(join(save_dir, "ds.npz"), x=input_np)
+                if target_np is not None:
+                    np.savez_compressed(join(save_dir, "ds.npz"), x=input_np, y=target_np)
+                else:
+                    np.savez_compressed(join(save_dir, "ds.npz"), x=input_np)
         
         # Export attention masks based on source_labels presence
         if self.source_labels is None:

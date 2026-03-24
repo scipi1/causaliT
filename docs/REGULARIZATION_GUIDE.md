@@ -1,314 +1,372 @@
-# Regularization & Annealing Guide for causaliT
+# Regularization Guide for CausaliT
 
-This document describes all regularization techniques and annealing schedules available in the causaliT forecasters, particularly for the ToeplitzLieAttention mechanism.
+This document describes all regularization techniques and annealing schedules available in the CausaliT forecasters.
 
 ## Table of Contents
 1. [Overview](#overview)
-2. [ToeplitzLieAttention Regularizers](#toeplitzlieattention-regularizers)
-3. [Annealing Schedules](#annealing-schedules)
-4. [Configuration Examples](#configuration-examples)
+2. [Regularization Parameters by Category](#regularization-parameters-by-category)
+3. [Architecture Support Matrix](#architecture-support-matrix)
+4. [Attention Type Compatibility](#attention-type-compatibility)
+5. [Annealing Schedules](#annealing-schedules)
+6. [Configuration Examples](#configuration-examples)
 
 ---
 
 ## Overview
 
-The ToeplitzLieAttention mechanism learns DAG structure through two components:
-- **Gate probabilities** (`σ(γ)`) - Controls edge existence (symmetric)
-- **Direction probabilities** (`σ(φ)`) - Controls edge direction (antisymmetric)
+CausaliT supports various regularization techniques to encourage:
+- **Sparsity**: Fewer edges in the learned DAG
+- **Acyclicity**: No cycles in the DAG (NOTEARS constraint)
+- **Decisiveness**: Edge probabilities pushed toward 0 or 1
+- **Independence**: Residuals independent of source variables (HSIC)
+- **Focused Attention**: Low entropy = concentrated attention weights
 
-Final edge probability: `P(i→j) = σ(γ_ij) × σ(φ_ij)`
+### Key Design Principles
 
-### Problem: Constant DAG Values (0.84)
-
-If DAG probabilities converge to constant values (e.g., 0.84) across all experiments:
-1. **Temperature too high**: Gumbel-Softmax relaxation is too smooth
-2. **Missing sparsity pressure**: No incentive for gates to close
-3. **Gradient saturation**: Tanh activations saturating before learning
+1. **Unified Score Tensor**: Each attention type exposes `score_tensor_for_sparsity` property
+2. **Architecture-Specific Support**: Not all regularizers work with all architectures
+3. **Attention-Type Compatibility**: Some regularizers only work with specific attention types
 
 ---
 
-## ToeplitzLieAttention Regularizers
+## Regularization Parameters by Category
 
-### Sparsity Regularizers Comparison
+### A. Structure Learning (DAG)
 
-There are **multiple sparsity mechanisms** that work on different targets:
+| Parameter | Target | Description |
+|-----------|--------|-------------|
+| `kappa` | NOTEARS | Acyclicity constraint: penalizes cycles in self-attention DAG |
+| `lambda_sparse` | σ(phi).mean() | Sparsity on self-attention edge probabilities |
+| `lambda_sparse_cross` | σ(phi).mean() | Sparsity on cross-attention edge probabilities |
+| `lambda_decisive` | Binary entropy | Pushes self-attention edges away from 0.5 |
+| `lambda_decisive_cross` | Binary entropy | Pushes cross-attention edges away from 0.5 |
 
-| Parameter | Target | Formula | Works With |
-|-----------|--------|---------|------------|
-| `lambda_l1_*_scores` | Attention weights | `mean(A_ij)` | GeLU-based only (see below) |
-| `lambda_sparse` | DAG probabilities | `mean(σ(phi))` | Only phi-based attention |
-| `lambda_entropy_*` | Distribution entropy | `-Σ A log(A)` | **All attention types** |
-| `lambda_l1_toeplitz_gate` | Gate probabilities | `mean(σ(γ))` | Only ToeplitzLieAttention |
+### B. Unified Score Sparsity (Attention Sharpening)
 
-### L1 Scores Compatibility by Attention Type
+The new unified approach combines L1 and entropy regularization with automatic mode selection and fallback:
 
-| Attention Type | Activation | `lambda_l1_*_scores` Works? |
-|----------------|-----------|----------------------------|
-| ScaledDotProduct | Softmax | ❌ No (sums to 1) |
-| PhiSoftMax | Softmax + phi mask | ❌ No (sums to 1) |
-| LieAttention | GeLU(commutator) | ✅ Yes |
-| **CausalCrossAttention** | GeLU(Tanh) | ✅ **Yes** |
-| ToeplitzLieAttention | GeLU(Tanh) | ✅ Yes |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `lambda_self_score_sparse` | Weight for self-attention score sparsity | 0.0 |
+| `lambda_cross_score_sparse` | Weight for cross-attention score sparsity | 0.0 |
+| `self_sparsity_regularizer` | Mode: `"l1"` or `"entropy"` | `"l1"` |
+| `cross_sparsity_regularizer` | Mode: `"l1"` or `"entropy"` | `"entropy"` |
 
-**Why `lambda_l1_*_scores` fails for softmax:**
-Softmax outputs sum to 1, so `mean(A) ≈ 1/seq_len` regardless of sparsity. Use entropy instead.
+**Mode Selection**:
+- `"l1"`: Uses `score_tensor_for_sparsity` property (effective for GeLU-based attention)
+- `"entropy"`: Uses attention entropy -Σ p log(p) (effective for **all** attention types)
 
-**Why it works for GeLU-based attention:**
-GeLU/Tanh outputs don't sum to 1, so penalizing mean directly encourages sparsity.
+**Automatic Fallback**: If `"l1"` mode is selected but `score_tensor_for_sparsity` is `None` (softmax-based attention), the forecaster automatically falls back to entropy with a warning.
 
-**Recommendations by attention type:**
+**Note**: L1 on attention scores is **ineffective for softmax-based attention** because outputs always sum to 1, making the mean approximately constant (1/seq_len). The automatic fallback handles this gracefully.
 
-| Attention Type | Best Sparsity Method |
+### C. Temperature Control
+
+| Parameter | Description |
+|-----------|-------------|
+| `lambda_tau` | Penalizes high Gumbel-Softmax temperature |
+| `target_tau` | Target temperature for penalty (no penalty below this) |
+
+### D. Independence / Causal
+
+| Parameter | Description |
+|-----------|-------------|
+| `lambda_hsic` | HSIC independence test between S and residuals |
+| `hsic_sigma` | Kernel bandwidth for HSIC computation |
+
+### E. Priors
+
+| Parameter | Description |
+|-----------|-------------|
+| `lambda_kl` | KL divergence from running average prior |
+| `adaptive_z_scaling` | Use SNR-based scaling for KL prior (recommended: true) |
+| `lambda_noise_prior` | Prior on noise parameters (noise-aware only) |
+
+### F. Capacity Control
+
+| Parameter | Description |
+|-----------|-------------|
+| `lambda_embed_l1` | L1 on embedding parameters (for ANS experiments) |
+
+---
+
+## Architecture Support Matrix
+
+| Regularizer | SingleCausal | NoiseAware | StageCausal |
+|-------------|:------------:|:----------:|:-----------:|
+| `kappa` (NOTEARS) | ✅ | ✅ | ✅ |
+| `lambda_sparse[_cross]` | ✅ | ✅ | ✅ |
+| `lambda_entropy_*` | ✅ | ✅ | ✅ |
+| `lambda_l1_*_scores` | ✅ | ✅ | ✅ |
+| `lambda_hsic` | ✅ | ✅ | ❌ |
+| `lambda_kl` | ✅ | ✅ | ❌ |
+| `lambda_decisive[_cross]` | ✅ | ✅ | ❌ |
+| `lambda_tau` | ✅ | ✅ | ❌ |
+| `lambda_embed_l1` | ✅ | ❌ | ❌ |
+| `lambda_noise_prior` | ❌ | ✅ | ❌ |
+| All annealing schedules | ✅ | ✅ | ❌ |
+
+---
+
+## Attention Type Compatibility
+
+### Sparsity Regularizers by Attention Type
+
+| Attention Type | Activation | `lambda_l1_*_scores` | `lambda_sparse` | `lambda_entropy_*` |
+|----------------|------------|:--------------------:|:---------------:|:------------------:|
+| ScaledDotProduct | Softmax | ❌ Ineffective | ❌ No phi | ✅ **Use this** |
+| PhiSoftMax | Softmax + phi | ❌ Ineffective | ✅ Works | ✅ Works |
+| LieAttention | GeLU | ✅ Works | ✅ Works | ✅ Works |
+| CausalCrossAttention | GeLU(Tanh) | ✅ Works | ✅ Works | ✅ Works |
+| ToeplitzLieAttention | ReLU(Tanh) | ✅ Works | ✅ Works on gate | ✅ Works |
+
+### Recommended Combinations
+
+| Attention Type | Recommended Sparsity |
 |----------------|---------------------|
-| ScaledDotProduct | `lambda_entropy_*` (only option that works) |
-| LieAttention | `lambda_l1_self_scores` + `lambda_sparse` |
-| ToeplitzLieAttention | `lambda_l1_toeplitz_gate` + `lambda_l1_self_scores` |
-| CausalCrossAttention | `lambda_l1_cross_scores` + `lambda_sparse_cross` |
+| ScaledDotProduct | `lambda_entropy_*` (only effective option) |
+| PhiSoftMax | `lambda_sparse` + `lambda_entropy_*` |
+| LieAttention | `lambda_l1_*_scores` + `lambda_sparse` |
+| ToeplitzLieAttention | `lambda_l1_*_scores` (applies to gate) |
 
-### 1. L1 Gate Sparsity (`lambda_l1_toeplitz_gate`)
+### ToeplitzLieAttention Specifics
 
-Penalizes average gate probability to encourage sparse DAGs (ToeplitzLieAttention only):
+ToeplitzLieAttention decomposes attention into:
+- **Gate (symmetric)**: Controls edge existence - P(edge exists)
+- **Direction (antisymmetric)**: Controls flow direction - P(i→j | edge exists)
 
-```yaml
-training:
-  lambda_l1_toeplitz_gate: 0.1  # Penalize open gates
-```
-
-**Effect**: Pushes `σ(γ) → 0` for unnecessary edges.
-
-### 2. Decisiveness Regularizer (`lambda_decisive`)
-
-Pushes DAG probabilities away from 0.5 toward 0 or 1:
-
-```yaml
-training:
-  lambda_decisive: 0.1
-  lambda_decisive_cross: 0.1
-```
-
-**Note:** `lambda_decisive` acts on **phi (DAG logits)**, not on tau_gs. It is **complementary** to temperature annealing and can be used together with `use_tau_gs_annealing`.
-
-### Parameter Interaction Summary
-
-| Parameter | Target | Effect |
-|-----------|--------|--------|
-| `lambda_decisive` | phi (DAG logits) | Pushes σ(phi) toward 0 or 1 |
-| `lambda_tau` | tau_gs (via loss) | Soft incentive to decrease temperature |
-| `use_tau_gs_annealing` | tau_gs (direct) | Hard schedule for temperature |
-
-**Complementary pairs** (use together):
-- `lambda_decisive` + `use_tau_gs_annealing` ✓
-- `lambda_decisive` + `lambda_tau` ✓
-
-**Conflicting pairs** (use one, not both):
-- `lambda_tau` + `use_tau_gs_annealing` ✗
-- `lambda_hsic` + `use_hsic_annealing` ✗ (hsic_lambda_start/end override lambda_hsic)
-
-### HSIC Parameter Interaction
-
-| Parameter | Role | Affected by Annealing? |
-|-----------|------|------------------------|
-| `lambda_hsic` | Fixed coefficient | N/A (not used if annealing enabled) |
-| `hsic_lambda_start/end` | Annealing schedule | Yes (overrides lambda_hsic) |
-| `hsic_sigma` | Kernel bandwidth | **No** (stays constant) |
-
-**Usage:**
-```yaml
-# Option A: Fixed HSIC coefficient
-training:
-  lambda_hsic: 0.1
-  hsic_sigma: 1.0
-  use_hsic_annealing: false
-
-# Option B: Annealed HSIC (recommended for staged learning)
-training:
-  lambda_hsic: 0.0  # Ignored when annealing enabled
-  hsic_sigma: 1.0   # Kernel bandwidth (not annealed)
-  use_hsic_annealing: true
-  hsic_lambda_start: 1.0  # Strong early
-  hsic_lambda_end: 0.0    # Disabled late
-```
-
-### τ_gs Control: `lambda_tau` vs `use_tau_gs_annealing`
-
-There are **two complementary but conflicting** mechanisms for controlling τ_gs:
-
-| Parameter | Mechanism | τ_gs Learnable? |
-|-----------|-----------|-----------------|
-| `lambda_tau` + `target_tau` | Gradient-based loss penalty | Yes |
-| `use_tau_gs_annealing` | Direct override at epoch start | No (reset each epoch) |
-
-**Recommendation:** Use one or the other, not both.
-
-```yaml
-# Option A: Gradient-driven (soft incentive)
-training:
-  lambda_tau: 0.1
-  target_tau: 0.1
-  use_tau_gs_annealing: false
-
-# Option B: Scheduled annealing (hard schedule, recommended for ToeplitzLieAttention)
-training:
-  lambda_tau: 0.0
-  use_tau_gs_annealing: true
-  tau_gs_start: 2.0
-  tau_gs_end: 0.2
-```
-
-**When to use which:**
-- **`lambda_tau`**: When you want the model to discover optimal temperature via gradient descent
-- **`use_tau_gs_annealing`**: When you want predictable exploration→exploitation behavior (recommended for ToeplitzLieAttention)
-
-### 3. HSIC Regularizer (`lambda_hsic`)
-
-Encourages independence between interventions and residuals:
-
-```yaml
-training:
-  lambda_hsic: 0.1
-  hsic_sigma: 1.0
-```
+The `lambda_l1_*_scores` regularizer applies to the **gate probabilities**, encouraging sparse edge existence rather than penalizing direction. This is the recommended approach because:
+1. We want to penalize "is there an edge?" not "which direction?"
+2. The gate controls edge existence (both directions)
+3. Sparse gates → sparse DAG
 
 ---
 
 ## Annealing Schedules
 
-### 1. Gumbel-Softmax Temperature Annealing (`tau_gs`)
-
-Anneals the Gumbel-Softmax temperature from high (exploration) to low (exploitation).
+### 1. Gumbel-Softmax Temperature (`tau_gs`)
 
 ```yaml
 training:
   use_tau_gs_annealing: true
-  tau_gs_start: 2.0          # Start with smooth relaxation
-  tau_gs_end: 0.2            # End with sharp decisions
-  tau_gs_anneal_epochs: 80   # Anneal over 80 epochs
+  tau_gs_start: 2.0          # High = exploration (soft masks)
+  tau_gs_end: 0.2            # Low = exploitation (hard masks)
+  tau_gs_anneal_epochs: 80
 ```
 
 **Schedule**: Exponential `τ(t) = τ_start × (τ_end/τ_start)^(t/T)`
 
-### 2. Toeplitz Activation Temperature Annealing (`tau_gate`, `tau_dir`)
+**When to use**: When you want predictable exploration→exploitation behavior. Recommended for ToeplitzLieAttention.
 
-Anneals the tanh activation temperatures in ToeplitzLieAttention.
+### 2. Activation Temperature (`tau_gate`, `tau_dir`)
+
+For ToeplitzLieAttention only:
 
 ```yaml
 training:
   use_tau_act_annealing: true
-  tau_gate_start: 1.0        # Gate activation temperature
+  tau_gate_start: 1.0
   tau_gate_end: 0.2
-  tau_dir_start: 0.5         # Direction activation temperature
+  tau_dir_start: 0.5
   tau_dir_end: 0.1
   tau_act_anneal_epochs: 80
 ```
 
 ### 3. HSIC Annealing
 
-Decreases HSIC regularization over training (allows fitting early, then enforces independence).
-
 ```yaml
 training:
   use_hsic_annealing: true
   hsic_lambda_start: 1.0     # Strong early
   hsic_lambda_end: 0.0       # Disabled late
-  hsic_anneal_epochs: 50     # Anneal over 50 epochs
+  hsic_anneal_epochs: 50
 ```
 
-**Schedule**: Linear `λ(t) = λ_start + (t/T) × (λ_end - λ_start)`
+**Schedule**: Linear annealing
+
+### Conflicting Mechanisms
+
+**Choose one, not both:**
+
+| Mechanism A | Mechanism B | Conflict |
+|-------------|-------------|----------|
+| `lambda_tau` | `use_tau_gs_annealing` | Both control τ_gs |
+| `lambda_hsic` (fixed) | `use_hsic_annealing` | Both control HSIC strength |
 
 ---
 
 ## Configuration Examples
 
-### Recommended Settings for DAG Learning
+### Minimal Baseline (No Regularization)
+
+```yaml
+training:
+  # All regularization disabled - pure reconstruction loss
+  kappa: 0.0
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  lambda_entropy_self: 0.0
+  lambda_entropy_cross: 0.0
+  lambda_l1_self_scores: 0.0
+  lambda_l1_cross_scores: 0.0
+  lambda_hsic: 0.0
+  lambda_decisive: 0.0
+  lambda_decisive_cross: 0.0
+  lambda_tau: 0.0
+  lambda_kl: 0.0
+  lambda_embed_l1: 0.0
+```
+
+### DAG Learning with ToeplitzLieAttention
 
 ```yaml
 experiment:
   dec_self_attention_type: "ToeplitzLieAttention"
-  
+
 training:
-  # Temperature annealing
+  # Temperature annealing (exploration → exploitation)
   use_tau_gs_annealing: true
   tau_gs_start: 2.0
   tau_gs_end: 0.2
   tau_gs_anneal_epochs: 80
   
-  # Gate sparsity
-  lambda_l1_toeplitz_gate: 0.1
+  # Sparsity via L1 on gate probabilities
+  lambda_l1_self_scores: 0.1
   
-  # Decisiveness
+  # Decisiveness (push edges away from 0.5)
   lambda_decisive: 0.05
   
-  # HSIC (optional)
-  use_hsic_annealing: true
-  hsic_lambda_start: 0.5
-  hsic_lambda_end: 0.0
+  # Acyclicity constraint
+  kappa: 0.1
   
   # Logging
-  log_tau_annealing: true
+  log_entropy: true
+  log_acyclicity: true
   log_decisiveness: true
+  log_l1_scores: true
 ```
 
-### Debugging Constant DAG Values
+### ScaledDotProduct with Entropy Regularization
 
-If DAG values stay constant at ~0.84:
+```yaml
+experiment:
+  dec_self_attention_type: "ScaledDotProduct"
 
-1. **Check temperature**:
-   ```yaml
-   training:
-     use_tau_gs_annealing: true
-     tau_gs_start: 1.0  # Lower start
-     tau_gs_end: 0.1    # Lower end
-   ```
+training:
+  # Use entropy for sparsity (L1 scores ineffective with softmax)
+  lambda_entropy_self: 0.1
+  lambda_entropy_cross: 0.1
+  
+  # No phi-based regularizers available
+  lambda_sparse: 0.0
+  lambda_decisive: 0.0
+```
 
-2. **Add sparsity pressure**:
-   ```yaml
-   training:
-     lambda_l1_toeplitz_gate: 0.2
-     lambda_decisive: 0.1
-   ```
+### ANS (Attention Necessity Score) Experiment
 
-3. **Check initialization**:
-   ```yaml
-   model:
-     kwargs:
-       dag_parameterization_self: "gated"
-   ```
+```yaml
+model:
+  attention_bypass: false  # Toggle in sweep
+
+training:
+  # Embedding L1 to limit capacity
+  lambda_embed_l1: 0.01  # Sweep this: [0.0, 0.0001, 0.001, 0.01, 0.1, 1.0]
+  log_embed_l1: true
+  
+  # Disable other regularizers for clean comparison
+  kappa: 0.0
+  lambda_sparse: 0.0
+```
 
 ---
 
-## Logging
+## Logging Configuration
 
-Enable detailed logging for debugging:
+Enable logging with these flags:
 
 ```yaml
 training:
-  log_entropy: true
-  log_l1_scores: true
-  log_decisiveness: true
-  log_tau_annealing: true
-  log_hsic_annealing: true
+  log_entropy: true          # Attention entropy
+  log_acyclicity: true       # NOTEARS value
+  log_sparsity: true         # Sparsity regularizer value
+  log_l1_scores: true        # L1 attention scores
+  log_hsic: true             # HSIC value
+  log_decisiveness: true     # Decisiveness metrics
+  log_embed_l1: true         # Embedding L1 norm
+  log_tau_annealing: true    # Annealed temperature values
+  log_hsic_annealing: true   # Annealed HSIC coefficient
+  log_noise_params: true     # σ_A, σ_R (noise-aware only)
 ```
-
-Logged metrics:
-- `annealed_tau_gs`: Current Gumbel-Softmax temperature
-- `annealed_tau_gate`: Current gate activation temperature
-- `annealed_tau_dir`: Current direction activation temperature
-- `annealed_lambda_hsic`: Current HSIC coefficient
 
 ---
 
-## Mathematical Background
+## Debugging Tips
 
-### Why 0.84 appears
+### Problem: DAG values stuck at ~0.5
 
-With `σ(γ) ≈ 0.84` and `σ(φ) ≈ 1.0`:
-- `γ ≈ 1.6` (log-odds)
-- This is a local optimum where reconstruction loss balances with implicit regularization
+**Cause**: Insufficient decisiveness pressure
 
-### Solution via Annealing
+**Solution**:
+```yaml
+training:
+  lambda_decisive: 0.1
+  use_tau_gs_annealing: true
+  tau_gs_end: 0.1  # Lower temperature
+```
 
-1. **Early training** (high τ): Explore structure space
-2. **Mid training**: Learn meaningful edges
-3. **Late training** (low τ): Commit to discrete structure
+### Problem: DAG too sparse (all edges pruned)
 
-The exponential schedule ensures most annealing happens early, allowing the model to stabilize.
+**Cause**: Over-regularization
+
+**Solution**: Reduce sparsity penalties:
+```yaml
+training:
+  lambda_sparse: 0.01  # Lower
+  lambda_l1_self_scores: 0.01  # Lower
+```
+
+### Problem: HSIC too high throughout training
+
+**Cause**: Model not learning causal structure
+
+**Solution**: Use HSIC annealing to allow fitting first:
+```yaml
+training:
+  use_hsic_annealing: true
+  hsic_lambda_start: 0.0  # Disabled early
+  hsic_lambda_end: 0.5    # Active late
+```
+
+---
+
+## Migration Notes
+
+### Deprecated Parameters
+
+The following parameters are no longer used and should be removed from configs:
+
+| Deprecated | Replacement |
+|------------|-------------|
+| `gamma` | Removed (was never a config parameter, internal to ToeplitzLieAttention) |
+| `lambda_l1_toeplitz_gate` | Use `lambda_l1_self_scores` instead (unified via `score_tensor_for_sparsity` property) |
+
+### Unified Score Regularization
+
+All attention types now expose a `score_tensor_for_sparsity` property that returns the appropriate tensor for L1 sparsity regularization:
+
+| Attention Type | `score_tensor_for_sparsity` Returns | Notes |
+|----------------|-------------------------------------|-------|
+| LieAttention | `sigmoid(phi)` | Edge existence probabilities |
+| CausalCrossAttention | `sigmoid(phi)` | Edge existence probabilities |
+| PhiSoftMax | `None` | Use entropy regularization instead |
+| ScaledDotAttention | `None` | Use entropy regularization instead |
+| ToeplitzAttention | `P_edge_for_reg` | Edge existence probabilities |
+| ToeplitzLieAttention | `gate_probs_for_reg` | Gate (edge existence) probabilities |
+
+The forecasters automatically use this property via `lambda_l1_self_scores` and `lambda_l1_cross_scores`. If the property returns `None`, no regularization is applied (appropriate for softmax-based attention where L1 is ineffective).
+
+### Parameter Renaming
+
+For consistency, consider using these patterns:
+- `lambda_*_self` for self-attention
+- `lambda_*_cross` for cross-attention

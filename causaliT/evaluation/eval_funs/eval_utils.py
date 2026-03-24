@@ -1049,3 +1049,493 @@ def _get_learned_dag_per_fold(
     
     # No data available
     return [(fn, None) for fn in fold_names], "none"
+
+
+# =============================================================================
+# Markov Equivalence Class (MEC) Metrics
+# =============================================================================
+
+def _dag_to_skeleton(dag_adj: np.ndarray) -> set:
+    """
+    Convert a DAG adjacency matrix to its skeleton (undirected edges).
+    
+    The skeleton is the set of undirected edges, represented as frozensets.
+    An edge exists between i and j if either dag_adj[i,j]=1 or dag_adj[j,i]=1.
+    
+    Args:
+        dag_adj: Binary adjacency matrix where dag_adj[i,j]=1 means j→i (edge from j to i)
+        
+    Returns:
+        set: Set of frozenset({i, j}) representing undirected edges
+        
+    Example:
+        >>> dag = np.array([[0, 1, 0],
+        ...                 [0, 0, 1],
+        ...                 [0, 0, 0]])  # 1→0, 2→1
+        >>> skeleton = _dag_to_skeleton(dag)
+        >>> frozenset({0, 1}) in skeleton
+        True
+    """
+    n = dag_adj.shape[0]
+    skeleton = set()
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Edge exists if either direction is present
+            if dag_adj[i, j] > 0 or dag_adj[j, i] > 0:
+                skeleton.add(frozenset({i, j}))
+    
+    return skeleton
+
+
+def _find_v_structures(dag_adj: np.ndarray) -> set:
+    """
+    Find all v-structures (colliders) in a DAG.
+    
+    A v-structure is a pattern A → B ← C where A and C are NOT adjacent.
+    This function identifies all colliders by finding nodes with multiple parents
+    where the parents are not adjacent to each other.
+    
+    Args:
+        dag_adj: Binary adjacency matrix where dag_adj[i,j]=1 means j→i (edge from j to i)
+        
+    Returns:
+        set: Set of tuples (collider_idx, parent1_idx, parent2_idx) where parent1 < parent2
+             for consistent ordering
+             
+    Example:
+        >>> # DAG: 0 → 2 ← 1 (v-structure at node 2), and 0 and 1 are NOT adjacent
+        >>> dag = np.array([[0, 0, 0],
+        ...                 [0, 0, 0],
+        ...                 [1, 1, 0]])  # 0→2, 1→2
+        >>> v_structs = _find_v_structures(dag)
+        >>> (2, 0, 1) in v_structs
+        True
+    """
+    n = dag_adj.shape[0]
+    skeleton = _dag_to_skeleton(dag_adj)
+    v_structures = set()
+    
+    for collider in range(n):
+        # Find all parents of this node (nodes j where dag_adj[collider, j] = 1)
+        parents = [j for j in range(n) if dag_adj[collider, j] > 0]
+        
+        # Check all pairs of parents
+        for i, p1 in enumerate(parents):
+            for p2 in parents[i + 1:]:
+                # V-structure exists if parents are NOT adjacent
+                if frozenset({p1, p2}) not in skeleton:
+                    # Store with consistent ordering (smaller index first)
+                    v_structures.add((collider, min(p1, p2), max(p1, p2)))
+    
+    return v_structures
+
+
+def _combine_attention_to_full_dag(
+    cross_adj: np.ndarray,
+    self_adj: np.ndarray,
+    n_source: int,
+    n_intermediate: int,
+) -> np.ndarray:
+    """
+    Combine cross-attention and self-attention matrices into a full DAG adjacency matrix.
+    
+    For a model with S source variables and X intermediate variables:
+    - cross_adj has shape (n_X, n_S) representing S → X edges
+    - self_adj has shape (n_X, n_X) representing X → X edges
+    
+    The combined DAG has shape (n_S + n_X, n_S + n_X):
+    - Rows/cols 0:n_S correspond to source variables (no parents)
+    - Rows/cols n_S:n_S+n_X correspond to intermediate variables
+    
+    Args:
+        cross_adj: Cross-attention matrix (n_X, n_S) where entry [i,j]=1 means S_j → X_i
+        self_adj: Self-attention matrix (n_X, n_X) where entry [i,j]=1 means X_j → X_i
+        n_source: Number of source variables
+        n_intermediate: Number of intermediate variables
+        
+    Returns:
+        np.ndarray: Full DAG adjacency matrix of shape (n_S + n_X, n_S + n_X)
+        
+    Example:
+        >>> cross = np.array([[1, 0], [0, 1]])  # S1→X1, S2→X2
+        >>> self_att = np.array([[0, 0], [1, 0]])  # X1→X2
+        >>> full_dag = _combine_attention_to_full_dag(cross, self_att, n_source=2, n_intermediate=2)
+        >>> full_dag.shape
+        (4, 4)
+    """
+    n_total = n_source + n_intermediate
+    full_dag = np.zeros((n_total, n_total))
+    
+    # S → X edges: cross_adj[i, j] means S_j → X_i
+    # In full DAG: row n_source+i, col j
+    full_dag[n_source:n_source + n_intermediate, 0:n_source] = cross_adj
+    
+    # X → X edges: self_adj[i, j] means X_j → X_i
+    # In full DAG: row n_source+i, col n_source+j
+    full_dag[n_source:n_source + n_intermediate, n_source:n_source + n_intermediate] = self_adj
+    
+    return full_dag
+
+
+def _soft_skeleton_distance(
+    learned_adj: np.ndarray,
+    true_skeleton: set,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute soft skeleton distance between a learned adjacency matrix and true skeleton.
+    
+    For continuous learned adjacency values in [0,1], this computes:
+    - Recall: For true edges, how strong is max(A[i,j], A[j,i])?
+    - Precision: For non-edges, how low is max(A[i,j], A[j,i])?
+    - Distance: 1 - F1(recall, precision)
+    
+    Args:
+        learned_adj: Continuous adjacency matrix with values in [0, 1]
+        true_skeleton: Set of frozenset({i, j}) representing true undirected edges
+        
+    Returns:
+        Tuple of (distance, details):
+            - distance: Float in [0, 1] where 0 = perfect skeleton match
+            - details: Dict with 'recall', 'precision', 'f1' scores
+            
+    Example:
+        >>> learned = np.array([[0, 0.9, 0.1],
+        ...                     [0.8, 0, 0.2],
+        ...                     [0.1, 0.1, 0]])
+        >>> true_skel = {frozenset({0, 1})}  # Only edge 0-1 exists
+        >>> dist, details = _soft_skeleton_distance(learned, true_skel)
+    """
+    n = learned_adj.shape[0]
+    all_pairs = {frozenset({i, j}) for i in range(n) for j in range(i + 1, n)}
+    
+    # For true edges: we WANT presence (either direction)
+    if true_skeleton:
+        true_edge_scores = []
+        for edge in true_skeleton:
+            i, j = tuple(edge)
+            edge_strength = max(learned_adj[i, j], learned_adj[j, i])
+            true_edge_scores.append(edge_strength)
+        recall = float(np.mean(true_edge_scores))
+    else:
+        # No true edges - recall is perfect by definition
+        recall = 1.0
+    
+    # For non-edges: we DON'T want presence
+    false_pairs = all_pairs - true_skeleton
+    if false_pairs:
+        false_edge_scores = []
+        for edge in false_pairs:
+            i, j = tuple(edge)
+            edge_strength = max(learned_adj[i, j], learned_adj[j, i])
+            false_edge_scores.append(edge_strength)
+        precision = 1.0 - float(np.mean(false_edge_scores))
+    else:
+        # All possible edges are true edges - precision is perfect
+        precision = 1.0
+    
+    # F1-style combination
+    if recall + precision == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * recall * precision / (recall + precision)
+    
+    distance = 1.0 - f1
+    
+    details = {
+        "recall": recall,
+        "precision": precision,
+        "f1": f1,
+        "n_true_edges": len(true_skeleton),
+        "n_possible_edges": len(all_pairs),
+    }
+    
+    return distance, details
+
+
+def _soft_v_structure_distance(
+    learned_adj: np.ndarray,
+    true_v_structures: set,
+    true_skeleton: set,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute soft v-structure distance between learned adjacency and true v-structures.
+    
+    For each true v-structure (collider at c with parents p1, p2):
+    - Both p1→c and p2→c should be present (high values)
+    - p1 and p2 should NOT be adjacent (low values for p1-p2 edge)
+    
+    The function also penalizes spurious v-structures in the learned DAG.
+    
+    Args:
+        learned_adj: Continuous adjacency matrix with values in [0, 1]
+        true_v_structures: Set of (collider, parent1, parent2) tuples
+        true_skeleton: Set of frozenset({i, j}) representing true undirected edges
+        
+    Returns:
+        Tuple of (distance, details):
+            - distance: Float in [0, 1] where 0 = perfect v-structure match
+            - details: Dict with 'recall', 'precision', 'f1' scores
+            
+    Example:
+        >>> learned = np.array([[0, 0, 0],
+        ...                     [0, 0, 0],
+        ...                     [0.9, 0.8, 0]])  # Strong edges 0→2, 1→2
+        >>> true_v = {(2, 0, 1)}  # V-structure at 2 with parents 0, 1
+        >>> true_skel = {frozenset({0, 2}), frozenset({1, 2})}
+        >>> dist, details = _soft_v_structure_distance(learned, true_v, true_skel)
+    """
+    n = learned_adj.shape[0]
+    
+    # Compute recall: how well are true v-structures captured?
+    if true_v_structures:
+        v_recall_scores = []
+        for (c, p1, p2) in true_v_structures:
+            # Both parent edges should be present (into collider)
+            parent_strength = min(learned_adj[c, p1], learned_adj[c, p2])
+            # Parents should NOT be adjacent
+            no_parent_edge = 1.0 - max(learned_adj[p1, p2], learned_adj[p2, p1])
+            # Combined score: both conditions must hold
+            v_score = parent_strength * no_parent_edge
+            v_recall_scores.append(v_score)
+        recall = float(np.mean(v_recall_scores))
+    else:
+        # No true v-structures - recall is 1 by definition
+        recall = 1.0
+    
+    # Compute precision: penalize spurious v-structures
+    # Find potential v-structures in learned DAG (nodes with multiple strong incoming edges
+    # where those sources are not adjacent)
+    spurious_scores = []
+    
+    for collider in range(n):
+        # Find potential parents (nodes with edge into collider)
+        potential_parents = []
+        for j in range(n):
+            if j != collider and learned_adj[collider, j] > 0.3:  # threshold for "potential" edge
+                potential_parents.append((j, learned_adj[collider, j]))
+        
+        # Check pairs of potential parents
+        for i, (p1, strength1) in enumerate(potential_parents):
+            for p2, strength2 in potential_parents[i + 1:]:
+                # This is a potential v-structure if p1-p2 not adjacent
+                p1_p2_edge = max(learned_adj[p1, p2], learned_adj[p2, p1])
+                
+                # If this is NOT a true v-structure, penalize it
+                v_tuple = (collider, min(p1, p2), max(p1, p2))
+                if v_tuple not in true_v_structures:
+                    # Spurious v-structure strength
+                    spurious_strength = min(strength1, strength2) * (1.0 - p1_p2_edge)
+                    spurious_scores.append(spurious_strength)
+    
+    if spurious_scores:
+        precision = 1.0 - float(np.mean(spurious_scores))
+        precision = max(0.0, precision)  # Clip to [0, 1]
+    else:
+        precision = 1.0
+    
+    # F1-style combination
+    if recall + precision == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * recall * precision / (recall + precision)
+    
+    distance = 1.0 - f1
+    
+    details = {
+        "recall": recall,
+        "precision": precision,
+        "f1": f1,
+        "n_true_v_structures": len(true_v_structures),
+        "n_spurious_candidates": len(spurious_scores),
+    }
+    
+    return distance, details
+
+
+def _compute_mec_distance(
+    learned_adj: np.ndarray,
+    true_dag_adj: np.ndarray,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Compute the Markov Equivalence Class (MEC) distance between learned and true DAG.
+    
+    The MEC distance combines skeleton distance and v-structure distance:
+        MEC_distance = (skeleton_distance + v_structure_distance) / 2
+    
+    A distance of 0 means the learned DAG is in the same MEC as the true DAG.
+    A distance of 1 means maximum difference (completely wrong skeleton and v-structures).
+    
+    Args:
+        learned_adj: Continuous adjacency matrix with values in [0, 1]
+        true_dag_adj: Binary true DAG adjacency matrix
+        
+    Returns:
+        Tuple of (mec_distance, details):
+            - mec_distance: Float in [0, 1] where 0 = same MEC
+            - details: Dict containing component distances and scores
+            
+    Example:
+        >>> true_dag = np.array([[0, 0, 0],
+        ...                      [0, 0, 0],
+        ...                      [1, 1, 0]])  # V-structure: 0→2←1
+        >>> learned = np.array([[0, 0, 0],
+        ...                     [0, 0, 0],
+        ...                     [0.9, 0.85, 0]])  # Good approximation
+        >>> dist, details = _compute_mec_distance(learned, true_dag)
+    """
+    # Extract skeleton and v-structures from true DAG
+    true_skeleton = _dag_to_skeleton(true_dag_adj)
+    true_v_structures = _find_v_structures(true_dag_adj)
+    
+    # Compute component distances
+    skel_dist, skel_details = _soft_skeleton_distance(learned_adj, true_skeleton)
+    v_dist, v_details = _soft_v_structure_distance(learned_adj, true_v_structures, true_skeleton)
+    
+    # Combined distance (simple mean)
+    mec_distance = (skel_dist + v_dist) / 2.0
+    
+    details = {
+        "mec_distance": mec_distance,
+        "skeleton_distance": skel_dist,
+        "skeleton_recall": skel_details["recall"],
+        "skeleton_precision": skel_details["precision"],
+        "skeleton_f1": skel_details["f1"],
+        "v_structure_distance": v_dist,
+        "v_structure_recall": v_details["recall"],
+        "v_structure_precision": v_details["precision"],
+        "v_structure_f1": v_details["f1"],
+        "n_true_skeleton_edges": skel_details["n_true_edges"],
+        "n_true_v_structures": v_details["n_true_v_structures"],
+    }
+    
+    return mec_distance, details
+
+
+def _check_mec_membership(
+    learned_adj: np.ndarray,
+    true_dag_adj: np.ndarray,
+    threshold: float = 0.5,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Check if a learned DAG belongs to the Markov Equivalence Class of the true DAG.
+    
+    This is the binary version of MEC distance. After thresholding the learned
+    adjacency matrix at `threshold`, it checks:
+    1. Same skeleton: All edges (ignoring direction) must match exactly
+    2. Same v-structures: All colliders must match exactly
+    
+    Args:
+        learned_adj: Continuous adjacency matrix with values in [0, 1]
+        true_dag_adj: Binary true DAG adjacency matrix
+        threshold: Threshold for binarizing learned adjacency (default: 0.5)
+        
+    Returns:
+        Tuple of (in_mec, details):
+            - in_mec: Boolean indicating if learned DAG is in the same MEC
+            - details: Dict with diagnostic information
+            
+    Example:
+        >>> true_dag = np.array([[0, 0, 0],
+        ...                      [0, 0, 0],
+        ...                      [1, 1, 0]])  # V-structure: 0→2←1
+        >>> learned = np.array([[0, 0, 0],
+        ...                     [0, 0, 0],
+        ...                     [0.9, 0.85, 0]])
+        >>> in_mec, details = _check_mec_membership(learned, true_dag)
+    """
+    # Binarize learned adjacency
+    learned_binary = (learned_adj >= threshold).astype(float)
+    
+    # Extract skeletons
+    true_skeleton = _dag_to_skeleton(true_dag_adj)
+    learned_skeleton = _dag_to_skeleton(learned_binary)
+    
+    # Check skeleton equality
+    skeleton_match = (true_skeleton == learned_skeleton)
+    
+    # Extract v-structures
+    true_v_structures = _find_v_structures(true_dag_adj)
+    learned_v_structures = _find_v_structures(learned_binary)
+    
+    # Check v-structure equality
+    v_structure_match = (true_v_structures == learned_v_structures)
+    
+    # In MEC if both conditions hold
+    in_mec = skeleton_match and v_structure_match
+    
+    # Compute detailed differences
+    missing_edges = true_skeleton - learned_skeleton
+    extra_edges = learned_skeleton - true_skeleton
+    missing_v_structures = true_v_structures - learned_v_structures
+    extra_v_structures = learned_v_structures - true_v_structures
+    
+    details = {
+        "in_mec": in_mec,
+        "threshold": threshold,
+        "skeleton_match": skeleton_match,
+        "v_structure_match": v_structure_match,
+        "n_true_skeleton_edges": len(true_skeleton),
+        "n_learned_skeleton_edges": len(learned_skeleton),
+        "n_missing_edges": len(missing_edges),
+        "n_extra_edges": len(extra_edges),
+        "missing_edges": [tuple(e) for e in missing_edges],
+        "extra_edges": [tuple(e) for e in extra_edges],
+        "n_true_v_structures": len(true_v_structures),
+        "n_learned_v_structures": len(learned_v_structures),
+        "n_missing_v_structures": len(missing_v_structures),
+        "n_extra_v_structures": len(extra_v_structures),
+        "missing_v_structures": list(missing_v_structures),
+        "extra_v_structures": list(extra_v_structures),
+    }
+    
+    return in_mec, details
+
+
+def _load_full_true_dag(
+    datadir_path: str,
+    dataset: str,
+) -> Optional[np.ndarray]:
+    """
+    Load the full true DAG adjacency matrix combining all attention mask blocks.
+    
+    For datasets with source variables (S → X structure), this combines:
+    - dec1_cross_att_mask.csv (S → X edges)
+    - dec1_self_att_mask.csv (X → X edges)
+    
+    Into a full (n_S + n_X) × (n_S + n_X) adjacency matrix.
+    
+    Args:
+        datadir_path: Path to the data directory
+        dataset: Dataset name
+        
+    Returns:
+        np.ndarray: Full DAG adjacency matrix, or None if files not found
+    """
+    # Load cross-attention mask (S → X)
+    cross_mask = _load_true_dag_mask(datadir_path, dataset, "dec1_cross")
+    # Load self-attention mask (X → X)
+    self_mask = _load_true_dag_mask(datadir_path, dataset, "dec1_self")
+    
+    if cross_mask is None or self_mask is None:
+        # Try to load full DAG directly if available
+        filepath = join(datadir_path, dataset, "dag_adj_mask.csv")
+        if exists(filepath):
+            try:
+                df = pd.read_csv(filepath, index_col=0)
+                return df.values.astype(float)
+            except Exception as e:
+                print(f"Warning: Failed to load full DAG mask: {e}")
+        return None
+    
+    n_X, n_S = cross_mask.shape
+    
+    # Combine into full DAG
+    full_dag = _combine_attention_to_full_dag(
+        cross_adj=cross_mask,
+        self_adj=self_mask,
+        n_source=n_S,
+        n_intermediate=n_X,
+    )
+    
+    return full_dag

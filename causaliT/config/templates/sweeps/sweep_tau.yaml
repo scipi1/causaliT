@@ -1,0 +1,25 @@
+# =============================================================================
+# Toeplitz Tau (Steepness) Sweep Configuration
+# =============================================================================
+#
+# Sweeps the tau parameter which controls tanh steepness in ToeplitzLieAttention:
+#   tanh(x/tau)
+#
+# Tau controls how "decisive" the attention edges are:
+#   - tau=0.2 → steep → decisive edges (near binary 0/1)
+#   - tau=1.0 → gentle → uncertain edges
+#   - tau=5.0 → nearly linear → very uncertain
+#
+# Lower tau values encourage sparser, more interpretable DAG structures.
+# Higher tau values allow more gradient flow but less decisive edges.
+#
+# Usage:
+#   python -m causaliT.euler_sweep.euler_sweep.cli sweep \
+#       --exp_id <your_exp_id> \
+#       --sweep_mode combination
+#
+# Total runs: 5
+# =============================================================================
+
+experiment:
+  toeplitz_tau: [0.2, 0.5, 1.0, 2.0, 5.0]

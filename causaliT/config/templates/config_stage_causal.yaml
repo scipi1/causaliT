@@ -1,0 +1,316 @@
+# =============================================================================
+# StageCausaliT Template (SCM Datasets - Shared Embeddings)
+# =============================================================================
+# Model: StageCausaliT
+# Embedding: Shared embedding across S, X, Y
+# Use for: SCM datasets where S/X/Y share the same variable indexing
+#
+# Architecture: Dual-decoder with two prediction stages
+# - Decoder 1: S → X (reconstruct intermediate variables from sources)
+# - Decoder 2: X → Y (predict targets from intermediate variables)
+#
+# Key Features:
+# - Shared embedding ensures consistent variable representations
+# - Teacher forcing support for autoregressive training
+# - Separate loss weights for X reconstruction and Y prediction
+# - Optional hard masks for enforcing ground-truth DAG structure
+#
+# For dyconex datasets with independent S/X/Y indexing, 
+# use config_stage_causal_dyconex.yaml instead.
+#
+# Auto-populated fields (from dataset_metadata.json):
+# - data.S_seq_len, data.X_seq_len, data.Y_seq_len
+# - data.num_embeddings_shared
+# - data.feature_indices.value, data.feature_indices.variable
+#
+# =============================================================================
+# EXPERIMENT NAMING CONVENTION
+# =============================================================================
+# Format: stage_<SelfAttn>_<CrossAttn>_<dataset>_[modifiers]
+#
+# Components:
+#   stage     : StageCausaliT (this template)
+#   SelfAttn  : SM (ScaledDotProduct), Lie (LieAttention), 
+#               PhiSM (PhiSoftMax), Toeplitz (ToeplitzLieAttention)
+#   CrossAttn : SM (ScaledDotProduct), CC (CausalCrossAttention), PhiSM (PhiSoftMax)
+#   dataset   : scm1, scm2, scm3, scm6, scm7, etc.
+#   modifiers : (optional) SVFA, antisym, gated, indep, hard, orthS
+#
+# Modifier meanings:
+#   SVFA    : comps_embed_shared = "svfa" (default is "summation")
+#   antisym : dag_parameterization = "antisymmetric"
+#   gated   : dag_parameterization = "gated"
+#   indep   : dag_parameterization = "independent"
+#   hard    : use_hard_masks = true
+#   orthS   : orthogonal frozen S embedding (default is learnable)
+#
+# Example folder names for this template:
+#   experiments/stage/scm6/stage_SM_SM_scm6/
+#   experiments/stage/scm6/stage_Lie_SM_scm6/
+#   experiments/stage/scm6/stage_Toeplitz_SM_scm6_SVFA/
+#
+# To run:
+#   python -m causaliT.cli train experiments/stage/scm6/stage_SM_SM_scm6/
+# =============================================================================
+
+experiment:
+  # Model dimensions
+  d_model_set: 12         # Shared embedding dimension for all variables
+  d1_layers: 1            # Decoder 1 layers (S → X)
+  d2_layers: 1            # Decoder 2 layers (X → Y)
+  n_heads: 1              # Number of attention heads
+  d_ff: 24                # Feedforward dimension
+  d_qk: 6                 # Query/key dimension
+  dropout: 0.0            # Dropout rate
+  
+  # Training hyperparameters
+  lr: 0.0005
+  batch_size: 64
+  max_epochs: 100
+  
+  # Loss weights
+  loss_weight_x: 1.0      # Weight for X reconstruction
+  loss_weight_y: 1.0      # Weight for Y prediction
+
+
+model:
+  model_object: "StageCausaliT"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+    time_emb_hidden: ${experiment.d_model_set}
+  
+  kwargs:
+    model: ${model.model_object}
+    
+    # =========================================================================
+    # SHARED EMBEDDING (S, X, Y use the same embedding)
+    # =========================================================================
+    # Use this when S, X, Y variables share the same indexing scheme
+    comps_embed_shared: "summation"
+    
+    ds_embed_shared:
+      setting:
+        d_model: ${experiment.d_model_set}
+        sparse_grad: false
+      
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_shared}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_shared.setting.sparse_grad}
+            max_norm: 1
+        
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+    
+    # =========================================================================
+    # ATTENTION CONFIGURATION - Decoder 1 (S → X)
+    # =========================================================================
+    dec1_cross_attention_type: "ScaledDotProduct"
+    dec1_cross_mask_type: "Uniform"
+    dec1_self_attention_type: "ScaledDotProduct"
+    dec1_self_mask_type: "Uniform"
+    
+    # =========================================================================
+    # ATTENTION CONFIGURATION - Decoder 2 (X → Y)
+    # =========================================================================
+    dec2_cross_attention_type: "ScaledDotProduct"
+    dec2_cross_mask_type: "Uniform"
+    dec2_self_attention_type: "ScaledDotProduct"
+    dec2_self_mask_type: "Uniform"
+    
+    n_heads: ${experiment.n_heads}
+    
+    # Causal masking
+    dec1_causal_mask: false
+    dec2_causal_mask: false
+    
+    # =========================================================================
+    # MODEL ARCHITECTURE
+    # =========================================================================
+    d1_layers: ${experiment.d1_layers}
+    d2_layers: ${experiment.d2_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+    
+    # Model dimensions
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${experiment.d_model_set}
+    d_qk: ${experiment.d_qk}
+    
+    # Sequence lengths
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    Y_seq_len: ${data.Y_seq_len}
+    
+    # =========================================================================
+    # DROPOUT
+    # =========================================================================
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    
+    # Decoder 1 dropout
+    dec1_cross_dropout_qkv: ${experiment.dropout}
+    dec1_cross_attention_dropout: ${experiment.dropout}
+    dec1_self_dropout_qkv: ${experiment.dropout}
+    dec1_self_attention_dropout: ${experiment.dropout}
+    
+    # Decoder 2 dropout
+    dec2_cross_dropout_qkv: ${experiment.dropout}
+    dec2_cross_attention_dropout: ${experiment.dropout}
+    dec2_self_dropout_qkv: ${experiment.dropout}
+    dec2_self_attention_dropout: ${experiment.dropout}
+
+
+training:
+  # =========================================================================
+  # OPTIMIZER
+  # =========================================================================
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+  
+  # =========================================================================
+  # LOSS
+  # =========================================================================
+  loss_fn: "mse"
+  loss_weight_x: ${experiment.loss_weight_x}
+  loss_weight_y: ${experiment.loss_weight_y}
+  
+  # =========================================================================
+  # TEACHER FORCING
+  # =========================================================================
+  teacher_forcing: false
+  
+  # =========================================================================
+  # TRAINING LOOP
+  # =========================================================================
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+  
+  # =========================================================================
+  # LOGGING FLAGS
+  # =========================================================================
+  log_entropy: true
+  log_acyclicity: true
+  log_sparsity: true
+  log_hsic: false
+  log_decisiveness: false
+  log_l1_scores: true
+  log_embed_l1: false
+  log_jacobian: false
+  jacobian_every_n_epochs: 1
+  
+  # =========================================================================
+  # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # =========================================================================
+  
+  # Entropy regularization
+  lambda_entropy_self: 0.0
+  lambda_entropy_cross: 0.0
+  
+  # Acyclicity (NOTEARS)
+  kappa: 0.0
+  
+  # Sparsity
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  
+  # HSIC
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  
+  # Decisiveness
+  lambda_decisive: 0.0
+  lambda_decisive_cross: 0.0
+  lambda_tau: 0.0
+  target_tau: 0.0
+  
+  # L1 on attention scores
+  lambda_l1_self_scores: 0.0
+  lambda_l1_cross_scores: 0.0
+  
+  # KL prior regularization
+  lambda_kl: 0.0
+  adaptive_z_scaling: true
+  
+  # Embedding L1
+  lambda_embed_l1: 0.0
+  
+  # =========================================================================
+  # EMBEDDING FREEZING
+  # =========================================================================
+  freeze_embeddings: false
+  
+  # =========================================================================
+  # HARD MASKS
+  # =========================================================================
+  use_hard_masks: false
+  hard_mask_files:
+    dec1_cross: "dec1_cross_att_mask.csv"
+    dec1_self: "dec1_self_att_mask.csv"
+    dec2_cross: "dec2_cross_att_mask.csv"
+    dec2_self: "dec2_self_att_mask.csv"
+
+
+data:
+  dataset: "scm6"
+  filename_input: "ds.npz"  # Single file (used when train_file/test_file are null)
+  
+  # Pre-split train/test files (optional)
+  # If both are specified and exist, they will be used INSTEAD of filename_input
+  # Set both to null to use the single filename_input file
+  train_file: null          # e.g., "ds_train.npz" for holdout split datasets
+  test_file: null           # e.g., "ds_test.npz" for holdout split datasets
+  
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+  
+  # Auto-populated from dataset_metadata.json
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+  
+  feature_indices:
+    value: null
+    variable: null
+
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  functions: []
+
+
+special:
+  mode: []

@@ -1,0 +1,546 @@
+# =============================================================================
+# StageCausaliT Template (Dyconex - Independent Embeddings)
+# =============================================================================
+# Model: StageCausaliT
+# Embedding: Independent embeddings for S, X, Y
+# Use for: Dyconex datasets where S/X/Y have independent variable indexing
+#
+# IMPORTANT: In dyconex datasets, variable index 1 in S represents a 
+# DIFFERENT entity than variable index 1 in X. This requires separate
+# embedding tables for each stage.
+#
+# Architecture: Dual-decoder with two prediction stages
+# - Decoder 1: S → X (reconstruct intermediate variables from sources)
+# - Decoder 2: X → Y (predict targets from intermediate variables)
+#
+# Key Features:
+# - Independent embeddings with rich feature sets (process, occurrence, step, time)
+# - In-context masks computed from data features (causal/category constraints)
+# - Teacher forcing support
+# - Time2Vec temporal embeddings
+#
+# For SCM datasets with shared variable indexing,
+# use config_stage_causal.yaml instead.
+#
+# =============================================================================
+# EXPERIMENT NAMING CONVENTION
+# =============================================================================
+# Format: stage_<SelfAttn>_<CrossAttn>_<dataset>_[modifiers]
+#
+# Components:
+#   stage     : StageCausaliT (this template)
+#   SelfAttn  : SM (ScaledDotProduct), Lie (LieAttention), 
+#               PhiSM (PhiSoftMax), Toeplitz (ToeplitzLieAttention)
+#   CrossAttn : SM (ScaledDotProduct), CC (CausalCrossAttention), PhiSM (PhiSoftMax)
+#   dataset   : dyconex, or specific dyconex dataset identifiers
+#   modifiers : (optional) SVFA, antisym, gated, indep, hard
+#
+# Modifier meanings:
+#   SVFA    : comps_embed_{S,X,Y} = "svfa" (default is "summation")
+#   antisym : dag_parameterization = "antisymmetric"
+#   gated   : dag_parameterization = "gated"
+#   indep   : dag_parameterization = "independent"
+#   hard    : use_hard_masks = true
+#
+# Example folder names for this template:
+#   experiments/stage/dyconex/stage_SM_SM_dyconex/
+#   experiments/stage/dyconex/stage_Lie_SM_dyconex/
+#
+# To run:
+#   python -m causaliT.cli train experiments/stage/dyconex/stage_SM_SM_dyconex/
+# =============================================================================
+
+experiment:
+  # Model dimensions
+  d_model_set: 100        # Embedding dimension for all components
+  d1_layers: 1            # Decoder 1 layers (S → X)
+  d2_layers: 1            # Decoder 2 layers (X → Y)
+  n_heads: 1              # Number of attention heads
+  d_ff: 200               # Feedforward dimension
+  d_qk: 100               # Query/key dimension
+  dropout: 0.1            # Dropout rate
+  
+  # Training hyperparameters
+  lr: 0.0001
+  batch_size: 50
+  max_epochs: 500
+  
+  # Loss weights
+  loss_weight_x: 1.0      # Weight for X reconstruction
+  loss_weight_y: 1.0      # Weight for Y prediction
+
+
+model:
+  model_object: "StageCausaliT"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    # S embeddings
+    s_pro_emb_hidden: ${experiment.d_model_set}
+    s_occ_emb_hidden: ${experiment.d_model_set}
+    s_step_emb_hidden: ${experiment.d_model_set}
+    s_var_emb_hidden: ${experiment.d_model_set}
+    s_val_emb_hidden: ${experiment.d_model_set}
+    s_time_emb_hidden: ${experiment.d_model_set}
+    # X embeddings
+    x_pro_emb_hidden: ${experiment.d_model_set}
+    x_occ_emb_hidden: ${experiment.d_model_set}
+    x_step_emb_hidden: ${experiment.d_model_set}
+    x_var_emb_hidden: ${experiment.d_model_set}
+    x_val_emb_hidden: ${experiment.d_model_set}
+    x_time_emb_hidden: ${experiment.d_model_set}
+    # Y embeddings
+    y_var_emb_hidden: ${experiment.d_model_set}
+    y_val_emb_hidden: ${experiment.d_model_set}
+    y_pos_emb_hidden: ${experiment.d_model_set}
+    y_time_emb_hidden: ${experiment.d_model_set}
+  
+  kwargs:
+    model: ${model.model_object}
+    
+    # =========================================================================
+    # INDEPENDENT EMBEDDINGS CONFIGURATION
+    # =========================================================================
+    use_independent_embeddings: true
+    val_idx_X: ${data.features.S.value}
+    
+    # =========================================================================
+    # S EMBEDDING (Source Variables)
+    # =========================================================================
+    comps_embed_S: "summation"
+    ds_embed_S:
+      setting:
+        d_model: ${experiment.d_model_set}
+        sparse_grad: false
+      
+      modules:
+        - idx: ${data.features.S.process}
+          embed: "nn_embedding"
+          label: "process"
+          kwargs:
+            num_embeddings: 3
+            embedding_dim: ${model.embed_dim.s_pro_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.S.occurrence}
+          embed: "nn_embedding"
+          label: "occurrence"
+          kwargs:
+            num_embeddings: 5
+            embedding_dim: ${model.embed_dim.s_occ_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.S.step}
+          embed: "nn_embedding"
+          label: "step"
+          kwargs:
+            num_embeddings: 3
+            embedding_dim: ${model.embed_dim.s_step_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.S.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs:
+            num_embeddings: 53    # S unique variables + 1 for padding
+            embedding_dim: ${model.embed_dim.s_var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.S.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.s_val_emb_hidden}
+        
+        - idx: ${data.features.S.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+        
+        - idx: ${data.features.S.order}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+        
+        - idx: ${data.features.S.time}
+          embed: "time2vec"
+          label: "time"
+          kwargs:
+            input_dim: 5
+            embed_dim: ${model.embed_dim.s_time_emb_hidden}
+    
+    # =========================================================================
+    # X EMBEDDING (Input/Intermediate Variables)
+    # =========================================================================
+    comps_embed_X: "summation"
+    ds_embed_X:
+      setting:
+        d_model: ${experiment.d_model_set}
+        sparse_grad: false
+      
+      modules:
+        - idx: ${data.features.X.process}
+          embed: "nn_embedding"
+          label: "process"
+          kwargs:
+            num_embeddings: 3
+            embedding_dim: ${model.embed_dim.x_pro_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.X.occurrence}
+          embed: "nn_embedding"
+          label: "occurrence"
+          kwargs:
+            num_embeddings: 5
+            embedding_dim: ${model.embed_dim.x_occ_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.X.step}
+          embed: "nn_embedding"
+          label: "step"
+          kwargs:
+            num_embeddings: 3
+            embedding_dim: ${model.embed_dim.x_step_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.X.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs:
+            num_embeddings: 78    # X unique variables + 1 for padding
+            embedding_dim: ${model.embed_dim.x_var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.X.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.x_val_emb_hidden}
+        
+        - idx: ${data.features.X.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+        
+        - idx: ${data.features.X.order}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+        
+        - idx: ${data.features.X.time}
+          embed: "time2vec"
+          label: "time"
+          kwargs:
+            input_dim: 5
+            embed_dim: ${model.embed_dim.x_time_emb_hidden}
+    
+    # =========================================================================
+    # Y EMBEDDING (Target Variables)
+    # =========================================================================
+    comps_embed_Y: "summation"
+    ds_embed_Y:
+      setting:
+        d_model: ${experiment.d_model_set}
+        sparse_grad: false
+      
+      modules:
+        - idx: ${data.features.Y.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs:
+            num_embeddings: 3     # Y unique variables + 1 for padding
+            embedding_dim: ${model.embed_dim.y_var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        
+        - idx: ${data.features.Y.position}
+          embed: "sinusoidal"
+          label: "position"
+          kwargs:
+            max_pos: 500
+            embed_dim: ${model.embed_dim.y_pos_emb_hidden}
+        
+        - idx: ${data.features.Y.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.y_val_emb_hidden}
+        
+        - idx: ${data.features.Y.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+        
+        - idx: ${data.features.Y.position}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+        
+        - idx: ${data.features.Y.time}
+          embed: "time2vec"
+          label: "time"
+          kwargs:
+            input_dim: 5
+            embed_dim: ${model.embed_dim.y_time_emb_hidden}
+    
+    # =========================================================================
+    # ATTENTION CONFIGURATION - Decoder 1 (S → X)
+    # =========================================================================
+    dec1_cross_attention_type: "ScaledDotProduct"
+    dec1_cross_mask_type: "Uniform"
+    dec1_self_attention_type: "ScaledDotProduct"
+    dec1_self_mask_type: "Uniform"
+    
+    # =========================================================================
+    # ATTENTION CONFIGURATION - Decoder 2 (X → Y)
+    # =========================================================================
+    dec2_cross_attention_type: "ScaledDotProduct"
+    dec2_cross_mask_type: "Uniform"
+    dec2_self_attention_type: "ScaledDotProduct"
+    dec2_self_mask_type: "Uniform"
+    
+    n_heads: ${experiment.n_heads}
+    
+    # Causal masking
+    dec1_causal_mask: false
+    dec2_causal_mask: false
+    
+    # =========================================================================
+    # MODEL ARCHITECTURE
+    # =========================================================================
+    d1_layers: ${experiment.d1_layers}
+    d2_layers: ${experiment.d2_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+    
+    # Model dimensions
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${experiment.d_model_set}
+    d_qk: ${experiment.d_qk}
+    
+    # Sequence lengths
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    Y_seq_len: ${data.Y_seq_len}
+    
+    # =========================================================================
+    # DROPOUT
+    # =========================================================================
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    
+    # Decoder 1 dropout
+    dec1_cross_dropout_qkv: ${experiment.dropout}
+    dec1_cross_attention_dropout: ${experiment.dropout}
+    dec1_self_dropout_qkv: ${experiment.dropout}
+    dec1_self_attention_dropout: ${experiment.dropout}
+    
+    # Decoder 2 dropout
+    dec2_cross_dropout_qkv: ${experiment.dropout}
+    dec2_cross_attention_dropout: ${experiment.dropout}
+    dec2_self_dropout_qkv: ${experiment.dropout}
+    dec2_self_attention_dropout: ${experiment.dropout}
+
+
+training:
+  # =========================================================================
+  # OPTIMIZER
+  # =========================================================================
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+  
+  # =========================================================================
+  # LOSS
+  # =========================================================================
+  loss_fn: "mse"
+  loss_weight_x: ${experiment.loss_weight_x}
+  loss_weight_y: ${experiment.loss_weight_y}
+  
+  # =========================================================================
+  # TEACHER FORCING
+  # =========================================================================
+  teacher_forcing: true
+  
+  # =========================================================================
+  # TRAINING LOOP
+  # =========================================================================
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 100
+  
+  # =========================================================================
+  # LOGGING FLAGS
+  # =========================================================================
+  log_entropy: false
+  log_acyclicity: true
+  log_sparsity: false
+  log_hsic: false
+  log_decisiveness: false
+  log_l1_scores: false
+  log_embed_l1: false
+  log_jacobian: false
+  jacobian_every_n_epochs: 1
+  
+  # =========================================================================
+  # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # =========================================================================
+  
+  # Entropy regularization
+  lambda_entropy_self: 0.0
+  lambda_entropy_cross: 0.0
+  
+  # Acyclicity (NOTEARS)
+  kappa: 0.0
+  
+  # Sparsity
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  
+  # HSIC
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  
+  # Decisiveness
+  lambda_decisive: 0.0
+  lambda_decisive_cross: 0.0
+  lambda_tau: 0.0
+  target_tau: 0.0
+  
+  # L1 on attention scores
+  lambda_l1_self_scores: 0.0
+  lambda_l1_cross_scores: 0.0
+  
+  # KL prior regularization
+  lambda_kl: 0.0
+  adaptive_z_scaling: true
+  
+  # Embedding L1
+  lambda_embed_l1: 0.0
+  
+  # =========================================================================
+  # HARD MASKS
+  # =========================================================================
+  use_hard_masks: false
+  
+  # =========================================================================
+  # IN-CONTEXT MASKS (computed per-batch from data features)
+  # =========================================================================
+  use_in_context_masks: true
+  
+  in_context_mask_config:
+    # Decoder 1 Cross-Attention: X queries S
+    dec1_cross:
+      causal: true
+      category: true
+      order_idx_q: 6
+      order_idx_k: 6
+      category_idx: [1, 2, 3]
+    
+    # Decoder 1 Self-Attention: X self-attention
+    dec1_self:
+      causal: true
+      order_idx: 6
+    
+    # Decoder 2 Cross-Attention: Y queries X
+    dec2_cross:
+      causal: true
+      order_idx_q: 1
+      order_idx_k: 6
+    
+    # Decoder 2 Self-Attention: Y self-attention
+    dec2_self:
+      causal: true
+      order_idx: 1
+
+
+data:
+  # Dataset configuration
+  dataset: "ds_dyconex_SX_MuMi_260302"
+  train_file: "train_data.npz"
+  test_file: "test_data.npz"
+  filename_input: null
+  
+  # Value indices for blanking/loss computation
+  val_idx_X: 5
+  val_idx_Y: 3
+  
+  test_ds_ixd: null
+  max_data_size: null
+  
+  # Sequence lengths (from dataset shapes)
+  S_seq_len: 106
+  X_seq_len: 173
+  Y_seq_len: 400
+  
+  # Feature indices - S and X share structure, Y is different
+  features:
+    S:
+      group: 0
+      process: 1
+      occurrence: 2
+      step: 3
+      variable: 4
+      value: 5
+      order: 6
+      time: [7, 8, 9, 10, 11]
+    
+    X:
+      group: 0
+      process: 1
+      occurrence: 2
+      step: 3
+      variable: 4
+      value: 5
+      order: 6
+      time: [7, 8, 9, 10, 11]
+    
+    Y:
+      group: 0
+      position: 1
+      variable: 2
+      value: 3
+      time: [4, 5, 6, 7, 8]
+
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  functions:
+    - "fix_kfold_summary"
+    - "enrich_kfold_summary"
+    - "eval_train_metrics"
+    - "eval_metrics"
+    - "eval_dyconex_predictions"
+
+
+special:
+  mode: []

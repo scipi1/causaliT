@@ -1,0 +1,354 @@
+# =============================================================================
+# SingleCausalLayer Template (SVFA Embeddings)
+# =============================================================================
+# Model: SingleCausalLayer
+# Embedding: SVFA (Structure-Value Factorized Attention) for S and X
+# Use for: Experiments requiring separate structure/value pathways
+#
+# SVFA separates embeddings into:
+# - Structure component: variable identity (for attention computation)
+# - Value component: actual values (for output computation)
+#
+# Key Features:
+# - Single decoder architecture: S → X prediction
+# - SVFA factorization for both S and X embeddings
+# - Supports ANS (Attention Necessity Score) experiments
+# - Optional attention_bypass for ablation studies
+#
+# For standard summation embeddings, use config_single_causal.yaml instead.
+#
+# Auto-populated fields (from dataset_metadata.json):
+# - data.S_seq_len, data.X_seq_len, data.Y_seq_len
+# - data.num_embeddings_S, data.num_embeddings_X
+# - data.feature_indices.value, data.feature_indices.variable
+#
+# =============================================================================
+# EXPERIMENT NAMING CONVENTION
+# =============================================================================
+# Format: <arch>_<SelfAttn>_<CrossAttn>_<dataset>_SVFA_[modifiers]
+#
+# Components:
+#   arch      : single (this template)
+#   SelfAttn  : SM (ScaledDotProduct), Lie (LieAttention), 
+#               PhiSM (PhiSoftMax), Toeplitz (ToeplitzLieAttention)
+#   CrossAttn : SM (ScaledDotProduct), CC (CausalCrossAttention), PhiSM (PhiSoftMax)
+#   dataset   : scm1, scm2, scm3, scm6, scm7, etc.
+#   SVFA      : REQUIRED for this template (indicates SVFA embeddings)
+#   modifiers : (optional) antisym, gated, indep, hard, orthS
+#
+# Modifier meanings:
+#   antisym : dag_parameterization_self = "antisymmetric"
+#   gated   : dag_parameterization_self = "gated"
+#   indep   : dag_parameterization_self = "independent"
+#   hard    : use_hard_masks = true
+#   orthS   : orthogonal frozen S embedding (default is learnable)
+#
+# Example folder names for this template:
+#   experiments/single/scm6/single_SM_SM_scm6_SVFA/
+#   experiments/single/scm6/single_Lie_SM_scm6_SVFA/
+#   experiments/single/scm6/single_Toeplitz_SM_scm6_SVFA_antisym/
+#
+# To run:
+#   python -m causaliT.cli train experiments/single/scm6/single_Lie_SM_scm6_SVFA/
+# =============================================================================
+
+experiment:
+  # Model dimensions
+  d_model_set: 12         # Embedding dimension (smaller for SVFA factorization)
+  dec_layers: 1           # Number of decoder layers
+  n_heads: 1              # Number of attention heads
+  d_ff: 24                # Feedforward dimension
+  d_qk: 6                 # Query/key dimension
+  dropout: 0.0            # Dropout rate
+  
+  # Training hyperparameters
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 100
+  
+  # Attention types (options: ScaledDotProduct, LieAttention, PhiSoftMax, ToeplitzLieAttention)
+  dec_self_attention_type: "ScaledDotProduct"
+  dec_cross_attention_type: "ScaledDotProduct"
+
+
+model:
+  model_object: "SingleCausalLayer"
+  
+  # ANS: attention_bypass at top level for sweep compatibility
+  # When true: replaces learned attention with uniform attention
+  # This tests if embeddings + MLP alone can fit the data
+  attention_bypass: false
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+  
+  kwargs:
+    model: ${model.model_object}
+    
+    # SVFA factorization mode
+    factorization: "svfa"
+    
+    # =========================================================================
+    # S EMBEDDING (Source/Intervention Variables) - SVFA
+    # =========================================================================
+    # DEFAULT: Learnable SVFA embedding for S
+    # Note the `role` field which designates structure vs value components
+    ds_embed_S:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_S}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+    
+    comps_embed_S: "svfa"
+    
+    # ALTERNATIVE: Orthogonal frozen embedding for S
+    # Each S variable gets a fixed orthogonal embedding vector.
+    # Uncomment below and comment out the learnable SVFA version above.
+    # Also remove: comps_embed_S: "svfa"
+    # -----------------------------------------------------------------
+    # ds_embed_S:
+    #   num_variables: ${data.S_seq_len}
+    #   value_input_dim: 1
+    #   value_idx: ${data.feature_indices.value}
+    #   var_idx: ${data.feature_indices.variable}
+    #   freeze: true
+    # -----------------------------------------------------------------
+    
+    # =========================================================================
+    # X EMBEDDING (Observed Variables) - SVFA
+    # =========================================================================
+    # SVFA embedding with role annotations
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_X}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+    
+    comps_embed_X: "svfa"
+    
+    # =========================================================================
+    # ATTENTION CONFIGURATION
+    # =========================================================================
+    dec_cross_attention_type: ${experiment.dec_cross_attention_type}
+    dec_cross_mask_type: "Uniform"
+    dec_self_attention_type: ${experiment.dec_self_attention_type}
+    dec_self_mask_type: "Uniform"
+    
+    n_heads: ${experiment.n_heads}
+    dec_causal_mask: false
+    dec_layers: ${experiment.dec_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+    
+    # =========================================================================
+    # MODEL DIMENSIONS
+    # =========================================================================
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+    
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    
+    # =========================================================================
+    # DROPOUT
+    # =========================================================================
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dec_cross_dropout_qkv: ${experiment.dropout}
+    dec_cross_attention_dropout: ${experiment.dropout}
+    dec_self_dropout_qkv: ${experiment.dropout}
+    dec_self_attention_dropout: ${experiment.dropout}
+    
+    # =========================================================================
+    # DAG PARAMETERIZATION
+    # =========================================================================
+    # Options: "independent", "antisymmetric", "gated", or null
+    dag_parameterization_self: null
+    dag_parameterization_cross: null
+
+
+training:
+  # =========================================================================
+  # OPTIMIZER
+  # =========================================================================
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+  
+  # =========================================================================
+  # LOSS
+  # =========================================================================
+  loss_fn: "mse"
+  
+  # =========================================================================
+  # TRAINING LOOP
+  # =========================================================================
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+  
+  # =========================================================================
+  # LOGGING FLAGS
+  # =========================================================================
+  log_entropy: true
+  log_acyclicity: true
+  log_sparsity: true
+  log_hsic: true
+  log_decisiveness: true
+  log_l1_scores: true
+  log_embed_l1: true     # Important for ANS experiments
+  
+  # =========================================================================
+  # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # =========================================================================
+  
+  # Acyclicity (NOTEARS) - enforces DAG structure
+  kappa: 0.0
+  
+  # DAG Sparsity - L1 on edge probabilities (phi)
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  
+  # =========================================================================
+  # UNIFIED SCORE SPARSITY REGULARIZATION
+  # Combines L1 and entropy with mode selection and automatic fallback
+  # =========================================================================
+  # Weight for self-attention score sparsity
+  lambda_self_score_sparse: 0.0
+  # Weight for cross-attention score sparsity
+  lambda_cross_score_sparse: 0.0
+  # Mode: "l1" (uses score_tensor_for_sparsity) or "entropy" (uses attention entropy)
+  # If "l1" is selected but attention type doesn't support it, falls back to entropy
+  self_sparsity_regularizer: "l1"
+  cross_sparsity_regularizer: "entropy"
+  
+  # HSIC - encourages independence between S and residuals
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  
+  # Decisiveness - pushes edge probabilities away from 0.5
+  lambda_decisive: 0.0
+  lambda_decisive_cross: 0.0
+  lambda_tau: 0.0
+  target_tau: 0.0
+  
+  # KL prior regularization
+  lambda_kl: 0.0
+  adaptive_z_scaling: true
+  
+  # Embedding L1 (for ANS experiments - limits embedding capacity)
+  # Sweep this to find lambda_critical where ANS becomes significant
+  lambda_embed_l1: 0.0
+  
+  # =========================================================================
+  # HARD MASKS
+  # =========================================================================
+  use_hard_masks: false
+  hard_mask_files:
+    dec_cross: "dec1_cross_att_mask.csv"
+    dec_self: "dec1_self_att_mask.csv"
+
+
+data:
+  dataset: "scm6"           # Dataset name (folder in data/)
+  filename_input: "ds.npz"  # Single file (used when train_file/test_file are null)
+  
+  # Pre-split train/test files (optional)
+  # If both are specified and exist, they will be used INSTEAD of filename_input
+  # Set both to null to use the single filename_input file
+  train_file: null          # e.g., "ds_train.npz" for holdout split datasets
+  test_file: null           # e.g., "ds_test.npz" for holdout split datasets
+  
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+  
+  # Auto-populated from dataset_metadata.json
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+  
+  feature_indices:
+    value: null
+    variable: null
+
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+# Specify which evaluation functions to run after training.
+# Empty list = run default evaluations for the model type.
+#
+# Available functions:
+# - eval_train_metrics: Training curves and loss analysis
+# - eval_attention_scores: DAG recovery metrics
+# - eval_embed: Embedding evolution analysis
+# - eval_interventions: Causal intervention tests (do-calculus)
+# - eval_embedding_dag_correlation: Embedding-DAG correlation
+# - eval_ans: ANS (Attention Necessity Score) analysis
+# - fix_kfold_summary: Fix tensor strings in kfold_summary.json
+# - enrich_kfold_summary: Add aggregated statistics
+# =============================================================================
+
+evaluation:
+  functions: []
+
+
+special:
+  mode: []
