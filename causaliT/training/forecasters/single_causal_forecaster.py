@@ -15,7 +15,7 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.single_causal import SingleCausalLayer
 from causaliT.core.utils import load_dag_masks
-from causaliT.utils.hsic_utils import hsic_per_token
+from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair
 from causaliT.core.modules.extra_layers import dag_decisiveness_loss, dag_temperature_loss
 
 
@@ -95,6 +95,7 @@ class SingleCausalForecaster(pl.LightningModule):
         
         # HSIC regularization - encourages independence between S and residuals
         # Lower HSIC values indicate better causal structure learning
+        # log_hsic also enables HSIC_X logging (X→X independence for self-attention DAG)
         self.lambda_hsic = config["training"].get("lambda_hsic", 0)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.log_hsic = config["training"].get("log_hsic", False)
@@ -550,6 +551,18 @@ class SingleCausalForecaster(pl.LightningModule):
         if self.log_hsic and hsic_value is not None:
             self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
             self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
+        
+        # Log HSIC_X: independence between X values and per-X residuals
+        # This measures self-attention DAG correctness (X→X relationships)
+        if self.log_hsic:
+            # Compute per-X residuals (not mean): (batch, seq_len_x)
+            residuals_per_x = x_target.squeeze() - pred_x.squeeze()
+            
+            if residuals_per_x.dim() > 1:
+                # Get true X values for HSIC computation
+                x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
+                hsic_x_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
+                self.log(f"{stage}_hsic_x", hsic_x_value, on_step=False, on_epoch=True)
         
         # Log decisiveness if requested
         if self.log_decisiveness:

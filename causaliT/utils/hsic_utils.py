@@ -115,3 +115,55 @@ def hsic_per_token(
     
     # Return mean across all positions
     return torch.stack(hsic_values).mean()
+
+
+def hsic_per_x_pair(
+    x_values: torch.Tensor,
+    residuals: torch.Tensor,
+    sigma: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute HSIC between X values and per-X residuals for self-attention DAG validation.
+    
+    For each pair (i, j) where i != j, computes HSIC(X_j, residual_i).
+    This measures whether the residual for X_i is independent of X_j,
+    which is relevant for self-attention DAG learning.
+    
+    If the true DAG has X_j → X_i, then X_i's residual should be independent of X_j
+    (the parent is properly accounted for). If the model learns the wrong direction,
+    X_i's residual will still depend on X_j.
+    
+    Args:
+        x_values: X variable values of shape (batch, seq_len_x)
+        residuals: Per-X residuals of shape (batch, seq_len_x) - i.e., x_target - x_pred
+        sigma: RBF kernel bandwidth
+        
+    Returns:
+        Mean HSIC across all (i, j) pairs where i != j (scalar)
+        
+    Example:
+        >>> x_values = torch.randn(100, 3)  # 3 X variables
+        >>> residuals = torch.randn(100, 3)  # Per-variable residuals
+        >>> hsic_x = hsic_per_x_pair(x_values, residuals, sigma=1.0)
+        >>> # Computes HSIC for pairs: (X_1, res_0), (X_2, res_0), (X_0, res_1), etc.
+    """
+    batch_size, seq_len_x = x_values.shape
+    
+    hsic_values = []
+    for i in range(seq_len_x):
+        # Residual for X_i
+        res_i = residuals[:, i]  # (batch,)
+        
+        # Compute HSIC against all OTHER X values
+        for j in range(seq_len_x):
+            if i != j:
+                x_j = x_values[:, j]  # (batch,)
+                hsic_ij = hsic(x_j, res_i, sigma=sigma)
+                hsic_values.append(hsic_ij)
+    
+    # Return mean across all (i, j) pairs
+    if len(hsic_values) == 0:
+        # Edge case: single X variable, no pairs
+        return torch.tensor(0.0, device=x_values.device, dtype=x_values.dtype)
+    
+    return torch.stack(hsic_values).mean()
