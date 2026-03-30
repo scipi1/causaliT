@@ -11,7 +11,7 @@ from typing import List
 
 # Import evaluation functions from sibling modules
 from .eval_training import eval_train_metrics
-from .eval_attention import eval_attention_scores
+from .eval_attention import eval_attention_scores, eval_attention_evolution
 from .eval_embeddings import eval_embed, eval_embedding_dag_correlation
 from .eval_interventions import eval_interventions
 from .update_manifest import fix_kfold_summary, enrich_kfold_summary
@@ -39,11 +39,13 @@ def run_evaluations_from_config(
         show_plots: If True, display plots. If False, only save to files.
         functions: List of function names to run. Available functions:
             - "eval_train_metrics": Training curves and loss analysis
-            - "eval_attention_scores": DAG recovery metrics
-            - "eval_embed": Embedding evolution analysis
-            - "eval_interventions": Causal intervention tests
-            - "eval_embedding_dag_correlation": Embedding-DAG correlation
+            - "eval_attention_scores": DAG recovery metrics (FAST - final checkpoint)
+            - "eval_attention_evolution": Track attention/phi across epochs (SLOW - optional)
+            - "eval_interventions": Causal intervention tests (ATE)
+            - "eval_d_model_sweep": d_model × seed sweep evaluation
             - "eval_dyconex_predictions": Dyconex-specific prediction evaluation
+            - "fix_kfold_summary": Fix tensor strings in kfold_summary.json
+            - "enrich_kfold_summary": Add aggregated statistics to kfold_summary
             
     Returns:
         dict: Summary of evaluation results
@@ -76,9 +78,10 @@ def run_evaluations_from_config(
     FUNCTION_REGISTRY = {
         "eval_train_metrics": lambda exp: eval_train_metrics(exp, show_plots=show_plots),
         "eval_attention_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
-        "eval_embed": lambda exp: eval_embed(exp, show_plots=show_plots),
+        # "eval_attention_evolution": lambda exp: eval_attention_evolution(exp, show_plots=show_plots),  # SLOW: evolution tracking
+        # "eval_embed": lambda exp: eval_embed(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "eval_interventions": lambda exp: eval_interventions(exp, show_plots=show_plots),
-        "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),
+        # "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
         "enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
     }
@@ -192,10 +195,10 @@ def run_all_evaluations(
     eval_functions = [
         ("eval_train_metrics", lambda exp: eval_train_metrics(exp, show_plots=show_plots)),
         ("eval_attention_scores", lambda exp: eval_attention_scores(exp, show_plots=show_plots)),
-        ("eval_embed", lambda exp: eval_embed(exp, show_plots=show_plots)),
+        # ("eval_embed", lambda exp: eval_embed(exp, show_plots=show_plots)),  # Disabled: k-fold seeding bug fixed
         ("eval_interventions", lambda exp: eval_interventions(exp, show_plots=show_plots)),
         # eval_embedding_dag_correlation requires eval_embed and eval_attention_scores to run first
-        ("eval_embedding_dag_correlation", lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots)),
+        # ("eval_embedding_dag_correlation", lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots)),  # Disabled: k-fold seeding bug fixed
     ]
     
     for idx, (name, func) in enumerate(eval_functions, start=3):

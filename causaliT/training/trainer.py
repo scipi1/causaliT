@@ -112,7 +112,24 @@ def trainer(
     
     # k-fold cross-validation
     k_folds = config["training"]["k_fold"]
-    kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+    
+    # Handle k=1 case (no cross-validation, simple 80/20 split)
+    if k_folds == 1:
+        print("k=1: Using simple 80/20 train/validation split (no cross-validation)")
+        logger_info.info("k=1: Using simple 80/20 train/validation split (no cross-validation)")
+        
+        # Shuffle indices using the seed for reproducibility
+        rng = np.random.default_rng(seed)
+        shuffled_idx = rng.permutation(len(train_val_idx))
+        split_point = int(0.8 * len(shuffled_idx))
+        
+        # Create single fold as list of tuples (train_local_idx, val_local_idx)
+        # These are LOCAL indices into train_val_idx array
+        fold_splits = [(shuffled_idx[:split_point], shuffled_idx[split_point:])]
+    else:
+        # Standard k-fold cross-validation (k >= 2)
+        kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+        fold_splits = list(kfold.split(train_val_idx))
     
     metrics_dict = {}
     
@@ -124,7 +141,7 @@ def trainer(
     trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
     del temp_model  # Clean up temporary model
     
-    for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
+    for fold, (train_local_idx, val_local_idx) in enumerate(fold_splits):
         
         # =====================================================================
         # RESET SEED BEFORE MODEL CREATION FOR REPRODUCIBLE INITIALIZATION

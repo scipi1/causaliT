@@ -1,0 +1,22 @@
+# =============================================================================
+# Seed Sweep Configuration for Paper Experiments
+# =============================================================================
+#
+# Purpose: Run experiments with 10 different random seeds to measure
+# variability in metrics (ETA, SHD, MEC, MAE) across initializations.
+#
+# Used for:
+# - Vanilla baseline experiments
+# - Our model (with λ*) experiments
+# - Ablation studies
+#
+# Usage:
+#   python -m causaliT.euler_sweep.euler_sweep.cli sweep \
+#       --exp_id <your_exp_id> \
+#       --sweep_mode combination
+#
+# Total runs: 10 seeds per experiment
+# =============================================================================
+
+training:
+  seed: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]

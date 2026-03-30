@@ -1,9 +1,17 @@
 """
 Attention score and DAG recovery evaluation functions for CausaliT experiments.
 
-This module provides functions for analyzing attention weights and DAG recovery:
-- load_attention_evolution: Track attention evolution during training
-- eval_attention_scores: Evaluate attention scores and DAG recovery metrics
+This module provides two main evaluation functions:
+
+1. eval_attention_scores (FAST - always run):
+   - Loads attention from best checkpoint only
+   - Computes DAG recovery metrics (soft Hamming, MEC)
+   - Plots attention heatmaps
+
+2. eval_attention_evolution (SLOW - optional):
+   - Loads attention from multiple checkpoints
+   - Tracks how phi/attention evolves during training
+   - Plots attention drift over epochs
 """
 
 import json
@@ -30,6 +38,8 @@ from .eval_utils import (
     _compute_dag_confidence,
     _get_learned_dag_per_fold,
     load_dataset_metadata,
+    get_architecture_config,
+    ARCHITECTURE_REGISTRY,
     DEFAULT_PLOT_FORMAT,
     # MEC metrics
     _combine_attention_to_full_dag,
@@ -60,272 +70,38 @@ from .eval_plot_lib import plot_attention_scores, plot_attention_evolution
 
 
 # =============================================================================
-# Attention Evolution Functions
+# Model Loading Helper
 # =============================================================================
 
-def load_attention_evolution(
-    experiment_path: str,
-    datadir_path: str = None,
-    dataset_label: str = "test",
-    input_conditioning_fn = None,
-    n_evaluations: int = 10,
-) -> pd.DataFrame:
-    """
-    Load attention scores and phi tensors across training epochs to track their evolution.
-    
-    This function tracks how learned DAG structure (attention scores and phi tensors) 
-    evolve during training from initialization. For each selected checkpoint across all 
-    k-folds, it computes the difference from initialization at the sample level, then 
-    aggregates to mean and std.
-    
-    Args:
-        experiment_path: Path to the experiment folder containing config and k_* folders
-        datadir_path: Path to data directory. If None, uses "../data/" relative to project root
-        dataset_label: One of ["train", "test", "all"]
-        input_conditioning_fn: Optional function to condition inputs before forward pass
-        n_evaluations: Number of checkpoints to evaluate (evenly distributed across epochs).
-                      If 0 or None, evaluates ALL checkpoints (original behavior).
-                      Default is 10, ensuring consistent evaluation time regardless of total epochs.
-        
-    Returns:
-        pd.DataFrame with columns:
-            - kfold: fold identifier (e.g., "k_0", "k_1")
-            - epoch: epoch number (0 for initialization)
-            
-            For each attention block (e.g., dec1_self, dec2_cross):
-            - {block}_{i}{j}_mean: mean attention score across samples
-            - {block}_{i}{j}_std: std of attention scores across samples
-            - {block}_{i}{j}_diff_mean: mean of (score_t - score_0) across samples
-            - {block}_{i}{j}_diff_std: std of (score_t - score_0) across samples
-            
-            For each phi tensor (when available):
-            - phi_{block}_{i}{j}: learned DAG probability (sigmoid(phi))
-            - phi_{block}_{i}{j}_diff: difference from initialization
-            
-    Example:
-        >>> from notebooks.eval_funs.eval_attention import load_attention_evolution
-        >>> 
-        >>> # Load attention evolution with 10 evaluation points (default)
-        >>> df = load_attention_evolution("../experiments/euler/stage_Lie_scm6")
-        >>> 
-        >>> # Load ALL checkpoints (slower, more detailed)
-        >>> df = load_attention_evolution("../experiments/euler/stage_Lie_scm6", n_evaluations=0)
-    """
-    import os
-    import traceback
-    
-    # Default data directory
-    if datadir_path is None:
-        datadir_path = join(root_path, "data")
-    
-    # Find config file
-    config_path = find_config_file(experiment_path)
-    config = OmegaConf.load(config_path)
-    
-    # Determine architecture type
-    architecture_type = get_architecture_type(config)
-    print(f"Detected architecture: {architecture_type}")
-    
-    # Determine which attention keys to track based on architecture
+def _load_model_from_checkpoint(checkpoint_path: str, architecture_type: str):
+    """Load model from checkpoint based on architecture type."""
     if architecture_type == "TransformerForecaster":
-        attention_keys = ["encoder", "decoder", "cross"]
-        phi_keys = ["encoder", "decoder", "cross"]
+        return TransformerForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "StageCausalForecaster":
-        attention_keys = ["dec1_self", "dec1_cross", "dec2_self", "dec2_cross"]
-        phi_keys = ["decoder1", "decoder1_cross", "decoder2", "decoder2_cross"]
+        return StageCausalForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "SingleCausalForecaster":
-        attention_keys = ["dec_self", "dec_cross"]
-        phi_keys = ["decoder", "decoder_cross"]
+        return SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "NoiseAwareCausalForecaster":
-        # Same structure as SingleCausalForecaster
-        attention_keys = ["dec_self", "dec_cross"]
-        phi_keys = ["decoder", "decoder_cross"]
+        return NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
     else:
         raise ValueError(f"Unknown architecture type: {architecture_type}")
-    
-    # Find all k-fold directories
-    kfold_dirs = sorted([
-        d for d in listdir(experiment_path) 
-        if isdir(join(experiment_path, d)) and d.startswith('k_')
-    ])
-    
-    if not kfold_dirs:
-        raise ValueError(f"No k-fold directories found in {experiment_path}")
-    
-    print(f"Found {len(kfold_dirs)} k-fold directories: {kfold_dirs}")
-    
-    all_records = []
-    
-    # Process each k-fold
-    for kfold_dir in kfold_dirs:
-        kfold_path = join(experiment_path, kfold_dir)
-        checkpoints_dir = join(kfold_path, 'checkpoints')
-        
-        try:
-            # Find all checkpoints sorted by epoch
-            epoch_checkpoints = find_all_checkpoints(checkpoints_dir)
-            total_checkpoints = len(epoch_checkpoints)
-            print(f"\n{kfold_dir}: Found {total_checkpoints} checkpoints")
-            
-            if not epoch_checkpoints:
-                print(f"  ✗ No checkpoints found for {kfold_dir}")
-                continue
-            
-            # Select evenly spaced checkpoints if n_evaluations is specified
-            if n_evaluations and n_evaluations > 0:
-                selected_checkpoints = _select_evenly_spaced_checkpoints(epoch_checkpoints, n_evaluations)
-                print(f"  Selected {len(selected_checkpoints)} checkpoints for evaluation (n_evaluations={n_evaluations})")
-                epochs_selected = [ep for ep, _ in selected_checkpoints]
-                print(f"  Epochs: {epochs_selected}")
-            else:
-                selected_checkpoints = epoch_checkpoints
-                print(f"  Evaluating ALL {len(selected_checkpoints)} checkpoints")
-            
-            # Storage for initial attention scores (for computing diffs)
-            init_attention = {}  # key -> (B, Q, K) array
-            init_phi = {}  # key -> (Q, K) array
-            
-            # Process each selected checkpoint
-            for epoch, checkpoint_path in selected_checkpoints:
-                print(f"  Processing epoch {epoch}: {os.path.basename(checkpoint_path)}")
-                
-                record = {
-                    'kfold': kfold_dir,
-                    'epoch': epoch,
-                }
-                
-                try:
-                    # Run predictions to get attention weights
-                    predictions = predict_test_from_ckpt(
-                        config=config,
-                        datadir_path=datadir_path,
-                        checkpoint_path=checkpoint_path,
-                        dataset_label=dataset_label,
-                        cluster=False,
-                        input_conditioning_fn=input_conditioning_fn
-                    )
-                    
-                    att_weights = predictions.attention_weights
-                    
-                    # Load model to extract phi tensors
-                    if architecture_type == "TransformerForecaster":
-                        model = TransformerForecaster.load_from_checkpoint(checkpoint_path)
-                    elif architecture_type == "StageCausalForecaster":
-                        model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
-                    elif architecture_type == "SingleCausalForecaster":
-                        model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
-                    elif architecture_type == "NoiseAwareCausalForecaster":
-                        model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
-                    
-                    phi_dict = extract_phi_from_model(model, architecture_type)
-                    
-                    # Process attention weights
-                    if att_weights is not None:
-                        for att_key in attention_keys:
-                            att_tensor = att_weights.get(att_key)
-                            
-                            if att_tensor is None:
-                                continue
-                            
-                            # Ensure 3D: (B, Q, K)
-                            if att_tensor.ndim == 2:
-                                att_tensor = np.expand_dims(att_tensor, axis=0)
-                            
-                            # For epoch 0 (or first evaluated epoch), store as initial
-                            if att_key not in init_attention:
-                                init_attention[att_key] = att_tensor
-                            
-                            # Compute mean and std across samples
-                            mean_att = att_tensor.mean(axis=0)  # (Q, K)
-                            std_att = att_tensor.std(axis=0)  # (Q, K)
-                            
-                            # Flatten and add to record
-                            n_rows, n_cols = mean_att.shape
-                            for i in range(n_rows):
-                                for j in range(n_cols):
-                                    record[f"{att_key}_{i}{j}_mean"] = mean_att[i, j]
-                                    record[f"{att_key}_{i}{j}_std"] = std_att[i, j]
-                            
-                            # Compute sample-wise diff from initialization
-                            if att_key in init_attention:
-                                init_att = init_attention[att_key]
-                                
-                                # Handle batch size mismatch by using min size
-                                min_batch = min(att_tensor.shape[0], init_att.shape[0])
-                                diff = att_tensor[:min_batch] - init_att[:min_batch]  # (B, Q, K)
-                                
-                                diff_mean = diff.mean(axis=0)  # (Q, K)
-                                diff_std = diff.std(axis=0)  # (Q, K)
-                                
-                                for i in range(n_rows):
-                                    for j in range(n_cols):
-                                        record[f"{att_key}_{i}{j}_diff_mean"] = diff_mean[i, j]
-                                        record[f"{att_key}_{i}{j}_diff_std"] = diff_std[i, j]
-                            else:
-                                # No init available, set diff to 0
-                                for i in range(n_rows):
-                                    for j in range(n_cols):
-                                        record[f"{att_key}_{i}{j}_diff_mean"] = 0.0
-                                        record[f"{att_key}_{i}{j}_diff_std"] = 0.0
-                    
-                    # Process phi tensors
-                    for phi_key in phi_keys:
-                        phi_tensor = phi_dict.get(phi_key)
-                        
-                        if phi_tensor is None:
-                            continue
-                        
-                        # For first evaluated checkpoint, store as initial
-                        if phi_key not in init_phi:
-                            init_phi[phi_key] = phi_tensor
-                        
-                        # Flatten and add to record
-                        n_rows, n_cols = phi_tensor.shape
-                        for i in range(n_rows):
-                            for j in range(n_cols):
-                                record[f"phi_{phi_key}_{i}{j}"] = phi_tensor[i, j]
-                        
-                        # Compute diff from initialization
-                        if phi_key in init_phi:
-                            phi_diff = phi_tensor - init_phi[phi_key]
-                            for i in range(n_rows):
-                                for j in range(n_cols):
-                                    record[f"phi_{phi_key}_{i}{j}_diff"] = phi_diff[i, j]
-                        else:
-                            for i in range(n_rows):
-                                for j in range(n_cols):
-                                    record[f"phi_{phi_key}_{i}{j}_diff"] = 0.0
-                    
-                    all_records.append(record)
-                    print(f"    ✓ Processed epoch {epoch}")
-                    
-                except Exception as e:
-                    print(f"    ✗ Error processing epoch {epoch}: {e}")
-                    traceback.print_exc()
-                    continue
-            
-        except Exception as e:
-            print(f"  ✗ Error processing {kfold_dir}: {e}")
-            traceback.print_exc()
-            continue
-    
-    # Build DataFrame
-    if all_records:
-        df = pd.DataFrame(all_records)
-        print(f"\nLoaded attention evolution: {len(df)} rows from {df['kfold'].nunique()} folds")
-        return df
-    else:
-        print("Warning: No records were successfully processed")
-        return pd.DataFrame()
 
+
+# =============================================================================
+# FAST: Final Attention Analysis (from best checkpoint)
+# =============================================================================
 
 def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     """
-    Evaluate attention scores, DAG (phi) evolution, and DAG recovery metrics.
+    Evaluate final attention scores and DAG recovery metrics.
     
-    Loads attention weights from the best checkpoint of each k-fold and tracks
-    how attention scores and learned DAG probabilities (phi) evolve during training.
-    Also computes DAG recovery metrics by comparing learned phi/attention to true DAG.
+    FAST: Only loads best checkpoint from each fold (~10-30 seconds).
+    For evolution tracking across epochs, use eval_attention_evolution().
+    
+    This function:
+    - Loads attention weights from the best checkpoint of each k-fold
+    - Computes DAG recovery metrics (soft Hamming, MEC distance)
+    - Plots attention score heatmaps and DAG comparisons
     
     Args:
         experiment: Path to the experiment folder containing k_* subdirectories
@@ -337,23 +113,17 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             - soft_hamming_self: Soft Hamming distance for X→X edges (best/mean/worst/std/per_fold)
             - dag_confidence_cross: DAG consistency across folds for S→X (1=identical, 0=max disagreement)
             - dag_confidence_self: DAG consistency across folds for X→X (1=identical, 0=max disagreement)
+            - mec_distance: MEC distance metrics (if computable)
         
     Output Files:
-        - fig/attention_scores_{exp_id}.pdf: Attention score heatmaps for all folds
-        - fig/attention_drift_{exp_id}.pdf: Attention evolution over training
-        - fig/dag_comparison_{exp_id}.pdf: Learned vs true DAG comparison heatmaps
+        - fig/attention_scores_{exp_id}.png: Attention score heatmaps for all folds
+        - fig/dag_comparison_{fold}_{exp_id}.png: Learned vs true DAG comparison heatmaps
         - files/final_scores/: Saved attention data (can be reloaded quickly)
-        - files/scores_evol.csv: Attention evolution data
-        - files/dag_metrics.json: DAG recovery metrics (soft Hamming + dag_confidence)
-        
-    Notes:
-        - Supports TransformerForecaster, StageCausalForecaster, and SingleCausalForecaster
-        - Results are cached; delete files/ contents to recompute
-        - DAG metrics compare phi (if available) or mean attention scores to true DAG masks
-        - dag_confidence = 1 - 2*mean(std of edges across folds), measuring fold consistency
+        - files/dag_metrics.json: DAG recovery metrics (soft Hamming + MEC + dag_confidence)
+        - files/attention_labels.json: Descriptions of attention blocks
         
     Example:
-        >>> metrics = eval_attention_scores("../experiments/single/local/my_experiment")
+        >>> metrics = eval_attention_scores("experiments/single/local/my_experiment")
         >>> print(f"Soft Hamming (cross): {metrics['soft_hamming_cross']['mean']:.4f}")
         >>> print(f"DAG Confidence (cross): {metrics['dag_confidence_cross']:.4f}")
     """
@@ -362,133 +132,86 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         _setup_eval_directories(experiment, "eval_attention_scores")
 
     final_scores_dirname = "final_scores"
-    scores_evolution_filename = "scores_evol.csv"
     dag_metrics_filename = "dag_metrics.json"
     attention_labels_filename = "attention_labels.json"
 
-    # =========================================================================
-    # Attention labels for AI interpretation
-    # =========================================================================
+    print(f"Experiment ID: {exp_id}")
     
-    # Generic attention block descriptions (architecture-dependent, not dataset-specific)
+    # =========================================================================
+    # Load dataset metadata for variable mappings
+    # =========================================================================
+    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
+    if not config_files:
+        raise ValueError(f"No config file found in {experiment}")
+    
+    config = OmegaConf.load(join(experiment, config_files[0]))
+    dataset_name = config.get("data", {}).get("dataset")
+    
+    if not dataset_name:
+        raise ValueError("No dataset specified in experiment config.")
+    
+    datadir_path = join(root_path, "data")
+    metadata = load_dataset_metadata(datadir_path, dataset_name)
+    
+    if not metadata:
+        raise ValueError(f"Dataset metadata not found for '{dataset_name}'.")
+    
+    print(f"  Dataset: {dataset_name}")
+    
+    # =========================================================================
+    # Build attention labels for AI interpretation
+    # =========================================================================
     attention_labels = {
         "description": "Attention weights and DAG (phi) structure learned by the model",
-        "attention_blocks": {
-            "SingleCausalForecaster": {
-                "dec_cross": "Cross-attention: S → X (source variables influence intermediate variables)",
-                "dec_self": "Self-attention: X → X (intermediate variables influence each other)",
-            },
-            "NoiseAwareCausalForecaster": {
-                "dec_cross": "Cross-attention: S → X (source variables influence intermediate variables)",
-                "dec_self": "Self-attention: X → X (intermediate variables influence each other)",
-            },
-            "StageCausalForecaster": {
-                "dec1_cross": "Stage 1 Cross-attention: S → X (source to intermediate)",
-                "dec1_self": "Stage 1 Self-attention: X → X (intermediate to intermediate)",
-                "dec2_cross": "Stage 2 Cross-attention: X → Y (intermediate to output)",
-                "dec2_self": "Stage 2 Self-attention: Y → Y (output to output)",
-            },
-            "TransformerForecaster": {
-                "encoder": "Encoder self-attention",
-                "decoder": "Decoder self-attention",
-                "cross": "Decoder cross-attention (encoder → decoder)",
-            },
-        },
+        "attention_blocks": {arch: cfg for arch, cfg in [
+            (arch, {
+                k: f"Attention block: {k}" for k in config_data["attention_keys"]
+            }) for arch, config_data in ARCHITECTURE_REGISTRY.items()
+        ]},
         "phi_tensors": {
             "description": "Learned DAG edge probabilities (sigmoid(phi)). Values in [0,1] where 1 = edge present.",
-            "interpretation": "phi is learned by LieAttention and CausalCrossAttention modules",
         },
         "dag_metrics": {
             "soft_hamming": "Mean absolute difference between learned and true DAG. 0 = perfect, 1 = inverted",
-            "source": "'phi' if LieAttention/CausalCrossAttention used, else 'attention' (mean attention scores)",
         },
-        "matrix_indexing": {
-            "rows": "Target variables (queries) - the variables being predicted",
-            "columns": "Source variables (keys) - the variables providing information",
-            "value_ij": "Attention weight from source j to target i (how much target i attends to source j)",
-        },
+        "dataset": dataset_name,
     }
     
-    # =========================================================================
-    # Load dataset metadata for variable mappings (NO FALLBACK - requires metadata)
-    # =========================================================================
-    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
-    dataset_name = None
-    if config_files:
-        try:
-            config = OmegaConf.load(join(experiment, config_files[0]))
-            dataset_name = config.get("data", {}).get("dataset")
-        except Exception:
-            pass
-    
-    if dataset_name:
-        datadir_path = join(root_path, "data")
-        metadata = load_dataset_metadata(datadir_path, dataset_name)
-        
-        if metadata:
-            # Build variable mapping from metadata
-            variable_mapping = {}
-            
-            # Add variable descriptions
-            if "variable_descriptions" in metadata:
-                variable_mapping.update(metadata["variable_descriptions"])
-            
-            # Add DAG structure description from edges
-            if "causal_structure" in metadata and "edges" in metadata["causal_structure"]:
-                edges = metadata["causal_structure"]["edges"]
-                edge_strs = [f"{src}→{tgt}" for src, tgt in edges]
-                variable_mapping["dag_structure"] = ", ".join(edge_strs) + " (true causal DAG)"
-            
-            attention_labels["variable_mapping"] = variable_mapping
-            attention_labels["dataset"] = dataset_name
-            print(f"  Loaded variable mappings from metadata for dataset: {dataset_name}")
-        else:
-            raise ValueError(
-                f"Dataset metadata not found for '{dataset_name}'. "
-                f"Ensure dataset_metadata.json exists in data/{dataset_name}/"
-            )
-    else:
-        raise ValueError(
-            f"No dataset specified in experiment config. "
-            f"Cannot load variable mappings."
-        )
+    # Add variable mapping from metadata
+    if "variable_descriptions" in metadata:
+        attention_labels["variable_mapping"] = metadata["variable_descriptions"]
+    if "causal_structure" in metadata and "edges" in metadata["causal_structure"]:
+        edges = metadata["causal_structure"]["edges"]
+        edge_strs = [f"{src}→{tgt}" for src, tgt in edges]
+        attention_labels["dag_structure"] = ", ".join(edge_strs)
     
     _save_variable_labels(eval_path_files, attention_labels, attention_labels_filename)
 
-    # Save README with column documentation
+    # Save README
     _save_readme(
         eval_path_root, eval_path_cline, eval_path_files, eval_path_fig,
-        description="This evaluation folder contains attention scores from test predictions and DAG recovery metrics.",
+        description="Attention scores evaluation (FAST): final checkpoint analysis and DAG recovery metrics.",
         files_info={
             final_scores_dirname: "Saved attention data (npz files) for fast reloading",
-            scores_evolution_filename: "Attention scores evolution over training epochs (CSV)",
-            dag_metrics_filename: "Soft Hamming distance comparing learned DAG to true DAG (JSON)",
+            dag_metrics_filename: "Soft Hamming distance and MEC metrics comparing learned DAG to true DAG (JSON)",
             attention_labels_filename: "Descriptions of attention blocks and interpretation guide (JSON)",
         },
-        column_documentation={
-            "kfold": "Cross-validation fold identifier (k_0, k_1, ...)",
-            "epoch": "Training epoch number",
-            "{block}_{i}{j}_mean": "Mean attention from source j to target i (averaged across samples)",
-            "{block}_{i}{j}_diff_mean": "Change in attention from initialization",
-            "phi_{block}_{i}{j}": "Learned DAG probability for edge j→i",
-        }
     )
     
-    # Create cline notes template
     _create_cline_template(eval_path_cline, "eval_attention_scores", exp_id)
-
-    print(f"Experiment ID: {exp_id}")
     
+    # =========================================================================
     # Load or compute final attention scores
+    # =========================================================================
     if exists(join(eval_path_files, final_scores_dirname)):
         final_scores_dict = load_attention_data_from_file(join(eval_path_files, final_scores_dirname))
-        print("Experiment already available. Data loaded!")
+        print("  Loaded cached attention data.")
     else:
         final_scores_dict = load_attention_data(experiment)
         save_attention_data(final_scores_dict, join(eval_path_files, final_scores_dirname), save_predictions=True)
-        print("Data saved!")
+        print("  Computed and saved attention data.")
     
-    # Plot: Attention score heatmaps
+    # Plot attention score heatmaps
     fig = plot_attention_scores(final_scores_dict, cmap='viridis', annotation_fontsize=8, scale_mode="row")
     plt.savefig(join(eval_path_fig, f"attention_scores_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
     if show_plots:
@@ -496,79 +219,25 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     else:
         plt.close()
     
-    # Load or compute attention evolution
-    if exists(join(eval_path_files, scores_evolution_filename)):
-        df = pd.read_csv(join(eval_path_files, scores_evolution_filename))
-        print("Experiment already available. Data loaded!")
-    else:
-        df = load_attention_evolution(experiment, n_evaluations=10)
-        df.to_csv(join(eval_path_files, scores_evolution_filename))
-        print("Data saved!")
-    
-    # Plot: Attention evolution
-    fig = plot_attention_evolution(df, aggregate_folds=False, include_phi=True)
-    plt.savefig(join(eval_path_fig, f"attention_drift_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
-    if show_plots:
-        plt.show()
-    else:
-        plt.close()
-    
     # =========================================================================
-    # DAG Recovery Metrics (Per-Fold)
+    # Compute DAG Recovery Metrics
     # =========================================================================
-    print("\n--- Computing DAG Recovery Metrics (Per-Fold) ---")
+    print("\n--- Computing DAG Recovery Metrics ---")
     
-    # Load config to get dataset name
-    config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
-    if not config_files:
-        print("Warning: No config file found, skipping DAG metrics")
-        return {}
-    
-    config = OmegaConf.load(join(experiment, config_files[0]))
-    dataset = config.get("data", {}).get("dataset")
-    
-    if dataset is None:
-        print("Warning: No dataset specified in config, skipping DAG metrics")
-        return {}
-    
-    # Data directory (relative to project root)
-    datadir_path = join(root_path, "data")
-    
-    # Initialize metrics dict
-    dag_metrics = {
-        "dataset": dataset,
-        "architecture": final_scores_dict.architecture_type,
-    }
-    
-    # Define which attention blocks to evaluate based on architecture
     architecture = final_scores_dict.architecture_type
     
-    if architecture == "SingleCausalForecaster":
-        blocks_to_eval = [
-            ("dec_cross", "decoder_cross", "dec_cross"),
-            ("dec_self", "decoder", "dec_self"),
-        ]
-    elif architecture == "NoiseAwareCausalForecaster":
-        # Same structure as SingleCausalForecaster
-        blocks_to_eval = [
-            ("dec_cross", "decoder_cross", "dec_cross"),
-            ("dec_self", "decoder", "dec_self"),
-        ]
-    elif architecture == "StageCausalForecaster":
-        blocks_to_eval = [
-            ("decoder1_cross", "decoder1_cross", "dec1_cross"),
-            ("decoder1_self", "decoder1", "dec1_self"),
-            ("decoder2_cross", "decoder2_cross", "dec2_cross"),
-            ("decoder2_self", "decoder2", "dec2_self"),
-        ]
-    elif architecture == "TransformerForecaster":
-        blocks_to_eval = [
-            ("cross", "cross", "dec_cross"),
-            ("decoder", "decoder", "dec_self"),
-        ]
-    else:
+    try:
+        arch_config = get_architecture_config(architecture)
+        blocks_to_eval = arch_config["blocks_to_eval"]
+        mec_keys = arch_config["mec_keys"]
+    except ValueError:
         print(f"Warning: Unknown architecture {architecture}, skipping DAG metrics")
         return {}
+    
+    dag_metrics = {
+        "dataset": dataset_name,
+        "architecture": architecture,
+    }
     
     # Store per-fold comparison data for plotting
     per_fold_comparison_data = []
@@ -576,7 +245,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     for att_key, phi_key, mask_type in blocks_to_eval:
         print(f"  Evaluating {att_key}...")
         
-        # Get learned DAG for each fold separately
+        # Get learned DAG for each fold
         fold_dags, source = _get_learned_dag_per_fold(final_scores_dict, att_key, phi_key)
         
         if all(dag is None for _, dag in fold_dags):
@@ -584,7 +253,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             continue
         
         # Load true DAG mask
-        true_dag = _load_true_dag_mask(datadir_path, dataset, mask_type)
+        true_dag = _load_true_dag_mask(datadir_path, dataset_name, mask_type)
         
         if true_dag is None:
             print(f"    No true DAG mask found for {mask_type}")
@@ -595,25 +264,16 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         fold_sh_list = []
         
         for fold_name, learned_dag in fold_dags:
-            if learned_dag is None:
-                print(f"    {fold_name}: No data available")
+            if learned_dag is None or learned_dag.shape != true_dag.shape:
                 per_fold_values[fold_name] = None
                 continue
             
-            # Check shape compatibility
-            if learned_dag.shape != true_dag.shape:
-                print(f"    {fold_name}: Shape mismatch: learned {learned_dag.shape} vs true {true_dag.shape}")
-                per_fold_values[fold_name] = None
-                continue
-            
-            # Compute soft Hamming distance for this fold
             soft_hamming = _compute_soft_hamming(learned_dag, true_dag)
             per_fold_values[fold_name] = soft_hamming
             fold_sh_list.append(soft_hamming)
             
             print(f"    {fold_name}: Soft Hamming ({source}) = {soft_hamming:.4f}")
             
-            # Store for per-fold plotting
             per_fold_comparison_data.append({
                 "fold_name": fold_name,
                 "block": att_key,
@@ -623,9 +283,10 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "source": source,
             })
         
-        # Compute statistics across folds
+        # Compute statistics
         if fold_sh_list:
             fold_sh_array = np.array(fold_sh_list)
+            # Derive metric key from mask_type (remove prefixes)
             metric_key = f"soft_hamming_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
             
             dag_metrics[metric_key] = {
@@ -636,162 +297,96 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "per_fold": per_fold_values,
             }
             dag_metrics[f"{metric_key}_source"] = source
-            
-            print(f"    Statistics: best={np.min(fold_sh_array):.4f}, mean={np.mean(fold_sh_array):.4f}, worst={np.max(fold_sh_array):.4f}, std={np.std(fold_sh_array):.4f}")
         
-        # Compute DAG confidence (consistency across folds)
+        # Compute DAG confidence
         valid_fold_dags = [dag for _, dag in fold_dags if dag is not None]
         if len(valid_fold_dags) >= 2:
             confidence_key = f"dag_confidence_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
-            confidence = _compute_dag_confidence(valid_fold_dags)
-            dag_metrics[confidence_key] = confidence
-            print(f"    DAG Confidence: {confidence:.4f}")
-        elif len(valid_fold_dags) == 1:
-            confidence_key = f"dag_confidence_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
-            dag_metrics[confidence_key] = 1.0
-            print(f"    DAG Confidence: 1.0 (single fold)")
+            dag_metrics[confidence_key] = _compute_dag_confidence(valid_fold_dags)
+            print(f"    DAG Confidence: {dag_metrics[confidence_key]:.4f}")
     
     # =========================================================================
-    # Markov Equivalence Class (MEC) Metrics
+    # Compute MEC Metrics
     # =========================================================================
-    print("\n--- Computing MEC Metrics (Full DAG) ---")
+    print("\n--- Computing MEC Metrics ---")
     
-    # MEC metrics require combining cross and self attention into full DAG
-    # to correctly detect v-structures (colliders) where parents may come from 
-    # different variable groups (S and X)
+    cross_att_key, cross_phi_key = mec_keys["cross"]
+    self_att_key, self_phi_key = mec_keys["self"]
     
-    if architecture in ["SingleCausalForecaster", "NoiseAwareCausalForecaster"]:
-        cross_att_key, cross_phi_key = "dec_cross", "decoder_cross"
-        self_att_key, self_phi_key = "dec_self", "decoder"
-    elif architecture == "StageCausalForecaster":
-        # For stage causal, focus on first decoder (S→X, X→X)
-        cross_att_key, cross_phi_key = "decoder1_cross", "decoder1_cross"
-        self_att_key, self_phi_key = "decoder1_self", "decoder1"
-    elif architecture == "TransformerForecaster":
-        cross_att_key, cross_phi_key = "cross", "cross"
-        self_att_key, self_phi_key = "decoder", "decoder"
-    else:
-        cross_att_key, cross_phi_key = None, None
-        self_att_key, self_phi_key = None, None
+    cross_fold_dags, _ = _get_learned_dag_per_fold(final_scores_dict, cross_att_key, cross_phi_key)
+    self_fold_dags, _ = _get_learned_dag_per_fold(final_scores_dict, self_att_key, self_phi_key)
     
-    if cross_att_key is not None:
-        # Get learned DAGs for cross and self attention per fold
-        cross_fold_dags, cross_source = _get_learned_dag_per_fold(
-            final_scores_dict, cross_att_key, cross_phi_key
-        )
-        self_fold_dags, self_source = _get_learned_dag_per_fold(
-            final_scores_dict, self_att_key, self_phi_key
-        )
+    true_full_dag = _load_full_true_dag(datadir_path, dataset_name)
+    
+    if true_full_dag is not None:
+        true_skeleton = _dag_to_skeleton(true_full_dag)
+        true_v_structures = _find_v_structures(true_full_dag)
+        print(f"  True DAG: {len(true_skeleton)} edges, {len(true_v_structures)} v-structures")
         
-        # Load true full DAG
-        true_full_dag = _load_full_true_dag(datadir_path, dataset)
+        mec_per_fold = {}
+        mec_distances = []
+        mec_memberships = []
         
-        if true_full_dag is not None:
-            # Report true DAG structure info
-            true_skeleton = _dag_to_skeleton(true_full_dag)
-            true_v_structures = _find_v_structures(true_full_dag)
-            print(f"  True DAG: {len(true_skeleton)} edges, {len(true_v_structures)} v-structures")
-            if true_v_structures:
-                print(f"    V-structures: {list(true_v_structures)}")
+        for i, (fold_name, cross_dag) in enumerate(cross_fold_dags):
+            if i >= len(self_fold_dags):
+                continue
+            _, self_dag = self_fold_dags[i]
             
-            # Compute MEC metrics per fold
-            mec_per_fold = {}
-            mec_distances = []
-            mec_memberships = []
+            if cross_dag is None or self_dag is None:
+                mec_per_fold[fold_name] = None
+                continue
             
-            for i, (fold_name, cross_dag) in enumerate(cross_fold_dags):
-                # Get corresponding self-attention DAG
-                if i < len(self_fold_dags):
-                    _, self_dag = self_fold_dags[i]
-                else:
-                    self_dag = None
-                
-                if cross_dag is None or self_dag is None:
-                    print(f"    {fold_name}: Missing data for MEC computation")
-                    mec_per_fold[fold_name] = None
-                    continue
-                
-                # Get dimensions
-                n_X, n_S = cross_dag.shape
-                
-                # Combine into full learned DAG
-                learned_full_dag = _combine_attention_to_full_dag(
-                    cross_adj=cross_dag,
-                    self_adj=self_dag,
-                    n_source=n_S,
-                    n_intermediate=n_X,
-                )
-                
-                # Check shape compatibility
-                if learned_full_dag.shape != true_full_dag.shape:
-                    print(f"    {fold_name}: Shape mismatch - learned {learned_full_dag.shape} vs true {true_full_dag.shape}")
-                    mec_per_fold[fold_name] = None
-                    continue
-                
-                # Compute MEC distance (continuous)
-                mec_dist, mec_details = _compute_mec_distance(learned_full_dag, true_full_dag)
-                
-                # Compute MEC membership (binary)
-                in_mec, membership_details = _check_mec_membership(learned_full_dag, true_full_dag)
-                
-                mec_distances.append(mec_dist)
-                mec_memberships.append(in_mec)
-                
-                mec_per_fold[fold_name] = {
-                    "mec_distance": mec_dist,
-                    "in_mec": in_mec,
-                    "skeleton_distance": mec_details["skeleton_distance"],
-                    "skeleton_recall": mec_details["skeleton_recall"],
-                    "skeleton_precision": mec_details["skeleton_precision"],
-                    "v_structure_distance": mec_details["v_structure_distance"],
-                    "v_structure_recall": mec_details["v_structure_recall"],
-                    "v_structure_precision": mec_details["v_structure_precision"],
-                    "n_missing_edges": membership_details["n_missing_edges"],
-                    "n_extra_edges": membership_details["n_extra_edges"],
-                    "n_missing_v_structures": membership_details["n_missing_v_structures"],
-                    "n_extra_v_structures": membership_details["n_extra_v_structures"],
-                }
-                
-                print(f"    {fold_name}: MEC distance = {mec_dist:.4f}, in MEC = {in_mec}")
-                print(f"      Skeleton: recall={mec_details['skeleton_recall']:.3f}, precision={mec_details['skeleton_precision']:.3f}")
-                print(f"      V-struct: recall={mec_details['v_structure_recall']:.3f}, precision={mec_details['v_structure_precision']:.3f}")
+            n_X, n_S = cross_dag.shape
+            learned_full_dag = _combine_attention_to_full_dag(cross_dag, self_dag, n_S, n_X)
             
-            # Aggregate MEC metrics across folds
-            if mec_distances:
-                mec_dist_array = np.array(mec_distances)
-                dag_metrics["mec_distance"] = {
-                    "best": float(np.min(mec_dist_array)),
-                    "mean": float(np.mean(mec_dist_array)),
-                    "worst": float(np.max(mec_dist_array)),
-                    "std": float(np.std(mec_dist_array)),
-                    "per_fold": mec_per_fold,
-                }
-                dag_metrics["mec_membership_rate"] = float(np.mean(mec_memberships))
-                dag_metrics["n_true_v_structures"] = len(true_v_structures)
-                dag_metrics["n_true_skeleton_edges"] = len(true_skeleton)
-                dag_metrics["true_v_structures"] = [list(v) for v in true_v_structures]
-                
-                print(f"\n  MEC Summary:")
-                print(f"    Distance: best={np.min(mec_dist_array):.4f}, mean={np.mean(mec_dist_array):.4f}, worst={np.max(mec_dist_array):.4f}")
-                print(f"    MEC membership rate: {np.mean(mec_memberships)*100:.1f}% of folds")
-        else:
-            print("  Could not load full true DAG for MEC computation")
+            if learned_full_dag.shape != true_full_dag.shape:
+                mec_per_fold[fold_name] = None
+                continue
+            
+            mec_dist, mec_details = _compute_mec_distance(learned_full_dag, true_full_dag)
+            in_mec, membership_details = _check_mec_membership(learned_full_dag, true_full_dag)
+            
+            mec_distances.append(mec_dist)
+            mec_memberships.append(in_mec)
+            
+            mec_per_fold[fold_name] = {
+                "mec_distance": mec_dist,
+                "in_mec": in_mec,
+                "skeleton_recall": mec_details["skeleton_recall"],
+                "skeleton_precision": mec_details["skeleton_precision"],
+                "v_structure_recall": mec_details["v_structure_recall"],
+                "v_structure_precision": mec_details["v_structure_precision"],
+            }
+            
+            print(f"    {fold_name}: MEC distance = {mec_dist:.4f}, in MEC = {in_mec}")
+        
+        if mec_distances:
+            mec_dist_array = np.array(mec_distances)
+            dag_metrics["mec_distance"] = {
+                "best": float(np.min(mec_dist_array)),
+                "mean": float(np.mean(mec_dist_array)),
+                "worst": float(np.max(mec_dist_array)),
+                "std": float(np.std(mec_dist_array)),
+                "per_fold": mec_per_fold,
+            }
+            dag_metrics["mec_membership_rate"] = float(np.mean(mec_memberships))
+            dag_metrics["n_true_v_structures"] = len(true_v_structures)
     else:
-        print("  MEC computation not supported for this architecture")
+        print("  Could not load full true DAG for MEC computation")
     
-    # Save DAG metrics to JSON
+    # Save DAG metrics
     with open(join(eval_path_files, dag_metrics_filename), 'w') as f:
         json.dump(dag_metrics, f, indent=2)
-    print(f"  Saved: {dag_metrics_filename}")
+    print(f"\n  Saved: {dag_metrics_filename}")
     
-    # Plot: Per-fold DAG comparison heatmaps (one PDF per fold)
+    # =========================================================================
+    # Plot DAG comparisons
+    # =========================================================================
     if per_fold_comparison_data:
-        # Group by fold_name
         fold_data_groups = defaultdict(list)
         for data in per_fold_comparison_data:
             fold_data_groups[data["fold_name"]].append(data)
         
-        # Generate one plot per fold
         for fold_name, fold_data_list in fold_data_groups.items():
             n_blocks = len(fold_data_list)
             fig, axes = plt.subplots(n_blocks, 2, figsize=(8, 3 * n_blocks), squeeze=False)
@@ -805,7 +400,6 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 ax_learned.set_ylabel("Targets")
                 plt.colorbar(im, ax=ax_learned)
                 
-                # Add value annotations
                 for i in range(data["learned"].shape[0]):
                     for j in range(data["learned"].shape[1]):
                         ax_learned.text(j, i, f"{data['learned'][i,j]:.2f}", 
@@ -819,7 +413,6 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 ax_true.set_ylabel("Targets")
                 plt.colorbar(im, ax=ax_true)
                 
-                # Add value annotations
                 for i in range(data["true"].shape[0]):
                     for j in range(data["true"].shape[1]):
                         ax_true.text(j, i, f"{int(data['true'][i,j])}", 
@@ -833,4 +426,289 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             else:
                 plt.close()
     
+    print(f"\n✓ eval_attention_scores complete!")
     return dag_metrics
+
+
+# =============================================================================
+# SLOW: Attention Evolution Tracking (across training epochs)
+# =============================================================================
+
+def eval_attention_evolution(
+    experiment: str,
+    n_evaluations: int = 10,
+    show_plots: bool = True,
+) -> pd.DataFrame:
+    """
+    Track attention/phi evolution during training.
+    
+    SLOW: Loads multiple checkpoints per fold (~2-5 minutes depending on n_evaluations).
+    Run separately when evolution analysis is needed.
+    
+    This function tracks how learned DAG structure (attention scores and phi tensors) 
+    evolve during training from initialization.
+    
+    Args:
+        experiment: Path to the experiment folder containing config and k_* folders
+        n_evaluations: Number of checkpoints to evaluate (evenly distributed).
+                      Default is 10. Set to 0 for ALL checkpoints (slowest).
+        show_plots: If True (default), display plots. If False, only save to files.
+        
+    Returns:
+        pd.DataFrame with columns:
+            - kfold: fold identifier (e.g., "k_0", "k_1")
+            - epoch: epoch number (0 for initialization)
+            - {block}_{i}{j}_mean: mean attention score across samples
+            - {block}_{i}{j}_std: std of attention scores
+            - phi_{block}_{i}{j}: learned DAG probability (sigmoid(phi))
+            
+    Output Files:
+        - fig/attention_drift_{exp_id}.png: Attention evolution over training
+        - files/scores_evol.csv: Attention evolution data
+        
+    Example:
+        >>> # Track evolution with 10 checkpoints (default, ~2-5 min)
+        >>> df = eval_attention_evolution("experiments/my_experiment")
+        >>> 
+        >>> # Track ALL checkpoints (slower, more detailed)
+        >>> df = eval_attention_evolution("experiments/my_experiment", n_evaluations=0)
+    """
+    import os
+    import traceback
+    
+    # Setup directories
+    eval_path_root, eval_path_fig, eval_path_files, eval_path_cline, exp_id = \
+        _setup_eval_directories(experiment, "eval_attention_evolution")
+    
+    scores_evolution_filename = "scores_evol.csv"
+    
+    print(f"Experiment ID: {exp_id}")
+    print(f"n_evaluations: {n_evaluations if n_evaluations > 0 else 'ALL'}")
+    
+    # Save README
+    _save_readme(
+        eval_path_root, eval_path_cline, eval_path_files, eval_path_fig,
+        description="Attention evolution tracking (SLOW): how attention/phi evolves during training.",
+        files_info={
+            scores_evolution_filename: "Attention scores evolution over training epochs (CSV)",
+        },
+    )
+    
+    _create_cline_template(eval_path_cline, "eval_attention_evolution", exp_id)
+    
+    # Check for cached results
+    if exists(join(eval_path_files, scores_evolution_filename)):
+        df = pd.read_csv(join(eval_path_files, scores_evolution_filename))
+        print(f"  Loaded cached evolution data: {len(df)} rows")
+    else:
+        # Compute evolution data
+        df = _load_attention_evolution_data(experiment, n_evaluations)
+        df.to_csv(join(eval_path_files, scores_evolution_filename), index=False)
+        print(f"  Computed and saved evolution data: {len(df)} rows")
+    
+    # Plot evolution
+    if len(df) > 0:
+        fig = plot_attention_evolution(df, aggregate_folds=False, include_phi=True)
+        plt.savefig(join(eval_path_fig, f"attention_drift_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
+        if show_plots:
+            plt.show()
+        else:
+            plt.close()
+    
+    print(f"\n✓ eval_attention_evolution complete!")
+    return df
+
+
+def _load_attention_evolution_data(
+    experiment_path: str,
+    n_evaluations: int = 10,
+    datadir_path: str = None,
+    dataset_label: str = "test",
+) -> pd.DataFrame:
+    """
+    Load attention scores across training epochs (internal helper).
+    
+    Args:
+        experiment_path: Path to experiment folder
+        n_evaluations: Number of checkpoints to evaluate (0 = all)
+        datadir_path: Path to data directory
+        dataset_label: One of ["train", "test", "all"]
+        
+    Returns:
+        pd.DataFrame with attention evolution data
+    """
+    import traceback
+    
+    if datadir_path is None:
+        datadir_path = join(root_path, "data")
+    
+    # Find config
+    config_path = find_config_file(experiment_path)
+    config = OmegaConf.load(config_path)
+    
+    # Get architecture config
+    architecture_type = get_architecture_type(config)
+    print(f"  Architecture: {architecture_type}")
+    
+    try:
+        arch_config = get_architecture_config(architecture_type)
+        attention_keys = arch_config["attention_keys"]
+        phi_keys = arch_config["phi_keys"]
+    except ValueError:
+        # Fallback for unknown architecture
+        attention_keys = ["decoder", "cross"]
+        phi_keys = ["decoder", "cross"]
+    
+    # Find k-fold directories
+    kfold_dirs = sorted([
+        d for d in listdir(experiment_path) 
+        if isdir(join(experiment_path, d)) and d.startswith('k_')
+    ])
+    
+    if not kfold_dirs:
+        raise ValueError(f"No k-fold directories found in {experiment_path}")
+    
+    print(f"  Found {len(kfold_dirs)} k-fold directories")
+    
+    all_records = []
+    
+    for kfold_dir in kfold_dirs:
+        kfold_path = join(experiment_path, kfold_dir)
+        checkpoints_dir = join(kfold_path, 'checkpoints')
+        
+        try:
+            epoch_checkpoints = find_all_checkpoints(checkpoints_dir)
+            total_checkpoints = len(epoch_checkpoints)
+            print(f"\n  {kfold_dir}: {total_checkpoints} checkpoints")
+            
+            if not epoch_checkpoints:
+                continue
+            
+            # Select checkpoints
+            if n_evaluations and n_evaluations > 0:
+                selected_checkpoints = _select_evenly_spaced_checkpoints(epoch_checkpoints, n_evaluations)
+                print(f"    Selected {len(selected_checkpoints)} checkpoints")
+            else:
+                selected_checkpoints = epoch_checkpoints
+            
+            # Storage for initial values (for computing diffs)
+            init_attention = {}
+            init_phi = {}
+            
+            for epoch, checkpoint_path in selected_checkpoints:
+                record = {'kfold': kfold_dir, 'epoch': epoch}
+                
+                try:
+                    # Run predictions to get attention weights
+                    predictions = predict_test_from_ckpt(
+                        config=config,
+                        datadir_path=datadir_path,
+                        checkpoint_path=checkpoint_path,
+                        dataset_label=dataset_label,
+                        cluster=False,
+                    )
+                    
+                    att_weights = predictions.attention_weights
+                    
+                    # Load model for phi
+                    model = _load_model_from_checkpoint(checkpoint_path, architecture_type)
+                    phi_dict = extract_phi_from_model(model, architecture_type)
+                    
+                    # Process attention weights
+                    if att_weights is not None:
+                        for att_key in attention_keys:
+                            att_tensor = att_weights.get(att_key)
+                            if att_tensor is None:
+                                continue
+                            
+                            if att_tensor.ndim == 2:
+                                att_tensor = np.expand_dims(att_tensor, axis=0)
+                            
+                            if att_key not in init_attention:
+                                init_attention[att_key] = att_tensor
+                            
+                            mean_att = att_tensor.mean(axis=0)
+                            std_att = att_tensor.std(axis=0)
+                            
+                            n_rows, n_cols = mean_att.shape
+                            for i in range(n_rows):
+                                for j in range(n_cols):
+                                    record[f"{att_key}_{i}{j}_mean"] = mean_att[i, j]
+                                    record[f"{att_key}_{i}{j}_std"] = std_att[i, j]
+                            
+                            # Compute diff from init
+                            if att_key in init_attention:
+                                init_att = init_attention[att_key]
+                                min_batch = min(att_tensor.shape[0], init_att.shape[0])
+                                diff = att_tensor[:min_batch] - init_att[:min_batch]
+                                diff_mean = diff.mean(axis=0)
+                                diff_std = diff.std(axis=0)
+                                
+                                for i in range(n_rows):
+                                    for j in range(n_cols):
+                                        record[f"{att_key}_{i}{j}_diff_mean"] = diff_mean[i, j]
+                                        record[f"{att_key}_{i}{j}_diff_std"] = diff_std[i, j]
+                    
+                    # Process phi tensors
+                    for phi_key in phi_keys:
+                        phi_tensor = phi_dict.get(phi_key)
+                        if phi_tensor is None:
+                            continue
+                        
+                        if phi_key not in init_phi:
+                            init_phi[phi_key] = phi_tensor
+                        
+                        n_rows, n_cols = phi_tensor.shape
+                        for i in range(n_rows):
+                            for j in range(n_cols):
+                                record[f"phi_{phi_key}_{i}{j}"] = phi_tensor[i, j]
+                        
+                        if phi_key in init_phi:
+                            phi_diff = phi_tensor - init_phi[phi_key]
+                            for i in range(n_rows):
+                                for j in range(n_cols):
+                                    record[f"phi_{phi_key}_{i}{j}_diff"] = phi_diff[i, j]
+                    
+                    all_records.append(record)
+                    print(f"    ✓ epoch {epoch}")
+                    
+                except Exception as e:
+                    print(f"    ✗ epoch {epoch}: {e}")
+                    continue
+            
+        except Exception as e:
+            print(f"  ✗ {kfold_dir}: {e}")
+            continue
+    
+    if all_records:
+        df = pd.DataFrame(all_records)
+        print(f"\n  Loaded {len(df)} rows from {df['kfold'].nunique()} folds")
+        return df
+    else:
+        print("  Warning: No records processed")
+        return pd.DataFrame()
+
+
+# =============================================================================
+# Backward Compatibility: Original Function Name
+# =============================================================================
+
+def load_attention_evolution(
+    experiment_path: str,
+    datadir_path: str = None,
+    dataset_label: str = "test",
+    input_conditioning_fn = None,
+    n_evaluations: int = 10,
+) -> pd.DataFrame:
+    """
+    [DEPRECATED] Use eval_attention_evolution() instead.
+    
+    This function is kept for backward compatibility.
+    """
+    print("Warning: load_attention_evolution() is deprecated. Use eval_attention_evolution() instead.")
+    return _load_attention_evolution_data(
+        experiment_path=experiment_path,
+        n_evaluations=n_evaluations,
+        datadir_path=datadir_path,
+        dataset_label=dataset_label,
+    )

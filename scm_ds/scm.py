@@ -725,7 +725,7 @@ class SCMDataset:
     
     def compute_ate_ground_truth(
         self,
-        do_values: List[float] = None,
+        do_values: Union[List[float], Dict[str, List[float]]] = None,
         method: str = "analytical",
         n_samples: int = 10000,
         seed: int = 42
@@ -738,8 +738,12 @@ class SCMDataset:
         
         Parameters
         ----------
-        do_values : List[float]
-            List of intervention values to compute. Default: [0, 1, -1]
+        do_values : Union[List[float], Dict[str, List[float]]]
+            Either:
+            - List[float]: Same values applied to all source variables
+            - Dict[str, List[float]]: Per-source intervention values, e.g.,
+              {"S1": [0.5], "S2": [-1.7], "S3": [-0.5, 1.0]}
+            Default: PAPER_INTERVENTIONS (paper-specific values)
         method : str
             "analytical" or "monte_carlo"
         n_samples : int
@@ -754,34 +758,70 @@ class SCMDataset:
             
         Example
         -------
-        >>> ate_gt = scm_ds.compute_ate_ground_truth(do_values=[0, 1, -1])
-        >>> ate_gt["S2=0"]["X1"]  # E[X1 | do(S2=0)]
-        0.0
-        >>> ate_gt["S2=1"]["X1"]  # E[X1 | do(S2=1)]
-        1.0  # (for linear SCM with coefficient 1)
+        >>> # Using paper-specific interventions (default)
+        >>> ate_gt = scm_ds.compute_ate_ground_truth()
+        >>> ate_gt["S1=0.5"]["X1"]  # E[X1 | do(S1=0.5)] - should be 0 (S1 is dangling)
+        
+        >>> # Using custom per-source interventions
+        >>> ate_gt = scm_ds.compute_ate_ground_truth(
+        ...     do_values={"S2": [-1.7], "S3": [-0.5, 1.0]}
+        ... )
         """
+        # Paper-specific intervention values:
+        # - S1: dangling (no children) - negative control
+        # - S2: one-to-one → X1 - positive control  
+        # - S3: one-to-many → X2, X3 - structure test (1.0 is OOD holdout)
+        # - S5: many-to-one → X4 - confounding test (2.5 is OOD holdout)
+        PAPER_INTERVENTIONS = {
+            "S1": [0.5],           # In-distribution only (dangling, null effect expected)
+            "S2": [-1.7],          # In-distribution only (one-to-one, positive control)
+            "S3": [-0.5, 1.0],     # In-distribution (-0.5) + OOD holdout (1.0)
+            "S5": [-0.8, 2.5],     # In-distribution (-0.8) + OOD holdout (2.5)
+        }
+        
         if do_values is None:
-            do_values = [0, 1, -1]
+            do_values = PAPER_INTERVENTIONS
         
         if not self.source_labels:
             raise ValueError("No source_labels defined. Cannot compute ATE ground truth.")
         
         ate_ground_truth: Dict[str, Dict[str, float]] = {}
         
-        for source in self.source_labels:
-            for do_value in do_values:
-                intervention = {source: do_value}
-                key = f"{source}={do_value}"
-                
-                expectations = self.compute_interventional_expectation(
-                    intervention=intervention,
-                    target_vars=self.input_labels,
-                    method=method,
-                    n_samples=n_samples,
-                    seed=seed
-                )
-                
-                ate_ground_truth[key] = expectations
+        # Handle both Dict and List formats
+        if isinstance(do_values, dict):
+            # Per-source intervention values
+            for source, values in do_values.items():
+                if source not in self.source_labels:
+                    continue  # Skip sources not in this dataset
+                for do_value in values:
+                    intervention = {source: do_value}
+                    key = f"{source}={do_value}"
+                    
+                    expectations = self.compute_interventional_expectation(
+                        intervention=intervention,
+                        target_vars=self.input_labels,
+                        method=method,
+                        n_samples=n_samples,
+                        seed=seed
+                    )
+                    
+                    ate_ground_truth[key] = expectations
+        else:
+            # Same values for all sources (legacy behavior)
+            for source in self.source_labels:
+                for do_value in do_values:
+                    intervention = {source: do_value}
+                    key = f"{source}={do_value}"
+                    
+                    expectations = self.compute_interventional_expectation(
+                        intervention=intervention,
+                        target_vars=self.input_labels,
+                        method=method,
+                        n_samples=n_samples,
+                        seed=seed
+                    )
+                    
+                    ate_ground_truth[key] = expectations
         
         return ate_ground_truth
     
@@ -1360,25 +1400,42 @@ class SCMDataset:
         # Export ATE ground truth for intervention evaluation
         if self.source_labels:
             try:
-                # Compute ATE ground truth using analytical method (default)
-                # Use standard do-values that match eval_interventions.py
+                # Paper-specific intervention values (matched with eval_interventions.py):
+                # - S1: [0.5] - dangling (no children) - negative control
+                # - S2: [-1.7] - one-to-one → X1 - positive control  
+                # - S3: [-0.5, 1.0] - one-to-many → X2, X3 - structure test (1.0 is OOD)
+                # - S5: [-0.8, 2.5] - many-to-one → X4 - confounding test (2.5 is OOD)
+                # Uses default PAPER_INTERVENTIONS from compute_ate_ground_truth()
                 ate_ground_truth = self.compute_ate_ground_truth(
-                    do_values=[0, 1, -1],
+                    do_values=None,  # Uses PAPER_INTERVENTIONS by default
                     method="analytical"
                 )
                 
                 # Also compute Monte Carlo estimates for validation
                 ate_ground_truth_mc = self.compute_ate_ground_truth(
-                    do_values=[0, 1, -1],
+                    do_values=None,  # Uses PAPER_INTERVENTIONS by default
                     method="monte_carlo",
                     n_samples=50000,
                     seed=seed
                 )
                 
+                # Extract the do_values used for documentation
+                PAPER_INTERVENTIONS = {
+                    "S1": [0.5],
+                    "S2": [-1.7],
+                    "S3": [-0.5, 1.0],
+                    "S5": [-0.8, 2.5],
+                }
+                
                 # Package with metadata for evaluation functions
                 ate_export = {
                     "description": "Ground-truth interventional expectations E[X | do(S=s)] for ATE evaluation",
-                    "do_values_used": [0, 1, -1],
+                    "interventions": {
+                        "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
+                        "S2": {"values": [-1.7], "type": "in_distribution", "role": "positive_control"},
+                        "S3": {"values": [-0.5, 1.0], "type": "mixed", "role": "structure_test", "ood_values": [1.0]},
+                        "S5": {"values": [-0.8, 2.5], "type": "mixed", "role": "confounding_test", "ood_values": [2.5]},
+                    },
                     "computation_methods": {
                         "analytical": "Symbolic computation assuming E[eps]=0",
                         "monte_carlo": "Empirical mean from 50,000 samples"

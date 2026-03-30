@@ -148,6 +148,10 @@ def _build_cos_to_dag_map(
 
 def eval_embed(experiment: str, show_plots: bool = True) -> None:
     """
+    DEPRECATED: This function is disabled due to k-fold seeding bug that was fixed.
+    The embeddings are now properly initialized per fold, making cross-fold embedding
+    comparison less meaningful. Keep for reference but do not use in production.
+    
     Evaluate embedding evolution during training.
     
     Analyzes how source (S) and intermediate (X) embeddings evolve during training
@@ -453,6 +457,10 @@ def eval_embed(experiment: str, show_plots: bool = True) -> None:
 
 def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> dict:
     """
+    DEPRECATED: This function is disabled due to k-fold seeding bug that was fixed.
+    The embeddings are now properly initialized per fold, making cross-fold embedding
+    comparison less meaningful. Keep for reference but do not use in production.
+    
     Evaluate correlation between embedding similarity and learned DAG structure.
     
     This function tests H6: whether causally-linked variables have more similar

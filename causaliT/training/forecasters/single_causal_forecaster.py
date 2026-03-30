@@ -15,7 +15,7 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.single_causal import SingleCausalLayer
 from causaliT.core.utils import load_dag_masks
-from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair
+from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted
 from causaliT.core.modules.extra_layers import dag_decisiveness_loss, dag_temperature_loss
 
 
@@ -93,10 +93,19 @@ class SingleCausalForecaster(pl.LightningModule):
         self._self_sparsity_fallback_warned = False
         self._cross_sparsity_fallback_warned = False
         
-        # HSIC regularization - encourages independence between S and residuals
-        # Lower HSIC values indicate better causal structure learning
-        # log_hsic also enables HSIC_X logging (X→X independence for self-attention DAG)
-        self.lambda_hsic = config["training"].get("lambda_hsic", 0)
+        # =====================================================================
+        # HSIC REGULARIZATION - encourages independence between residuals and parents
+        # =====================================================================
+        # lambda_hsic_cross: Weight for S→X HSIC (cross-attention, replaces old lambda_hsic)
+        # lambda_hsic_self: Weight for X→X HSIC (self-attention)
+        # use_attention_weighted_hsic: If True, weight HSIC by attention scores
+        #   - False: uniform HSIC (all edges weighted equally)
+        #   - True: attention-weighted HSIC (higher penalty for strongly attended edges)
+        # log_hsic: Log HSIC values during training
+        self.lambda_hsic_cross = config["training"].get("lambda_hsic_cross", 
+                                     config["training"].get("lambda_hsic", 0.0))  # Fallback to old name
+        self.lambda_hsic_self = config["training"].get("lambda_hsic_self", 0.0)
+        self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.log_hsic = config["training"].get("log_hsic", False)
         
@@ -435,27 +444,61 @@ class SingleCausalForecaster(pl.LightningModule):
         mse_x_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
         loss_x = mse_x_per_elem.mean()
         
-        # HSIC regularizer - encourages independence between S and residuals
-        # Lower HSIC = less dependence = better causal structure learning
-        if self.lambda_hsic > 0 or self.log_hsic:
-            # Compute residuals: (batch, seq_len_y)
-            residuals = x_target.squeeze() - pred_x.squeeze()
+        # =====================================================================
+        # HSIC REGULARIZATION
+        # Encourages independence between residuals and parents (S for cross, X for self)
+        # - use_attention_weighted_hsic=False: uniform weighting (all edges equal)
+        # - use_attention_weighted_hsic=True: weight by attention scores
+        # =====================================================================
+        hsic_regularizer = 0.0
+        hsic_cross_value = None
+        hsic_self_value = None
+        
+        if self.lambda_hsic_cross > 0 or self.lambda_hsic_self > 0 or self.log_hsic:
+            # Compute per-X residuals: (batch, seq_len_x)
+            residuals_per_x = x_target.squeeze() - pred_x.squeeze()
             
-            # Mean residuals across sequence length: (batch,)
-            if residuals.dim() > 1:
-                mean_residuals = residuals.mean(dim=1)
-            else:
-                mean_residuals = residuals
+            # S→X HSIC (cross-attention)
+            if self.lambda_hsic_cross > 0 or self.log_hsic:
+                s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
+                
+                if self.use_attention_weighted_hsic:
+                    # Attention-weighted: higher penalty for strongly attended edges
+                    att_cross_mean = dec_cross_att[0].mean(dim=0)  # (seq_len_x, seq_len_s)
+                    hsic_cross_value = hsic_attention_weighted(
+                        source_values=s_values,
+                        residuals=residuals_per_x,
+                        attention_weights=att_cross_mean,
+                        sigma=self.hsic_sigma,
+                        exclude_diagonal=False
+                    )
+                else:
+                    # Uniform weighting: use mean residuals for efficiency
+                    mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
+                    hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
+                
+                hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
             
-            # Extract S values: (batch, seq_len_s)
-            s_values = S[:, :, self.val_idx]
-            
-            # Compute HSIC between each S token and mean residuals
-            hsic_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
-            hsic_regularizer = self.lambda_hsic * hsic_value
-        else:
-            hsic_regularizer = 0.0
-            hsic_value = None
+            # X→X HSIC (self-attention)
+            if self.lambda_hsic_self > 0 or self.log_hsic:
+                x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
+                
+                if residuals_per_x.dim() > 1:
+                    if self.use_attention_weighted_hsic:
+                        # Attention-weighted: higher penalty for strongly attended edges
+                        att_self_mean = dec_self_att[0].mean(dim=0)  # (seq_len_x, seq_len_x)
+                        hsic_self_value = hsic_attention_weighted(
+                            source_values=x_values_for_hsic,
+                            residuals=residuals_per_x,
+                            attention_weights=att_self_mean,
+                            sigma=self.hsic_sigma,
+                            exclude_diagonal=True  # X shouldn't attend to itself
+                        )
+                    else:
+                        # Uniform weighting
+                        hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
+                    
+                    hsic_regularizer += self.lambda_hsic_self * hsic_self_value
         
         # DAG Decisiveness regularizer - encourages edge probabilities away from 0.5
         # This addresses the problem with antisymmetric DAG parameterization where
@@ -548,21 +591,12 @@ class SingleCausalForecaster(pl.LightningModule):
             self.log(f"{stage}_cross_sparsity_mode", 1.0 if cross_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
         
         # Log HSIC if requested
-        if self.log_hsic and hsic_value is not None:
-            self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
-            self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
-        
-        # Log HSIC_X: independence between X values and per-X residuals
-        # This measures self-attention DAG correctness (X→X relationships)
         if self.log_hsic:
-            # Compute per-X residuals (not mean): (batch, seq_len_x)
-            residuals_per_x = x_target.squeeze() - pred_x.squeeze()
-            
-            if residuals_per_x.dim() > 1:
-                # Get true X values for HSIC computation
-                x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
-                hsic_x_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
-                self.log(f"{stage}_hsic_x", hsic_x_value, on_step=False, on_epoch=True)
+            if hsic_cross_value is not None:
+                self.log(f"{stage}_hsic_cross", hsic_cross_value, on_step=False, on_epoch=True)
+            if hsic_self_value is not None:
+                self.log(f"{stage}_hsic_self", hsic_self_value, on_step=False, on_epoch=True)
+            self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
         
         # Log decisiveness if requested
         if self.log_decisiveness:

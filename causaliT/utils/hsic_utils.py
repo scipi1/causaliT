@@ -167,3 +167,70 @@ def hsic_per_x_pair(
         return torch.tensor(0.0, device=x_values.device, dtype=x_values.dtype)
     
     return torch.stack(hsic_values).mean()
+
+
+def hsic_attention_weighted(
+    source_values: torch.Tensor,
+    residuals: torch.Tensor,
+    attention_weights: torch.Tensor,
+    sigma: float = 1.0,
+    exclude_diagonal: bool = False,
+) -> torch.Tensor:
+    """
+    Attention-weighted HSIC for causal structure regularization.
+    
+    Computes: sum(att[i,j] * HSIC(source_j, residual_i)) / sum(att)
+    
+    The attention weight acts as a "confidence" factor: the model is penalized
+    proportionally to how much it relies on each edge. High penalty occurs when:
+    - The model strongly attends to a source (high att[i,j])
+    - But the residual still depends on that source (high HSIC)
+    
+    For self-attention (X→X):
+        - source_values = X values (batch, seq_len_x)
+        - residuals = per-X residuals (batch, seq_len_x)
+        - attention_weights = self-attention (seq_len_x, seq_len_x)
+        - exclude_diagonal = True (X_i shouldn't attend to itself)
+        
+    For cross-attention (S→X):
+        - source_values = S values (batch, seq_len_s)
+        - residuals = per-X residuals (batch, seq_len_x)
+        - attention_weights = cross-attention (seq_len_x, seq_len_s)
+        - exclude_diagonal = False (no diagonal concept)
+    
+    Args:
+        source_values: Source variable values (batch, seq_len_source) - S or X values
+        residuals: Per-target residuals (batch, seq_len_target)
+        attention_weights: Attention matrix (seq_len_target, seq_len_source) - averaged over batch
+        sigma: RBF kernel bandwidth
+        exclude_diagonal: If True, skip diagonal entries (for self-attention)
+        
+    Returns:
+        Normalized attention-weighted HSIC (scalar)
+    """
+    seq_len_target = residuals.shape[1]
+    seq_len_source = source_values.shape[1]
+    
+    weighted_hsic_sum = torch.tensor(0.0, device=source_values.device, dtype=source_values.dtype)
+    weight_sum = torch.tensor(0.0, device=source_values.device, dtype=source_values.dtype)
+    
+    for i in range(seq_len_target):
+        res_i = residuals[:, i]  # (batch,)
+        
+        for j in range(seq_len_source):
+            # Skip diagonal for self-attention
+            if exclude_diagonal and i == j:
+                continue
+            
+            source_j = source_values[:, j]  # (batch,)
+            weight_ij = attention_weights[i, j]  # scalar
+            
+            hsic_ij = hsic(source_j, res_i, sigma=sigma)
+            weighted_hsic_sum = weighted_hsic_sum + weight_ij * hsic_ij
+            weight_sum = weight_sum + weight_ij
+    
+    # Normalize by total attention weight (avoid division by zero)
+    if weight_sum > 1e-8:
+        return weighted_hsic_sum / weight_sum
+    else:
+        return torch.tensor(0.0, device=source_values.device, dtype=source_values.dtype)

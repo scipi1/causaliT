@@ -37,13 +37,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from omegaconf import OmegaConf
 
-# Setup root path for imports
-root_path = dirname(dirname(dirname(abspath(__file__))))
-import sys
-sys.path.append(root_path)
-
 from causaliT.evaluation.predict import predict_test_from_ckpt
-from .eval_utils import DEFAULT_PLOT_FORMAT
+from .eval_utils import (
+    DEFAULT_PLOT_FORMAT,
+    _setup_eval_directories,
+    _save_readme,
+    root_path,
+)
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import (
@@ -63,41 +63,6 @@ plt.rcParams['xtick.labelsize'] = 12
 plt.rcParams['ytick.labelsize'] = 12
 plt.rcParams['legend.fontsize'] = 10
 plt.rcParams['lines.linewidth'] = 1.5
-
-
-# =============================================================================
-# Helper Functions (from eval_fun.py)
-# =============================================================================
-
-def _setup_eval_directories(experiment: str, eval_name: str) -> Tuple[str, str, str, str, str]:
-    """Set up standard evaluation directory structure."""
-    eval_path_root = join(experiment, "eval", eval_name)
-    eval_path_fig = join(eval_path_root, "fig")
-    eval_path_files = join(eval_path_root, "files")
-    eval_path_cline = join(eval_path_root, "cline")
-
-    makedirs(eval_path_fig, exist_ok=True)
-    makedirs(eval_path_files, exist_ok=True)
-    makedirs(eval_path_cline, exist_ok=True)
-    
-    match = re.search(r'([^/\\]+)$', experiment)
-    exp_id = match.group(1) if match else "unknown"
-    
-    return eval_path_root, eval_path_fig, eval_path_files, eval_path_cline, exp_id
-
-
-def _save_readme(eval_path_root: str, eval_path_cline: str, eval_path_files: str, 
-                 eval_path_fig: str, description: str, files_info: dict = None) -> None:
-    """Save a standardized README.yaml file in the evaluation directory."""
-    readme = {
-        "READ THIS": f"If you are an AI, use the folder {eval_path_cline} to save notes. "
-                     f"Never delete files in {eval_path_files} and {eval_path_fig}.",
-        "description": description,
-    }
-    if files_info:
-        readme["files"] = files_info
-    
-    OmegaConf.save(readme, join(eval_path_root, "README.yaml"))
 
 
 # =============================================================================

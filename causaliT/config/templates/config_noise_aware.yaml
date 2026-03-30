@@ -312,8 +312,13 @@ training:
   self_sparsity_regularizer: "l1"
   cross_sparsity_regularizer: "entropy"
   
-  # HSIC - encourages independence between S and residuals
-  lambda_hsic: 0.0
+  # HSIC - encourages independence between residuals and parents
+  # lambda_hsic_cross: Weight for S→X HSIC (cross-attention)
+  # lambda_hsic_self: Weight for X→X HSIC (self-attention)
+  # use_attention_weighted_hsic: If True, weight HSIC by attention scores
+  lambda_hsic_cross: 0.0
+  lambda_hsic_self: 0.0
+  use_attention_weighted_hsic: false
   hsic_sigma: 1.0
   
   # Decisiveness - pushes edge probabilities away from 0.5

@@ -226,7 +226,20 @@ class DataIndexTracker(Callback):
 
 
 class KFoldResultsTracker:
-    """Class to track and aggregate results across all k-folds."""
+    """
+    Class to track and aggregate results across all k-folds.
+    
+    Best fold selection strategy (for causal inference):
+    - Primary: Minimum val_hsic_reg (independence between residuals and parents)
+    - Fallback: val_hsic_cross, val_hsic, then val_mae if no HSIC available
+    
+    Rationale: Within a seed, CV fold results are clustered together. Minimum 
+    validation HSIC rarely corresponds to worst SHD (structural Hamming distance),
+    making it a reliable proxy for causal structure quality when ground truth is unavailable.
+    """
+    
+    # HSIC metrics to try, in order of preference
+    HSIC_METRICS_PRIORITY = ["val_hsic_reg", "val_hsic_cross", "val_hsic"]
     
     def __init__(self, save_dir: str, k_folds: int):
         self.save_dir = save_dir
@@ -254,6 +267,82 @@ class KFoldResultsTracker:
         
         self._update_summary()
     
+    def _find_hsic_metric(self, metric_names: list) -> str:
+        """
+        Find the best available HSIC metric from the logged metrics.
+        
+        Returns:
+            str: Name of the HSIC metric to use, or None if not found
+        """
+        for hsic_metric in self.HSIC_METRICS_PRIORITY:
+            if hsic_metric in metric_names:
+                return hsic_metric
+        return None
+    
+    def _select_best_fold(self, metric_names: list) -> dict:
+        """
+        Select the best fold using causal-first selection strategy.
+        
+        Strategy:
+        1. Try to select by minimum HSIC (causal quality proxy)
+        2. Fall back to minimum val_mae (prediction quality)
+        
+        Returns:
+            dict: Best fold info with selection_criterion field
+        """
+        # Try HSIC-based selection first (causal inference default)
+        hsic_metric = self._find_hsic_metric(metric_names)
+        
+        if hsic_metric is not None:
+            # Filter folds with valid (non-NaN, non-None) HSIC values
+            valid_folds = [
+                fold for fold in self.fold_results.keys()
+                if self.fold_results[fold]["metrics"].get(hsic_metric) is not None
+                and isinstance(self.fold_results[fold]["metrics"].get(hsic_metric), (int, float))
+                and not np.isnan(self.fold_results[fold]["metrics"].get(hsic_metric))
+            ]
+            
+            if valid_folds:
+                best_fold = min(valid_folds,
+                               key=lambda x: self.fold_results[x]["metrics"][hsic_metric])
+                return {
+                    "fold_number": best_fold,
+                    "selection_criterion": hsic_metric,
+                    "selection_value": self.fold_results[best_fold]["metrics"][hsic_metric],
+                    "metrics": self.fold_results[best_fold]["metrics"],
+                    "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
+                }
+        
+        # Fallback to val_mae (prediction-based selection)
+        if "val_mae" in metric_names:
+            valid_folds = [
+                fold for fold in self.fold_results.keys()
+                if self.fold_results[fold]["metrics"].get("val_mae") is not None
+                and isinstance(self.fold_results[fold]["metrics"].get("val_mae"), (int, float))
+                and not np.isnan(self.fold_results[fold]["metrics"].get("val_mae"))
+            ]
+            
+            if valid_folds:
+                best_fold = min(valid_folds,
+                               key=lambda x: self.fold_results[x]["metrics"]["val_mae"])
+                return {
+                    "fold_number": best_fold,
+                    "selection_criterion": "val_mae",
+                    "selection_value": self.fold_results[best_fold]["metrics"]["val_mae"],
+                    "metrics": self.fold_results[best_fold]["metrics"],
+                    "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
+                }
+        
+        # Last resort: return first fold
+        first_fold = min(self.fold_results.keys())
+        return {
+            "fold_number": first_fold,
+            "selection_criterion": "first_available",
+            "selection_value": None,
+            "metrics": self.fold_results[first_fold]["metrics"],
+            "checkpoint_path": self.fold_results[first_fold]["best_checkpoint_path"]
+        }
+    
     def _update_summary(self):
         """Update the k-fold summary file."""
         if not self.fold_results:
@@ -279,15 +368,8 @@ class KFoldResultsTracker:
                     "max": float(np.max(values))
                 }
         
-        if "val_mae" in metric_names:
-            best_fold = min(self.fold_results.keys(), 
-                           key=lambda x: self.fold_results[x]["metrics"]["val_mae"])
-            summary["best_fold"] = {
-                "fold_number": best_fold,
-                "val_mae": self.fold_results[best_fold]["metrics"]["val_mae"],
-                "metrics": self.fold_results[best_fold]["metrics"],
-                "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
-            }
+        # Select best fold using causal-first strategy
+        summary["best_fold"] = self._select_best_fold(metric_names)
         
         with open(self.summary_file, 'w') as f:
             json.dump(summary, f, indent=2, default=str)

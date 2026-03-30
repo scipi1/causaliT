@@ -46,6 +46,99 @@ plt.rcParams['lines.linewidth'] = 1.5
 
 
 # =============================================================================
+# Architecture Registry
+# =============================================================================
+# Centralized configuration for all supported model architectures.
+# This eliminates repetitive architecture-specific if/elif blocks.
+
+ARCHITECTURE_REGISTRY = {
+    "SingleCausalForecaster": {
+        "attention_keys": ["dec_self", "dec_cross"],
+        "phi_keys": ["decoder", "decoder_cross"],
+        "blocks_to_eval": [
+            # (attention_key, phi_key, mask_type)
+            ("dec_cross", "decoder_cross", "dec_cross"),
+            ("dec_self", "decoder", "dec_self"),
+        ],
+        "mec_keys": {
+            "cross": ("dec_cross", "decoder_cross"),
+            "self": ("dec_self", "decoder"),
+        },
+    },
+    "NoiseAwareCausalForecaster": {
+        # Same structure as SingleCausalForecaster
+        "attention_keys": ["dec_self", "dec_cross"],
+        "phi_keys": ["decoder", "decoder_cross"],
+        "blocks_to_eval": [
+            ("dec_cross", "decoder_cross", "dec_cross"),
+            ("dec_self", "decoder", "dec_self"),
+        ],
+        "mec_keys": {
+            "cross": ("dec_cross", "decoder_cross"),
+            "self": ("dec_self", "decoder"),
+        },
+    },
+    "StageCausalForecaster": {
+        "attention_keys": ["dec1_self", "dec1_cross", "dec2_self", "dec2_cross"],
+        "phi_keys": ["decoder1", "decoder1_cross", "decoder2", "decoder2_cross"],
+        "blocks_to_eval": [
+            ("decoder1_cross", "decoder1_cross", "dec1_cross"),
+            ("decoder1_self", "decoder1", "dec1_self"),
+            ("decoder2_cross", "decoder2_cross", "dec2_cross"),
+            ("decoder2_self", "decoder2", "dec2_self"),
+        ],
+        "mec_keys": {
+            # For stage causal, focus on first decoder (S→X, X→X)
+            "cross": ("decoder1_cross", "decoder1_cross"),
+            "self": ("decoder1_self", "decoder1"),
+        },
+    },
+    "TransformerForecaster": {
+        "attention_keys": ["encoder", "decoder", "cross"],
+        "phi_keys": ["encoder", "decoder", "cross"],
+        "blocks_to_eval": [
+            ("cross", "cross", "dec_cross"),
+            ("decoder", "decoder", "dec_self"),
+        ],
+        "mec_keys": {
+            "cross": ("cross", "cross"),
+            "self": ("decoder", "decoder"),
+        },
+    },
+}
+
+
+def get_architecture_config(architecture_type: str) -> dict:
+    """
+    Get architecture-specific configuration from the registry.
+    
+    Args:
+        architecture_type: Name of the architecture (e.g., "SingleCausalForecaster")
+        
+    Returns:
+        dict: Configuration with keys:
+            - attention_keys: List of attention weight keys to track
+            - phi_keys: List of phi tensor keys to extract
+            - blocks_to_eval: List of (att_key, phi_key, mask_type) tuples for DAG metrics
+            - mec_keys: Dict with 'cross' and 'self' keys for MEC computation
+            
+    Raises:
+        ValueError: If architecture is not in the registry
+        
+    Example:
+        >>> config = get_architecture_config("SingleCausalForecaster")
+        >>> config["attention_keys"]
+        ['dec_self', 'dec_cross']
+    """
+    if architecture_type not in ARCHITECTURE_REGISTRY:
+        raise ValueError(
+            f"Unknown architecture: {architecture_type}. "
+            f"Supported: {list(ARCHITECTURE_REGISTRY.keys())}"
+        )
+    return ARCHITECTURE_REGISTRY[architecture_type]
+
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 

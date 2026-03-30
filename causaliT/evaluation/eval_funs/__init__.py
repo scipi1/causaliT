@@ -29,10 +29,13 @@ from .eval_utils import (
     _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
     _load_true_dag_mask,
-    load_dataset_metadata,  # NEW: Load dataset metadata for dataset-agnostic evaluation
+    load_dataset_metadata,
     _get_learned_dag,
     _compute_dag_confidence,
     _get_learned_dag_per_fold,
+    # Architecture registry
+    ARCHITECTURE_REGISTRY,
+    get_architecture_config,
     # Metric plotting helpers
     _should_use_log_scale,
     _is_column_plottable,
@@ -83,8 +86,9 @@ from .eval_embeddings import (
 
 # Attention/DAG evaluation
 from .eval_attention import (
-    load_attention_evolution,
-    eval_attention_scores,
+    load_attention_evolution,  # Deprecated, use eval_attention_evolution
+    eval_attention_scores,     # FAST: final checkpoint DAG metrics
+    eval_attention_evolution,  # SLOW: evolution tracking across epochs
 )
 
 # Intervention evaluation
@@ -94,7 +98,7 @@ from .eval_interventions import eval_interventions
 from .eval_ans import eval_ans
 
 # d_model sweep evaluation
-from .eval_d_model_sweep import eval_d_model_sweep
+from .eval_d_model_sweep import eval_d_model_sweep, analyze_hsic_ate_correlation
 
 # Manifest functions
 from .update_manifest import (
@@ -169,14 +173,19 @@ __all__ = [
     "eval_embed",
     "eval_embedding_dag_correlation",
     # Attention
-    "load_attention_evolution",
+    "load_attention_evolution",  # Deprecated
     "eval_attention_scores",
+    "eval_attention_evolution",
+    # Architecture registry
+    "ARCHITECTURE_REGISTRY",
+    "get_architecture_config",
     # Interventions
     "eval_interventions",
     # ANS (sweep experiments only)
     "eval_ans",
     # d_model sweep evaluation
     "eval_d_model_sweep",
+    "analyze_hsic_ate_correlation",
     # Manifest
     "fix_kfold_summary",
     "enrich_kfold_summary",

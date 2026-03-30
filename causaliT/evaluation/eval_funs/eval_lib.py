@@ -104,18 +104,30 @@ def find_config_file(folder_path: str) -> str:
     return matching_files[0]
 
 
-def find_best_or_last_checkpoint(checkpoints_dir: str) -> str:
+def find_best_or_last_checkpoint(
+    checkpoints_dir: str, 
+    checkpoint_type: str = "last"
+) -> str:
     """
-    Find the best checkpoint if available, otherwise return the last epoch checkpoint.
+    Find a checkpoint from the checkpoints directory.
     
     Args:
         checkpoints_dir: Path to the checkpoints directory
+        checkpoint_type: Which checkpoint to return:
+            - "last": Last epoch checkpoint (default) - better for causal analysis
+            - "best": best_checkpoint.ckpt if available, else last
         
     Returns:
         str: Full path to the selected checkpoint
         
     Raises:
         FileNotFoundError: If no checkpoints are found
+        
+    Note:
+        For causal discovery, "last" is preferred because:
+        - "best" selects based on prediction loss, not causal correctness
+        - Causal regularizers (HSIC, sparsity) may need more epochs to converge
+        - "last" represents the model's final DAG hypothesis
     """
     if not exists(checkpoints_dir) or not isdir(checkpoints_dir):
         raise FileNotFoundError(f"Checkpoints directory not found: {checkpoints_dir}")
@@ -125,28 +137,31 @@ def find_best_or_last_checkpoint(checkpoints_dir: str) -> str:
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoint files found in {checkpoints_dir}")
     
-    # Check for best_checkpoint.ckpt first
-    if 'best_checkpoint.ckpt' in checkpoint_files:
+    # If checkpoint_type is "best", try to find best_checkpoint.ckpt first
+    if checkpoint_type == "best" and 'best_checkpoint.ckpt' in checkpoint_files:
         return join(checkpoints_dir, 'best_checkpoint.ckpt')
     
-    # Otherwise, find the checkpoint with the highest epoch number
+    # Otherwise (or for "last"), find the checkpoint with the highest epoch number
     epoch_pattern = re.compile(r'epoch=(\d+)')
     max_epoch = -1
-    best_ckpt = None
+    last_ckpt = None
     
     for ckpt in checkpoint_files:
+        # Skip best_checkpoint.ckpt when looking for last
+        if ckpt == 'best_checkpoint.ckpt':
+            continue
         match = epoch_pattern.search(ckpt)
         if match:
             epoch = int(match.group(1))
             if epoch > max_epoch:
                 max_epoch = epoch
-                best_ckpt = ckpt
+                last_ckpt = ckpt
     
-    if best_ckpt is None:
+    if last_ckpt is None:
         # Fall back to first checkpoint if no epoch pattern found
-        best_ckpt = checkpoint_files[0]
+        last_ckpt = checkpoint_files[0]
     
-    return join(checkpoints_dir, best_ckpt)
+    return join(checkpoints_dir, last_ckpt)
 
 
 def find_all_checkpoints(checkpoints_dir: str) -> List[Tuple[int, str]]:
@@ -548,7 +563,7 @@ def load_attention_data(
     experiment_path: str,
     datadir_path: str = None,
     dataset_label: str = "test",
-    checkpoint_type: str = "best",
+    checkpoint_type: str = "last",
     input_conditioning_fn: Callable = None,
 ) -> AttentionData:
     """
@@ -565,7 +580,8 @@ def load_attention_data(
         experiment_path: Path to the experiment folder containing config and k_* folders
         datadir_path: Path to data directory. If None, uses "../data/" relative to project root
         dataset_label: One of ["train", "test", "all"]
-        checkpoint_type: "best" for best_checkpoint.ckpt, "last" for last epoch
+        checkpoint_type: "last" (default) for last epoch, "best" for best_checkpoint.ckpt
+                        Note: "last" is preferred for causal analysis (phi/DAG converged)
         input_conditioning_fn: Optional function to condition inputs before forward pass
         
     Returns:
@@ -684,11 +700,8 @@ def load_attention_data(
         checkpoints_dir = join(kfold_path, 'checkpoints')
         
         try:
-            # Find checkpoint
-            if checkpoint_type == "best":
-                checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir)
-            else:
-                checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir)  # Same logic, finds last if no best
+            # Find checkpoint - pass checkpoint_type to get the correct one
+            checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir, checkpoint_type)
             
             print(f"Processing {kfold_dir}: {os.path.basename(checkpoint_path)}")
             result.checkpoint_paths.append(checkpoint_path)
@@ -1392,8 +1405,8 @@ def predict_from_experiment(
         checkpoints_dir = join(kfold_path, 'checkpoints')
         
         try:
-            # Find checkpoint (best or last)
-            checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir)
+            # Find checkpoint (best or last) - pass checkpoint_type
+            checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir, checkpoint_type)
             checkpoint_name = os.path.basename(checkpoint_path)
             
             print(f"Processing {kfold_dir}: {checkpoint_name}...")

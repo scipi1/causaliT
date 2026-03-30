@@ -1,22 +1,160 @@
 # Paper Outline
 
 - Motivate the need of a surrogate that is intervention invariance
-- Intervention invariance is guaranteed if the true DAG is given to the attention
-- Learning the DAG through attention is desired
+- Intervention invariance is guaranteed if the true DAG is given to the attention, 
+    - how does the ETA look like?
+    - shall we keep the hard-mask model in the benchmarks?
 
-- Standard attention has problems
+- Since the causal structure is not always available, learning the DAG through attention is desired.
+
+- Standard attention has fundamental problems in learning the DAG (from CausaliT report)
+
+### Proposal
 - Architectural changes designed for learning the causal structure
-- Show that we are more intervention invariant than vanilla transformer from the ETA
-- Show the learned causal structure
+    - SVFA 
+    - Toeplitz Attention + Cross Causal
+    - noise_aware architecture
+
+- Regularization
+    - HSIC regularization (potentially with cross-splitting)
+    - L1 (sparsity) on scores
+
+
+### Results
+
+- Benchmark models
+    - Toeplitz + SVFA (Ours)
+    - Vanilla Transformer
+    - Vanilla Transformer true DAG
+
+- Datasets
+    - scm 1
+    - scm 2
+    - scm 3
+    - scm_mix
+
+- Metrics (variability given by 10 seeds)
+    - ETA
+    - SHD
+    - Markov Equivalence Class
+    - test MAE (as a control metric)
+
+- Ablation: record metrics drop from benchmark (variability given by 10 seeds)
+    - No SVFA
+    - SoftMax attention
+    - No noise aware architecture
+    - No HSIC regularization
+
+- lambda_L1 vs edge score Plot vs test loss
+
+### Appendix 1: How to use CausaliT
+- Criterion for d_model: HSIC under random masks --> propose a starting value of lambda_hsic
+- Criterion for lambda_sparse: minimum number of edges such that the loss doesn't change
+- Warning for user for too large lambda_hsic when training gets unstable
+
+### Appendix 2: ATE Intervention Scheme
+
+Paper uses non-binary treatments with carefully selected intervention values:
+
+| Variable | In-Distribution | Out-of-Distribution | Role |
+|----------|-----------------|---------------------|------|
+| **S1** | 0.5 | - | Negative control (dangling, no children) |
+| **S2** | -1.7 | - | Positive control (one-to-one → X1) |
+| **S3** | -0.5 | 1.0 (holdout) | Structure test (one-to-many → X2, X3) |
+| **S5** | -0.8 | 2.5 (holdout) | Confounding test (many-to-one → X4) |
+
+**Total: 6 interventions**
+
+Expected behavior:
+- S1: Zero effect on all X (tests intervention invariance for non-causal paths)
+- S2: Effect only on X1 (tests simple one-to-one causal learning)
+- S3: Effects on X2, X3 (tests one-to-many structure learning)
+- S5: Effect on X4 (tests confounded parent learning)
+
+### Appendix 2: WHat didn't work
+- Lie Attention + Gated phi --> unstable training
+- Orthogonal frozen S embeddings (maybe it works, still to check)
+
 
 
 # TODO today
-- dataset test split on unique single choices (generalization test)
-- Add a metric for Markov Equivalence class calculation
+
+## Finalized Action Plan for Paper Experiments
+
+### Datasets
+All experiments use **discrete S sampling with holdout split**:
+- `data/scm1/` - Linear Gaussian (discrete holdout)
+- `data/scm2/` - Non-linear Gaussian (discrete holdout)
+- `data/scm3/` - Non-linear Non-Gaussian (discrete holdout)
+
+Holdout values: S3=1.0, S5=2.5 → OOD test evaluation
+
+**To generate datasets:**
+```bash
+python -m scm_ds.datasets
+```
+
+### Training Configuration
+- `k_fold: 1` (no cross-validation, single train/val/test split)
+- `d_model: 24` (from template, adjust based on past experiments)
+- 10 seeds for variability measurement
+
+### Step 1: Sparsity Sweep (YOUR model)
+**Config:** `config_noise_aware.yaml` + `sweeps/sweep_sparsity_joint.yaml`
+- Sweeps λ_self × λ_cross: [0.0, 0.01, 0.05, 0.1, 0.5]²
+- 3 seeds × 3 datasets = 225 runs total
+- **Output:** Lasso-style 2D heatmap, select λ_sparse*
+
+### Step 2: HSIC Sweep (YOUR model)
+**Config:** `config_noise_aware.yaml` + `sweeps/sweep_hsic.yaml`
+- Sweeps λ_hsic_cross × λ_hsic_self
+- 3 seeds × 3 datasets = 135 runs total
+- **Output:** Stability upper bound, select λ_hsic*
+
+### Step 3: Main Experiments (10 seeds × 3 datasets)
+Run in parallel:
+1. **Vanilla baseline (no reg):** `config_vanilla_transformer.yaml`
+2. **Vanilla baseline (same λ*):** `config_vanilla_transformer.yaml` with λ* overrides
+3. **Our model (λ*):** `config_noise_aware.yaml` with λ* overrides
+
+**Output:** Comparison table (ETA, SHD, MEC, MAE ± std)
+
+### Step 4: Ablation Studies (10 seeds × 3 datasets)
+| Ablation | Config Change |
+|----------|---------------|
+| No SVFA | `comps_embed_S/X: "summation"` |
+| No Toeplitz | `dec_self_attention_type: "ScaledDotProduct"` |
+| No noise-aware | Use `SingleCausalLayer` |
+| No HSIC | `lambda_hsic_cross/self: 0.0` |
+| No sparsity | `lambda_self/cross_score_sparse: 0.0` |
+
+**Output:** Metric drop table from main model
+
+### Step 5: Analysis & Plots
+1. Lasso-style edge selection plot (from Step 1)
+2. Comparison table (from Step 3)
+3. Ablation metric drop table (from Step 4)
+
+---
+
+# Important notes
+- the d_model sweep will tell if we would benefit from cross-splitting
+- the experiments with different architectures will tell us 
+
 
 
 
 # TODOs in priority order
+
+
+## (!!!) How to aggregate k-fold results?
+- stack? https://arxiv.org/pdf/2401.01645
+- if we use cross split, we need some sort of aggregation
+- don't use cross-validation at all
+- select the best fold but not according to loss but HSIC, which is the causality metric used during training
+
+
+
 
 ## Cross-validation inconsistency SOLVED ✅
 It was a bug in the trainer where the model was not initialized in the same way for each fold, the seed was at the beginning and, as training kept going it changed/got consumed, changing the model initialization

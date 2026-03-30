@@ -46,13 +46,12 @@ from .update_manifest import batch_update_manifest, MANIFEST_PATH
 
 AVAILABLE_FUNCTIONS = [
     "eval_train_metrics",
-    "eval_attention_scores",
-    "eval_embed",
+    "eval_attention_scores",      # FAST: final checkpoint DAG metrics
+    "eval_attention_evolution",   # SLOW: evolution tracking across epochs
     "eval_interventions",
-    "eval_embedding_dag_correlation",
     "eval_dyconex_predictions",
-    "eval_ans",  # ANS evaluation for sweep experiments
-    "eval_d_model_sweep",  # d_model × seed sweep evaluation
+    "eval_ans",                   # ANS evaluation for sweep experiments
+    "eval_d_model_sweep",         # d_model × seed sweep evaluation
     "fix_kfold_summary",
     "enrich_kfold_summary",
 ]

@@ -30,16 +30,20 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_
 
 **Available functions:**
 
-| Function | Description |
-|----------|-------------|
-| `eval_train_metrics` | Training curves, loss analysis, and instability metrics |
-| `eval_attention_scores` | DAG recovery metrics (phi, attention) |
-| `eval_embed` | Embedding evolution analysis |
-| `eval_interventions` | Causal intervention tests |
-| `eval_embedding_dag_correlation` | Embedding-DAG correlation |
-| `eval_dyconex_predictions` | Dyconex-specific prediction evaluation |
-| `fix_kfold_summary` | Fix tensor strings in kfold_summary.json |
-| `enrich_kfold_summary` | Add aggregated statistics to kfold_summary |
+| Function | Description | Status |
+|----------|-------------|--------|
+| `eval_train_metrics` | Training curves, loss analysis, and instability metrics | ✓ Active |
+| `eval_attention_scores` | DAG recovery metrics (phi, attention) - FAST | ✓ Active |
+| `eval_attention_evolution` | Track attention/phi across epochs - SLOW | ⚠ Disabled |
+| `eval_interventions` | Causal intervention tests (ATE) | ✓ Active |
+| `eval_d_model_sweep` | d_model × seed sweep analysis | ✓ Active |
+| `eval_dyconex_predictions` | Dyconex-specific prediction evaluation | ✓ Active |
+| `fix_kfold_summary` | Fix tensor strings in kfold_summary.json | ✓ Active |
+| `enrich_kfold_summary` | Add aggregated statistics to kfold_summary | ✓ Active |
+| `eval_embed` | Embedding evolution analysis | ⚠ Disabled |
+| `eval_embedding_dag_correlation` | Embedding-DAG correlation | ⚠ Disabled |
+
+> **Note:** `eval_embed` and `eval_embedding_dag_correlation` are currently disabled in the wrapper functions.
 
 ---
 
@@ -73,6 +77,27 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli manifest -f experiments/eul
 
 ```bash
 python -m causaliT.evaluation.eval_funs.eval_ans experiments/ANS_sweep_exp --no-show
+```
+
+---
+
+## Checkpoint Selection
+
+For causal discovery evaluations (`eval_attention_scores`, `load_attention_data`), the **last checkpoint** is used by default instead of the "best" checkpoint. This is because:
+
+- **"best"** selects based on prediction loss, not causal correctness
+- Causal regularizers (HSIC, sparsity) may need more epochs to converge
+- **"last"** represents the model's final DAG hypothesis
+
+To override this behavior in the Python API:
+```python
+from causaliT.evaluation.eval_funs import load_attention_data
+
+# Use last checkpoint (default for causal analysis)
+data = load_attention_data("experiments/my_exp", checkpoint_type="last")
+
+# Use best checkpoint (prediction-optimized)
+data = load_attention_data("experiments/my_exp", checkpoint_type="best")
 ```
 
 ---

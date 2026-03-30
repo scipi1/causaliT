@@ -104,6 +104,54 @@ def _load_ate_metrics(run_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _load_ate_metrics_per_fold(run_path: str) -> Dict[str, Dict[str, float]]:
+    """
+    Load ate_metrics.csv and aggregate ATE errors per fold.
+    
+    Returns:
+        Dict mapping fold_name -> {
+            'ate_mean_abs_error': float,     # Mean abs error across all interventions
+            'ate_median_abs_error': float,   # Median abs error
+            'ate_std_abs_error': float,      # Std of abs errors (consistency)
+            'ate_max_abs_error': float,      # Max abs error (worst case)
+            'ate_n_interventions': int,      # Number of intervention×variable pairs
+        }
+    """
+    ate_csv_path = join(run_path, "eval", "eval_do", "default", "files", "ate_metrics.csv")
+    
+    if not exists(ate_csv_path):
+        return {}
+    
+    try:
+        df = pd.read_csv(ate_csv_path)
+        
+        if 'kfold' not in df.columns or 'abs_error' not in df.columns:
+            print(f"Warning: ate_metrics.csv missing required columns in {run_path}")
+            return {}
+        
+        result = {}
+        
+        for fold_name, fold_df in df.groupby('kfold'):
+            abs_errors = fold_df['abs_error'].dropna().values
+            
+            if len(abs_errors) == 0:
+                continue
+            
+            result[fold_name] = {
+                'ate_mean_abs_error': float(np.mean(abs_errors)),
+                'ate_median_abs_error': float(np.median(abs_errors)),
+                'ate_std_abs_error': float(np.std(abs_errors)),
+                'ate_max_abs_error': float(np.max(abs_errors)),
+                'ate_n_interventions': int(len(abs_errors)),
+            }
+        
+        return result
+        
+    except Exception as e:
+        print(f"Warning: Could not load ate_metrics.csv from {run_path}: {e}")
+        return {}
+
+
 def _load_training_hsic_per_fold(run_path: str) -> Dict[str, Dict[str, float]]:
     """
     Load training metrics.csv from all k-folds and compute HSIC statistics over epochs.
@@ -115,6 +163,7 @@ def _load_training_hsic_per_fold(run_path: str) -> Dict[str, Dict[str, float]]:
             'train_hsic_min_over_epochs': X,
             'train_hsic_final': X,
             'val_hsic_mean_over_epochs': X,
+            'train_hsic_x_mean_over_epochs': X,  # HSIC for X→X independence
             ...
         }
     """
@@ -138,6 +187,7 @@ def _load_training_hsic_per_fold(run_path: str) -> Dict[str, Dict[str, float]]:
             df = pd.read_csv(metrics_path)
             fold_stats = {}
             
+            # HSIC for S→X (original)
             if 'train_hsic' in df.columns:
                 train_hsic = df['train_hsic'].dropna().values
                 if len(train_hsic) > 0:
@@ -153,6 +203,23 @@ def _load_training_hsic_per_fold(run_path: str) -> Dict[str, Dict[str, float]]:
                     fold_stats['val_hsic_max_over_epochs'] = float(np.max(val_hsic))
                     fold_stats['val_hsic_min_over_epochs'] = float(np.min(val_hsic))
                     fold_stats['val_hsic_final'] = float(val_hsic[-1])
+            
+            # HSIC_X for X→X independence (self-attention DAG)
+            if 'train_hsic_x' in df.columns:
+                train_hsic_x = df['train_hsic_x'].dropna().values
+                if len(train_hsic_x) > 0:
+                    fold_stats['train_hsic_x_mean_over_epochs'] = float(np.mean(train_hsic_x))
+                    fold_stats['train_hsic_x_max_over_epochs'] = float(np.max(train_hsic_x))
+                    fold_stats['train_hsic_x_min_over_epochs'] = float(np.min(train_hsic_x))
+                    fold_stats['train_hsic_x_final'] = float(train_hsic_x[-1])
+            
+            if 'val_hsic_x' in df.columns:
+                val_hsic_x = df['val_hsic_x'].dropna().values
+                if len(val_hsic_x) > 0:
+                    fold_stats['val_hsic_x_mean_over_epochs'] = float(np.mean(val_hsic_x))
+                    fold_stats['val_hsic_x_max_over_epochs'] = float(np.max(val_hsic_x))
+                    fold_stats['val_hsic_x_min_over_epochs'] = float(np.min(val_hsic_x))
+                    fold_stats['val_hsic_x_final'] = float(val_hsic_x[-1])
             
             result[kfold_dir] = fold_stats
                     
@@ -266,7 +333,7 @@ def eval_d_model_sweep(
     
     sweep_labels = {
         "description": "d_model × seed sweep evaluation - per-fold raw data (no aggregation)",
-        "purpose": "Identify minimum model complexity threshold where HSIC can proxy for correct causal structure",
+        "purpose": "Analyze correlation between val_hsic and ATE error to evaluate fold selection strategy",
         "columns": {
             "run_name": "Folder name of the sweep run",
             "d_model": "Model dimensionality (embedding/hidden dimension)",
@@ -274,22 +341,39 @@ def eval_d_model_sweep(
             "fold": "K-fold identifier (k_0, k_1, ...)",
             "shd_cross": "Soft Hamming Distance for S→X edges (lower is better)",
             "shd_self": "Soft Hamming Distance for X→X edges",
-            "test_hsic": "HSIC on test set (lower = more independent residuals)",
-            "val_hsic": "HSIC on validation set",
-            "train_hsic_mean_over_epochs": "Average train HSIC over all training epochs",
-            "train_hsic_max_over_epochs": "Maximum train HSIC during training",
-            "train_hsic_min_over_epochs": "Minimum train HSIC during training",
-            "train_hsic_final": "Train HSIC at last training epoch",
-            "val_hsic_mean_over_epochs": "Average val HSIC over all training epochs",
-            "val_hsic_max_over_epochs": "Maximum val HSIC during training",
-            "val_hsic_min_over_epochs": "Minimum val HSIC during training",
-            "val_hsic_final": "Val HSIC at last training epoch",
+            # HSIC for S→X (cross-attention)
+            "test_hsic": "HSIC(S, residuals) on test set - measures S→X independence",
+            "val_hsic": "HSIC(S, residuals) on validation set",
+            "train_hsic_mean_over_epochs": "Average train HSIC(S, residuals) over all epochs",
+            "train_hsic_max_over_epochs": "Maximum train HSIC(S, residuals) during training",
+            "train_hsic_min_over_epochs": "Minimum train HSIC(S, residuals) during training",
+            "train_hsic_final": "Train HSIC(S, residuals) at last epoch",
+            "val_hsic_mean_over_epochs": "Average val HSIC(S, residuals) over all epochs",
+            "val_hsic_max_over_epochs": "Maximum val HSIC(S, residuals) during training",
+            "val_hsic_min_over_epochs": "Minimum val HSIC(S, residuals) during training",
+            "val_hsic_final": "Val HSIC(S, residuals) at last epoch",
+            # HSIC_X for X→X (self-attention)
+            "train_hsic_x_mean_over_epochs": "Average train HSIC(X, per-X residuals) - measures X→X independence",
+            "train_hsic_x_max_over_epochs": "Maximum train HSIC_X during training",
+            "train_hsic_x_min_over_epochs": "Minimum train HSIC_X during training",
+            "train_hsic_x_final": "Train HSIC_X at last epoch",
+            "val_hsic_x_mean_over_epochs": "Average val HSIC(X, per-X residuals) over all epochs",
+            "val_hsic_x_max_over_epochs": "Maximum val HSIC_X during training",
+            "val_hsic_x_min_over_epochs": "Minimum val HSIC_X during training",
+            "val_hsic_x_final": "Val HSIC_X at last epoch",
+            # ATE (Average Treatment Effect) metrics
+            "ate_mean_abs_error": "Mean absolute ATE error across all interventions for this fold",
+            "ate_median_abs_error": "Median absolute ATE error across all interventions",
+            "ate_std_abs_error": "Std of absolute ATE errors (fold consistency measure)",
+            "ate_max_abs_error": "Maximum absolute ATE error (worst case intervention)",
+            "ate_n_interventions": "Number of intervention×variable pairs evaluated",
+            # Performance metrics
             "test_loss": "Test loss (NLL for NoiseAware)",
             "test_r2": "Test R²",
             "test_mae": "Test MAE",
             "test_rmse": "Test RMSE",
         },
-        "note": "This file contains per-fold data. Aggregate in your notebook as needed.",
+        "note": "Use val_hsic vs ate_mean_abs_error correlation to evaluate if min(val_hsic) selects best fold.",
     }
     _save_variable_labels(eval_path_files, sweep_labels, "sweep_labels.json")
     
@@ -342,6 +426,7 @@ def eval_d_model_sweep(
         kfold_data = _load_kfold_summary(run_path)
         dag_data = _load_dag_metrics(run_path)
         ate_data = _load_ate_metrics(run_path)
+        ate_per_fold_data = _load_ate_metrics_per_fold(run_path)
         hsic_training_data = _load_training_hsic_per_fold(run_path)
         
         if kfold_data is None:
@@ -403,6 +488,12 @@ def eval_d_model_sweep(
                 for hsic_key, hsic_val in fold_hsic.items():
                     record[hsic_key] = hsic_val
             
+            # Extract ATE metrics for this fold
+            if fold_name in ate_per_fold_data:
+                fold_ate = ate_per_fold_data[fold_name]
+                for ate_key, ate_val in fold_ate.items():
+                    record[ate_key] = ate_val
+            
             all_records.append(record)
         
         print(f"  ✓ {run_folder}: d_model={d_model}, seed={seed}, {len(fold_results)} folds")
@@ -436,6 +527,106 @@ def eval_d_model_sweep(
     print(f"{'='*60}")
     
     return df
+
+
+# =============================================================================
+# HSIC vs ATE Correlation Analysis
+# =============================================================================
+
+def analyze_hsic_ate_correlation(
+    df: pd.DataFrame,
+    hsic_column: str = "val_hsic",
+    ate_column: str = "ate_mean_abs_error",
+    print_results: bool = True,
+) -> Dict[str, Any]:
+    """
+    Analyze correlation between HSIC and ATE error across all folds.
+    
+    Returns the raw dataframe with all k-folds and computes only overall correlation.
+    Per-group analysis can be done in a notebook.
+    
+    Args:
+        df: DataFrame from eval_d_model_sweep containing val_hsic and ate_mean_abs_error
+        hsic_column: Column name for HSIC metric (default: "val_hsic")
+        ate_column: Column name for ATE error metric (default: "ate_mean_abs_error")
+        print_results: Whether to print summary results
+        
+    Returns:
+        Dict containing:
+            - df: Raw DataFrame with all folds (filtered to valid rows)
+            - overall_spearman: Spearman correlation (all data pooled)
+            - overall_spearman_pval: p-value for Spearman
+            - overall_pearson: Pearson correlation (all data pooled)
+            - overall_pearson_pval: p-value for Pearson
+            - n_samples: Number of valid samples
+    
+    Example:
+        >>> df = eval_d_model_sweep("experiments/.../sweep_d_model_61106018")
+        >>> results = analyze_hsic_ate_correlation(df)
+        >>> # Access raw data for custom analysis
+        >>> raw_df = results['df']
+        >>> print(f"Spearman: {results['overall_spearman']:.4f}")
+    """
+    from scipy import stats
+    
+    # Ensure required columns exist
+    required_cols = [hsic_column, ate_column, 'd_model', 'seed', 'fold']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    # Filter to rows with valid values
+    df_valid = df.dropna(subset=[hsic_column, ate_column]).copy()
+    
+    if len(df_valid) == 0:
+        raise ValueError(f"No valid data with both {hsic_column} and {ate_column}")
+    
+    results = {}
+    
+    # Store raw dataframe
+    results['df'] = df_valid
+    results['n_samples'] = len(df_valid)
+    
+    # =========================================================================
+    # Overall correlation (all data pooled)
+    # =========================================================================
+    
+    overall_spearman, spearman_pval = stats.spearmanr(
+        df_valid[hsic_column], df_valid[ate_column]
+    )
+    overall_pearson, pearson_pval = stats.pearsonr(
+        df_valid[hsic_column], df_valid[ate_column]
+    )
+    
+    results['overall_spearman'] = overall_spearman
+    results['overall_spearman_pval'] = spearman_pval
+    results['overall_pearson'] = overall_pearson
+    results['overall_pearson_pval'] = pearson_pval
+    
+    # =========================================================================
+    # Print results
+    # =========================================================================
+    
+    if print_results:
+        print("\n" + "="*70)
+        print("HSIC vs ATE Error Correlation Analysis")
+        print("="*70)
+        
+        print(f"\n--- Overall Correlation (n={len(df_valid)}) ---")
+        print(f"  Spearman: {overall_spearman:.4f} (p={spearman_pval:.2e})")
+        print(f"  Pearson:  {overall_pearson:.4f} (p={pearson_pval:.2e})")
+        
+        print(f"\n--- Data Summary ---")
+        print(f"  Total folds: {len(df_valid)}")
+        print(f"  d_model values: {sorted(df_valid['d_model'].unique())}")
+        print(f"  Seeds: {sorted(df_valid['seed'].unique())}")
+        
+        print(f"\n--- Columns available for analysis ---")
+        print(f"  {list(df_valid.columns)}")
+        
+        print("="*70)
+    
+    return results
 
 
 # =============================================================================
