@@ -62,8 +62,8 @@ experiment:
   batch_size: 64
   max_epochs: 100
   
-  # Attention types (options: ScaledDotProduct, LieAttention, PhiSoftMax, ToeplitzLieAttention)
-  dec_self_attention_type: "ScaledDotProduct"
+  # Attention types (options: ScaledDotProduct, ToeplitzAttention)
+  dec_self_attention_type: "ToeplitzAttention"
   dec_cross_attention_type: "ScaledDotProduct"
 
 
@@ -276,8 +276,22 @@ training:
   lambda_kl: 0.0
   adaptive_z_scaling: true
   
-  # Embedding L1 (for ANS experiments)
-  lambda_embed_l1: 0.0
+  # =========================================================================
+  # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
+  # =========================================================================
+  # Encourages entire embedding dimensions to go to zero,
+  # effectively reducing d_model and constraining model capacity.
+  # This is the Group LASSO regularizer (Yuan & Lin, 2006).
+  # 
+  # Unlike element-wise L1: Group L1 zeroes out entire dimensions,
+  # truly reducing capacity rather than just sparsifying individual weights.
+  # 
+  # Used for:
+  # - ANS (Attention Necessity Score) experiments
+  # - Staged training calibration (balancing HSIC gradient signal)
+  # - Capacity control for causal structure learning
+  lambda_group_l1: 0.0
+  log_group_l1: false
   
   # =========================================================================
   # HARD MASKS
@@ -288,15 +302,51 @@ training:
     dec_self: "dec1_self_att_mask.csv"
 
 
+
+# =============================================================================
+# STAGED TRAINING
+# =============================================================================
+# Enable multi-stage training pipeline for robust causal structure learning:
+# Stage 0 (Calibration): Find λ_group for gradient balance
+# Stage 1 (Causal Init): Pre-train with high HSIC for structure initialization
+# Stage 2 (Main Training): Standard training with calibrated regularization
+#
+# To run: python -m causaliT.cli staged_train --exp_id <experiment>
+# =============================================================================
+staged_training:
+  # Master switches (both off by default for backward compatibility)
+  use_calibration: false
+  use_causal_init: false
+  
+  # Stage 0: Calibration
+  calibration_epochs: 10            # Epochs per calibration trial
+  calibration_balance_threshold: 2.0  # Ratio threshold for "balanced" gradients
+  calibration_lambda_group_range: [1.0e-5, 1.0e-1]  # Search range for λ_group
+  calibration_max_iterations: 10    # Max binary search iterations
+  
+  # Stage 1: Causal Initialization
+  # Pre-train with HSIC-dominated loss to initialize toward causal structure.
+  # The model learns the causal mechanism before fitting pressure takes over.
+  causal_init_epochs: 20            # Epochs for causal initialization
+  causal_init_hsic_multiplier: 10.0 # λ_hsic_init = λ_hsic_base × multiplier
+  
+  # Manual override for λ_group (skip calibration if already known)
+  # Set to null to use calibration result or training.lambda_group_l1
+  lambda_group_l1: null
+
+
+# =========================================================================
+# DATA
+# =========================================================================
 data:
-  dataset: "scm6"           # Dataset name (folder in data/)
+  dataset: "scm1"           # Dataset name (folder in data/)
   filename_input: "ds.npz"  # Single file (used when train_file/test_file are null)
   
   # Pre-split train/test files (optional)
   # If both are specified and exist, they will be used INSTEAD of filename_input
   # Set both to null to use the single filename_input file
-  train_file: null          # e.g., "ds_train.npz" for holdout split datasets
-  test_file: null           # e.g., "ds_test.npz" for holdout split datasets
+  train_file: "ds_train.npz" # e.g., "ds_train.npz" for holdout split datasets
+  test_file: "ds_test.npz"   # e.g., "ds_test.npz" for holdout split datasets
   
   val_idx: ${data.feature_indices.value}
   test_ds_ixd: null
@@ -334,7 +384,6 @@ data:
 
 evaluation:
   functions: []
-
 
 special:
   mode: []

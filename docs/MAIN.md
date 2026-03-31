@@ -215,3 +215,9 @@ Also lambda we should do a sweep and find the combination that lowers the test l
 ## Test loss as a proxy for generalization
 In the case of discrete $S$ sampling we can leave out one choice for testing. This would be 100% unseen during training, ensuring that the test metrics capture the generalization. What if we use a sort of cross split where we keep out one "label" at a time, and use it to calculate the HSIC instead of the validation loss, which contains S data that we also used for training? In this way HSIC is unbiased.
 
+
+## Clean Code
+- old experiment ID in training
+- make many loggins ON by default and delete option, always log
+- trim very long comments/explanations
+- adjust config templates

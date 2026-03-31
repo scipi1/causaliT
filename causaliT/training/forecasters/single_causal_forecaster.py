@@ -127,11 +127,27 @@ class SingleCausalForecaster(pl.LightningModule):
         self.target_tau = config["training"].get("target_tau", 0.1)
         self.log_decisiveness = config["training"].get("log_decisiveness", False)
         
-        # Embedding L1 regularization - limits embedding capacity for causal capacity assessment
-        # Higher lambda_embed_l1 → sparser/lower-capacity embeddings
-        # Used in ANS (Attention Necessity Score) evaluation to determine if attention is necessary
-        self.lambda_embed_l1 = config["training"].get("lambda_embed_l1", 0.0)
-        self.log_embed_l1 = config["training"].get("log_embed_l1", False)
+        # =====================================================================
+        # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
+        # =====================================================================
+        # This encourages entire embedding dimensions to go to zero,
+        # effectively reducing d_model and constraining model capacity.
+        # Unlike element-wise L1, group L1 creates a true information bottleneck.
+        # Used in staged training for calibration and causal initialization.
+        # Also replaces old lambda_embed_l1 for ANS (Attention Necessity Score) evaluation.
+        # 
+        # Backward compatibility: falls back to lambda_embed_l1 if lambda_group_l1 not specified
+        self.lambda_group_l1 = config["training"].get("lambda_group_l1", 
+                                   config["training"].get("lambda_embed_l1", 0.0))
+        self.log_group_l1 = config["training"].get("log_group_l1",
+                                config["training"].get("log_embed_l1", False))
+        
+        # =====================================================================
+        # GRADIENT NORM LOGGING (for calibration stage)
+        # =====================================================================
+        # When enabled, logs separate gradient norms for reconstruction and HSIC losses.
+        # Used during calibration to find λ_group that balances gradient signals.
+        self.log_gradient_norms = config["training"].get("log_gradient_norms", False)
         
         if self.lambda_decisive_cross is None:
             self.lambda_decisive_cross = self.lambda_decisive
@@ -546,14 +562,152 @@ class SingleCausalForecaster(pl.LightningModule):
             self.lambda_tau * (tau_self_loss + tau_cross_loss)
         )
         
-        # Embedding L1 regularizer - limits embedding capacity
-        # Used for Attention Necessity Score (ANS) evaluation
-        if self.lambda_embed_l1 > 0 or self.log_embed_l1:
-            embed_l1_loss = self._compute_embedding_l1()
-            embed_l1_regularizer = self.lambda_embed_l1 * embed_l1_loss
+        # =====================================================================
+        # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
+        # =====================================================================
+        # Encourages entire embedding dimensions to go to zero, creating an
+        # information bottleneck that makes the HSIC signal meaningful.
+        # Unlike element-wise L1, this truly reduces effective d_model.
+        # Replaces old embed_l1 regularizer with more principled group sparsity.
+        if self.lambda_group_l1 > 0 or self.log_group_l1:
+            group_l1_loss, effective_dims = self._compute_group_l1()
+            group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
         else:
-            embed_l1_loss = torch.tensor(0.0, device=x_target.device)
-            embed_l1_regularizer = 0.0
+            group_l1_loss = torch.tensor(0.0, device=x_target.device)
+            effective_dims = None
+            group_l1_regularizer = 0.0
+        
+        # =====================================================================
+        # GRADIENT AND UPDATE SIGNAL LOGGING (for two-step calibration)
+        # =====================================================================
+        # When enabled, computes BOTH:
+        # 1. BASE GRADIENTS - for Step 1 (sparsity calibration via λ_group)
+        # 2. UPDATE SIGNALS - for Step 2 (λ_hsic selection and verification)
+        #
+        # Two-Step Calibration Process:
+        # Step 1: Find λ_group to make HSIC landscape non-flat
+        #   - Use BASE gradient ratios (train_grad_ratio_*)
+        #   - Target: bring base ratio toward 1.0 via sparsity
+        #   - Output: λ_group_optimal, final_base_ratio
+        #
+        # Step 2: Select λ_hsic and verify balance
+        #   - Set λ_hsic = final_base_ratio (makes update_ratio ≈ 1.0)
+        #   - Verify with UPDATE ratios (train_update_ratio_*)
+        #   - Output: suggested λ_hsic values
+        #
+        # Why both metrics?
+        # - Base gradients reflect the HSIC landscape shape (sparsity effect)
+        # - Update signals reflect the actual learning contribution (λ effect)
+        # - Step 1 uses sparsity to shape the landscape
+        # - Step 2 uses λ to balance the learning signals
+        if self.log_gradient_norms and stage == "train":
+            # Compute gradient norms for each loss component separately
+            # Using torch.autograd.grad to compute gradients without accumulating
+            
+            def _compute_grad_norm(loss_tensor, model_params):
+                """Compute Frobenius norm of gradients for a loss component."""
+                if loss_tensor == 0.0 or not isinstance(loss_tensor, torch.Tensor):
+                    return torch.tensor(0.0, device=x_target.device)
+                
+                grads = torch.autograd.grad(
+                    loss_tensor, model_params, 
+                    retain_graph=True, allow_unused=True, create_graph=False
+                )
+                total_norm = 0.0
+                for g in grads:
+                    if g is not None:
+                        total_norm += g.norm(2).item() ** 2
+                return torch.tensor(total_norm ** 0.5, device=x_target.device)
+            
+            # Get list of model parameters with gradients
+            params_with_grad = [p for p in self.model.parameters() if p.requires_grad]
+            
+            # =================================================================
+            # RECONSTRUCTION GRADIENT (same for base and update, implicit λ=1)
+            # =================================================================
+            recon_grad_norm = _compute_grad_norm(loss_x, params_with_grad)
+            self.log("train_recon_grad_norm", recon_grad_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # HSIC CROSS - BASE GRADIENT AND UPDATE SIGNAL
+            # =================================================================
+            hsic_cross_base_grad = torch.tensor(0.0, device=x_target.device)
+            hsic_cross_update_norm = torch.tensor(0.0, device=x_target.device)
+            
+            if hsic_cross_value is not None and isinstance(hsic_cross_value, torch.Tensor):
+                # BASE gradient: ||∇ hsic_cross_value|| (no lambda)
+                hsic_cross_base_grad = _compute_grad_norm(hsic_cross_value, params_with_grad)
+                
+                # UPDATE signal: λ * ||∇ hsic_cross_value||
+                # Note: SingleCausalForecaster uses MSE, no loss normalization needed
+                hsic_cross_update_norm = self.lambda_hsic_cross * hsic_cross_base_grad
+            
+            # Log BASE gradient (for Step 1: sparsity calibration)
+            self.log("train_hsic_cross_grad_norm", hsic_cross_base_grad, on_step=False, on_epoch=True)
+            # Log UPDATE signal (for Step 2: verification)
+            self.log("train_hsic_cross_update_norm", hsic_cross_update_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # HSIC SELF - BASE GRADIENT AND UPDATE SIGNAL
+            # =================================================================
+            hsic_self_base_grad = torch.tensor(0.0, device=x_target.device)
+            hsic_self_update_norm = torch.tensor(0.0, device=x_target.device)
+            
+            if hsic_self_value is not None and isinstance(hsic_self_value, torch.Tensor):
+                # BASE gradient: ||∇ hsic_self_value|| (no lambda)
+                hsic_self_base_grad = _compute_grad_norm(hsic_self_value, params_with_grad)
+                
+                # UPDATE signal: λ * ||∇ hsic_self_value||
+                hsic_self_update_norm = self.lambda_hsic_self * hsic_self_base_grad
+            
+            # Log BASE gradient (for Step 1: sparsity calibration)
+            self.log("train_hsic_self_grad_norm", hsic_self_base_grad, on_step=False, on_epoch=True)
+            # Log UPDATE signal (for Step 2: verification)
+            self.log("train_hsic_self_update_norm", hsic_self_update_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # BASE GRADIENT RATIOS (for Step 1: sparsity calibration)
+            # =================================================================
+            # These ratios are independent of λ_hsic
+            # Step 1 tries to bring these toward 1.0 via λ_group (sparsity)
+            if hsic_cross_base_grad > 1e-10:
+                ratio_cross = recon_grad_norm / hsic_cross_base_grad
+                self.log("train_grad_ratio_cross", ratio_cross, on_step=False, on_epoch=True)
+            
+            if hsic_self_base_grad > 1e-10:
+                ratio_self = recon_grad_norm / hsic_self_base_grad
+                self.log("train_grad_ratio_self", ratio_self, on_step=False, on_epoch=True)
+            
+            # Min base ratio (for Step 1 convergence)
+            base_ratios = []
+            if hsic_cross_base_grad > 1e-10:
+                base_ratios.append(float(recon_grad_norm / hsic_cross_base_grad))
+            if hsic_self_base_grad > 1e-10:
+                base_ratios.append(float(recon_grad_norm / hsic_self_base_grad))
+            if base_ratios:
+                self.log("train_grad_ratio_min", min(base_ratios), on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # UPDATE SIGNAL RATIOS (for Step 2: verification)
+            # =================================================================
+            # These ratios reflect actual learning balance with current λ values
+            # After setting λ_hsic = base_ratio, update_ratio should be ≈ 1.0
+            if hsic_cross_update_norm > 1e-10:
+                update_ratio_cross = recon_grad_norm / hsic_cross_update_norm
+                self.log("train_update_ratio_cross", update_ratio_cross, on_step=False, on_epoch=True)
+            
+            if hsic_self_update_norm > 1e-10:
+                update_ratio_self = recon_grad_norm / hsic_self_update_norm
+                self.log("train_update_ratio_self", update_ratio_self, on_step=False, on_epoch=True)
+            
+            # Min update ratio (for Step 2 verification)
+            update_ratios = []
+            if hsic_cross_update_norm > 1e-10:
+                update_ratios.append(float(recon_grad_norm / hsic_cross_update_norm))
+            if hsic_self_update_norm > 1e-10:
+                update_ratios.append(float(recon_grad_norm / hsic_self_update_norm))
+            if update_ratios:
+                self.log("train_update_ratio_min", min(update_ratios), on_step=False, on_epoch=True)
         
         # Total loss
         total_loss = (loss_x + 
@@ -563,7 +717,7 @@ class SingleCausalForecaster(pl.LightningModule):
                      score_sparsity_regularizer +
                      hsic_regularizer +
                      decisiveness_regularizer +
-                     embed_l1_regularizer)
+                     group_l1_regularizer)
         
         # Log loss
         self.log(f"{stage}_loss_x", loss_x, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
@@ -616,10 +770,12 @@ class SingleCausalForecaster(pl.LightningModule):
                 if log_tau_gs_cross is not None:
                     self.log(f"{stage}_tau_gs_cross_value", torch.exp(log_tau_gs_cross), on_step=False, on_epoch=True)
         
-        # Log embedding L1 if requested
-        if self.log_embed_l1:
-            self.log(f"{stage}_embed_l1", embed_l1_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_embed_l1_reg", embed_l1_regularizer, on_step=False, on_epoch=True)
+        # Log group L1 if requested
+        if self.log_group_l1:
+            self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
+            if effective_dims is not None:
+                self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     
@@ -753,30 +909,69 @@ class SingleCausalForecaster(pl.LightningModule):
         expm_A = torch.matrix_exp(torch.relu(A))
         return torch.trace(expm_A) - d
     
-    def _compute_embedding_l1(self) -> torch.Tensor:
+    def _compute_group_l1(self) -> tuple:
         """
-        Compute L1 norm of X embedding parameters.
+        Compute Group L1 (L2,1 norm) on embedding columns - Group LASSO regularization.
         
-        This is used for capacity control in Attention Necessity Score (ANS) evaluation.
-        Higher L1 penalty → sparser embeddings → reduced capacity → forces attention to be useful.
+        This regularizer encourages entire embedding dimensions (columns) to go to zero,
+        effectively reducing d_model and creating an information bottleneck that makes
+        the HSIC signal meaningful during causal structure learning.
         
-        Only applies to learnable X embeddings (embedding_X), not to orthogonal S embeddings
-        which are frozen by design.
+        Unlike element-wise L1 (standard LASSO):
+        - Element-wise L1: Different variables can use different sparse dimensions
+        - Group L1 (L2,1): Entire dimensions are zeroed out, truly reducing capacity
+        
+        The L2,1 norm is computed as:
+            ||W||_{2,1} = Σ_j ||W[:,j]||_2 = Σ_j sqrt(Σ_i W[i,j]²)
+        
+        - L2 within columns: Keeps values within a column grouped together
+        - L1 over column norms: Induces sparsity at the column level (LASSO effect)
+        
+        References:
+            - Yuan & Lin (2006): "Model selection and estimation in regression with 
+              grouped variables" - Introduced Group LASSO
+            - Argyriou et al. (2008): Used L2,1 for multi-task feature learning
+            - Nie et al. (2010): "Efficient and Robust Feature Selection via 
+              Joint ℓ2,1-Norms Minimization"
         
         Returns:
-            torch.Tensor: Sum of absolute values of all X embedding parameters, 
-                         normalized by the number of parameters.
+            Tuple of:
+            - group_l1_loss: Normalized L2,1 norm of embedding weights
+            - effective_dims: Number of embedding dimensions with ||col||_2 > threshold
         """
-        l1_sum = torch.tensor(0.0, device=next(self.model.embedding_X.parameters()).device)
-        n_params = 0
+        device = next(self.model.embedding_X.parameters()).device
+        l21_norm = torch.tensor(0.0, device=device)
+        total_dims = 0
+        active_dims = 0
+        threshold = 1e-3  # Threshold for counting "active" dimensions
+        
+        # Get embedding weight matrices
+        # For nn.Embedding, weight shape is (num_embeddings, d_model)
+        # We want to regularize columns (dimensions) to encourage entire dimensions to be zero
         
         for p in self.model.embedding_X.parameters():
-            if p.requires_grad:  # Only count trainable parameters
-                l1_sum = l1_sum + p.abs().sum()
-                n_params += p.numel()
+            if p.requires_grad and p.dim() >= 2:
+                # Get weight matrix - shape is (num_embeddings, d_model) for Embedding
+                # or (out_features, in_features) for Linear
+                W = p
+                
+                # Compute L2 norm per column (dimension)
+                # For Embedding: columns are the embedding dimensions
+                # norm over dim=0 gives (d_model,) - one norm per dimension
+                l2_per_col = W.norm(p=2, dim=0)  # (d_model,)
+                
+                # Sum of L2 norms (L2,1 norm) - this is the Group LASSO penalty
+                l21_norm = l21_norm + l2_per_col.sum()
+                
+                # Count active dimensions
+                total_dims += l2_per_col.numel()
+                active_dims += (l2_per_col > threshold).sum().item()
         
-        # Normalize by number of parameters to make λ scale-independent
-        if n_params > 0:
-            l1_sum = l1_sum / n_params
+        # Normalize by total dimensions to make λ scale-independent
+        if total_dims > 0:
+            l21_norm = l21_norm / total_dims
         
-        return l1_sum
+        # Effective dimensions (float for logging)
+        effective_dims = torch.tensor(float(active_dims), device=device)
+        
+        return l21_norm, effective_dims

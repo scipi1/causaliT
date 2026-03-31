@@ -121,12 +121,20 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         #   - False: uniform HSIC (all edges weighted equally)
         #   - True: attention-weighted HSIC (higher penalty for strongly attended edges)
         # log_hsic: Log HSIC values during training
+        # normalize_hsic_by_loss: Scale HSIC by |loss_nll| to handle NLL scale differences
+        #   - Required for noise_aware because NLL has 1/σ² term that amplifies gradients
+        #   - Keeps λ_hsic at sensible values (~1-100) instead of needing millions
         self.lambda_hsic_cross = config["training"].get("lambda_hsic_cross", 
                                      config["training"].get("lambda_hsic", 0.0))  # Fallback to old name
         self.lambda_hsic_self = config["training"].get("lambda_hsic_self", 0.0)
         self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.log_hsic = config["training"].get("log_hsic", False)
+        
+        # NLL-aware HSIC normalization (critical for noise-aware training)
+        # When enabled: effective_hsic = lambda_hsic * |loss_nll| * hsic_value
+        # This ensures HSIC gradients scale with NLL gradients automatically
+        self.normalize_hsic_by_loss = config["training"].get("normalize_hsic_by_loss", False)
         
         # KL divergence prior regularization
         self.lambda_kl = config["training"].get("lambda_kl", 1.0)
@@ -146,6 +154,26 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.lambda_noise_prior = config["training"].get("lambda_noise_prior", 0.0)
         self.prior_sigma_A = config["training"].get("prior_sigma_A", 0.01)
         self.prior_sigma_R = config["training"].get("prior_sigma_R", 0.05)
+        
+        # =====================================================================
+        # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
+        # =====================================================================
+        # This encourages entire embedding dimensions to go to zero,
+        # effectively reducing d_model and constraining model capacity.
+        # Unlike element-wise L1, group L1 creates a true information bottleneck.
+        # Used in staged training for calibration and causal initialization.
+        # Backward compatibility: falls back to lambda_embed_l1 if lambda_group_l1 not specified
+        self.lambda_group_l1 = config["training"].get("lambda_group_l1", 
+                                   config["training"].get("lambda_embed_l1", 0.0))
+        self.log_group_l1 = config["training"].get("log_group_l1",
+                                config["training"].get("log_embed_l1", False))
+        
+        # =====================================================================
+        # GRADIENT NORM LOGGING (for calibration stage)
+        # =====================================================================
+        # When enabled, logs separate gradient norms for reconstruction and HSIC losses.
+        # Used during calibration to find λ_group that balances gradient signals.
+        self.log_gradient_norms = config["training"].get("log_gradient_norms", False)
         
         # =====================================================================
         # ANNEALING CONFIGURATION
@@ -457,10 +485,20 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # Encourages independence between residuals and parents (S for cross, X for self)
         # - use_attention_weighted_hsic=False: uniform weighting (all edges equal)
         # - use_attention_weighted_hsic=True: weight by attention scores
+        # - normalize_hsic_by_loss=True: scale HSIC by |loss_nll| for NLL training
         # =====================================================================
         hsic_regularizer = 0.0
         hsic_cross_value = None
         hsic_self_value = None
+        
+        # Compute loss normalization factor for NLL-aware HSIC
+        # This ensures HSIC gradients scale with NLL gradients, keeping λ_hsic sensible
+        # Without this, NLL's 1/σ² term amplifies gradients ~10,000-100,000x vs HSIC
+        if self.normalize_hsic_by_loss:
+            # Use |loss_nll| as scaling factor (detached to avoid second-order gradients)
+            hsic_loss_scale = torch.abs(loss_nll).detach()
+        else:
+            hsic_loss_scale = 1.0
         
         if self.lambda_hsic_cross > 0 or self.lambda_hsic_self > 0 or self.log_hsic:
             # Compute per-X residuals: (batch, seq_len_x)
@@ -485,7 +523,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                     mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
                     hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
                 
-                hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
+                # Apply loss-normalized scaling: effective_loss = λ * |loss_nll| * hsic
+                hsic_regularizer += self.lambda_hsic_cross * hsic_loss_scale * hsic_cross_value
             
             # X→X HSIC (self-attention)
             if self.lambda_hsic_self > 0 or self.log_hsic:
@@ -506,7 +545,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                         # Uniform weighting
                         hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
                     
-                    hsic_regularizer += self.lambda_hsic_self * hsic_self_value
+                    # Apply loss-normalized scaling
+                    hsic_regularizer += self.lambda_hsic_self * hsic_loss_scale * hsic_self_value
         
         # DAG Decisiveness regularizer
         decisive_self_loss = torch.tensor(0.0, device=x_target.device)
@@ -562,6 +602,155 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             )
         
         # =====================================================================
+        # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
+        # =====================================================================
+        # Encourages entire embedding dimensions to go to zero, creating an
+        # information bottleneck that makes the HSIC signal meaningful.
+        # Unlike element-wise L1, this truly reduces effective d_model.
+        if self.lambda_group_l1 > 0 or self.log_group_l1:
+            group_l1_loss, effective_dims = self._compute_group_l1()
+            group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
+        else:
+            group_l1_loss = torch.tensor(0.0, device=x_target.device)
+            effective_dims = None
+            group_l1_regularizer = 0.0
+        
+        # =====================================================================
+        # GRADIENT AND UPDATE SIGNAL LOGGING (for two-step calibration)
+        # =====================================================================
+        # When enabled, computes BOTH:
+        # 1. BASE GRADIENTS - for Step 1 (sparsity calibration via λ_group)
+        # 2. UPDATE SIGNALS - for Step 2 (λ_hsic selection and verification)
+        #
+        # Two-Step Calibration Process:
+        # Step 1: Find λ_group to make HSIC landscape non-flat
+        #   - Use BASE gradient ratios (train_grad_ratio_*)
+        #   - Target: bring base ratio toward 1.0 via sparsity
+        #   - Output: λ_group_optimal, final_base_ratio
+        #
+        # Step 2: Select λ_hsic and verify balance
+        #   - Set λ_hsic = final_base_ratio (makes update_ratio ≈ 1.0)
+        #   - Verify with UPDATE ratios (train_update_ratio_*)
+        #   - Output: suggested λ_hsic values
+        #
+        # Why both metrics?
+        # - Base gradients reflect the HSIC landscape shape (sparsity effect)
+        # - Update signals reflect the actual learning contribution (λ effect)
+        # - Step 1 uses sparsity to shape the landscape
+        # - Step 2 uses λ to balance the learning signals
+        if self.log_gradient_norms and stage == "train":
+            # Compute gradient norms for each loss component separately
+            # Using torch.autograd.grad to compute gradients without accumulating
+            
+            def _compute_grad_norm(loss_tensor, model_params):
+                """Compute Frobenius norm of gradients for a loss component."""
+                if loss_tensor == 0.0 or not isinstance(loss_tensor, torch.Tensor):
+                    return torch.tensor(0.0, device=x_target.device)
+                
+                grads = torch.autograd.grad(
+                    loss_tensor, model_params, 
+                    retain_graph=True, allow_unused=True, create_graph=False
+                )
+                total_norm = 0.0
+                for g in grads:
+                    if g is not None:
+                        total_norm += g.norm(2).item() ** 2
+                return torch.tensor(total_norm ** 0.5, device=x_target.device)
+            
+            # Get list of model parameters with gradients
+            params_with_grad = [p for p in self.model.parameters() if p.requires_grad]
+            
+            # =================================================================
+            # RECONSTRUCTION GRADIENT (same for base and update, implicit λ=1)
+            # =================================================================
+            recon_grad_norm = _compute_grad_norm(loss_nll, params_with_grad)
+            self.log("train_recon_grad_norm", recon_grad_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # HSIC CROSS - BASE GRADIENT AND UPDATE SIGNAL
+            # =================================================================
+            hsic_cross_base_grad = torch.tensor(0.0, device=x_target.device)
+            hsic_cross_update_norm = torch.tensor(0.0, device=x_target.device)
+            
+            if hsic_cross_value is not None and isinstance(hsic_cross_value, torch.Tensor):
+                # BASE gradient: ||∇ hsic_cross_value|| (no lambda)
+                hsic_cross_base_grad = _compute_grad_norm(hsic_cross_value, params_with_grad)
+                
+                # UPDATE signal: λ * [scale] * ||∇ hsic_cross_value||
+                hsic_cross_update_norm = self.lambda_hsic_cross * hsic_cross_base_grad
+                if self.normalize_hsic_by_loss:
+                    hsic_cross_update_norm = hsic_cross_update_norm * hsic_loss_scale
+            
+            # Log BASE gradient (for Step 1: sparsity calibration)
+            self.log("train_hsic_cross_grad_norm", hsic_cross_base_grad, on_step=False, on_epoch=True)
+            # Log UPDATE signal (for Step 2: verification)
+            self.log("train_hsic_cross_update_norm", hsic_cross_update_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # HSIC SELF - BASE GRADIENT AND UPDATE SIGNAL
+            # =================================================================
+            hsic_self_base_grad = torch.tensor(0.0, device=x_target.device)
+            hsic_self_update_norm = torch.tensor(0.0, device=x_target.device)
+            
+            if hsic_self_value is not None and isinstance(hsic_self_value, torch.Tensor):
+                # BASE gradient: ||∇ hsic_self_value|| (no lambda)
+                hsic_self_base_grad = _compute_grad_norm(hsic_self_value, params_with_grad)
+                
+                # UPDATE signal: λ * [scale] * ||∇ hsic_self_value||
+                hsic_self_update_norm = self.lambda_hsic_self * hsic_self_base_grad
+                if self.normalize_hsic_by_loss:
+                    hsic_self_update_norm = hsic_self_update_norm * hsic_loss_scale
+            
+            # Log BASE gradient (for Step 1: sparsity calibration)
+            self.log("train_hsic_self_grad_norm", hsic_self_base_grad, on_step=False, on_epoch=True)
+            # Log UPDATE signal (for Step 2: verification)
+            self.log("train_hsic_self_update_norm", hsic_self_update_norm, on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # BASE GRADIENT RATIOS (for Step 1: sparsity calibration)
+            # =================================================================
+            # These ratios are independent of λ_hsic
+            # Step 1 tries to bring these toward 1.0 via λ_group (sparsity)
+            if hsic_cross_base_grad > 1e-10:
+                ratio_cross = recon_grad_norm / hsic_cross_base_grad
+                self.log("train_grad_ratio_cross", ratio_cross, on_step=False, on_epoch=True)
+            
+            if hsic_self_base_grad > 1e-10:
+                ratio_self = recon_grad_norm / hsic_self_base_grad
+                self.log("train_grad_ratio_self", ratio_self, on_step=False, on_epoch=True)
+            
+            # Min base ratio (for Step 1 convergence)
+            base_ratios = []
+            if hsic_cross_base_grad > 1e-10:
+                base_ratios.append(float(recon_grad_norm / hsic_cross_base_grad))
+            if hsic_self_base_grad > 1e-10:
+                base_ratios.append(float(recon_grad_norm / hsic_self_base_grad))
+            if base_ratios:
+                self.log("train_grad_ratio_min", min(base_ratios), on_step=False, on_epoch=True)
+            
+            # =================================================================
+            # UPDATE SIGNAL RATIOS (for Step 2: verification)
+            # =================================================================
+            # These ratios reflect actual learning balance with current λ values
+            # After setting λ_hsic = base_ratio, update_ratio should be ≈ 1.0
+            if hsic_cross_update_norm > 1e-10:
+                update_ratio_cross = recon_grad_norm / hsic_cross_update_norm
+                self.log("train_update_ratio_cross", update_ratio_cross, on_step=False, on_epoch=True)
+            
+            if hsic_self_update_norm > 1e-10:
+                update_ratio_self = recon_grad_norm / hsic_self_update_norm
+                self.log("train_update_ratio_self", update_ratio_self, on_step=False, on_epoch=True)
+            
+            # Min update ratio (for Step 2 verification)
+            update_ratios = []
+            if hsic_cross_update_norm > 1e-10:
+                update_ratios.append(float(recon_grad_norm / hsic_cross_update_norm))
+            if hsic_self_update_norm > 1e-10:
+                update_ratios.append(float(recon_grad_norm / hsic_self_update_norm))
+            if update_ratios:
+                self.log("train_update_ratio_min", min(update_ratios), on_step=False, on_epoch=True)
+        
+        # =====================================================================
         # TOTAL LOSS
         # =====================================================================
         
@@ -572,7 +761,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                      score_sparsity_regularizer +
                      hsic_regularizer +
                      decisiveness_regularizer +
-                     noise_prior_regularizer)
+                     noise_prior_regularizer +
+                     group_l1_regularizer)
         
         # =====================================================================
         # LOGGING
@@ -628,6 +818,13 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         if self.log_decisiveness:
             self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
             self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
+        
+        # Log group L1 if requested
+        if self.log_group_l1:
+            self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+            self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
+            if effective_dims is not None:
+                self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
         
         return total_loss, mu, log_var, X
     
@@ -751,6 +948,66 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         d = A.shape[0]
         expm_A = torch.matrix_exp(torch.relu(A))
         return torch.trace(expm_A) - d
+    
+    def _compute_group_l1(self) -> tuple:
+        """
+        Compute Group L1 (L2,1 norm) on embedding columns - Group LASSO regularization.
+        
+        This regularizer encourages entire embedding dimensions (columns) to go to zero,
+        effectively reducing d_model and creating an information bottleneck that makes
+        the HSIC signal meaningful during causal structure learning.
+        
+        Unlike element-wise L1 (standard LASSO):
+        - Element-wise L1: Different variables can use different sparse dimensions
+        - Group L1 (L2,1): Entire dimensions are zeroed out, truly reducing capacity
+        
+        The L2,1 norm is computed as:
+            ||W||_{2,1} = Σ_j ||W[:,j]||_2 = Σ_j sqrt(Σ_i W[i,j]²)
+        
+        - L2 within columns: Keeps values within a column grouped together
+        - L1 over column norms: Induces sparsity at the column level (LASSO effect)
+        
+        Returns:
+            Tuple of:
+            - group_l1_loss: Normalized L2,1 norm of embedding weights
+            - effective_dims: Number of embedding dimensions with ||col||_2 > threshold
+        """
+        device = next(self.model.embedding_X.parameters()).device
+        l21_norm = torch.tensor(0.0, device=device)
+        total_dims = 0
+        active_dims = 0
+        threshold = 1e-3  # Threshold for counting "active" dimensions
+        
+        # Get embedding weight matrices
+        # For nn.Embedding, weight shape is (num_embeddings, d_model)
+        # We want to regularize columns (dimensions) to encourage entire dimensions to be zero
+        
+        for p in self.model.embedding_X.parameters():
+            if p.requires_grad and p.dim() >= 2:
+                # Get weight matrix - shape is (num_embeddings, d_model) for Embedding
+                # or (out_features, in_features) for Linear
+                W = p
+                
+                # Compute L2 norm per column (dimension)
+                # For Embedding: columns are the embedding dimensions
+                # norm over dim=0 gives (d_model,) - one norm per dimension
+                l2_per_col = W.norm(p=2, dim=0)  # (d_model,)
+                
+                # Sum of L2 norms (L2,1 norm) - this is the Group LASSO penalty
+                l21_norm = l21_norm + l2_per_col.sum()
+                
+                # Count active dimensions
+                total_dims += l2_per_col.numel()
+                active_dims += (l2_per_col > threshold).sum().item()
+        
+        # Normalize by total dimensions to make λ scale-independent
+        if total_dims > 0:
+            l21_norm = l21_norm / total_dims
+        
+        # Effective dimensions (float for logging)
+        effective_dims = torch.tensor(float(active_dims), device=device)
+        
+        return l21_norm, effective_dims
     
     # =========================================================================
     # INFERENCE UTILITIES

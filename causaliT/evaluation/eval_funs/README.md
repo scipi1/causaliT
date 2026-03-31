@@ -37,6 +37,7 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_
 | `eval_attention_evolution` | Track attention/phi across epochs - SLOW | ⚠ Disabled |
 | `eval_interventions` | Causal intervention tests (ATE) | ✓ Active |
 | `eval_d_model_sweep` | d_model × seed sweep analysis | ✓ Active |
+| `eval_seed_sweep` | Aggregate metrics across seeds for paper reporting | ✓ Active |
 | `eval_dyconex_predictions` | Dyconex-specific prediction evaluation | ✓ Active |
 | `fix_kfold_summary` | Fix tensor strings in kfold_summary.json | ✓ Active |
 | `enrich_kfold_summary` | Add aggregated statistics to kfold_summary | ✓ Active |
@@ -70,6 +71,33 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli manifest -f experiments/eul
 | `--no-show` | Don't display plots (save to files only) |
 | `--update-manifest` | Update manifest after running evaluations |
 | `--functions` | Specific functions to run (default: all) |
+
+---
+
+## Evaluate Seed Sweep (Paper Reporting)
+
+Aggregate metrics across multiple training seeds for paper tables:
+
+```bash
+# CLI usage
+python -m causaliT.evaluation.eval_funs.eval_seed_sweep experiments/baseline/euler/vanilla_transformer_scm1_61555008
+
+# Python API
+from causaliT.evaluation.eval_funs import eval_seed_sweep
+df = eval_seed_sweep("experiments/baseline/euler/vanilla_transformer_scm1_61555008")
+```
+
+**Output files:**
+- `summary_stats.csv` - Summary table with mean, std, min, max (one row per metric)
+- `ate_by_intervention.csv` - ATE errors per intervention × variable × seed
+- `raw_per_seed.csv` - Raw per-seed data for custom analysis
+- `ate_by_intervention_{exp_id}.png` - Bar chart of ATE errors
+- `dag_metrics_{exp_id}.png` - Bar chart of DAG recovery metrics (SHD, MEC)
+
+**Metrics aggregated:**
+- **Test Performance:** test_loss, test_mae, test_r2, test_rmse
+- **ATE Errors:** Overall and per-intervention (S1, S2, S3, S5)
+- **DAG Recovery:** SHD_cross, SHD_self, MEC_distance, MEC_in_class
 
 ---
 

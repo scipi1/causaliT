@@ -100,6 +100,9 @@ from .eval_ans import eval_ans
 # d_model sweep evaluation
 from .eval_d_model_sweep import eval_d_model_sweep, analyze_hsic_ate_correlation
 
+# Seed sweep evaluation (paper reporting)
+from .eval_seed_sweep import eval_seed_sweep
+
 # Manifest functions
 from .update_manifest import (
     fix_kfold_summary,
@@ -186,6 +189,8 @@ __all__ = [
     # d_model sweep evaluation
     "eval_d_model_sweep",
     "analyze_hsic_ate_correlation",
+    # Seed sweep evaluation (paper reporting)
+    "eval_seed_sweep",
     # Manifest
     "fix_kfold_summary",
     "enrich_kfold_summary",
