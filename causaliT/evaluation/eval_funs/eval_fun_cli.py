@@ -52,6 +52,7 @@ AVAILABLE_FUNCTIONS = [
     "eval_dyconex_predictions",
     "eval_ans",                   # ANS evaluation for sweep experiments
     "eval_d_model_sweep",         # d_model × seed sweep evaluation
+    "eval_seed_sweep",            # Aggregate metrics across seeds for paper reporting
     "fix_kfold_summary",
     "enrich_kfold_summary",
 ]

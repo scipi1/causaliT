@@ -100,6 +100,13 @@ def run_evaluations_from_config(
     
     FUNCTION_REGISTRY["eval_d_model_sweep"] = _get_d_model_sweep
     
+    # Seed sweep evaluation for paper reporting (lazy import)
+    def _get_seed_sweep(exp):
+        from .eval_seed_sweep import eval_seed_sweep
+        return eval_seed_sweep(exp, show_plots=show_plots)
+    
+    FUNCTION_REGISTRY["eval_seed_sweep"] = _get_seed_sweep
+    
     # Run specified functions
     for idx, func_name in enumerate(functions, start=1):
         print(f"\n--- Step {idx}: Running {func_name} ---")

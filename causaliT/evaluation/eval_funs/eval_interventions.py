@@ -109,60 +109,85 @@ def compute_ate_metrics(
     input_labels: List[str],
 ) -> pd.DataFrame:
     """
-    Compute ATE metrics: |E_model[X | do(S=s)] - E_SCM[X | do(S=s)]|
+    Compute ATE metrics: model_ATE vs true_ATE
+    
+    ATE = E[X | do(S=s)] - E[X | do(S=0)]  (difference, not absolute)
     
     Args:
         df: DataFrame with predictions (columns: intervention, pred_feat_0, pos_idx, kfold)
-        ate_ground_truth: Dict from ate_ground_truth.json
+        ate_ground_truth: Dict from ate_ground_truth.json (new format with 'ate' key)
         norm_stats: Dict from normalization.json
         input_labels: List of input variable names (e.g., ["X1", "X2", ...])
         
     Returns:
         DataFrame with ATE metrics per intervention × variable × fold
     """
-    # Use analytical ground truth
+    # Use analytical ground truth - handle both old and new format
     gt_method = "analytical" if "analytical" in ate_ground_truth else "monte_carlo"
-    ground_truth = ate_ground_truth.get(gt_method, {})
+    gt_data = ate_ground_truth.get(gt_method, {})
+    
+    # New format: gt_data has 'ate', 'baseline', 'treated' keys
+    # Old format: gt_data directly maps intervention -> {var: value}
+    if "ate" in gt_data:
+        ground_truth_ate = gt_data["ate"]  # New format
+    else:
+        ground_truth_ate = gt_data  # Old format (backward compatibility)
     
     ate_records = []
+    
+    # Get baseline predictions
+    df_baseline = df[df["intervention"] == "baseline"]
     
     # Get interventions (excluding baseline)
     interventions = [i for i in df["intervention"].unique() if i != "baseline"]
     
     for intervention in interventions:
-        df_interv = df[df["intervention"] == intervention]
+        df_treated = df[df["intervention"] == intervention]
         
-        for pos_idx in df_interv["pos_idx"].unique():
+        for pos_idx in df_treated["pos_idx"].unique():
             # Map position to variable name
             var_name = input_labels[int(pos_idx)] if int(pos_idx) < len(input_labels) else f"X{pos_idx+1}"
             
-            for kfold in df_interv["kfold"].unique():
-                mask = (df_interv["pos_idx"] == pos_idx) & (df_interv["kfold"] == kfold)
-                subset = df_interv[mask]["pred_feat_0"]
+            for kfold in df_treated["kfold"].unique():
+                # Get treated predictions for this variable/fold
+                mask_treated = (df_treated["pos_idx"] == pos_idx) & (df_treated["kfold"] == kfold)
+                subset_treated = df_treated[mask_treated]["pred_feat_0"]
                 
-                if len(subset) == 0:
+                # Get baseline predictions for this variable/fold
+                mask_baseline = (df_baseline["pos_idx"] == pos_idx) & (df_baseline["kfold"] == kfold)
+                subset_baseline = df_baseline[mask_baseline]["pred_feat_0"]
+                
+                if len(subset_treated) == 0 or len(subset_baseline) == 0:
                     continue
                 
-                # Model's mean prediction (normalized) → de-normalized
-                model_ate_norm = float(subset.mean())
-                model_ate_raw = denormalize_value(model_ate_norm, norm_stats, "input")
+                # Compute model ATE = mean(treated) - mean(baseline)
+                # De-normalize both before computing difference
+                treated_mean_norm = float(subset_treated.mean())
+                baseline_mean_norm = float(subset_baseline.mean())
                 
-                # Ground truth lookup
-                true_ate = ground_truth.get(intervention, {}).get(var_name)
+                treated_mean_raw = denormalize_value(treated_mean_norm, norm_stats, "input")
+                baseline_mean_raw = denormalize_value(baseline_mean_norm, norm_stats, "input")
+                
+                model_ate = treated_mean_raw - baseline_mean_raw
+                
+                # Ground truth ATE lookup
+                true_ate = ground_truth_ate.get(intervention, {}).get(var_name)
                 
                 # Compute errors
-                abs_error = abs(model_ate_raw - true_ate) if true_ate is not None else None
+                abs_error = abs(model_ate - true_ate) if true_ate is not None else None
                 rel_error = abs_error / abs(true_ate) if (true_ate and abs(true_ate) > 1e-10) else None
                 
                 ate_records.append({
                     "intervention": intervention,
                     "variable": var_name,
                     "kfold": kfold,
-                    "model_ate_raw": model_ate_raw,
+                    "model_ate": model_ate,
+                    "model_treated_raw": treated_mean_raw,
+                    "model_baseline_raw": baseline_mean_raw,
                     "true_ate": true_ate,
                     "abs_error": abs_error,
                     "rel_error": rel_error,
-                    "n_samples": len(subset),
+                    "n_samples": len(subset_treated),
                 })
     
     return pd.DataFrame(ate_records)
@@ -312,8 +337,8 @@ def eval_ate(experiment: str) -> pd.DataFrame:
                 "intervention": intervention,
                 "variable": variable,
                 "true_ate": float(subset["true_ate"].iloc[0]) if subset["true_ate"].notna().any() else None,
-                "model_ate_raw_mean": float(subset["model_ate_raw"].mean()),
-                "model_ate_raw_std": float(subset["model_ate_raw"].std()),
+                "model_ate_mean": float(subset["model_ate"].mean()),
+                "model_ate_std": float(subset["model_ate"].std()),
                 "abs_error_mean": float(abs_err.mean()) if len(abs_err) > 0 else None,
                 "abs_error_std": float(abs_err.std()) if len(abs_err) > 0 else None,
                 "rel_error_mean": float(rel_err.mean()) if len(rel_err) > 0 else None,

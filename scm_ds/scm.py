@@ -729,12 +729,12 @@ class SCMDataset:
         method: str = "analytical",
         n_samples: int = 10000,
         seed: int = 42
-    ) -> Dict[str, Dict[str, float]]:
+    ) -> Dict[str, Any]:
         """
         Compute ground-truth ATE for all source -> input variable combinations.
         
-        Computes E[X | do(S=s)] for each source variable S, each do-value s,
-        and each input variable X.
+        ATE is defined as the DIFFERENCE:
+            ATE(S→X, s) = E[X | do(S=s)] - E[X | do(S=0)]
         
         Parameters
         ----------
@@ -753,19 +753,15 @@ class SCMDataset:
             
         Returns
         -------
-        Dict[str, Dict[str, float]]
-            Nested dict: ate_ground_truth[f"{source}={do_value}"][target_var] = E[target | do(source=do_value)]
+        Dict with keys:
+            - "ate": Dict[str, Dict[str, float]] - ATE values (treated - baseline)
+            - "baseline": Dict[str, float] - E[X | do(S=0)] for each X
+            - "treated": Dict[str, Dict[str, float]] - E[X | do(S=s)] for each intervention
             
         Example
         -------
-        >>> # Using paper-specific interventions (default)
         >>> ate_gt = scm_ds.compute_ate_ground_truth()
-        >>> ate_gt["S1=0.5"]["X1"]  # E[X1 | do(S1=0.5)] - should be 0 (S1 is dangling)
-        
-        >>> # Using custom per-source interventions
-        >>> ate_gt = scm_ds.compute_ate_ground_truth(
-        ...     do_values={"S2": [-1.7], "S3": [-0.5, 1.0]}
-        ... )
+        >>> ate_gt["ate"]["S1=0.5"]["X1"]  # ATE = E[X1|do(S1=0.5)] - E[X1|do(S1=0)] = 0
         """
         # Paper-specific intervention values:
         # - S1: dangling (no children) - negative control
@@ -785,7 +781,21 @@ class SCMDataset:
         if not self.source_labels:
             raise ValueError("No source_labels defined. Cannot compute ATE ground truth.")
         
-        ate_ground_truth: Dict[str, Dict[str, float]] = {}
+        # Compute baseline: E[X | do(S=0)] for each source
+        # For ATE, baseline is do(S=0) for the specific source being intervened
+        baseline_expectations: Dict[str, Dict[str, float]] = {}
+        for source in self.source_labels:
+            baseline_intervention = {source: 0.0}
+            baseline_expectations[source] = self.compute_interventional_expectation(
+                intervention=baseline_intervention,
+                target_vars=self.input_labels,
+                method=method,
+                n_samples=n_samples,
+                seed=seed
+            )
+        
+        ate_values: Dict[str, Dict[str, float]] = {}
+        treated_expectations: Dict[str, Dict[str, float]] = {}
         
         # Handle both Dict and List formats
         if isinstance(do_values, dict):
@@ -797,15 +807,22 @@ class SCMDataset:
                     intervention = {source: do_value}
                     key = f"{source}={do_value}"
                     
-                    expectations = self.compute_interventional_expectation(
+                    # Compute E[X | do(S=s)]
+                    treated = self.compute_interventional_expectation(
                         intervention=intervention,
                         target_vars=self.input_labels,
                         method=method,
                         n_samples=n_samples,
                         seed=seed
                     )
+                    treated_expectations[key] = treated
                     
-                    ate_ground_truth[key] = expectations
+                    # Compute ATE = treated - baseline
+                    baseline = baseline_expectations[source]
+                    ate_values[key] = {
+                        var: treated[var] - baseline[var]
+                        for var in self.input_labels
+                    }
         else:
             # Same values for all sources (legacy behavior)
             for source in self.source_labels:
@@ -813,17 +830,28 @@ class SCMDataset:
                     intervention = {source: do_value}
                     key = f"{source}={do_value}"
                     
-                    expectations = self.compute_interventional_expectation(
+                    # Compute E[X | do(S=s)]
+                    treated = self.compute_interventional_expectation(
                         intervention=intervention,
                         target_vars=self.input_labels,
                         method=method,
                         n_samples=n_samples,
                         seed=seed
                     )
+                    treated_expectations[key] = treated
                     
-                    ate_ground_truth[key] = expectations
+                    # Compute ATE = treated - baseline
+                    baseline = baseline_expectations[source]
+                    ate_values[key] = {
+                        var: treated[var] - baseline[var]
+                        for var in self.input_labels
+                    }
         
-        return ate_ground_truth
+        return {
+            "ate": ate_values,
+            "baseline": baseline_expectations,
+            "treated": treated_expectations,
+        }
     
     def _generate_dataset_metadata(self, shared_vars_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
         """
@@ -1428,8 +1456,9 @@ class SCMDataset:
                 }
                 
                 # Package with metadata for evaluation functions
+                # New format: includes ate, baseline, and treated separately
                 ate_export = {
-                    "description": "Ground-truth interventional expectations E[X | do(S=s)] for ATE evaluation",
+                    "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] for evaluation",
                     "interventions": {
                         "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
                         "S2": {"values": [-1.7], "type": "in_distribution", "role": "positive_control"},
@@ -1440,8 +1469,16 @@ class SCMDataset:
                         "analytical": "Symbolic computation assuming E[eps]=0",
                         "monte_carlo": "Empirical mean from 50,000 samples"
                     },
-                    "analytical": ate_ground_truth,
-                    "monte_carlo": ate_ground_truth_mc,
+                    "analytical": {
+                        "ate": ate_ground_truth["ate"],
+                        "baseline": ate_ground_truth["baseline"],
+                        "treated": ate_ground_truth["treated"],
+                    },
+                    "monte_carlo": {
+                        "ate": ate_ground_truth_mc["ate"],
+                        "baseline": ate_ground_truth_mc["baseline"],
+                        "treated": ate_ground_truth_mc["treated"],
+                    },
                 }
                 
                 with open(join(save_dir, 'ate_ground_truth.json'), 'w', encoding="utf-8") as file:

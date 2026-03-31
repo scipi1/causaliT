@@ -1,7 +1,7 @@
 # Paper Outline
 
 - Motivate the need of a surrogate that is intervention invariance
-- Intervention invariance is guaranteed if the true DAG is given to the attention, 
+- Intervention invariance is guaranteed if the true DAG is given to the attention (maybe not even), 
     - how does the ETA look like?
     - shall we keep the hard-mask model in the benchmarks?
 
@@ -15,9 +15,9 @@
     - Toeplitz Attention + Cross Causal
     - noise_aware architecture
 
-- Regularization
-    - HSIC regularization (potentially with cross-splitting)
-    - L1 (sparsity) on scores
+- Regularization & Training
+    - HSIC regularization (potentially with cross-splitting) with initial calibration in `staged_training` ✅
+    - L1 (sparsity) on scores (still don't know how to select it) ⌛
 
 
 ### Results
@@ -71,7 +71,7 @@ Expected behavior:
 - S3: Effects on X2, X3 (tests one-to-many structure learning)
 - S5: Effect on X4 (tests confounded parent learning)
 
-### Appendix 2: WHat didn't work
+### Appendix 2: What didn't work
 - Lie Attention + Gated phi --> unstable training
 - Orthogonal frozen S embeddings (maybe it works, still to check)
 
