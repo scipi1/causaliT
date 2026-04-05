@@ -397,20 +397,8 @@ training:
   save_ckpt_every_n_epochs: 100
   
   # =========================================================================
-  # LOGGING FLAGS
-  # =========================================================================
-  log_entropy: false
-  log_acyclicity: true
-  log_sparsity: false
-  log_hsic: false
-  log_decisiveness: false
-  log_l1_scores: false
-  log_embed_l1: false
-  log_jacobian: false
-  jacobian_every_n_epochs: 1
-  
-  # =========================================================================
   # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # All metrics are always logged - no log_* flags needed
   # =========================================================================
   
   # Entropy regularization

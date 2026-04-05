@@ -369,8 +369,10 @@ def _train_and_measure_gradient_ratio(
     
     config_cal["training"]["lambda_group_l1"] = float(lambda_group)
     config_cal["training"]["log_gradient_norms"] = True  # Enable gradient logging
-    config_cal["training"]["log_hsic"] = True  # Ensure HSIC values are computed
     
+    # Disable any annealing during calibration - need constant hyperparameters
+    config_cal["training"]["use_hsic_annealing"] = False
+
     # Create model and dataloader
     model = create_model_instance(config_cal, data_dir)
     dm = get_dataloader(config_cal, data_dir, cluster=False, seed=seed)

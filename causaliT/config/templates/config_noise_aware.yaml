@@ -59,12 +59,12 @@
 
 experiment:
   # Model dimensions
-  d_model_set: 24         # Embedding dimension
-  dec_layers: 1           # Number of decoder layers
-  n_heads: 1              # Number of attention heads
-  d_ff: 48                # Feedforward dimension
-  d_qk: 24                # Query/key dimension (should be >= d_model for orthogonal projection)
-  dropout: 0.0            # Dropout rate
+  d_model_set: 24                        # Embedding dimension
+  dec_layers: 1                          # Number of decoder layers
+  n_heads: 1                             # Number of attention heads
+  d_ff: ${experiment.d_model_set}        # Feedforward dimension (= d_model)
+  d_qk: ${experiment.d_model_set}        # Query/key dimension (= d_model)
+  dropout: 0.0                           # Dropout rate
   
   # Training hyperparameters
   lr: 0.001
@@ -276,19 +276,8 @@ training:
   save_ckpt_every_n_epochs: 10
   
   # =========================================================================
-  # LOGGING FLAGS
-  # =========================================================================
-  log_entropy: true
-  log_acyclicity: true
-  log_sparsity: true
-  log_hsic: true
-  log_decisiveness: true
-  log_l1_scores: true
-  log_embed_l1: false
-  log_noise_params: true  # Log σ_A, σ_R during training
-  
-  # =========================================================================
   # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # All metrics are always logged - no log_* flags needed
   # =========================================================================
   
   # Acyclicity (NOTEARS) - enforces DAG structure
@@ -324,11 +313,32 @@ training:
   normalize_hsic_by_loss: true   # Enable for noise-aware models!
   hsic_sigma: 1.0
   
+  # =========================================================================
+  # HSIC ANNEALING
+  # =========================================================================
+  # When enabled, lambda_hsic_cross and lambda_hsic_self are annealed from
+  # start values to end values over hsic_anneal_epochs.
+  # 
+  # For staged training: calibration sets start values, end defaults to 0.
+  # For manual use: set start/end values explicitly.
+  #
+  # Default behavior (when not set):
+  #   - hsic_lambda_cross_start defaults to lambda_hsic_cross
+  #   - hsic_lambda_cross_end defaults to 0.0
+  #   - hsic_lambda_self_start defaults to lambda_hsic_self  
+  #   - hsic_lambda_self_end defaults to 0.0
+  use_hsic_annealing: false
+  hsic_anneal_epochs: null       # null = anneal over all epochs
+  hsic_lambda_cross_start: null  # null = use lambda_hsic_cross
+  hsic_lambda_cross_end: 0.0     # Final cross-attention HSIC weight
+  hsic_lambda_self_start: null   # null = use lambda_hsic_self
+  hsic_lambda_self_end: 0.0      # Final self-attention HSIC weight
+  
   # Decisiveness - pushes edge probabilities away from 0.5
   lambda_decisive: 0.0
   lambda_decisive_cross: 0.0
   lambda_tau: 0.0
-  target_tau: 0.1
+  target_tau: 0.0
   
   # KL prior regularization
   lambda_kl: 0.0
@@ -351,7 +361,6 @@ training:
   # Creates information bottleneck that makes HSIC signal meaningful.
   # Used in staged training calibration to balance reconstruction vs HSIC gradients.
   lambda_group_l1: 0.0
-  log_group_l1: false
   
   # =========================================================================
   # GRADIENT NORM LOGGING (for calibration stage)
@@ -399,7 +408,15 @@ staged_training:
   # Manual override for λ_group (skip calibration if already known)
   # Set to null to use calibration result or training.lambda_group_l1
   lambda_group_l1: null
-
+  
+  # =========================================================================
+  # CALIBRATION OUTPUT VALUES (populated by staged_train)
+  # =========================================================================
+  # These are written during calibration and used for causal_init/main training.
+  # Leave as null - they will be populated automatically.
+  lambda_hsic_cross_suggested: null  # λ_hsic_cross from calibration
+  lambda_hsic_self_suggested: null   # λ_hsic_self from calibration
+  calibration_checkpoint: null       # Path to calibration checkpoint
 
 
 # =========================================================================

@@ -77,10 +77,6 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # Data indices for blanking values
         self.val_idx = config["data"]["val_idx"]
         
-        # Logging configuration
-        self.log_acyclicity = config["training"].get("log_acyclicity", False)
-        self.log_noise_params = config["training"].get("log_noise_params", True)
-        
         # Regularizers (same as SingleCausalForecaster)
         self.kappa = config["training"].get("kappa", 0)  # Acyclicity regularization
         
@@ -89,51 +85,27 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.lambda_sparse_cross = config["training"].get("lambda_sparse_cross", None)
         if self.lambda_sparse_cross is None:
             self.lambda_sparse_cross = self.lambda_sparse
-        self.log_sparsity = config["training"].get("log_sparsity", False)
         
         # =====================================================================
         # UNIFIED SCORE SPARSITY REGULARIZATION
-        # Combines L1 and entropy regularization with mode selection and fallback
         # =====================================================================
         self.lambda_self_score_sparse = config["training"].get("lambda_self_score_sparse", 0.0)
         self.lambda_cross_score_sparse = config["training"].get("lambda_cross_score_sparse", 0.0)
-        
-        # Mode selection: "l1" or "entropy"
-        # - "l1": Uses score_tensor_for_sparsity property (effective for GeLU-based attention)
-        # - "entropy": Uses attention entropy (effective for all attention types)
-        # Default: "l1" for self (often GeLU-based), "entropy" for cross (often softmax)
         self.self_sparsity_regularizer = config["training"].get("self_sparsity_regularizer", "l1")
         self.cross_sparsity_regularizer = config["training"].get("cross_sparsity_regularizer", "entropy")
-        
-        # Logging for unified score sparsity
-        self.log_score_sparsity = config["training"].get("log_score_sparsity", False)
         
         # Track if fallback was triggered (for warning once)
         self._self_sparsity_fallback_warned = False
         self._cross_sparsity_fallback_warned = False
         
         # =====================================================================
-        # HSIC REGULARIZATION - encourages independence between residuals and parents
+        # HSIC REGULARIZATION
         # =====================================================================
-        # lambda_hsic_cross: Weight for S→X HSIC (cross-attention, replaces old lambda_hsic)
-        # lambda_hsic_self: Weight for X→X HSIC (self-attention)
-        # use_attention_weighted_hsic: If True, weight HSIC by attention scores
-        #   - False: uniform HSIC (all edges weighted equally)
-        #   - True: attention-weighted HSIC (higher penalty for strongly attended edges)
-        # log_hsic: Log HSIC values during training
-        # normalize_hsic_by_loss: Scale HSIC by |loss_nll| to handle NLL scale differences
-        #   - Required for noise_aware because NLL has 1/σ² term that amplifies gradients
-        #   - Keeps λ_hsic at sensible values (~1-100) instead of needing millions
         self.lambda_hsic_cross = config["training"].get("lambda_hsic_cross", 
-                                     config["training"].get("lambda_hsic", 0.0))  # Fallback to old name
+                                     config["training"].get("lambda_hsic", 0.0))
         self.lambda_hsic_self = config["training"].get("lambda_hsic_self", 0.0)
         self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
-        self.log_hsic = config["training"].get("log_hsic", False)
-        
-        # NLL-aware HSIC normalization (critical for noise-aware training)
-        # When enabled: effective_hsic = lambda_hsic * |loss_nll| * hsic_value
-        # This ensures HSIC gradients scale with NLL gradients automatically
         self.normalize_hsic_by_loss = config["training"].get("normalize_hsic_by_loss", False)
         
         # KL divergence prior regularization
@@ -145,34 +117,19 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.lambda_decisive_cross = config["training"].get("lambda_decisive_cross", None)
         self.lambda_tau = config["training"].get("lambda_tau", 0)
         self.target_tau = config["training"].get("target_tau", 0.1)
-        self.log_decisiveness = config["training"].get("log_decisiveness", False)
         if self.lambda_decisive_cross is None:
             self.lambda_decisive_cross = self.lambda_decisive
         
-        # Noise-specific regularization (optional)
-        # Can add prior on noise parameters if needed for identifiability
+        # Noise-specific regularization
         self.lambda_noise_prior = config["training"].get("lambda_noise_prior", 0.0)
         self.prior_sigma_A = config["training"].get("prior_sigma_A", 0.01)
         self.prior_sigma_R = config["training"].get("prior_sigma_R", 0.05)
         
-        # =====================================================================
         # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
-        # =====================================================================
-        # This encourages entire embedding dimensions to go to zero,
-        # effectively reducing d_model and constraining model capacity.
-        # Unlike element-wise L1, group L1 creates a true information bottleneck.
-        # Used in staged training for calibration and causal initialization.
-        # Backward compatibility: falls back to lambda_embed_l1 if lambda_group_l1 not specified
         self.lambda_group_l1 = config["training"].get("lambda_group_l1", 
                                    config["training"].get("lambda_embed_l1", 0.0))
-        self.log_group_l1 = config["training"].get("log_group_l1",
-                                config["training"].get("log_embed_l1", False))
         
-        # =====================================================================
-        # GRADIENT NORM LOGGING (for calibration stage)
-        # =====================================================================
-        # When enabled, logs separate gradient norms for reconstruction and HSIC losses.
-        # Used during calibration to find λ_group that balances gradient signals.
+        # GRADIENT NORM LOGGING (for calibration stage) - only config-controlled logging option
         self.log_gradient_norms = config["training"].get("log_gradient_norms", False)
         
         # =====================================================================
@@ -193,15 +150,20 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.tau_dir_end = config["training"].get("tau_dir_end", 0.1)
         self.tau_act_anneal_epochs = config["training"].get("tau_act_anneal_epochs", None)
         
-        # 3. HSIC Annealing (lambda_hsic decreases over training)
+        # 3. HSIC Annealing - independent annealing for cross and self
+        # Each HSIC term has its own start/end values for full flexibility
         self.use_hsic_annealing = config["training"].get("use_hsic_annealing", False)
-        self.hsic_lambda_start = config["training"].get("hsic_lambda_start", 1.0)
-        self.hsic_lambda_end = config["training"].get("hsic_lambda_end", 0.0)
         self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
         
-        # Logging for annealing (disabled by default)
-        self.log_tau_annealing = config["training"].get("log_tau_annealing", False)
-        self.log_hsic_annealing = config["training"].get("log_hsic_annealing", False)
+        # Separate start/end values for cross-attention HSIC
+        # Default: start from current lambda_hsic_cross, anneal to 0
+        self.hsic_lambda_cross_start = config["training"].get("hsic_lambda_cross_start", self.lambda_hsic_cross)
+        self.hsic_lambda_cross_end = config["training"].get("hsic_lambda_cross_end", 0.0)
+        
+        # Separate start/end values for self-attention HSIC
+        # Default: start from current lambda_hsic_self, anneal to 0
+        self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
+        self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
         
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
@@ -500,12 +462,12 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         else:
             hsic_loss_scale = 1.0
         
-        if self.lambda_hsic_cross > 0 or self.lambda_hsic_self > 0 or self.log_hsic:
-            # Compute per-X residuals: (batch, seq_len_x)
-            residuals_per_x = x_target.squeeze() - mu.squeeze()
-            
+        # Always compute HSIC for logging
+        residuals_per_x = x_target.squeeze() - mu.squeeze()
+        
+        if self.lambda_hsic_cross > 0 or self.lambda_hsic_self > 0:
             # S→X HSIC (cross-attention)
-            if self.lambda_hsic_cross > 0 or self.log_hsic:
+            if self.lambda_hsic_cross > 0:
                 s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
                 
                 if self.use_attention_weighted_hsic:
@@ -527,34 +489,39 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                 hsic_regularizer += self.lambda_hsic_cross * hsic_loss_scale * hsic_cross_value
             
             # X→X HSIC (self-attention)
-            if self.lambda_hsic_self > 0 or self.log_hsic:
+            if self.lambda_hsic_self > 0:
                 x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
                 
                 if residuals_per_x.dim() > 1:
                     if self.use_attention_weighted_hsic:
-                        # Attention-weighted: higher penalty for strongly attended edges
-                        att_self_mean = dec_self_att[0].mean(dim=0)  # (seq_len_x, seq_len_x)
+                        att_self_mean = dec_self_att[0].mean(dim=0)
                         hsic_self_value = hsic_attention_weighted(
                             source_values=x_values_for_hsic,
                             residuals=residuals_per_x,
                             attention_weights=att_self_mean,
                             sigma=self.hsic_sigma,
-                            exclude_diagonal=True  # X shouldn't attend to itself
+                            exclude_diagonal=True
                         )
                     else:
-                        # Uniform weighting
                         hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
                     
-                    # Apply loss-normalized scaling
                     hsic_regularizer += self.lambda_hsic_self * hsic_loss_scale * hsic_self_value
         
-        # DAG Decisiveness regularizer
+        # Always compute HSIC for logging (if not already computed)
+        if hsic_cross_value is None:
+            s_values = S[:, :, self.val_idx]
+            mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
+            hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
+        if hsic_self_value is None and residuals_per_x.dim() > 1:
+            hsic_self_value = hsic_per_x_pair(x_target.squeeze(), residuals_per_x, sigma=self.hsic_sigma)
+        
+        # DAG Decisiveness regularizer (always compute for logging)
         decisive_self_loss = torch.tensor(0.0, device=x_target.device)
         decisive_cross_loss = torch.tensor(0.0, device=x_target.device)
         tau_self_loss = torch.tensor(0.0, device=x_target.device)
         tau_cross_loss = torch.tensor(0.0, device=x_target.device)
         
-        if self.lambda_decisive > 0 or self.lambda_tau > 0 or self.log_decisiveness:
+        if self.lambda_decisive > 0 or self.lambda_tau > 0:
             if dec_self_phi is not None:
                 log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
                 tau_gs_self = torch.exp(log_tau_gs_self) if log_tau_gs_self is not None else None
@@ -604,16 +571,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # =====================================================================
         # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
         # =====================================================================
-        # Encourages entire embedding dimensions to go to zero, creating an
-        # information bottleneck that makes the HSIC signal meaningful.
-        # Unlike element-wise L1, this truly reduces effective d_model.
-        if self.lambda_group_l1 > 0 or self.log_group_l1:
-            group_l1_loss, effective_dims = self._compute_group_l1()
-            group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
-        else:
-            group_l1_loss = torch.tensor(0.0, device=x_target.device)
-            effective_dims = None
-            group_l1_regularizer = 0.0
+        group_l1_loss, effective_dims = self._compute_group_l1()
+        group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
         
         # =====================================================================
         # GRADIENT AND UPDATE SIGNAL LOGGING (for two-step calibration)
@@ -765,68 +724,59 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                      group_l1_regularizer)
         
         # =====================================================================
-        # LOGGING
+        # LOGGING - Always log everything
         # =====================================================================
         
-        # Log NLL loss
+        # Main loss
         self.log(f"{stage}_nll", loss_nll, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
         
-        # Log reconstruction metrics (using mean prediction)
+        # Reconstruction metrics
         for name, metric in [("mae", self.mae_x), ("rmse", self.rmse_x), ("r2", self.r2_x)]:
             metric_eval = metric(mu.reshape(-1), x_target.reshape(-1))
             self.log(f"{stage}_x_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val" and name == "mae"))
         
-        # Log predicted variance statistics
+        # Predicted variance
         var = torch.exp(log_var)
         self.log(f"{stage}_pred_var_mean", var.mean(), on_step=False, on_epoch=True)
         self.log(f"{stage}_pred_var_std", var.std(), on_step=False, on_epoch=True)
         
-        # Log noise parameters
-        if self.log_noise_params:
-            sigma_A = self.model.ambient_noise.sigma_A
-            sigma_R = self.model.output_head.sigma_R
-            self.log(f"{stage}_sigma_A_mean", sigma_A.mean(), on_step=False, on_epoch=True)
-            self.log(f"{stage}_sigma_A_std", sigma_A.std(), on_step=False, on_epoch=True)
-            self.log(f"{stage}_sigma_R_mean", sigma_R.mean(), on_step=False, on_epoch=True)
-            self.log(f"{stage}_sigma_R_std", sigma_R.std(), on_step=False, on_epoch=True)
+        # Noise parameters
+        sigma_A = self.model.ambient_noise.sigma_A
+        sigma_R = self.model.output_head.sigma_R
+        self.log(f"{stage}_sigma_A_mean", sigma_A.mean(), on_step=False, on_epoch=True)
+        self.log(f"{stage}_sigma_A_std", sigma_A.std(), on_step=False, on_epoch=True)
+        self.log(f"{stage}_sigma_R_mean", sigma_R.mean(), on_step=False, on_epoch=True)
+        self.log(f"{stage}_sigma_R_std", sigma_R.std(), on_step=False, on_epoch=True)
         
-        # Log acyclicity if requested
-        if self.log_acyclicity:
-            self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
+        # Acyclicity
+        self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
         
-        # Log DAG sparsity (phi) if requested
-        if self.log_sparsity:
-            self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
-            self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
+        # DAG sparsity
+        self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
+        self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
         
-        # Log unified score sparsity if requested
-        if self.log_score_sparsity:
-            self.log(f"{stage}_self_score_sparse", self_score_sparse, on_step=False, on_epoch=True)
-            self.log(f"{stage}_cross_score_sparse", cross_score_sparse, on_step=False, on_epoch=True)
-            self.log(f"{stage}_self_sparsity_mode", 1.0 if self_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
-            self.log(f"{stage}_cross_sparsity_mode", 1.0 if cross_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
+        # HSIC
+        if hsic_cross_value is not None:
+            self.log(f"{stage}_hsic_cross", hsic_cross_value, on_step=False, on_epoch=True)
+        if hsic_self_value is not None:
+            self.log(f"{stage}_hsic_self", hsic_self_value, on_step=False, on_epoch=True)
+        self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
         
-        # Log HSIC if requested
-        if self.log_hsic:
-            if hsic_cross_value is not None:
-                self.log(f"{stage}_hsic_cross", hsic_cross_value, on_step=False, on_epoch=True)
-            if hsic_self_value is not None:
-                self.log(f"{stage}_hsic_self", hsic_self_value, on_step=False, on_epoch=True)
-            self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
+        # Decisiveness
+        self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
         
-        # Log decisiveness if requested
-        if self.log_decisiveness:
-            self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
-        
-        # Log group L1 if requested
-        if self.log_group_l1:
-            self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
-            if effective_dims is not None:
-                self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
+        # Group L1
+        self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
         
         return total_loss, mu, log_var, X
+    
+    @staticmethod
+    def _linear_anneal(start: float, end: float, epoch: int, total_epochs: int) -> float:
+        """Linear annealing from start to end over total_epochs."""
+        progress = min(1.0, epoch / max(1, total_epochs))
+        return start + progress * (end - start)
     
     def on_train_epoch_start(self):
         """Apply annealing schedules at the start of each training epoch."""
@@ -838,26 +788,20 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # 1. Gumbel-Softmax temperature annealing
         if self.use_tau_gs_annealing:
             anneal_epochs = self.tau_gs_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            # Exponential annealing: tau = start * (end/start)^progress
-            new_tau_gs = self.tau_gs_start * (self.tau_gs_end / self.tau_gs_start) ** progress
-            new_log_tau_gs = torch.log(torch.tensor(new_tau_gs))
+            new_tau_gs = self._linear_anneal(self.tau_gs_start, self.tau_gs_end, epoch, anneal_epochs)
             
             log_tau_gs = getattr(dec_self_inner, 'log_tau_gs', None)
             if log_tau_gs is not None:
                 with torch.no_grad():
-                    log_tau_gs.copy_(new_log_tau_gs)
+                    log_tau_gs.copy_(torch.log(torch.tensor(new_tau_gs)))
             
-            if self.log_tau_annealing:
-                self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
+            self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
         
         # 2. Toeplitz activation temperature annealing
         if self.use_tau_act_annealing:
             anneal_epochs = self.tau_act_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            
-            new_tau_gate = self.tau_gate_start * (self.tau_gate_end / self.tau_gate_start) ** progress
-            new_tau_dir = self.tau_dir_start * (self.tau_dir_end / self.tau_dir_start) ** progress
+            new_tau_gate = self._linear_anneal(self.tau_gate_start, self.tau_gate_end, epoch, anneal_epochs)
+            new_tau_dir = self._linear_anneal(self.tau_dir_start, self.tau_dir_end, epoch, anneal_epochs)
             
             log_tau_gate = getattr(dec_self_inner, 'log_tau_gate', None)
             log_tau_dir = getattr(dec_self_inner, 'log_tau_dir', None)
@@ -869,19 +813,25 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                 with torch.no_grad():
                     log_tau_dir.copy_(torch.log(torch.tensor(new_tau_dir)))
             
-            if self.log_tau_annealing:
-                self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
-                self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
+            self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
+            self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
         
-        # 3. HSIC annealing (decreasing lambda)
+        # 3. HSIC annealing - independent annealing for cross and self
         if self.use_hsic_annealing:
             anneal_epochs = self.hsic_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            # Linear annealing from start to end
-            self.lambda_hsic = self.hsic_lambda_start + progress * (self.hsic_lambda_end - self.hsic_lambda_start)
             
-            if self.log_hsic_annealing:
-                self.log("annealed_lambda_hsic", self.lambda_hsic, on_step=False, on_epoch=True)
+            # Anneal cross-attention HSIC independently
+            self.lambda_hsic_cross = self._linear_anneal(
+                self.hsic_lambda_cross_start, self.hsic_lambda_cross_end, epoch, anneal_epochs
+            )
+            
+            # Anneal self-attention HSIC independently
+            self.lambda_hsic_self = self._linear_anneal(
+                self.hsic_lambda_self_start, self.hsic_lambda_self_end, epoch, anneal_epochs
+            )
+            
+            self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
+            self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
         """Training step."""

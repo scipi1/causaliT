@@ -5,6 +5,8 @@ import os
 import sys
 import time
 from os.path import dirname, abspath, join
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 # Third-party imports
 import numpy as np
@@ -29,366 +31,480 @@ from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
 from causaliT.training.experiment_control import update_config
 from causaliT.training.config_utils import populate_seq_lengths_from_dataset
-#from causaliT.predict import mk_quick_pred_plot
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
+
+# =============================================================================
+# PRIMITIVES
+# =============================================================================
+
+def train_single_fold(
+    config: dict,
+    model: pl.LightningModule,
+    dm,
+    fold: int,
+    train_local_idx,
+    val_local_idx,
+    test_idx,
+    train_val_idx,
+    save_dir: str,
+    trainable_params: int = 0,
+    cluster: bool = False,
+    resume_ckpt: str = None,
+    experiment_tag: str = "NA",
+    debug: bool = False,
+    best: bool = False,
+    extra_callbacks: Optional[List] = None,
+) -> dict:
+    """
+    Execute training for a single fold and return metrics.
+
+    This is the **core execution primitive** shared by:
+    - ``trainer()``            — called for each k-fold, no extra callbacks
+    - ``calibration.py``       — called with k=1, injects GradientNormTracker
+    - ``causal_initialization.py`` — called with k=1, injects CausalInitProgressLogger
+
+    The ``extra_callbacks`` parameter is the extension point: any caller can
+    inject additional Lightning callbacks without modifying this function.
+    All Lightning-level bookkeeping (loggers, checkpoints, pl.Trainer creation,
+    fit/validate/test) lives exclusively here.
+
+    Args:
+        config:            Configuration dictionary.
+        model:             Already-instantiated LightningModule (seed already set by caller).
+        dm:                DataModule whose ``prepare_data()`` has been called.
+        fold:              Fold index (0-based); determines the ``k_{fold}`` subfolder.
+        train_local_idx:   Local indices into ``train_val_idx`` for this fold's training set.
+        val_local_idx:     Local indices into ``train_val_idx`` for this fold's validation set.
+        test_idx:          Global test indices (may be None if pre-split data).
+        train_val_idx:     Global index mapping array (local → global).
+        save_dir:          Parent directory; a ``k_{fold}`` subfolder is created here.
+        trainable_params:  Pre-computed parameter count (pass 0 if not needed).
+        cluster:           If True, disables progress bar and uses 1 GPU device.
+        resume_ckpt:       Optional checkpoint path to resume from.
+        experiment_tag:    Tag stored in the per-run manifest.
+        debug:             Enables anomaly detection, memory logger, etc.
+        best:              If True, return metrics from the best checkpoint rather
+                           than the final epoch.
+        extra_callbacks:   Additional Lightning callbacks injected by the caller.
+                           These are appended **after** the standard callbacks so
+                           they have access to all trainer state.
+
+    Returns:
+        dict: Metrics for this fold (val + test + timing).
+    """
+    logger_info = logging.getLogger("logger_info")
+
+    save_dir_k = join(save_dir, f"k_{fold}")
+    logs_dir = join(save_dir_k, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+
+    # Convert local indices → global indices
+    train_global_idx = train_val_idx[train_local_idx]
+    val_global_idx = train_val_idx[val_local_idx]
+
+    # ---- Loggers ----------------------------------------------------------------
+    logger_csv = CSVLogger(save_dir=logs_dir, name="csv")
+
+    # ---- Standard callbacks -----------------------------------------------------
+    checkpoint_callback = get_checkpoint_callback(
+        save_dir_k, config["training"]["save_ckpt_every_n_epochs"]
+    )
+    manifest_callback = PerRunManifest(config, path=save_dir_k, tag=experiment_tag)
+    best_checkpoint_callback = BestCheckpointCallback(
+        save_dir_k, monitor="val_mae", mode="min"
+    )
+    data_index_tracker = DataIndexTracker(
+        save_dir_k, fold, train_global_idx, val_global_idx, test_idx
+    )
+
+    callbacks_list = list(checkpoint_callback)
+    callbacks_list += [manifest_callback, best_checkpoint_callback, data_index_tracker]
+
+    if "early_stopping" in config["special"]["mode"]:
+        callbacks_list.append(early_stopping_callbacks)
+
+    if debug:
+        callbacks_list.append(MemoryLoggerCallback())
+
+    if "debug_optimizer" in config["special"]["mode"]:
+        callbacks_list.append(GradientLogger())
+        callbacks_list.append(LearningRateMonitor(logging_interval="epoch"))
+
+    if config["training"].get("log_jacobian", False):
+        jacobian_every_n_epochs = config["training"].get("jacobian_every_n_epochs", 5)
+        callbacks_list.append(
+            GradientJacobianLogger(
+                save_dir=save_dir_k,
+                every_n_epochs=jacobian_every_n_epochs,
+                enabled=True,
+            )
+        )
+
+    # ---- Inject caller-supplied callbacks (gradient trackers, progress loggers…)
+    if extra_callbacks:
+        callbacks_list.extend(extra_callbacks)
+
+    # ---- Data split for this fold -----------------------------------------------
+    dm.update_idx(
+        train_idx=train_local_idx,
+        val_idx=val_local_idx,
+        test_idx=test_idx,
+    )
+
+    # ---- Lightning Trainer ------------------------------------------------------
+    pl_trainer = pl.Trainer(
+        callbacks=callbacks_list,
+        logger=logger_csv,
+        accelerator="gpu" if torch.cuda.is_available() else "auto",
+        devices=1 if cluster else "auto",
+        max_epochs=config["training"]["max_epochs"],
+        log_every_n_steps=1,
+        deterministic=True,
+        enable_progress_bar=not cluster,
+        enable_model_summary=not cluster,
+        detect_anomaly=debug,
+    )
+
+    # ---- Training ---------------------------------------------------------------
+    start_time = time.time()
+    pl_trainer.fit(model, dm, ckpt_path=resume_ckpt)
+    training_time = time.time() - start_time
+    num_epochs = pl_trainer.current_epoch + 1
+    avg_time_per_epoch = training_time / num_epochs if num_epochs > 0 else 0
+
+    # ---- Validation -------------------------------------------------------------
+    if dm.val_ds is not None:
+        pl_trainer.validate(model, dm)
+        val_metrics = pl_trainer.callback_metrics.copy()
+    else:
+        val_metrics = {}
+
+    # ---- Test -------------------------------------------------------------------
+    pl_trainer.test(model, dm)
+    test_metrics = pl_trainer.callback_metrics.copy()
+
+    # ---- Collect metrics --------------------------------------------------------
+    if best:
+        best_metrics_file = join(save_dir_k, "best_metrics.json")
+        if os.path.exists(best_metrics_file):
+            with open(best_metrics_file, "r") as f:
+                best_metrics_data = json.load(f)
+            fold_metrics = {
+                k: v
+                for k, v in best_metrics_data.items()
+                if k not in ["best_epoch", "best_checkpoint_path"]
+            }
+        else:
+            fold_metrics = {**val_metrics, **test_metrics}
+    else:
+        fold_metrics = {**val_metrics, **test_metrics}
+
+    fold_metrics["trainable_params"] = trainable_params
+    fold_metrics["total_training_time"] = training_time
+    fold_metrics["avg_time_per_epoch"] = avg_time_per_epoch
+
+    logger_info.info(
+        f"Fold {fold}: training_time={training_time:.1f}s, epochs={num_epochs}"
+    )
+
+    return fold_metrics
+
+
+def _make_fold_splits(
+    config: dict,
+    dm,
+    seed: int,
+) -> Tuple[list, Optional[np.ndarray], np.ndarray]:
+    """
+    Build k-fold train/val index splits and return test indices.
+
+    Handles three cases:
+    - Pre-split data  (train_file / test_file set in config)
+    - Custom test-index file  (config["data"]["test_ds_ixd"] != None)
+    - Automatic 80/20 test split
+
+    Args:
+        config: Configuration dictionary.
+        dm:     DataModule (``prepare_data()`` must have been called already, or
+                ``get_ds_len()`` must work).
+        seed:   Random seed for KFold / permutation.
+
+    Returns:
+        fold_splits:   List of (train_local_idx, val_local_idx) tuples.
+        test_idx:      Global test indices array, or None for pre-split data.
+        train_val_idx: Global array mapping local → global indices.
+    """
+    use_presplit = (
+        config["data"].get("train_file") is not None
+        and config["data"].get("test_file") is not None
+    )
+
+    if use_presplit:
+        dataset_size = dm.get_ds_len()
+        train_val_idx = np.arange(dataset_size)
+        test_idx = None
+    else:
+        dataset_size = dm.get_ds_len()
+        indices = np.arange(dataset_size)
+        test_ds_idx_filename = config["data"]["test_ds_ixd"]
+
+        if test_ds_idx_filename is not None:
+            # Load pre-defined test indices
+            from causaliT.paths import DATA_DIR
+            data_dir = str(DATA_DIR)
+            test_idx = np.load(
+                join(data_dir, config["data"]["dataset"], test_ds_idx_filename)
+            )
+            mask = np.isin(indices, test_idx)
+            train_val_idx = indices[~mask]
+        else:
+            test_size = int(0.2 * dataset_size)
+            test_idx = indices[:test_size]
+            train_val_idx = indices[test_size:]
+
+    k_folds = config["training"]["k_fold"]
+
+    if k_folds == 1:
+        rng = np.random.default_rng(seed)
+        shuffled_idx = rng.permutation(len(train_val_idx))
+        split_point = int(0.8 * len(shuffled_idx))
+        fold_splits = [(shuffled_idx[:split_point], shuffled_idx[split_point:])]
+    else:
+        kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
+        fold_splits = list(kfold.split(train_val_idx))
+
+    return fold_splits, test_idx, train_val_idx
+
+
+def _count_trainable_params(config: dict, data_dir: str) -> int:
+    """
+    Instantiate a temporary model, count trainable parameters, then delete it.
+
+    Args:
+        config:   Configuration dictionary.
+        data_dir: Data directory (needed for hard-mask loading in some models).
+
+    Returns:
+        Number of trainable parameters.
+    """
+    temp_model = create_model_instance(config, data_dir)
+    n_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
+    del temp_model
+    return n_params
+
+
+def _run_post_training_evaluations(
+    config: dict,
+    save_dir: str,
+    data_dir: str,
+) -> None:
+    """
+    Run configured post-training evaluation functions.
+
+    Wrapped in try/except so that a failing evaluation never loses training
+    results.  Evaluation strategy is controlled by
+    ``config["evaluation"]["functions"]``:
+    - If not set: runs all standard evaluations.
+    - If set: runs only the listed functions.
+
+    Args:
+        config:   Configuration dictionary.
+        save_dir: Experiment save directory.
+        data_dir: Data directory.
+    """
+    try:
+        from causaliT.evaluation.eval_funs import (
+            run_all_evaluations,
+            run_evaluations_from_config,
+        )
+
+        print("\n" + "=" * 60)
+        print("Running post-training evaluations...")
+        print("=" * 60)
+
+        eval_functions = config.get("evaluation", {}).get("functions", None)
+
+        if eval_functions is not None:
+            print(f"Using config-specified evaluation functions: {eval_functions}")
+            run_evaluations_from_config(
+                experiment=save_dir,
+                datadir_path=data_dir,
+                show_plots=False,
+                functions=eval_functions,
+            )
+        else:
+            run_all_evaluations(
+                experiment=save_dir,
+                datadir_path=data_dir,
+                show_plots=False,
+            )
+
+        print("\nPost-training evaluations completed!")
+
+    except Exception as e:
+        print(f"\nWarning: Post-training evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Training results are saved. Run evaluations manually if needed.")
+
+
+# =============================================================================
+# COMPOSED FUNCTION: k-fold trainer
+# =============================================================================
 
 def trainer(
     config: dict,
     data_dir: str,
     save_dir: str,
     cluster: bool,
-    experiment_tag: str="NA",
-    resume_ckpt: str=None,
-    plot_pred_check: bool=False,
-    debug: bool=False,
-    best: bool=False,
-    )->pd.DataFrame:
+    experiment_tag: str = "NA",
+    resume_ckpt: str = None,
+    plot_pred_check: bool = False,
+    debug: bool = False,
+    best: bool = False,
+) -> pd.DataFrame:
     """
-    Training function with k-fold cross-validation
+    Training function with k-fold cross-validation.
+
+    Orchestrates the full training pipeline:
+    1. Populates sequence lengths from dataset metadata.
+    2. Creates data module and computes fold splits.
+    3. Calls ``train_single_fold`` for each fold.
+    4. Runs post-training evaluations.
+
+    The ``train_single_fold`` primitive carries all Lightning-level logic,
+    so this function is purely about orchestration.
 
     Args:
-        config (dict): configuration file
-        data_dir (str): data directory
-        save_dir (str): saving directory
-        cluster (bool): cluster used?
-        experiment_tag (str, optional): experiment tag for logging. Defaults to "NA".
-        resume_ckpt (str, optional): checkpoint to resume training. Defaults to None.
-        plot_pred_check (bool, optional): whether to plot prediction check. Defaults to False.
-        debug (bool, optional): turn on debug options. Defaults to False.
-        best (bool, optional): if True, use metrics from best checkpoint (based on val_mae), 
-                              if False, use final epoch metrics. Defaults to False.
-    
+        config:          Configuration dictionary.
+        data_dir:        Path to data directory.
+        save_dir:        Path to save outputs (checkpoints, logs, results).
+        cluster:         Whether running on a compute cluster.
+        experiment_tag:  Tag for experiment tracking.
+        resume_ckpt:     Optional checkpoint path to resume training from.
+        plot_pred_check: Whether to plot prediction checks (currently unused).
+        debug:           Enable debug mode (anomaly detection, memory logging).
+        best:            If True, use metrics from best checkpoint; otherwise
+                         use final-epoch metrics.
+
     Returns:
-        pd.DataFrame: DataFrame containing metrics for each fold
+        pd.DataFrame: Metrics for each fold (one row per fold).
     """
-    
-    # set logging
     logger_info = logging.getLogger("logger_info")
-    
-    # set seed
+
     seed = config["training"]["seed"]
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
-    
+
     # Populate sequence lengths from dataset metadata
-    # This reads S_seq_len, X_seq_len, Y_seq_len from dataset_metadata.json
     config = populate_seq_lengths_from_dataset(config, data_dir)
-    
-    # get model class and dataloader from configuration
-    model_class = get_model_class(config)
+
+    # Build data module and index splits
     dm = get_dataloader(config, data_dir, cluster, seed)
-    
-    
-    # Check if using pre-split data
-    use_presplit = config["data"].get("train_file") is not None and config["data"].get("test_file") is not None
-    
-    if use_presplit:
-        # Pre-split data: k-fold only on training data, test is already separate
-        dataset_size = dm.get_ds_len()  # This returns training data size
-        train_val_idx = np.arange(dataset_size)
-        test_idx = None  # Test data is already split separately
-        print("Using pre-split data: k-fold will be applied only to training data.")
-    
-    else:
-        # Normal data: need to create train/val/test split
-        dataset_size = dm.get_ds_len()
-        indices = np.arange(dataset_size)
-        
-        test_ds_idx_filename = config["data"]["test_ds_ixd"]
-        
-        if test_ds_idx_filename is not None:
-            test_idx = np.load(join(data_dir,config["data"]["dataset"],test_ds_idx_filename))
-            mask = np.isin(indices, test_idx)
-            train_val_idx = indices[~mask]
-        else:
-            test_size = int(0.2 * dataset_size)  # Reserve 20% for testing
-            test_idx = indices[:test_size]       # Fixed test indices
-            train_val_idx = indices[test_size:]  # Remaining for train/val cross-validation
-    
-    
-    
-    
-    # k-fold cross-validation
-    k_folds = config["training"]["k_fold"]
-    
-    # Handle k=1 case (no cross-validation, simple 80/20 split)
-    if k_folds == 1:
-        print("k=1: Using simple 80/20 train/validation split (no cross-validation)")
-        logger_info.info("k=1: Using simple 80/20 train/validation split (no cross-validation)")
-        
-        # Shuffle indices using the seed for reproducibility
-        rng = np.random.default_rng(seed)
-        shuffled_idx = rng.permutation(len(train_val_idx))
-        split_point = int(0.8 * len(shuffled_idx))
-        
-        # Create single fold as list of tuples (train_local_idx, val_local_idx)
-        # These are LOCAL indices into train_val_idx array
-        fold_splits = [(shuffled_idx[:split_point], shuffled_idx[split_point:])]
-    else:
-        # Standard k-fold cross-validation (k >= 2)
-        kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
-        fold_splits = list(kfold.split(train_val_idx))
-    
+    dm.prepare_data()
+    fold_splits, test_idx, train_val_idx = _make_fold_splits(config, dm, seed)
+
+    k_folds = len(fold_splits)
+    print(
+        f"k={k_folds}: "
+        + ("simple 80/20 split" if k_folds == 1 else f"{k_folds}-fold cross-validation")
+    )
+    logger_info.info(f"k_fold={k_folds}")
+
+    # Count trainable parameters once (identical for all folds)
+    trainable_params = _count_trainable_params(config, data_dir)
+
     metrics_dict = {}
-    
-    # Initialize k-fold results tracker
     kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
-    
-    # Count trainable parameters (same for all folds, calculated once)
-    temp_model = create_model_instance(config, data_dir)
-    trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
-    del temp_model  # Clean up temporary model
-    
+
     for fold, (train_local_idx, val_local_idx) in enumerate(fold_splits):
-        
-        # =====================================================================
-        # RESET SEED BEFORE MODEL CREATION FOR REPRODUCIBLE INITIALIZATION
-        # =====================================================================
-        # This ensures all folds start with identical model weights while still
-        # having different train/val data splits. The KFold split is controlled
-        # by random_state=seed (numpy RNG), which is separate from PyTorch's RNG.
-        #
-        # Why this matters:
-        # - nn.Embedding initializes weights from N(0,1) using PyTorch's RNG
-        # - Without reset, fold N's model has different initialization than fold 0
-        # - This causes different DAGs to be learned even with same seed
-        # - With reset, all folds have identical starting point for fair comparison
-        # =====================================================================
+        # Reset seed before each fold so model initialization is identical
         seed_everything(seed)
-        
-        # re-initialize the model at any fold
         model = create_model_instance(config, data_dir)
-        
-        print(f"Fold {fold + 1}/{k_folds}")
+
+        print(f"\nFold {fold + 1}/{k_folds}")
         logger_info.info(f"Fold {fold + 1}/{k_folds}")
-        
-        save_dir_k = join(save_dir, f"k_{fold}") # make subfolder for the given fold
-        logs_dir = join(save_dir_k, "logs")      # save dir for Tensorboard/CSV logs and checkpoints
-        os.makedirs(logs_dir, exist_ok=True)
 
-        # Convert local indices to global indices
-        train_global_idx = train_val_idx[train_local_idx]
-        val_global_idx = train_val_idx[val_local_idx]
-
-        # define loggers and callbacks
-        #logger = TensorBoardLogger(save_dir=logs_dir, name="tensorboard")
-        logger_csv = CSVLogger(save_dir=logs_dir, name="csv")
-        checkpoint_callback = get_checkpoint_callback(save_dir_k,config["training"]["save_ckpt_every_n_epochs"])        
-        manifest_callback  = PerRunManifest(config, path=save_dir_k, tag=experiment_tag)
-        
-        # Add new callbacks for best checkpoint tracking and data index saving
-        best_checkpoint_callback = BestCheckpointCallback(save_dir_k, monitor="val_mae", mode="min")
-        data_index_tracker = DataIndexTracker(save_dir_k, fold, train_global_idx, val_global_idx, test_idx)
-        
-        callbacks_list = [cb for cb in checkpoint_callback]
-        callbacks_list.append(manifest_callback)
-        callbacks_list.append(best_checkpoint_callback)
-        callbacks_list.append(data_index_tracker)
-        
-        # Add attention entropy logging callback
-        #entropy_enabled = True
-        #callbacks_list.append(AttentionEntropyLogger(enabled=entropy_enabled))
-        
-        if "early_stopping" in config["special"]["mode"]:
-            callbacks_list.append(early_stopping_callbacks)
-        
-        if debug:
-            callbacks_list.append(MemoryLoggerCallback())
-        
-        if "debug_optimizer" in config["special"]["mode"]:
-            callbacks_list.append(GradientLogger())
-            callbacks_list.append(LearningRateMonitor(logging_interval="epoch"))
-            # callbacks_list.append(MetricsAggregator())
-        
-        # Add gradient Jacobian logger if enabled
-        if config["training"].get("log_jacobian", False):
-            jacobian_every_n_epochs = config["training"].get("jacobian_every_n_epochs", 5)
-            callbacks_list.append(GradientJacobianLogger(
-                save_dir=save_dir_k,
-                every_n_epochs=jacobian_every_n_epochs,
-                enabled=True
-            ))
-        
-        # update ds
-        dm.update_idx(train_idx=train_local_idx, val_idx=val_local_idx, test_idx=test_idx)
-
-        trainer = pl.Trainer(
-            callbacks=callbacks_list,
-            logger=logger_csv, #[logger, logger_csv],
-            accelerator="gpu" if torch.cuda.is_available() else "auto",
-            devices=1 if cluster else "auto",
-            #overfit_batches=1 if debug else 0,
-            max_epochs=config["training"]["max_epochs"],
-            log_every_n_steps= 1,
-            deterministic=True,
-            enable_progress_bar=False if cluster else True,  # Disables the progress bar
-            enable_model_summary=False if cluster else True,
-            detect_anomaly=True if debug else False,
-        )
-        # * other stuff we can do
-        # trainer.tune() to find optimal hyperparameters
-
-        # Record start time
-        start_time = time.time()
-
-        # training
-        trainer.fit(
-            model,
-            dm,
-            ckpt_path=resume_ckpt, # resume training from checkpoint
+        fold_metrics = train_single_fold(
+            config=config,
+            model=model,
+            dm=dm,
+            fold=fold,
+            train_local_idx=train_local_idx,
+            val_local_idx=val_local_idx,
+            test_idx=test_idx,
+            train_val_idx=train_val_idx,
+            save_dir=save_dir,
+            trainable_params=trainable_params,
+            cluster=cluster,
+            resume_ckpt=resume_ckpt,
+            experiment_tag=experiment_tag,
+            debug=debug,
+            best=best,
         )
 
-        # Calculate training time
-        training_time = time.time() - start_time
-        num_epochs = trainer.current_epoch + 1
-        avg_time_per_epoch = training_time / num_epochs if num_epochs > 0 else 0
-
-        # validation (only if validation dataset exists)
-        if dm.val_ds is not None:
-            trainer.validate(model, dm)
-            val_metrics = trainer.callback_metrics.copy()
-        else:
-            val_metrics = {}
-        
-        # test
-        trainer.test(model, dm)
-        test_metrics = trainer.callback_metrics.copy()
-        
-        # Determine which metrics to use based on 'best' parameter
-        if best:
-            # Use metrics from the best checkpoint
-            best_metrics_file = join(save_dir_k, "best_metrics.json")
-            if os.path.exists(best_metrics_file):
-                with open(best_metrics_file, 'r') as f:
-                    best_metrics_data = json.load(f)
-                
-                # Extract metrics (excluding metadata like best_epoch, best_checkpoint_path)
-                fold_metrics = {k: v for k, v in best_metrics_data.items() 
-                               if k not in ['best_epoch', 'best_checkpoint_path']}
-                best_checkpoint_path = best_metrics_data.get('best_checkpoint_path')
-            else:
-                # Fallback to current metrics if best not available
-                fold_metrics = {**val_metrics, **test_metrics}
-                best_checkpoint_path = None
-        else:
-            # Use current behavior - final epoch metrics
-            fold_metrics = {**val_metrics, **test_metrics}
-            best_checkpoint_path = None
-        
-        # Add model size and timing metrics
-        fold_metrics['trainable_params'] = trainable_params
-        fold_metrics['total_training_time'] = training_time
-        fold_metrics['avg_time_per_epoch'] = avg_time_per_epoch
-        
-        # Update metrics dictionary
         metrics_dict[fold] = fold_metrics
-        
-        # Add fold result to tracker
-        kfold_tracker.add_fold_result(fold, fold_metrics, best_checkpoint_path)
-    
-    # Convert the dictionary to a pandas DataFrame
-    df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
-    df_metric = df_metric.applymap(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
-    
-    # =========================================================================
-    # Post-Training Evaluations
-    # =========================================================================
-    # Run evaluation functions after training completes.
-    # This is wrapped in try-except to ensure training results are not lost
-    # if evaluation fails.
-    #
-    # Evaluation strategy is controlled by config["evaluation"]["functions"]:
-    # - If not specified: runs default evaluations (run_all_evaluations)
-    # - If specified: runs only the listed functions (run_evaluations_from_config)
-    #
-    # Available functions:
-    # - eval_train_metrics: Training curves and loss analysis
-    # - eval_attention_scores: DAG recovery metrics
-    # - eval_embed: Embedding evolution analysis
-    # - eval_interventions: Causal intervention tests
-    # - eval_embedding_dag_correlation: Embedding-DAG correlation
-    # - eval_dyconex_predictions: Dyconex-specific prediction evaluation
-    # - eval_metrics: Flexible metric plotting
-    try:
-        from causaliT.evaluation.eval_funs import run_all_evaluations, run_evaluations_from_config
-        print("\n" + "="*60)
-        print("Running post-training evaluations...")
-        print("="*60)
-        
-        # Check for evaluation config
-        eval_functions = config.get("evaluation", {}).get("functions", None)
-        
-        if eval_functions is not None:
-            # Use config-specified functions
-            print(f"Using config-specified evaluation functions: {eval_functions}")
-            eval_results = run_evaluations_from_config(
-                experiment=save_dir,
-                datadir_path=data_dir,
-                show_plots=False,  # Always False for cluster
-                functions=eval_functions,
-            )
-        else:
-            # Default behavior: run all standard evaluations
-            eval_results = run_all_evaluations(
-                experiment=save_dir,
-                datadir_path=data_dir,
-                show_plots=False,  # Always False for cluster
-            )
-        print("\nPost-training evaluations completed!")
-    except Exception as e:
-        print(f"\nWarning: Post-training evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        print("Training results are still saved. You can run evaluations manually later.")
-    
+
+        best_ckpt_path = fold_metrics.pop("_best_checkpoint_path", None)
+        kfold_tracker.add_fold_result(fold, fold_metrics, best_ckpt_path)
+
+    # Convert to DataFrame
+    df_metric = pd.DataFrame.from_dict(metrics_dict, orient="index")
+    df_metric = df_metric.applymap(
+        lambda x: x.item() if isinstance(x, torch.Tensor) else x
+    )
+
+    _run_post_training_evaluations(config, save_dir, data_dir)
+
     return df_metric
 
 
+# =============================================================================
+# REGISTRY HELPERS  (unchanged public API)
+# =============================================================================
 
 def get_model_class(config: dict):
     """
-    Get the appropriate model class based on configuration.
-    
+    Return the model class (not instance) from the MODEL_REGISTRY.
+
     Args:
-        config: Configuration dictionary
-        
+        config: Configuration dictionary.
+
     Returns:
-        Model class (Lightning Module class, not instance)
+        LightningModule subclass.
     """
     model_obj = config["model"]["model_object"]
-    available_models = ["proT", "StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer", "LSTM", "GRU", "TCN", "MLP"]
-    
-    assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
-
+    available_models = [
+        "proT", "StageCausaliT", "SingleCausalLayer",
+        "NoiseAwareSingleCausalLayer", "LSTM", "GRU", "TCN", "MLP",
+    ]
+    assert model_obj in available_models, (
+        f"{model_obj} unavailable! Choose between {available_models}"
+    )
     MODEL_REGISTRY = {
         "proT": TransformerForecaster,
         "StageCausaliT": StageCausalForecaster,
         "SingleCausalLayer": SingleCausalForecaster,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
-        # "GRU": RNNForecaster,
-        # "LSTM": RNNForecaster,
-        # "TCN": RNNForecaster,
-        # "MLP": RNNForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
 
 def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningModule:
     """
-    Create a model instance based on configuration.
-    
+    Instantiate the model specified in the configuration.
+
     Args:
-        config: Configuration dictionary
-        data_dir: Data directory path (needed for StageCausaliT/SingleCausalLayer/NoiseAwareSingleCausalLayer hard masks)
-        
+        config:   Configuration dictionary.
+        data_dir: Data directory (required for models that load hard masks).
+
     Returns:
-        Model instance (Lightning Module)
+        Instantiated LightningModule.
     """
     model_obj = config["model"]["model_object"]
-    
-    # StageCausaliT, SingleCausalLayer, and NoiseAwareSingleCausalLayer need data_dir for hard mask loading
+
     if model_obj == "StageCausaliT":
         return StageCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "SingleCausalLayer":
@@ -398,48 +514,40 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
     elif model_obj == "proT":
         return TransformerForecaster(config)
     else:
-        # For other models, use the class from registry
-        model_class = get_model_class(config)
-        return model_class(config)
+        return get_model_class(config)(config)
 
 
 def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     """
-    Get the appropriate dataloader based on model type.
-    
-    Different models may require different data formats:
-    - Standard models (ProT, LSTM, etc.): (X, Y) format
-    - StageCausaliT, SingleCausalLayer, NoiseAwareSingleCausalLayer: (S, X, Y) format
-    
+    Instantiate the appropriate DataModule for the model type.
+
     Args:
-        config: Configuration dictionary
-        data_dir: Data directory path
-        cluster: Whether running on cluster
-        seed: Random seed
-        
+        config:   Configuration dictionary.
+        data_dir: Path to data directory.
+        cluster:  Whether running on cluster (affects num_workers).
+        seed:     Random seed.
+
     Returns:
-        DataModule instance (ProcessDataModule or StageCausalDataModule)
+        DataModule instance (ProcessDataModule or StageCausalDataModule).
     """
     model_obj = config["model"]["model_object"]
-    
+
     DATALOADER_REGISTRY = {
         "proT": ProcessDataModule,
         "StageCausaliT": StageCausalDataModule,
-        "SingleCausalLayer": StageCausalDataModule,  # Uses same (S, X, Y) format
-        "NoiseAwareSingleCausalLayer": StageCausalDataModule,  # Uses same (S, X, Y) format
+        "SingleCausalLayer": StageCausalDataModule,
+        "NoiseAwareSingleCausalLayer": StageCausalDataModule,
         "LSTM": ProcessDataModule,
         "GRU": ProcessDataModule,
         "TCN": ProcessDataModule,
         "MLP": ProcessDataModule,
     }
-    
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
-    
-    # StageCausaliT, SingleCausalLayer, and NoiseAwareSingleCausalLayer use a single file with (s, x, y) arrays
+
     if model_obj in ["StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer"]:
-        dm = DataModuleClass(
+        return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
-            input_file=config["data"]["filename_input"],  # Single .npz file with s, x, y
+            input_file=config["data"]["filename_input"],
             batch_size=config["training"]["batch_size"],
             num_workers=1 if cluster else 20,
             data_format="float32",
@@ -449,8 +557,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
             test_file=config["data"].get("test_file", None),
         )
     else:
-        # Standard models use separate input and target files
-        dm = DataModuleClass(
+        return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],
             target_file=config["data"]["filename_target"],
@@ -462,43 +569,38 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
             train_file=config["data"].get("train_file", None),
             test_file=config["data"].get("test_file", None),
         )
-    
-    return dm
 
 
-
-
-
+# =============================================================================
+# SCRIPT ENTRY POINT
+# =============================================================================
 
 if __name__ == "__main__":
-    
-    """
-    Run a quick test
-    """
     import re
     from causaliT.paths import ROOT_DIR, DATA_DIR, EXPERIMENTS_DIR
-    
+
     exp_dir = EXPERIMENTS_DIR / "SoftMax_scm4"
     data_dir = str(DATA_DIR)
-    
-    # look for config file
-    pattern_config = re.compile(r'config_.*\.yaml')
-    config_matching_files = [file for file in os.listdir(exp_dir) if pattern_config.match(file)]
+
+    pattern_config = re.compile(r"config_.*\.yaml")
+    config_matching_files = [
+        file for file in os.listdir(exp_dir) if pattern_config.match(file)
+    ]
     if len(config_matching_files) == 1:
-        config = OmegaConf.load(join(exp_dir,config_matching_files[0]))
+        config = OmegaConf.load(join(exp_dir, config_matching_files[0]))
     else:
-        raise ValueError(f"None or more than one config file found in {exp_dir}")
-    
-    
+        raise ValueError(
+            f"None or more than one config file found in {exp_dir}"
+        )
+
     config_updated = update_config(config)
-        
-    save_dir = exp_dir
-        
+
     trainer(
-        config = config_updated,
-        data_dir = data_dir, 
-        save_dir = save_dir,
-        experiment_tag = "test", 
-        cluster = False, 
-        resume_ckpt = None,
-        debug=True)
+        config=config_updated,
+        data_dir=data_dir,
+        save_dir=str(exp_dir),
+        experiment_tag="test",
+        cluster=False,
+        resume_ckpt=None,
+        debug=True,
+    )

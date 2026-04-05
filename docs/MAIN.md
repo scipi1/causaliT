@@ -17,6 +17,7 @@
 
 - Regularization & Training
     - HSIC regularization (potentially with cross-splitting) with initial calibration in `staged_training` ✅
+        TODO: plot gradient ratio VS sparsity lambda ⌛
     - L1 (sparsity) on scores (still don't know how to select it) ⌛
 
 
@@ -48,9 +49,8 @@
 - lambda_L1 vs edge score Plot vs test loss
 
 ### Appendix 1: How to use CausaliT
-- Criterion for d_model: HSIC under random masks --> propose a starting value of lambda_hsic
-- Criterion for lambda_sparse: minimum number of edges such that the loss doesn't change
-- Warning for user for too large lambda_hsic when training gets unstable
+- Criterion for d_model: if during calibration lambda_group_sparse is high and during causal initialization HSIC doesn't decrease substantially, further reduce d_model
+- Criterion for lambda_sparse: minimum number of edges such that the loss doesn't change. Cross-validation by selecting the best HSIC
 
 ### Appendix 2: ATE Intervention Scheme
 

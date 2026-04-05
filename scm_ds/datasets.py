@@ -104,11 +104,12 @@ ds_scm1_discrete_sampling = SCMDataset(
         "h": 0.6,
     },
     singles={
-        "S1": lambda rng, n: rng.choice([0.5, -1.2], n),                                            # 2 elements
-        "S2": lambda rng, n: rng.choice([-1.7, 3.0, -2.0], n),                                      # 3 elements
-        "S3": lambda rng, n: rng.choice([1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 10 elements
-        "S4": lambda rng, n: rng.choice([-0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 5 elements
-        "S5": lambda rng, n: rng.choice([0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 10 elements
+        # NOTE: 0 is included in all S distributions to ensure baseline do(S=0) is in-distribution
+        "S1": lambda rng, n: rng.choice([0, 0.5, -1.2], n),                                            # 3 elements (added 0)
+        "S2": lambda rng, n: rng.choice([0, -1.7, 3.0, -2.0], n),                                      # 4 elements (added 0)
+        "S3": lambda rng, n: rng.choice([0, 1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 11 elements (added 0)
+        "S4": lambda rng, n: rng.choice([0, -0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 6 elements (added 0)
+        "S5": lambda rng, n: rng.choice([0, 0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 11 elements (added 0)
         "X1": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X2": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X3": lambda rng, n: 0.1 * rng.standard_normal(n),
@@ -201,12 +202,12 @@ ds_scm2_discrete_sampling = SCMDataset(
         "h": 0.8,
     },
     singles={
-        # Same discrete values as scm1 for consistency across datasets
-        "S1": lambda rng, n: rng.choice([0.5, -1.2], n),                                            # 2 elements
-        "S2": lambda rng, n: rng.choice([-1.7, 3.0, -2.0], n),                                      # 3 elements
-        "S3": lambda rng, n: rng.choice([1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 10 elements
-        "S4": lambda rng, n: rng.choice([-0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 5 elements
-        "S5": lambda rng, n: rng.choice([0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 10 elements
+        # NOTE: 0 is included in all S distributions to ensure baseline do(S=0) is in-distribution
+        "S1": lambda rng, n: rng.choice([0, 0.5, -1.2], n),                                            # 3 elements (added 0)
+        "S2": lambda rng, n: rng.choice([0, -1.7, 3.0, -2.0], n),                                      # 4 elements (added 0)
+        "S3": lambda rng, n: rng.choice([0, 1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 11 elements (added 0)
+        "S4": lambda rng, n: rng.choice([0, -0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 6 elements (added 0)
+        "S5": lambda rng, n: rng.choice([0, 0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 11 elements (added 0)
         "X1": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X2": lambda rng, n: 0.1 * rng.standard_normal(n),
         "X3": lambda rng, n: 0.1 * rng.standard_normal(n),
@@ -301,12 +302,12 @@ ds_scm3_discrete_sampling = SCMDataset(
         "h": 0.8,
     },
     singles={
-        # Same discrete values as scm1/scm2 for consistency across datasets
-        "S1": lambda rng, n: rng.choice([0.5, -1.2], n),                                            # 2 elements
-        "S2": lambda rng, n: rng.choice([-1.7, 3.0, -2.0], n),                                      # 3 elements
-        "S3": lambda rng, n: rng.choice([1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 10 elements
-        "S4": lambda rng, n: rng.choice([-0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 5 elements
-        "S5": lambda rng, n: rng.choice([0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 10 elements
+        # NOTE: 0 is included in all S distributions to ensure baseline do(S=0) is in-distribution
+        "S1": lambda rng, n: rng.choice([0, 0.5, -1.2], n),                                            # 3 elements (added 0)
+        "S2": lambda rng, n: rng.choice([0, -1.7, 3.0, -2.0], n),                                      # 4 elements (added 0)
+        "S3": lambda rng, n: rng.choice([0, 1.0, 2.5, 2, -0.5, 0.8, -0.1, -2, -2.5, -2.7, -3], n),     # 11 elements (added 0)
+        "S4": lambda rng, n: rng.choice([0, -0.3, 1.5, 2.0, -1.0, 0.7], n),                            # 6 elements (added 0)
+        "S5": lambda rng, n: rng.choice([0, 0.2, -0.8, 1.8, -1.5, 2.5, -2, -2.2, -2.5, -2.6, -2.7], n),# 11 elements (added 0)
         # Feature nodes: non-Gaussian noise (centered)
         "X1": lambda rng, n: 0.1 * (rng.uniform(-1, 1, n)),                           # uniform
         "X2": lambda rng, n: 0.1 * (rng.exponential(1.0, n) - 1.0),                   # exponential (centered)

@@ -55,13 +55,13 @@
 
 experiment:
   # Model dimensions
-  d_model_set: 12         # Shared embedding dimension for all variables
-  d1_layers: 1            # Decoder 1 layers (S → X)
-  d2_layers: 1            # Decoder 2 layers (X → Y)
-  n_heads: 1              # Number of attention heads
-  d_ff: 24                # Feedforward dimension
-  d_qk: 6                 # Query/key dimension
-  dropout: 0.0            # Dropout rate
+  d_model_set: 24                        # Shared embedding dimension for all variables
+  d1_layers: 1                           # Decoder 1 layers (S → X)
+  d2_layers: 1                           # Decoder 2 layers (X → Y)
+  n_heads: 1                             # Number of attention heads
+  d_ff: ${experiment.d_model_set}        # Feedforward dimension (= d_model)
+  d_qk: ${experiment.d_model_set}        # Query/key dimension (= d_model)
+  dropout: 0.0                           # Dropout rate
   
   # Training hyperparameters
   lr: 0.0005
@@ -213,20 +213,8 @@ training:
   save_ckpt_every_n_epochs: 10
   
   # =========================================================================
-  # LOGGING FLAGS
-  # =========================================================================
-  log_entropy: true
-  log_acyclicity: true
-  log_sparsity: true
-  log_hsic: true           # Required for HSIC-based k-fold selection
-  log_decisiveness: true
-  log_l1_scores: true
-  log_embed_l1: false
-  log_jacobian: false
-  jacobian_every_n_epochs: 1
-  
-  # =========================================================================
   # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # All metrics are always logged - no log_* flags needed
   # =========================================================================
   
   # Entropy regularization
@@ -278,14 +266,14 @@ training:
 
 
 data:
-  dataset: "scm6"
+  dataset: "scm1"           # Dataset name (folder in data/)
   filename_input: "ds.npz"  # Single file (used when train_file/test_file are null)
   
   # Pre-split train/test files (optional)
   # If both are specified and exist, they will be used INSTEAD of filename_input
   # Set both to null to use the single filename_input file
-  train_file: null          # e.g., "ds_train.npz" for holdout split datasets
-  test_file: null           # e.g., "ds_test.npz" for holdout split datasets
+  train_file: "ds_train.npz" # e.g., "ds_train.npz" for holdout split datasets
+  test_file: "ds_test.npz"   # e.g., "ds_test.npz" for holdout split datasets
   
   val_idx: ${data.feature_indices.value}
   test_ds_ixd: null

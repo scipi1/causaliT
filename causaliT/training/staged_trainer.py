@@ -225,20 +225,38 @@ def staged_trainer(
     
     # Configure HSIC annealing for smooth transition from causal init
     if use_causal_init:
-        # Start with high HSIC (from causal init) and anneal down
-        hsic_mult = staged_config.get("causal_init_hsic_multiplier", 10.0)
-        base_hsic = config["training"].get("lambda_hsic_cross",
-                        config["training"].get("lambda_hsic", 0.1))
+        # Start from calibrated values (causal_init already used high HSIC with multiplier)
+        # Anneal down to user-specified end values (typically 0.0)
+        # NOTE: The multiplier is only applied during causal_init stage, NOT here
+        
+        # Get calibrated lambda values - priority: suggested (from calibration) → training config
+        lambda_hsic_cross = (
+            staged_config.get("lambda_hsic_cross_suggested") or
+            config["training"].get("lambda_hsic_cross",
+                config["training"].get("lambda_hsic", 0.1))
+        )
+        lambda_hsic_self = (
+            staged_config.get("lambda_hsic_self_suggested") or
+            config["training"].get("lambda_hsic_self", 0.1)
+        )
         
         config["training"]["use_hsic_annealing"] = True
-        config["training"]["hsic_lambda_start"] = base_hsic * hsic_mult
-        config["training"]["hsic_lambda_end"] = base_hsic
+        
+        # Start from calibrated values (NO multiplier - that's for causal_init only)
+        config["training"]["hsic_lambda_cross_start"] = lambda_hsic_cross
+        config["training"]["hsic_lambda_self_start"] = lambda_hsic_self
+        
+        # End at user-specified values (respect config, typically 0.0)
+        config["training"]["hsic_lambda_cross_end"] = config["training"].get("hsic_lambda_cross_end", 0.0)
+        config["training"]["hsic_lambda_self_end"] = config["training"].get("hsic_lambda_self_end", 0.0)
         
         # Set annealing epochs if not specified
         if "hsic_anneal_epochs" not in config["training"] or config["training"]["hsic_anneal_epochs"] is None:
             config["training"]["hsic_anneal_epochs"] = int(config["training"]["max_epochs"] * 0.5)
         
-        print(f"HSIC annealing: {config['training']['hsic_lambda_start']:.4f} → {config['training']['hsic_lambda_end']:.4f}")
+        print(f"HSIC annealing over {config['training']['hsic_anneal_epochs']} epochs:")
+        print(f"  Cross: {config['training']['hsic_lambda_cross_start']:.4f} → {config['training']['hsic_lambda_cross_end']:.4f}")
+        print(f"  Self:  {config['training']['hsic_lambda_self_start']:.4f} → {config['training']['hsic_lambda_self_end']:.4f}")
     
     # Run standard training
     # Pass the checkpoint from staged training (if any) as resume_ckpt

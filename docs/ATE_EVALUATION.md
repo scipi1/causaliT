@@ -114,15 +114,37 @@ This is chosen because:
 
 ## Normalization Handling
 
-The model operates in **normalized space**. Denormalization is applied to predictions before computing ATE:
+The model operates in **normalized space**. There are TWO normalization steps:
+
+### 1. Input Normalization (Intervention Values)
+
+Intervention values in `ate_ground_truth.json` are in **RAW scale** (e.g., S2=-1.7).
+The model expects **normalized** inputs. We must normalize intervention values before passing to the model:
+
+```python
+# For minmax normalization (source: [-3, 3] → [0, 1])
+val_normalized = (val_raw - min) / (max - min)
+
+# Example: S2=-1.7 with source range [-3, 3]
+# S2_norm = (-1.7 - (-3)) / (3 - (-3)) = 1.3 / 6 = 0.217
+```
+
+### 2. Output Denormalization (Predictions)
+
+Model predictions are denormalized to raw scale for comparison:
 
 ```python
 pred_raw = denormalize(pred_norm)
 ```
 
-Both treated and baseline predictions are denormalized, so the **difference** (ATE) is in original scale.
+### Summary
 
-Ground truth ATE is also computed in original scale.
+| Step | Direction | Applied To |
+|------|-----------|------------|
+| Normalize | raw → normalized | Intervention values (input to model) |
+| Denormalize | normalized → raw | Model predictions (for ATE comparison) |
+
+Ground truth ATE is in **raw scale**, so both must be converted properly.
 
 ---
 

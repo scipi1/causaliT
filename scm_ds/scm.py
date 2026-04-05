@@ -582,12 +582,11 @@ class SCMDataset:
         self, 
         intervention: Dict[str, float],
         target_vars: Optional[List[str]] = None,
-        method: str = "analytical",
         n_samples: int = 10000,
         seed: int = 42
     ) -> Dict[str, float]:
         """
-        Compute E[X | do(S=s)] for each target variable.
+        Compute E[X | do(S=s)] for each target variable using Monte Carlo sampling.
         
         This computes the expected value of downstream variables under a do-intervention.
         For synthetic SCMs, this provides the ground-truth causal effect.
@@ -599,11 +598,8 @@ class SCMDataset:
         target_vars : Optional[List[str]]
             List of target variable names to compute expectations for.
             If None, uses all input_labels.
-        method : str
-            "analytical" - Use symbolic computation assuming E[eps] = 0
-            "monte_carlo" - Use sampling to estimate expectation
         n_samples : int
-            Number of samples for Monte Carlo estimation (only used if method="monte_carlo")
+            Number of samples for Monte Carlo estimation
         seed : int
             Random seed for Monte Carlo sampling
             
@@ -617,23 +613,15 @@ class SCMDataset:
         >>> scm_ds.compute_interventional_expectation(
         ...     intervention={"S2": 0.5},
         ...     target_vars=["X1", "X2"],
-        ...     method="analytical"
         ... )
         {"X1": 0.5, "X2": 0.0}  # X1 depends on S2, X2 does not
         """
         if target_vars is None:
             target_vars = list(self.input_labels)
         
-        if method == "monte_carlo":
-            return self._compute_interventional_expectation_mc(
-                intervention, target_vars, n_samples, seed
-            )
-        elif method == "analytical":
-            return self._compute_interventional_expectation_analytical(
-                intervention, target_vars
-            )
-        else:
-            raise ValueError(f"Unknown method: {method}. Use 'analytical' or 'monte_carlo'.")
+        return self._compute_interventional_expectation_mc(
+            intervention, target_vars, n_samples, seed
+        )
     
     def _compute_interventional_expectation_mc(
         self,
@@ -663,75 +651,15 @@ class SCMDataset:
         
         return expectations
     
-    def _compute_interventional_expectation_analytical(
-        self,
-        intervention: Dict[str, float],
-        target_vars: List[str]
-    ) -> Dict[str, float]:
-        """
-        Compute interventional expectations analytically using SymPy.
-        
-        This propagates through the DAG in topological order, substituting:
-        - Intervention values for intervened variables
-        - E[eps] = 0 for noise terms (assuming zero-mean noise)
-        - Computed expectations for upstream variables
-        
-        Works for both linear and non-linear SCMs as long as E[f(eps)] = f(0)
-        for the functions involved (which holds for polynomial, tanh, sin, etc.
-        when noise is zero-mean and symmetric).
-        """
-        # Build symbolic expressions for each node
-        node_exprs: Dict[str, sp.Expr] = {}
-        expectations: Dict[str, float] = {}
-        
-        # Process nodes in topological order
-        for node in self.scm.order:
-            spec = self.scm.specs[node]
-            
-            # If this node is intervened upon, set to constant
-            if node in intervention:
-                node_exprs[node] = sp.Float(intervention[node])
-                expectations[node] = intervention[node]
-                continue
-            
-            # Build local symbol table for parents and noise
-            parent_symbols = {p: sp.symbols(p) for p in spec.parents}
-            eps_sym = sp.symbols(f"eps_{node}")
-            local_symbols = {**parent_symbols, f"eps_{node}": eps_sym}
-            
-            # Parse the expression
-            expr = sp.sympify(spec.expr, locals=local_symbols)
-            
-            # Substitute parent expectations (already computed due to topo order)
-            for parent in spec.parents:
-                if parent in expectations:
-                    expr = expr.subs(sp.symbols(parent), expectations[parent])
-            
-            # Set noise to zero (E[eps] = 0 assumption)
-            expr = expr.subs(eps_sym, 0)
-            
-            # Evaluate to float
-            try:
-                value = float(expr.evalf())
-            except (TypeError, ValueError):
-                # If expression can't be evaluated (e.g., remaining symbols), use NaN
-                value = float('nan')
-            
-            node_exprs[node] = expr
-            expectations[node] = value
-        
-        # Return only requested target variables
-        return {var: expectations.get(var, float('nan')) for var in target_vars}
-    
     def compute_ate_ground_truth(
         self,
         do_values: Union[List[float], Dict[str, List[float]]] = None,
-        method: str = "analytical",
-        n_samples: int = 10000,
+        n_samples: int = 50000,
         seed: int = 42
     ) -> Dict[str, Any]:
         """
-        Compute ground-truth ATE for all source -> input variable combinations.
+        Compute ground-truth ATE for all source -> input variable combinations
+        using Monte Carlo sampling.
         
         ATE is defined as the DIFFERENCE:
             ATE(S→X, s) = E[X | do(S=s)] - E[X | do(S=0)]
@@ -744,10 +672,8 @@ class SCMDataset:
             - Dict[str, List[float]]: Per-source intervention values, e.g.,
               {"S1": [0.5], "S2": [-1.7], "S3": [-0.5, 1.0]}
             Default: PAPER_INTERVENTIONS (paper-specific values)
-        method : str
-            "analytical" or "monte_carlo"
         n_samples : int
-            Number of samples for Monte Carlo (if used)
+            Number of samples for Monte Carlo estimation (default 50,000)
         seed : int
             Random seed
             
@@ -789,7 +715,6 @@ class SCMDataset:
             baseline_expectations[source] = self.compute_interventional_expectation(
                 intervention=baseline_intervention,
                 target_vars=self.input_labels,
-                method=method,
                 n_samples=n_samples,
                 seed=seed
             )
@@ -811,7 +736,6 @@ class SCMDataset:
                     treated = self.compute_interventional_expectation(
                         intervention=intervention,
                         target_vars=self.input_labels,
-                        method=method,
                         n_samples=n_samples,
                         seed=seed
                     )
@@ -834,7 +758,6 @@ class SCMDataset:
                     treated = self.compute_interventional_expectation(
                         intervention=intervention,
                         target_vars=self.input_labels,
-                        method=method,
                         n_samples=n_samples,
                         seed=seed
                     )
@@ -1425,7 +1348,7 @@ class SCMDataset:
             json.dump(dataset_metadata, file, indent=2, sort_keys=True, ensure_ascii=False)
         print(f"Exported dataset_metadata.json with causal structure and variable info")
 
-        # Export ATE ground truth for intervention evaluation
+        # Export ATE ground truth for intervention evaluation (Monte Carlo only)
         if self.source_labels:
             try:
                 # Paper-specific intervention values (matched with eval_interventions.py):
@@ -1434,56 +1357,36 @@ class SCMDataset:
                 # - S3: [-0.5, 1.0] - one-to-many → X2, X3 - structure test (1.0 is OOD)
                 # - S5: [-0.8, 2.5] - many-to-one → X4 - confounding test (2.5 is OOD)
                 # Uses default PAPER_INTERVENTIONS from compute_ate_ground_truth()
+                
+                # Compute Monte Carlo ground truth (used for both ground truth and model evaluation)
                 ate_ground_truth = self.compute_ate_ground_truth(
                     do_values=None,  # Uses PAPER_INTERVENTIONS by default
-                    method="analytical"
-                )
-                
-                # Also compute Monte Carlo estimates for validation
-                ate_ground_truth_mc = self.compute_ate_ground_truth(
-                    do_values=None,  # Uses PAPER_INTERVENTIONS by default
-                    method="monte_carlo",
                     n_samples=50000,
                     seed=seed
                 )
                 
-                # Extract the do_values used for documentation
-                PAPER_INTERVENTIONS = {
-                    "S1": [0.5],
-                    "S2": [-1.7],
-                    "S3": [-0.5, 1.0],
-                    "S5": [-0.8, 2.5],
-                }
-                
                 # Package with metadata for evaluation functions
-                # New format: includes ate, baseline, and treated separately
+                # Monte Carlo only - analytical removed due to incorrect E[f(eps)] = f(0) assumption
                 ate_export = {
-                    "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] for evaluation",
+                    "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] via Monte Carlo sampling",
                     "interventions": {
                         "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
                         "S2": {"values": [-1.7], "type": "in_distribution", "role": "positive_control"},
                         "S3": {"values": [-0.5, 1.0], "type": "mixed", "role": "structure_test", "ood_values": [1.0]},
                         "S5": {"values": [-0.8, 2.5], "type": "mixed", "role": "confounding_test", "ood_values": [2.5]},
                     },
-                    "computation_methods": {
-                        "analytical": "Symbolic computation assuming E[eps]=0",
-                        "monte_carlo": "Empirical mean from 50,000 samples"
-                    },
-                    "analytical": {
+                    "computation_method": "monte_carlo",
+                    "n_samples": 50000,
+                    "monte_carlo": {
                         "ate": ate_ground_truth["ate"],
                         "baseline": ate_ground_truth["baseline"],
                         "treated": ate_ground_truth["treated"],
-                    },
-                    "monte_carlo": {
-                        "ate": ate_ground_truth_mc["ate"],
-                        "baseline": ate_ground_truth_mc["baseline"],
-                        "treated": ate_ground_truth_mc["treated"],
                     },
                 }
                 
                 with open(join(save_dir, 'ate_ground_truth.json'), 'w', encoding="utf-8") as file:
                     json.dump(ate_export, file, indent=2, sort_keys=True, ensure_ascii=False)
-                print(f"Exported ate_ground_truth.json with {len(ate_ground_truth)} intervention combinations")
+                print(f"Exported ate_ground_truth.json (Monte Carlo, n=50000) with {len(ate_ground_truth['ate'])} interventions")
                 
             except Exception as e:
                 print(f"Warning: Could not compute ATE ground truth: {e}")

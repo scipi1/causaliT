@@ -171,9 +171,20 @@ class SingleCausalForecaster(pl.LightningModule):
         self.tau_act_anneal_epochs = config["training"].get("tau_act_anneal_epochs", None)
         
         # 3. HSIC Annealing (lambda_hsic decreases over training)
+        # Supports INDEPENDENT annealing for cross and self attention HSIC
+        # This is critical for staged training where calibrated values differ
         self.use_hsic_annealing = config["training"].get("use_hsic_annealing", False)
-        self.hsic_lambda_start = config["training"].get("hsic_lambda_start", 1.0)
-        self.hsic_lambda_end = config["training"].get("hsic_lambda_end", 0.0)
+        self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
+        
+        # Separate start/end values for cross-attention HSIC
+        # Default: start from current lambda_hsic_cross, anneal to 0
+        self.hsic_lambda_cross_start = config["training"].get("hsic_lambda_cross_start", self.lambda_hsic_cross)
+        self.hsic_lambda_cross_end = config["training"].get("hsic_lambda_cross_end", 0.0)
+        
+        # Separate start/end values for self-attention HSIC
+        # Default: start from current lambda_hsic_self, anneal to 0
+        self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
+        self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
         self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
         
         # Logging for annealing
@@ -779,6 +790,12 @@ class SingleCausalForecaster(pl.LightningModule):
         
         return total_loss, pred_x, X
     
+    @staticmethod
+    def _linear_anneal(start: float, end: float, epoch: int, total_epochs: int) -> float:
+        """Linear annealing from start to end over total_epochs."""
+        progress = min(1.0, epoch / max(1, total_epochs))
+        return start + progress * (end - start)
+    
     def on_train_epoch_start(self):
         """Apply annealing schedules at the start of each training epoch."""
         epoch = self.current_epoch
@@ -789,15 +806,12 @@ class SingleCausalForecaster(pl.LightningModule):
         # 1. Gumbel-Softmax temperature annealing
         if self.use_tau_gs_annealing:
             anneal_epochs = self.tau_gs_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            # Exponential annealing: tau = start * (end/start)^progress
-            new_tau_gs = self.tau_gs_start * (self.tau_gs_end / self.tau_gs_start) ** progress
-            new_log_tau_gs = torch.log(torch.tensor(new_tau_gs))
+            new_tau_gs = self._linear_anneal(self.tau_gs_start, self.tau_gs_end, epoch, anneal_epochs)
             
             log_tau_gs = getattr(dec_self_inner, 'log_tau_gs', None)
             if log_tau_gs is not None:
                 with torch.no_grad():
-                    log_tau_gs.copy_(new_log_tau_gs)
+                    log_tau_gs.copy_(torch.log(torch.tensor(new_tau_gs)))
             
             if self.log_tau_annealing:
                 self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
@@ -805,10 +819,8 @@ class SingleCausalForecaster(pl.LightningModule):
         # 2. Toeplitz activation temperature annealing
         if self.use_tau_act_annealing:
             anneal_epochs = self.tau_act_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            
-            new_tau_gate = self.tau_gate_start * (self.tau_gate_end / self.tau_gate_start) ** progress
-            new_tau_dir = self.tau_dir_start * (self.tau_dir_end / self.tau_dir_start) ** progress
+            new_tau_gate = self._linear_anneal(self.tau_gate_start, self.tau_gate_end, epoch, anneal_epochs)
+            new_tau_dir = self._linear_anneal(self.tau_dir_start, self.tau_dir_end, epoch, anneal_epochs)
             
             log_tau_gate = getattr(dec_self_inner, 'log_tau_gate', None)
             log_tau_dir = getattr(dec_self_inner, 'log_tau_dir', None)
@@ -824,15 +836,19 @@ class SingleCausalForecaster(pl.LightningModule):
                 self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
                 self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
         
-        # 3. HSIC annealing (decreasing lambda)
+        # 3. HSIC annealing
         if self.use_hsic_annealing:
             anneal_epochs = self.hsic_anneal_epochs or max_epochs
-            progress = min(1.0, epoch / anneal_epochs)
-            # Linear annealing from start to end
-            self.lambda_hsic = self.hsic_lambda_start + progress * (self.hsic_lambda_end - self.hsic_lambda_start)
+            self.lambda_hsic_cross = self._linear_anneal(
+                self.hsic_lambda_cross_start, self.hsic_lambda_cross_end, epoch, anneal_epochs
+            )
+            self.lambda_hsic_self = self._linear_anneal(
+                self.hsic_lambda_self_start, self.hsic_lambda_self_end, epoch, anneal_epochs
+            )
             
             if self.log_hsic_annealing:
-                self.log("annealed_lambda_hsic", self.lambda_hsic, on_step=False, on_epoch=True)
+                self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
+                self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
         """Training step."""

@@ -26,12 +26,12 @@
 
 experiment:
   # Model dimensions (same as noise_aware for fair comparison)
-  d_model_set: 24         # Embedding dimension
-  dec_layers: 1           # Number of decoder layers
-  n_heads: 1              # Number of attention heads
-  d_ff: 48                # Feedforward dimension
-  d_qk: 12                # Query/key dimension
-  dropout: 0.0            # Dropout rate
+  d_model_set: 24                        # Embedding dimension
+  dec_layers: 1                          # Number of decoder layers
+  n_heads: 1                             # Number of attention heads
+  d_ff: ${experiment.d_model_set}        # Feedforward dimension (= d_model)
+  d_qk: ${experiment.d_model_set}        # Query/key dimension (= d_model)
+  dropout: 0.0                           # Dropout rate
   
   # Training hyperparameters
   lr: 0.001
@@ -185,18 +185,8 @@ training:
   save_ckpt_every_n_epochs: 10
   
   # =========================================================================
-  # LOGGING FLAGS
-  # =========================================================================
-  log_entropy: true
-  log_acyclicity: true
-  log_sparsity: true
-  log_hsic: true
-  log_decisiveness: true
-  log_l1_scores: true
-  log_embed_l1: false
-  
-  # =========================================================================
   # REGULARIZATION - All defaults at 0.0 (pure baseline)
+  # All metrics are always logged - no log_* flags needed
   # Can be overridden for "vanilla with reg" experiments
   # =========================================================================
   kappa: 0.0
@@ -209,6 +199,7 @@ training:
   lambda_hsic_cross: 0.0
   lambda_hsic_self: 0.0
   use_attention_weighted_hsic: false
+  normalize_hsic_by_loss: false
   hsic_sigma: 1.0
   lambda_decisive: 0.0
   lambda_decisive_cross: 0.0
