@@ -15,12 +15,22 @@ The MLP head adds non-linearity at the output without compromising the causal
 structure learned by attention. The attention still determines WHICH information
 flows WHERE; the MLP determines HOW that information is transformed into predictions.
 
-Design Choices:
-- Hidden dim = d_ff (matches transformer convention)
-- Default 2 layers: d_model → d_ff → out_dim
-- ReLU activation (sparsity helps HSIC signal for causal discovery)
-- No residual connection (this is a projection head, not a sublayer)
-- n_layers=1 reduces to nn.Linear for backward compatibility
+Architecture (n_layers >= 2):
+    decoder_output (d_model)
+        → MLP Block: Linear(d_model, d_hidden) → Act → Dropout → Linear(d_hidden, d_model) → Dropout
+        → Residual: + decoder_output
+        → Final Projection: Linear(d_model, out_dim)
+
+    The MLP block maps d_model → d_hidden → d_model with a residual connection,
+    following the same pattern as transformer FFN sublayers. The final projection
+    maps d_model → out_dim without residual.
+
+    Standard expansion ratio is 2× (d_hidden = 2 * d_model), matching efficient
+    transformer designs. No extra LayerNorm is added because the decoder already
+    applies use_final_norm before this head.
+
+Architecture (n_layers=1, backward compatible):
+    d_model → Linear → out_dim  (equivalent to nn.Linear, no residual)
 
 Staged Training Integration:
 - Freeze MLP during causal initialization (structure learning phase)
@@ -35,26 +45,38 @@ import torch.nn.functional as F
 
 class MLPHead(nn.Module):
     """
-    Multi-layer perceptron output head.
+    Multi-layer perceptron output head with residual connection.
     
-    Replaces the single Linear forecaster/de-embedding layer with an MLP
-    to increase expressiveness for non-linear causal effect composition.
+    Separates the MLP block (d_model → d_hidden → d_model, with residual)
+    from the final projection (d_model → out_dim, no residual).
     
-    Architecture (n_layers=2, default):
-        d_model → Linear → activation → dropout → Linear → out_dim
+    Architecture (n_layers=2, default for MLP):
+        x_res = x
+        x = Linear(d_model, d_hidden) → activation → dropout
+        x = Linear(d_hidden, d_model) → dropout
+        x = x + x_res                    # residual connection
+        x = Linear(d_model, out_dim)     # final projection
     
     Architecture (n_layers=3):
-        d_model → Linear → activation → dropout → Linear → activation → dropout → Linear → out_dim
+        x_res = x
+        x = Linear(d_model, d_hidden) → activation → dropout
+        x = Linear(d_hidden, d_hidden) → activation → dropout
+        x = Linear(d_hidden, d_model) → dropout
+        x = x + x_res                    # residual connection
+        x = Linear(d_model, out_dim)     # final projection
     
     Architecture (n_layers=1, backward compatible):
-        d_model → Linear → out_dim  (equivalent to nn.Linear)
+        x = Linear(d_model, out_dim)     # single projection, no residual
     
     Args:
         d_model: Input dimension (transformer hidden dimension)
         out_dim: Output dimension per token (typically 1 for scalar predictions)
-        n_layers: Number of linear layers. 1 = linear only (backward compatible).
-                  2 = one hidden layer with activation. 3+ = deeper MLP.
-        d_hidden: Hidden dimension. Defaults to d_model if None.
+        n_layers: Number of linear layers in the MLP block.
+                  1 = linear only (backward compatible, no MLP block).
+                  2 = one hidden layer with activation + residual.
+                  3+ = deeper MLP block + residual.
+        d_hidden: Hidden dimension for MLP block. Defaults to 2 * d_model if None.
+                  Standard transformer practice: 2-4× d_model.
         activation: Activation function ('relu', 'gelu'). Default 'relu'.
         dropout: Dropout rate between hidden layers. Default 0.0.
         bias: Whether to use bias in linear layers. Default True.
@@ -77,7 +99,7 @@ class MLPHead(nn.Module):
         self.d_model = d_model
         self.out_dim = out_dim
         self.n_layers = n_layers
-        self.d_hidden = d_hidden if d_hidden is not None else d_model
+        self.d_hidden = d_hidden if d_hidden is not None else (2 * d_model)
         
         # Select activation
         if activation == "relu":
@@ -89,24 +111,27 @@ class MLPHead(nn.Module):
         
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         
-        # Build layers
-        if n_layers == 1:
-            # Backward compatible: single linear projection
-            self.layers = nn.ModuleList([
-                nn.Linear(d_model, out_dim, bias=bias)
-            ])
-        elif n_layers >= 2:
-            layers = []
-            # First layer: d_model → d_hidden
-            layers.append(nn.Linear(d_model, self.d_hidden, bias=bias))
-            # Middle layers: d_hidden → d_hidden
-            for _ in range(n_layers - 2):
-                layers.append(nn.Linear(self.d_hidden, self.d_hidden, bias=bias))
-            # Final layer: d_hidden → out_dim
-            layers.append(nn.Linear(self.d_hidden, out_dim, bias=bias))
-            self.layers = nn.ModuleList(layers)
-        else:
+        if n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+        
+        if n_layers == 1:
+            # Backward compatible: single linear projection, no MLP block
+            self.mlp_block = None
+            self.projection = nn.Linear(d_model, out_dim, bias=bias)
+        else:
+            # MLP block: d_model → d_hidden → ... → d_model (with residual)
+            block_layers = []
+            # First layer: d_model → d_hidden
+            block_layers.append(nn.Linear(d_model, self.d_hidden, bias=bias))
+            # Middle layers: d_hidden → d_hidden (for n_layers >= 3)
+            for _ in range(n_layers - 2):
+                block_layers.append(nn.Linear(self.d_hidden, self.d_hidden, bias=bias))
+            # Final block layer: d_hidden → d_model (back to residual dimension)
+            block_layers.append(nn.Linear(self.d_hidden, d_model, bias=bias))
+            self.mlp_block = nn.ModuleList(block_layers)
+            
+            # Final projection: d_model → out_dim (no residual)
+            self.projection = nn.Linear(d_model, out_dim, bias=bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -120,20 +145,31 @@ class MLPHead(nn.Module):
         """
         if self.n_layers == 1:
             # Single linear projection (backward compatible)
-            return self.layers[0](x)
+            return self.projection(x)
         
-        # Multi-layer: apply activation + dropout between hidden layers
-        for i, layer in enumerate(self.layers[:-1]):
+        # MLP block with residual connection
+        residual = x
+        
+        # Apply hidden layers with activation + dropout
+        for layer in self.mlp_block[:-1]:
             x = layer(x)
             x = self.activation(x)
             x = self.dropout(x)
         
-        # Final layer: no activation (raw output)
-        x = self.layers[-1](x)
+        # Final block layer: d_hidden → d_model (no activation, just dropout)
+        x = self.mlp_block[-1](x)
+        x = self.dropout(x)
+        
+        # Residual connection (d_model + d_model)
+        x = x + residual
+        
+        # Final projection to output dimension (no residual)
+        x = self.projection(x)
         return x
     
     def __repr__(self):
         return (
             f"MLPHead(d_model={self.d_model}, out_dim={self.out_dim}, "
-            f"n_layers={self.n_layers}, d_hidden={self.d_hidden})"
+            f"n_layers={self.n_layers}, d_hidden={self.d_hidden}, "
+            f"residual={self.n_layers >= 2})"
         )
