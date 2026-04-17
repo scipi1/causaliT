@@ -6,9 +6,49 @@ regularization, encouraging independence between inputs and residuals.
 
 HSIC measures statistical dependence: 0 = independent, higher = more dependent.
 Uses RBF (Gaussian) kernel for computing kernel matrices.
+
+Supports **adaptive bandwidth** via the median heuristic (Gretton et al., 2012):
+    σ = median( ||x_i − x_j|| )  over all pairs i < j
+This ensures the RBF kernel stays well-conditioned even as residuals shrink
+during training, preventing the kernel matrix from collapsing to all-ones.
 """
 
 import torch
+
+
+def _median_bandwidth(x: torch.Tensor) -> torch.Tensor:
+    """
+    Compute kernel bandwidth using the median heuristic.
+    
+    σ = median( ||x_i − x_j|| )  for all i < j
+    
+    This is the standard data-driven bandwidth selection for RBF kernels
+    (Gretton et al., 2012 - "A Kernel Two-Sample Test").
+    
+    The median heuristic ensures the kernel matrix is neither too peaked
+    (all off-diagonal entries ≈ 0) nor too flat (all entries ≈ 1),
+    keeping the HSIC estimator well-conditioned regardless of data scale.
+    
+    Args:
+        x: Input tensor of shape (n,) - 1D vector of n samples
+        
+    Returns:
+        Scalar bandwidth σ (detached, no gradient flow through bandwidth)
+    """
+    x_col = x.detach().unsqueeze(1)  # (n, 1)
+    dists = torch.abs(x_col - x_col.T)  # (n, n) pairwise absolute distances
+    
+    # Extract upper triangle (i < j) to avoid zero self-distances
+    mask = torch.triu(torch.ones_like(dists, dtype=torch.bool), diagonal=1)
+    pairwise_dists = dists[mask]
+    
+    if pairwise_dists.numel() == 0:
+        return torch.tensor(1.0, device=x.device, dtype=x.dtype)
+    
+    med = pairwise_dists.median()
+    
+    # Clamp to avoid degenerate bandwidth (numerical safety)
+    return torch.clamp(med, min=1e-5)
 
 
 def rbf_kernel(x: torch.Tensor, sigma: float) -> torch.Tensor:
@@ -33,6 +73,7 @@ def hsic(
     x: torch.Tensor,
     y: torch.Tensor,
     sigma: float = 1.0,
+    adaptive_bandwidth: bool = False,
 ) -> torch.Tensor:
     """
     Compute differentiable HSIC (Hilbert-Schmidt Independence Criterion).
@@ -43,10 +84,18 @@ def hsic(
     Uses the biased estimator: HSIC = (1/(n-1)^2) * tr(KHLH)
     where K, L are kernel matrices and H is the centering matrix.
     
+    When ``adaptive_bandwidth=True``, the ``sigma`` argument is ignored and
+    the bandwidth is computed separately for each variable using the median
+    heuristic (Gretton et al., 2012).  This makes the HSIC scale-invariant:
+    as residuals shrink during training, the kernel automatically adapts,
+    preventing artificial HSIC collapse.
+    
     Args:
         x: First variable tensor of shape (n,) - 1D vector of n samples
         y: Second variable tensor of shape (n,) - 1D vector of n samples
-        sigma: RBF kernel bandwidth (same for both x and y)
+        sigma: RBF kernel bandwidth (used when adaptive_bandwidth=False)
+        adaptive_bandwidth: If True, use median heuristic for bandwidth
+            selection (separate σ_x, σ_y). The ``sigma`` arg is ignored.
         
     Returns:
         Scalar HSIC value (differentiable)
@@ -60,12 +109,21 @@ def hsic(
         >>> y_dep = x + 0.1 * torch.randn(100)  # Dependent
         >>> hsic_val_dep = hsic(x, y_dep, sigma=1.0)
         >>> # hsic_val_dep should be > 0
+        
+        >>> # Adaptive bandwidth — scale-invariant
+        >>> hsic_val_adaptive = hsic(x, y_dep, adaptive_bandwidth=True)
     """
     n = len(x)
     
-    # Compute kernel matrices
-    K = rbf_kernel(x, sigma)  # (n, n)
-    L = rbf_kernel(y, sigma)  # (n, n)
+    # Compute kernel matrices (with per-variable bandwidth when adaptive)
+    if adaptive_bandwidth:
+        sigma_x = _median_bandwidth(x)
+        sigma_y = _median_bandwidth(y)
+        K = rbf_kernel(x, sigma_x)  # (n, n)
+        L = rbf_kernel(y, sigma_y)  # (n, n)
+    else:
+        K = rbf_kernel(x, sigma)  # (n, n)
+        L = rbf_kernel(y, sigma)  # (n, n)
     
     # Centering matrix H = I - (1/n) * 1*1^T
     H = torch.eye(n, device=x.device, dtype=x.dtype) - torch.ones(n, n, device=x.device, dtype=x.dtype) / n
@@ -85,6 +143,7 @@ def hsic_per_token(
     s_values: torch.Tensor,
     residuals: torch.Tensor,
     sigma: float = 1.0,
+    adaptive_bandwidth: bool = False,
 ) -> torch.Tensor:
     """
     Compute HSIC between each token position in S and the mean residuals.
@@ -99,7 +158,8 @@ def hsic_per_token(
     Args:
         s_values: Source values tensor of shape (batch, seq_len_s)
         residuals: Mean residuals tensor of shape (batch,)
-        sigma: RBF kernel bandwidth
+        sigma: RBF kernel bandwidth (ignored when adaptive_bandwidth=True)
+        adaptive_bandwidth: If True, use median heuristic per variable pair
         
     Returns:
         Mean HSIC across all token positions (scalar)
@@ -110,7 +170,7 @@ def hsic_per_token(
     hsic_values = []
     for i in range(seq_len_s):
         s_token = s_values[:, i]  # (batch,)
-        hsic_i = hsic(s_token, residuals, sigma=sigma)
+        hsic_i = hsic(s_token, residuals, sigma=sigma, adaptive_bandwidth=adaptive_bandwidth)
         hsic_values.append(hsic_i)
     
     # Return mean across all positions
@@ -121,6 +181,7 @@ def hsic_per_x_pair(
     x_values: torch.Tensor,
     residuals: torch.Tensor,
     sigma: float = 1.0,
+    adaptive_bandwidth: bool = False,
 ) -> torch.Tensor:
     """
     Compute HSIC between X values and per-X residuals for self-attention DAG validation.
@@ -136,7 +197,8 @@ def hsic_per_x_pair(
     Args:
         x_values: X variable values of shape (batch, seq_len_x)
         residuals: Per-X residuals of shape (batch, seq_len_x) - i.e., x_target - x_pred
-        sigma: RBF kernel bandwidth
+        sigma: RBF kernel bandwidth (ignored when adaptive_bandwidth=True)
+        adaptive_bandwidth: If True, use median heuristic per variable pair
         
     Returns:
         Mean HSIC across all (i, j) pairs where i != j (scalar)
@@ -158,7 +220,7 @@ def hsic_per_x_pair(
         for j in range(seq_len_x):
             if i != j:
                 x_j = x_values[:, j]  # (batch,)
-                hsic_ij = hsic(x_j, res_i, sigma=sigma)
+                hsic_ij = hsic(x_j, res_i, sigma=sigma, adaptive_bandwidth=adaptive_bandwidth)
                 hsic_values.append(hsic_ij)
     
     # Return mean across all (i, j) pairs
@@ -175,6 +237,7 @@ def hsic_attention_weighted(
     attention_weights: torch.Tensor,
     sigma: float = 1.0,
     exclude_diagonal: bool = False,
+    adaptive_bandwidth: bool = False,
 ) -> torch.Tensor:
     """
     Attention-weighted HSIC for causal structure regularization.
@@ -202,8 +265,9 @@ def hsic_attention_weighted(
         source_values: Source variable values (batch, seq_len_source) - S or X values
         residuals: Per-target residuals (batch, seq_len_target)
         attention_weights: Attention matrix (seq_len_target, seq_len_source) - averaged over batch
-        sigma: RBF kernel bandwidth
+        sigma: RBF kernel bandwidth (ignored when adaptive_bandwidth=True)
         exclude_diagonal: If True, skip diagonal entries (for self-attention)
+        adaptive_bandwidth: If True, use median heuristic per variable pair
         
     Returns:
         Normalized attention-weighted HSIC (scalar)
@@ -225,7 +289,7 @@ def hsic_attention_weighted(
             source_j = source_values[:, j]  # (batch,)
             weight_ij = attention_weights[i, j]  # scalar
             
-            hsic_ij = hsic(source_j, res_i, sigma=sigma)
+            hsic_ij = hsic(source_j, res_i, sigma=sigma, adaptive_bandwidth=adaptive_bandwidth)
             weighted_hsic_sum = weighted_hsic_sum + weight_ij * hsic_ij
             weight_sum = weight_sum + weight_ij
     

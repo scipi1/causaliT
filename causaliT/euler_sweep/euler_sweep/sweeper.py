@@ -243,6 +243,7 @@ def run_sequential_sweep(
     data_dir: Optional[str] = None,
     cluster: bool = False,
     experiment_id: Optional[str] = None,
+    pre_sweep_fn: Optional[Callable] = None,
     **kwargs
 ) -> None:
     """
@@ -305,7 +306,23 @@ def run_sequential_sweep(
     # Extract experiment_id from exp_dir if not provided
     if experiment_id is None:
         experiment_id = Path(exp_dir).name
-    
+
+    # ── PRE-SWEEP HOOK ───────────────────────────────────────────────────────
+    # Called once before the grid is expanded.  Returns a nested dict of config
+    # overrides that are merged into the base config so every combination
+    # automatically inherits calibrated values (e.g., lambda_group, lambda_hsic).
+    if pre_sweep_fn is not None:
+        logger.info("Running pre_sweep_fn before generating combinations...")
+        overrides = pre_sweep_fn(
+            config=OmegaConf.to_container(config, resolve=False),
+            data_dir=data_dir,
+            save_dir=exp_dir,
+        )
+        if overrides:
+            config = OmegaConf.merge(config, OmegaConf.create(overrides))
+            logger.info("Pre-sweep overrides applied: %s", list(overrides.keys()))
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Generate combinations based on mode
     # Results are saved in sweeper/runs/ folder
     runs_dir = join(exp_dir, "sweeper", "runs")

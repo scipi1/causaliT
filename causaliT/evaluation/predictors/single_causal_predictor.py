@@ -194,23 +194,40 @@ class SingleCausalPredictor(BasePredictor):
         Args:
             output: Tuple from model.forward():
                 (pred_x, attention_weights, masks, entropies)
-                where attention_weights = (dec_cross, dec_self)
+                where attention_weights = (dec_cross_list, dec_self_list)
+                and each list has one entry per decoder layer.
         
         Returns:
             Dictionary with:
                 - 'pred_x': X predictions
-                - 'attention_weights': Dict with 'dec_cross', 'dec_self'
+                - 'attention_weights': Dict with per-layer keys (dec_cross_L0, etc.)
+                  plus backward-compat keys (dec_cross = layer 0).
         """
         pred_x, attention_weights_tuple, masks, entropies = output
         
-        # Unpack attention weights from decoder
-        dec_cross_att, dec_self_att = attention_weights_tuple
+        # Unpack attention weight lists from decoder (one entry per layer)
+        dec_cross_att_list, dec_self_att_list = attention_weights_tuple
         
-        # Extract attention weights (take first layer for simplicity)
-        attention_weights = {
-            'dec_cross': dec_cross_att[0] if dec_cross_att else None,
-            'dec_self': dec_self_att[0] if dec_self_att else None,
-        }
+        # Build per-layer attention dict + backward-compat keys
+        attention_weights = {}
+        
+        if dec_cross_att_list:
+            for layer_idx, att in enumerate(dec_cross_att_list):
+                if att is not None:
+                    attention_weights[f'dec_cross_L{layer_idx}'] = att
+            # Backward compat: dec_cross = layer 0
+            attention_weights['dec_cross'] = dec_cross_att_list[0] if dec_cross_att_list[0] is not None else None
+        else:
+            attention_weights['dec_cross'] = None
+        
+        if dec_self_att_list:
+            for layer_idx, att in enumerate(dec_self_att_list):
+                if att is not None:
+                    attention_weights[f'dec_self_L{layer_idx}'] = att
+            # Backward compat: dec_self = layer 0
+            attention_weights['dec_self'] = dec_self_att_list[0] if dec_self_att_list[0] is not None else None
+        else:
+            attention_weights['dec_self'] = None
         
         return {
             'pred_x': pred_x,
@@ -278,10 +295,9 @@ class SingleCausalPredictor(BasePredictor):
         x_list = []      # Intermediate targets (X)
         pred_x_list = [] # X predictions
         
-        attention_dict = {
-            'dec_cross': [],
-            'dec_self': [],
-        }
+        # Dynamic attention dict: collects all keys including per-layer (dec_cross_L0, etc.)
+        from collections import defaultdict
+        attention_dict = defaultdict(list)
         
         # Loop over prediction batches
         print("Predicting...")
@@ -315,11 +331,11 @@ class SingleCausalPredictor(BasePredictor):
             x_list.append(X.cpu())
             pred_x_list.append(processed['pred_x'].cpu())
             
-            # Collect attention weights if available
+            # Collect all attention weights (backward-compat + per-layer keys)
             if processed.get('attention_weights') is not None:
-                for key in ['dec_cross', 'dec_self']:
-                    if key in processed['attention_weights'] and processed['attention_weights'][key] is not None:
-                        attention_dict[key].append(processed['attention_weights'][key].cpu())
+                for key, att in processed['attention_weights'].items():
+                    if att is not None:
+                        attention_dict[key].append(att.cpu())
             
             if debug_flag:
                 print("Debug mode: stopping after one batch...")

@@ -17,6 +17,7 @@ from .orthogonal_linear import OrthogonalLinear
 from .embedding_layers import *
 from .extra_layers import Normalization, UniformAttentionMask, DAGMask
 from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
+from .mlp_head import MLPHead
 
 __all__ = [
     'LieAttention',
@@ -41,4 +42,6 @@ __all__ = [
     'ReadingNoiseHead',
     'GaussianNLLLoss',
     'VariancePropagationTracker',
+    # Output head
+    'MLPHead',
 ]

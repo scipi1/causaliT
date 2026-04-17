@@ -216,6 +216,7 @@ def _make_fold_splits(
     config: dict,
     dm,
     seed: int,
+    data_dir: str = None,
 ) -> Tuple[list, Optional[np.ndarray], np.ndarray]:
     """
     Build k-fold train/val index splits and return test indices.
@@ -226,10 +227,12 @@ def _make_fold_splits(
     - Automatic 80/20 test split
 
     Args:
-        config: Configuration dictionary.
-        dm:     DataModule (``prepare_data()`` must have been called already, or
-                ``get_ds_len()`` must work).
-        seed:   Random seed for KFold / permutation.
+        config:   Configuration dictionary.
+        dm:       DataModule (``prepare_data()`` must have been called already,
+                  or ``get_ds_len()`` must work without it).
+        seed:     Random seed for KFold / permutation.
+        data_dir: Root data directory.  Required only when
+                  ``config["data"]["test_ds_ixd"]`` is set.
 
     Returns:
         fold_splits:   List of (train_local_idx, val_local_idx) tuples.
@@ -251,9 +254,11 @@ def _make_fold_splits(
         test_ds_idx_filename = config["data"]["test_ds_ixd"]
 
         if test_ds_idx_filename is not None:
-            # Load pre-defined test indices
-            from causaliT.paths import DATA_DIR
-            data_dir = str(DATA_DIR)
+            if data_dir is None:
+                raise ValueError(
+                    "_make_fold_splits: data_dir must be provided when "
+                    "config['data']['test_ds_ixd'] is set."
+                )
             test_idx = np.load(
                 join(data_dir, config["data"]["dataset"], test_ds_idx_filename)
             )
@@ -404,7 +409,7 @@ def trainer(
     # Build data module and index splits
     dm = get_dataloader(config, data_dir, cluster, seed)
     dm.prepare_data()
-    fold_splits, test_idx, train_val_idx = _make_fold_splits(config, dm, seed)
+    fold_splits, test_idx, train_val_idx = _make_fold_splits(config, dm, seed, data_dir=data_dir)
 
     k_folds = len(fold_splits)
     print(

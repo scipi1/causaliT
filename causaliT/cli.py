@@ -115,8 +115,9 @@ def calitrain(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, 
     # Get folders
     ROOT_DIR = dirname(dirname(abspath(__file__)))
     
-    print(f"Staged Training: {exp_id}")
-    print(f"Scratch path: {scratch_path}")
+    if not cluster:
+        print(f"Staged Training: {exp_id}")
+        print(f"Scratch path: {scratch_path}")
     
     if scratch_path is None:
         exp_dir = join(ROOT_DIR, "experiments/", exp_id)
@@ -150,14 +151,15 @@ def calitrain(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, 
     
     # Validate staged training config
     validation = check_staged_training_config(config)
-    if validation["warnings"]:
-        print("\n⚠️  Staged Training Warnings:")
-        for w in validation["warnings"]:
-            print(f"  - {w}")
-    if validation["info"]:
-        print("\nℹ️  Staged Training Info:")
-        for i in validation["info"]:
-            print(f"  - {i}")
+    if not cluster:
+        if validation["warnings"]:
+            print("\n⚠️  Staged Training Warnings:")
+            for w in validation["warnings"]:
+                print(f"  - {w}")
+        if validation["info"]:
+            print("\nℹ️  Staged Training Info:")
+            for i in validation["info"]:
+                print(f"  - {i}")
     
     # Run staged training pipeline
     staged_trainer(

@@ -106,6 +106,7 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.lambda_hsic_self = config["training"].get("lambda_hsic_self", 0.0)
         self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
+        self.hsic_adaptive_bandwidth = config["training"].get("hsic_adaptive_bandwidth", False)
         self.normalize_hsic_by_loss = config["training"].get("normalize_hsic_by_loss", False)
         
         # KL divergence prior regularization
@@ -478,12 +479,14 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                         residuals=residuals_per_x,
                         attention_weights=att_cross_mean,
                         sigma=self.hsic_sigma,
-                        exclude_diagonal=False
+                        exclude_diagonal=False,
+                        adaptive_bandwidth=self.hsic_adaptive_bandwidth,
                     )
                 else:
                     # Uniform weighting: use mean residuals for efficiency
                     mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
-                    hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
+                    hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma,
+                                                      adaptive_bandwidth=self.hsic_adaptive_bandwidth)
                 
                 # Apply loss-normalized scaling: effective_loss = λ * |loss_nll| * hsic
                 hsic_regularizer += self.lambda_hsic_cross * hsic_loss_scale * hsic_cross_value
@@ -500,10 +503,13 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                             residuals=residuals_per_x,
                             attention_weights=att_self_mean,
                             sigma=self.hsic_sigma,
-                            exclude_diagonal=True
+                            exclude_diagonal=True,
+                            adaptive_bandwidth=self.hsic_adaptive_bandwidth,
                         )
                     else:
-                        hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
+                        hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x,
+                                                          sigma=self.hsic_sigma,
+                                                          adaptive_bandwidth=self.hsic_adaptive_bandwidth)
                     
                     hsic_regularizer += self.lambda_hsic_self * hsic_loss_scale * hsic_self_value
         
@@ -511,9 +517,12 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         if hsic_cross_value is None:
             s_values = S[:, :, self.val_idx]
             mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
-            hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
+            hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma,
+                                              adaptive_bandwidth=self.hsic_adaptive_bandwidth)
         if hsic_self_value is None and residuals_per_x.dim() > 1:
-            hsic_self_value = hsic_per_x_pair(x_target.squeeze(), residuals_per_x, sigma=self.hsic_sigma)
+            hsic_self_value = hsic_per_x_pair(x_target.squeeze(), residuals_per_x,
+                                              sigma=self.hsic_sigma,
+                                              adaptive_bandwidth=self.hsic_adaptive_bandwidth)
         
         # DAG Decisiveness regularizer (always compute for logging)
         decisive_self_loss = torch.tensor(0.0, device=x_target.device)

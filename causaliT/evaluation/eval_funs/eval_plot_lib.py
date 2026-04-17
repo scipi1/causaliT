@@ -89,13 +89,39 @@ def plot_attention_scores(
             attention_blocks.append("dec2_cross")
             phi_mapping["dec2_cross"] = "decoder2_cross"  # Cross-attention DAG (X -> Y)
     elif data.architecture_type in ["SingleCausalForecaster", "NoiseAwareCausalForecaster"]:
-        # SingleCausalForecaster and NoiseAwareCausalForecaster have single decoder: S → X
-        if any(x is not None for x in data.attention_weights.get("dec_self", [])):
-            attention_blocks.append("dec_self")
-            phi_mapping["dec_self"] = "decoder"  # X self-attention DAG
-        if any(x is not None for x in data.attention_weights.get("dec_cross", [])):
-            attention_blocks.append("dec_cross")
-            phi_mapping["dec_cross"] = "decoder_cross"  # S → X cross-attention DAG
+        # Detect per-layer keys (dec_self_L0, dec_cross_L0, etc.)
+        import re
+        layer_keys_self = sorted(
+            [k for k in data.attention_weights.keys() if re.match(r'^dec_self_L\d+$', k)],
+            key=lambda k: int(re.search(r'L(\d+)', k).group(1))
+        )
+        layer_keys_cross = sorted(
+            [k for k in data.attention_weights.keys() if re.match(r'^dec_cross_L\d+$', k)],
+            key=lambda k: int(re.search(r'L(\d+)', k).group(1))
+        )
+        
+        has_multi_layer = len(layer_keys_self) > 1 or len(layer_keys_cross) > 1
+        
+        if has_multi_layer:
+            # Multi-layer: show per-layer rows (skip backward-compat to avoid duplication)
+            for lk in layer_keys_self:
+                if any(x is not None for x in data.attention_weights.get(lk, [])):
+                    layer_idx = re.search(r'L(\d+)', lk).group(1)
+                    attention_blocks.append(lk)
+                    phi_mapping[lk] = f"decoder_L{layer_idx}"
+            for lk in layer_keys_cross:
+                if any(x is not None for x in data.attention_weights.get(lk, [])):
+                    layer_idx = re.search(r'L(\d+)', lk).group(1)
+                    attention_blocks.append(lk)
+                    phi_mapping[lk] = f"decoder_cross_L{layer_idx}"
+        else:
+            # Single layer or old cached data: use backward-compat keys
+            if any(x is not None for x in data.attention_weights.get("dec_self", [])):
+                attention_blocks.append("dec_self")
+                phi_mapping["dec_self"] = "decoder"
+            if any(x is not None for x in data.attention_weights.get("dec_cross", [])):
+                attention_blocks.append("dec_cross")
+                phi_mapping["dec_cross"] = "decoder_cross"
     
     if not attention_blocks:
         raise ValueError("No attention blocks with data found")

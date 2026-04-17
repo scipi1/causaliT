@@ -23,7 +23,8 @@ import torch.nn.functional as F
 from causaliT.core.modules import (
     LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer,ToeplitzLieAttention, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
-    Normalization, UniformAttentionMask
+    Normalization, UniformAttentionMask,
+    MLPHead
 )
 from causaliT.core.architectures.stage_causal.decoder import (
     ReversedDecoder, ReversedDecoderLayer
@@ -127,6 +128,14 @@ class SingleCausalLayer(nn.Module):
         key_projection_type_self: str = "linear",
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
+        
+        # Output MLP head configuration
+        # Adds non-linearity at the output for composing indirect causal effects.
+        # n_layers=1 reduces to nn.Linear (backward compatible with existing checkpoints).
+        output_mlp_layers: int = 1,
+        output_mlp_hidden: int = None,       # None = d_ff
+        output_mlp_activation: str = "relu",
+        output_mlp_dropout: float = 0.0,
     ):
         super().__init__()
         
@@ -257,7 +266,17 @@ class SingleCausalLayer(nn.Module):
         )
         
         # De-embedding head (forecaster)
-        self.forecaster = nn.Linear(d_model, out_dim, bias=False)
+        # MLPHead with n_layers=1 is equivalent to nn.Linear (backward compatible)
+        mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
+        self.forecaster = MLPHead(
+            d_model=d_model,
+            out_dim=out_dim,
+            n_layers=output_mlp_layers,
+            d_hidden=mlp_hidden,
+            activation=output_mlp_activation,
+            dropout=output_mlp_dropout,
+            bias=(output_mlp_layers > 1),  # bias=False for single linear (backward compat), True for MLP
+        )
     
     def forward(
         self,

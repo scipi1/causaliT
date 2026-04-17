@@ -18,7 +18,8 @@ from causaliT.core.modules import (
     Decoder, DecoderLayer,
     ModularEmbedding,
     Encoder, EncoderLayer,
-    Normalization, UniformAttentionMask
+    Normalization, UniformAttentionMask,
+    MLPHead
 )
 
 
@@ -83,6 +84,12 @@ class ProT(nn.Module):
         
         # SVFA: factorization mode ("standard" or "svfa")
         factorization: str = "standard",
+        
+        # Output MLP head configuration
+        output_mlp_layers: int = 1,
+        output_mlp_hidden: int = None,       # None = d_ff
+        output_mlp_activation: str = "relu",
+        output_mlp_dropout: float = 0.0,
         ):
         super().__init__()
         
@@ -191,8 +198,18 @@ class ProT(nn.Module):
             factorization=factorization
             )
         
-        # final linear layer turns Transformer output into predictions
-        self.forecaster = nn.Linear(d_model_dec, out_dim, bias=False)
+        # final output head (forecaster) - turns Transformer output into predictions
+        # MLPHead with n_layers=1 is equivalent to nn.Linear (backward compatible)
+        mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
+        self.forecaster = MLPHead(
+            d_model=d_model_dec,
+            out_dim=out_dim,
+            n_layers=output_mlp_layers,
+            d_hidden=mlp_hidden,
+            activation=output_mlp_activation,
+            dropout=output_mlp_dropout,
+            bias=(output_mlp_layers > 1),
+        )
         
         
     def forward(

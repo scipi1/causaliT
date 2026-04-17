@@ -13,7 +13,7 @@ setup(
     version="0.1.0",
     description="Causal Process Transformer for sequence prediction",
     author="Your Name",
-    packages=find_packages(),
+    packages=find_packages() + ['scm_ds'],
     python_requires=">=3.8",
     # No install_requires - dependencies managed separately in requirements.txt
     # This allows pip install -e . without reinstalling packages

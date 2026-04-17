@@ -36,7 +36,8 @@ import torch.nn.functional as F
 from causaliT.core.modules import (
     LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
-    Normalization, UniformAttentionMask
+    Normalization, UniformAttentionMask,
+    MLPHead
 )
 from causaliT.core.modules.noise_layers import (
     AmbientNoiseLayer, ReadingNoiseHead, VariancePropagationTracker
@@ -183,6 +184,14 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         key_projection_type_self: str = "linear",
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
+        
+        # Output MLP head configuration
+        # Adds non-linearity at the output for composing indirect causal effects.
+        # n_layers=1 reduces to nn.Linear (backward compatible with existing checkpoints).
+        output_mlp_layers: int = 1,
+        output_mlp_hidden: int = None,       # None = d_ff
+        output_mlp_activation: str = "relu",
+        output_mlp_dropout: float = 0.0,
     ):
         super().__init__()
         
@@ -343,12 +352,24 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         # =====================================================================
         
         # Reading noise head (replaces standard forecaster)
+        # Build the mean prediction head: MLPHead or single Linear
+        mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
+        mean_head = MLPHead(
+            d_model=d_model,
+            out_dim=out_dim,
+            n_layers=output_mlp_layers,
+            d_hidden=mlp_hidden,
+            activation=output_mlp_activation,
+            dropout=output_mlp_dropout,
+            bias=(output_mlp_layers > 1),  # bias=False for single linear (backward compat)
+        )
         self.output_head = ReadingNoiseHead(
             d_model=d_model,
             num_nodes=X_seq_len,
             out_dim=out_dim,
             init_sigma_R=init_sigma_R,
-            learn_variance=True
+            learn_variance=True,
+            head_mu=mean_head,
         )
     
     def forward(

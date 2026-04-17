@@ -56,9 +56,6 @@ class SingleCausalForecaster(pl.LightningModule):
         # Data indices for blanking values
         self.val_idx = config["data"]["val_idx"]
         
-        # Logging configuration
-        self.log_acyclicity = config["training"].get("log_acyclicity", False)
-        
         # Regularizers
         self.kappa = config["training"].get("kappa", 0)   # Acyclicity regularization
         
@@ -68,9 +65,6 @@ class SingleCausalForecaster(pl.LightningModule):
         
         if self.lambda_sparse_cross is None:
             self.lambda_sparse_cross = self.lambda_sparse
-        
-        # Logging for DAG sparsity (phi)
-        self.log_sparsity = config["training"].get("log_sparsity", False)
         
         # =====================================================================
         # UNIFIED SCORE SPARSITY REGULARIZATION
@@ -86,9 +80,6 @@ class SingleCausalForecaster(pl.LightningModule):
         self.self_sparsity_regularizer = config["training"].get("self_sparsity_regularizer", "l1")
         self.cross_sparsity_regularizer = config["training"].get("cross_sparsity_regularizer", "entropy")
         
-        # Logging for unified score sparsity
-        self.log_score_sparsity = config["training"].get("log_score_sparsity", False)
-        
         # Track if fallback was triggered (for warning once)
         self._self_sparsity_fallback_warned = False
         self._cross_sparsity_fallback_warned = False
@@ -101,13 +92,12 @@ class SingleCausalForecaster(pl.LightningModule):
         # use_attention_weighted_hsic: If True, weight HSIC by attention scores
         #   - False: uniform HSIC (all edges weighted equally)
         #   - True: attention-weighted HSIC (higher penalty for strongly attended edges)
-        # log_hsic: Log HSIC values during training
         self.lambda_hsic_cross = config["training"].get("lambda_hsic_cross", 
                                      config["training"].get("lambda_hsic", 0.0))  # Fallback to old name
         self.lambda_hsic_self = config["training"].get("lambda_hsic_self", 0.0)
         self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
-        self.log_hsic = config["training"].get("log_hsic", False)
+        self.hsic_adaptive_bandwidth = config["training"].get("hsic_adaptive_bandwidth", False)
         
         # KL divergence prior regularization
         # lambda_kl: scalar weight for the KL prior term
@@ -125,7 +115,6 @@ class SingleCausalForecaster(pl.LightningModule):
         self.lambda_decisive_cross = config["training"].get("lambda_decisive_cross", None)
         self.lambda_tau = config["training"].get("lambda_tau", 0)
         self.target_tau = config["training"].get("target_tau", 0.1)
-        self.log_decisiveness = config["training"].get("log_decisiveness", False)
         
         # =====================================================================
         # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
@@ -139,8 +128,6 @@ class SingleCausalForecaster(pl.LightningModule):
         # Backward compatibility: falls back to lambda_embed_l1 if lambda_group_l1 not specified
         self.lambda_group_l1 = config["training"].get("lambda_group_l1", 
                                    config["training"].get("lambda_embed_l1", 0.0))
-        self.log_group_l1 = config["training"].get("log_group_l1",
-                                config["training"].get("log_embed_l1", False))
         
         # =====================================================================
         # GRADIENT NORM LOGGING (for calibration stage)
@@ -186,10 +173,6 @@ class SingleCausalForecaster(pl.LightningModule):
         self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
         self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
         self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
-        
-        # Logging for annealing
-        self.log_tau_annealing = config["training"].get("log_tau_annealing", False)
-        self.log_hsic_annealing = config["training"].get("log_hsic_annealing", False)
         
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
@@ -481,51 +464,54 @@ class SingleCausalForecaster(pl.LightningModule):
         hsic_cross_value = None
         hsic_self_value = None
         
-        if self.lambda_hsic_cross > 0 or self.lambda_hsic_self > 0 or self.log_hsic:
-            # Compute per-X residuals: (batch, seq_len_x)
-            residuals_per_x = x_target.squeeze() - pred_x.squeeze()
+        # Always compute HSIC values (for both regularization and logging)
+        # Compute per-X residuals: (batch, seq_len_x)
+        residuals_per_x = x_target.squeeze() - pred_x.squeeze()
+        
+        # S→X HSIC (cross-attention)
+        s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
+        
+        if self.use_attention_weighted_hsic:
+            # Attention-weighted: higher penalty for strongly attended edges
+            att_cross_mean = dec_cross_att[0].mean(dim=0)  # (seq_len_x, seq_len_s)
+            hsic_cross_value = hsic_attention_weighted(
+                source_values=s_values,
+                residuals=residuals_per_x,
+                attention_weights=att_cross_mean,
+                sigma=self.hsic_sigma,
+                exclude_diagonal=False,
+                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+            )
+        else:
+            # Uniform weighting: use mean residuals for efficiency
+            mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
+            hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma,
+                                              adaptive_bandwidth=self.hsic_adaptive_bandwidth)
+        
+        hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
+        
+        # X→X HSIC (self-attention)
+        x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
+        
+        if residuals_per_x.dim() > 1:
+            if self.use_attention_weighted_hsic:
+                # Attention-weighted: higher penalty for strongly attended edges
+                att_self_mean = dec_self_att[0].mean(dim=0)  # (seq_len_x, seq_len_x)
+                hsic_self_value = hsic_attention_weighted(
+                    source_values=x_values_for_hsic,
+                    residuals=residuals_per_x,
+                    attention_weights=att_self_mean,
+                    sigma=self.hsic_sigma,
+                    exclude_diagonal=True,  # X shouldn't attend to itself
+                    adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                )
+            else:
+                # Uniform weighting
+                hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x,
+                                                  sigma=self.hsic_sigma,
+                                                  adaptive_bandwidth=self.hsic_adaptive_bandwidth)
             
-            # S→X HSIC (cross-attention)
-            if self.lambda_hsic_cross > 0 or self.log_hsic:
-                s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
-                
-                if self.use_attention_weighted_hsic:
-                    # Attention-weighted: higher penalty for strongly attended edges
-                    att_cross_mean = dec_cross_att[0].mean(dim=0)  # (seq_len_x, seq_len_s)
-                    hsic_cross_value = hsic_attention_weighted(
-                        source_values=s_values,
-                        residuals=residuals_per_x,
-                        attention_weights=att_cross_mean,
-                        sigma=self.hsic_sigma,
-                        exclude_diagonal=False
-                    )
-                else:
-                    # Uniform weighting: use mean residuals for efficiency
-                    mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
-                    hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma)
-                
-                hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
-            
-            # X→X HSIC (self-attention)
-            if self.lambda_hsic_self > 0 or self.log_hsic:
-                x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
-                
-                if residuals_per_x.dim() > 1:
-                    if self.use_attention_weighted_hsic:
-                        # Attention-weighted: higher penalty for strongly attended edges
-                        att_self_mean = dec_self_att[0].mean(dim=0)  # (seq_len_x, seq_len_x)
-                        hsic_self_value = hsic_attention_weighted(
-                            source_values=x_values_for_hsic,
-                            residuals=residuals_per_x,
-                            attention_weights=att_self_mean,
-                            sigma=self.hsic_sigma,
-                            exclude_diagonal=True  # X shouldn't attend to itself
-                        )
-                    else:
-                        # Uniform weighting
-                        hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x, sigma=self.hsic_sigma)
-                    
-                    hsic_regularizer += self.lambda_hsic_self * hsic_self_value
+            hsic_regularizer += self.lambda_hsic_self * hsic_self_value
         
         # DAG Decisiveness regularizer - encourages edge probabilities away from 0.5
         # This addresses the problem with antisymmetric DAG parameterization where
@@ -535,37 +521,37 @@ class SingleCausalForecaster(pl.LightningModule):
         tau_self_loss = torch.tensor(0.0, device=x_target.device)
         tau_cross_loss = torch.tensor(0.0, device=x_target.device)
         
-        if self.lambda_decisive > 0 or self.lambda_tau > 0 or self.log_decisiveness:
-            # Self-attention decisiveness
-            if dec_self_phi is not None:
-                # Get Gumbel-Softmax temperature for self-attention (log_tau_gs is used for DAG mask)
-                log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
-                tau_gs_self = torch.exp(log_tau_gs_self) if log_tau_gs_self is not None else None
-                
-                # Exclude diagonal for self-attention (it's always 0 for antisymmetric)
-                is_square = dec_self_phi.shape[-2] == dec_self_phi.shape[-1]
-                decisive_self_loss = dag_decisiveness_loss(
-                    dec_self_phi, tau=tau_gs_self, exclude_diagonal=is_square
-                )
-                
-                # Temperature penalty for self-attention
-                if log_tau_gs_self is not None and self.lambda_tau > 0:
-                    tau_self_loss = dag_temperature_loss(log_tau_gs_self, target_tau=self.target_tau)
+        # Always compute decisiveness (for both regularization and logging)
+        # Self-attention decisiveness
+        if dec_self_phi is not None:
+            # Get Gumbel-Softmax temperature for self-attention (log_tau_gs is used for DAG mask)
+            log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
+            tau_gs_self = torch.exp(log_tau_gs_self) if log_tau_gs_self is not None else None
             
-            # Cross-attention decisiveness
-            if dec_cross_phi is not None:
-                # Get Gumbel-Softmax temperature for cross-attention (log_tau_gs is used for DAG mask)
-                log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
-                tau_gs_cross = torch.exp(log_tau_gs_cross) if log_tau_gs_cross is not None else None
-                
-                # Cross-attention is not square, so no diagonal to exclude
-                decisive_cross_loss = dag_decisiveness_loss(
-                    dec_cross_phi, tau=tau_gs_cross, exclude_diagonal=False
-                )
-                
-                # Temperature penalty for cross-attention
-                if log_tau_gs_cross is not None and self.lambda_tau > 0:
-                    tau_cross_loss = dag_temperature_loss(log_tau_gs_cross, target_tau=self.target_tau)
+            # Exclude diagonal for self-attention (it's always 0 for antisymmetric)
+            is_square = dec_self_phi.shape[-2] == dec_self_phi.shape[-1]
+            decisive_self_loss = dag_decisiveness_loss(
+                dec_self_phi, tau=tau_gs_self, exclude_diagonal=is_square
+            )
+            
+            # Temperature penalty for self-attention
+            if log_tau_gs_self is not None and self.lambda_tau > 0:
+                tau_self_loss = dag_temperature_loss(log_tau_gs_self, target_tau=self.target_tau)
+        
+        # Cross-attention decisiveness
+        if dec_cross_phi is not None:
+            # Get Gumbel-Softmax temperature for cross-attention (log_tau_gs is used for DAG mask)
+            log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+            tau_gs_cross = torch.exp(log_tau_gs_cross) if log_tau_gs_cross is not None else None
+            
+            # Cross-attention is not square, so no diagonal to exclude
+            decisive_cross_loss = dag_decisiveness_loss(
+                dec_cross_phi, tau=tau_gs_cross, exclude_diagonal=False
+            )
+            
+            # Temperature penalty for cross-attention
+            if log_tau_gs_cross is not None and self.lambda_tau > 0:
+                tau_cross_loss = dag_temperature_loss(log_tau_gs_cross, target_tau=self.target_tau)
         
         decisiveness_regularizer = (
             self.lambda_decisive * decisive_self_loss +
@@ -580,13 +566,8 @@ class SingleCausalForecaster(pl.LightningModule):
         # information bottleneck that makes the HSIC signal meaningful.
         # Unlike element-wise L1, this truly reduces effective d_model.
         # Replaces old embed_l1 regularizer with more principled group sparsity.
-        if self.lambda_group_l1 > 0 or self.log_group_l1:
-            group_l1_loss, effective_dims = self._compute_group_l1()
-            group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
-        else:
-            group_l1_loss = torch.tensor(0.0, device=x_target.device)
-            effective_dims = None
-            group_l1_regularizer = 0.0
+        group_l1_loss, effective_dims = self._compute_group_l1()
+        group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
         
         # =====================================================================
         # GRADIENT AND UPDATE SIGNAL LOGGING (for two-step calibration)
@@ -738,55 +719,48 @@ class SingleCausalForecaster(pl.LightningModule):
             metric_eval = metric(pred_x.reshape(-1), x_target.reshape(-1))
             self.log(f"{stage}_x_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val" and name == "mae"))
         
-        # Log acyclicity if requested
-        if self.log_acyclicity:
-            self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
+        # Log acyclicity
+        self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
         
-        # Log DAG sparsity (phi) if requested
-        if self.log_sparsity:
-            self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
-            self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
-            self.log(f"{stage}_sparsity_total", sparsity_regularizer, on_step=False, on_epoch=True)
+        # Log DAG sparsity (phi)
+        self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
+        self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
+        self.log(f"{stage}_sparsity_total", sparsity_regularizer, on_step=False, on_epoch=True)
         
-        # Log unified score sparsity if requested
-        if self.log_score_sparsity:
-            self.log(f"{stage}_self_score_sparse", self_score_sparse, on_step=False, on_epoch=True)
-            self.log(f"{stage}_cross_score_sparse", cross_score_sparse, on_step=False, on_epoch=True)
-            self.log(f"{stage}_self_sparsity_mode", 1.0 if self_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
-            self.log(f"{stage}_cross_sparsity_mode", 1.0 if cross_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
+        # Log unified score sparsity
+        self.log(f"{stage}_self_score_sparse", self_score_sparse, on_step=False, on_epoch=True)
+        self.log(f"{stage}_cross_score_sparse", cross_score_sparse, on_step=False, on_epoch=True)
+        self.log(f"{stage}_self_sparsity_mode", 1.0 if self_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
+        self.log(f"{stage}_cross_sparsity_mode", 1.0 if cross_mode_used == "l1" else 0.0, on_step=False, on_epoch=True)
         
-        # Log HSIC if requested
-        if self.log_hsic:
-            if hsic_cross_value is not None:
-                self.log(f"{stage}_hsic_cross", hsic_cross_value, on_step=False, on_epoch=True)
-            if hsic_self_value is not None:
-                self.log(f"{stage}_hsic_self", hsic_self_value, on_step=False, on_epoch=True)
-            self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
+        # Log HSIC
+        if hsic_cross_value is not None:
+            self.log(f"{stage}_hsic_cross", hsic_cross_value, on_step=False, on_epoch=True)
+        if hsic_self_value is not None:
+            self.log(f"{stage}_hsic_self", hsic_self_value, on_step=False, on_epoch=True)
+        self.log(f"{stage}_hsic_reg", hsic_regularizer, on_step=False, on_epoch=True)
         
-        # Log decisiveness if requested
-        if self.log_decisiveness:
-            self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_tau_self", tau_self_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_tau_cross", tau_cross_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_decisive_total", decisiveness_regularizer, on_step=False, on_epoch=True)
-            # Log actual Gumbel-Softmax temperature values for monitoring
-            # log_tau_gs is the Gumbel-Softmax temperature used for DAG mask sampling
-            if dec_self_phi is not None:
-                log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
-                if log_tau_gs_self is not None:
-                    self.log(f"{stage}_tau_gs_self_value", torch.exp(log_tau_gs_self), on_step=False, on_epoch=True)
-            if dec_cross_phi is not None:
-                log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
-                if log_tau_gs_cross is not None:
-                    self.log(f"{stage}_tau_gs_cross_value", torch.exp(log_tau_gs_cross), on_step=False, on_epoch=True)
+        # Log decisiveness
+        self.log(f"{stage}_decisive_self", decisive_self_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_decisive_cross", decisive_cross_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_tau_self", tau_self_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_tau_cross", tau_cross_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_decisive_total", decisiveness_regularizer, on_step=False, on_epoch=True)
+        # Log actual Gumbel-Softmax temperature values for monitoring
+        if dec_self_phi is not None:
+            log_tau_gs_self = getattr(dec_self_inner, 'log_tau_gs', None)
+            if log_tau_gs_self is not None:
+                self.log(f"{stage}_tau_gs_self_value", torch.exp(log_tau_gs_self), on_step=False, on_epoch=True)
+        if dec_cross_phi is not None:
+            log_tau_gs_cross = getattr(dec_cross_inner, 'log_tau_gs', None)
+            if log_tau_gs_cross is not None:
+                self.log(f"{stage}_tau_gs_cross_value", torch.exp(log_tau_gs_cross), on_step=False, on_epoch=True)
         
-        # Log group L1 if requested
-        if self.log_group_l1:
-            self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
-            self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
-            if effective_dims is not None:
-                self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
+        # Log group L1
+        self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+        self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
+        if effective_dims is not None:
+            self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     
@@ -813,8 +787,7 @@ class SingleCausalForecaster(pl.LightningModule):
                 with torch.no_grad():
                     log_tau_gs.copy_(torch.log(torch.tensor(new_tau_gs)))
             
-            if self.log_tau_annealing:
-                self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
+            self.log("annealed_tau_gs", new_tau_gs, on_step=False, on_epoch=True)
         
         # 2. Toeplitz activation temperature annealing
         if self.use_tau_act_annealing:
@@ -832,9 +805,8 @@ class SingleCausalForecaster(pl.LightningModule):
                 with torch.no_grad():
                     log_tau_dir.copy_(torch.log(torch.tensor(new_tau_dir)))
             
-            if self.log_tau_annealing:
-                self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
-                self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
+            self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
+            self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
         
         # 3. HSIC annealing
         if self.use_hsic_annealing:
@@ -846,9 +818,8 @@ class SingleCausalForecaster(pl.LightningModule):
                 self.hsic_lambda_self_start, self.hsic_lambda_self_end, epoch, anneal_epochs
             )
             
-            if self.log_hsic_annealing:
-                self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
-                self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
+            self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
+            self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
         """Training step."""

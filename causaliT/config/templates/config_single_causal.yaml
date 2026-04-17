@@ -181,6 +181,20 @@ model:
     X_seq_len: ${data.X_seq_len}
     
     # =========================================================================
+    # OUTPUT MLP HEAD
+    # =========================================================================
+    # Adds non-linearity at the output for composing indirect causal effects.
+    # With n_layers=1 (default), this reduces to nn.Linear (backward compatible).
+    # With n_layers=2, this becomes: d_model → d_ff → out_dim with activation.
+    # Use ReLU for sparsity (helps HSIC signal); GELU for smoother gradients.
+    #
+    # For staged training: freeze MLP during causal init, unfreeze for main training.
+    output_mlp_layers: 1               # 1 = linear (backward compat), 2 = MLP
+    output_mlp_hidden: ${experiment.d_ff}  # Hidden dim (null = d_ff)
+    output_mlp_activation: "relu"      # "relu" or "gelu"
+    output_mlp_dropout: 0.0            # Dropout between MLP layers
+    
+    # =========================================================================
     # DROPOUT
     # =========================================================================
     dropout_emb: ${experiment.dropout}
@@ -257,6 +271,7 @@ training:
   use_attention_weighted_hsic: false
   normalize_hsic_by_loss: false
   hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false  # Use median heuristic for scale-invariant HSIC
   
   # =========================================================================
   # HSIC ANNEALING
@@ -319,16 +334,18 @@ training:
 # STAGED TRAINING
 # =============================================================================
 # Enable multi-stage training pipeline for robust causal structure learning:
-# Stage 0 (Calibration): Find λ_group for gradient balance
-# Stage 1 (Causal Init): Pre-train with high HSIC for structure initialization
-# Stage 2 (Main Training): Standard training with calibrated regularization
+# Stage 0 (Calibration):       Find λ_group for gradient balance
+# Stage 1 (Causal Init):       Pre-train with high HSIC for structure initialization
+# Stage 2 (Score Sparsity CV): Select λ_score via k-fold cross-validation
+# Stage 3 (Main Training):     Standard training with calibrated regularization
 #
-# To run: python -m causaliT.cli staged_train --exp_id <experiment>
+# To run: python -m causaliT.cli calitrain --exp_id <experiment>
 # =============================================================================
 staged_training:
-  # Master switches (both off by default for backward compatibility)
+  # Master switches (all off by default for backward compatibility)
   use_calibration: false
   use_causal_init: false
+  use_score_sparsity_cv: false
   
   # Stage 0: Calibration
   calibration_epochs: 10            # Epochs per calibration trial
@@ -341,6 +358,24 @@ staged_training:
   # The model learns the causal mechanism before fitting pressure takes over.
   causal_init_epochs: 20            # Epochs for causal initialization
   causal_init_hsic_multiplier: 10.0 # λ_hsic_init = λ_hsic_base × multiplier
+  causal_init_n_seeds: 1            # Number of seeds to try (best HSIC wins)
+                                    # Higher values (5-10) find better init points
+                                    # at the cost of proportionally more compute
+  
+  # Freeze output MLP head during causal init to prevent it from
+  # compensating for incorrect structure via expressiveness.
+  # Only relevant when output_mlp_layers > 1. Default: true.
+  causal_init_freeze_output_mlp: true
+  
+  # Stage 2: Score Sparsity Cross-Validation
+  # Select optimal λ_score (attention score LASSO regularization) via k-fold CV.
+  # Uses the SAME lambda for both cross- and self-attention score sparsity.
+  # Selection rule: "min_hsic" (causal models) or "min_recon" (baselines).
+  # Both criteria are always reported in the summary for comparison.
+  score_sparsity_lambda_candidates: [0.0, 0.001, 0.005, 0.01, 0.05, 0.1]
+  score_sparsity_cv_folds: 5         # Number of CV folds
+  score_sparsity_cv_epochs: 20       # Training epochs per fold (short runs)
+  score_sparsity_selection_rule: "min_hsic"  # "min_hsic" or "min_recon"
   
   # Manual override for λ_group (skip calibration if already known)
   # Set to null to use calibration result or training.lambda_group_l1
@@ -349,11 +384,12 @@ staged_training:
   # =========================================================================
   # CALIBRATION OUTPUT VALUES (populated by staged_train)
   # =========================================================================
-  # These are written during calibration and used for causal_init/main training.
+  # These are written during staged training and propagated to main training.
   # Leave as null - they will be populated automatically.
-  lambda_hsic_cross_suggested: null  # λ_hsic_cross from calibration
-  lambda_hsic_self_suggested: null   # λ_hsic_self from calibration
-  calibration_checkpoint: null       # Path to calibration checkpoint
+  lambda_hsic_cross_suggested: null  # λ_hsic_cross from calibration (Stage 0)
+  lambda_hsic_self_suggested: null   # λ_hsic_self from calibration (Stage 0)
+  calibration_checkpoint: null       # Path to calibration checkpoint (Stage 0)
+  lambda_score_suggested: null       # λ_score from score sparsity CV (Stage 2)
 
 
 # =========================================================================

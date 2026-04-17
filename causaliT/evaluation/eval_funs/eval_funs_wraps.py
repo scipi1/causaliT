@@ -78,7 +78,7 @@ def run_evaluations_from_config(
     FUNCTION_REGISTRY = {
         "eval_train_metrics": lambda exp: eval_train_metrics(exp, show_plots=show_plots),
         "eval_attention_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
-        # "eval_attention_evolution": lambda exp: eval_attention_evolution(exp, show_plots=show_plots),  # SLOW: evolution tracking
+        "eval_attention_evolution": lambda exp: eval_attention_evolution(exp, show_plots=show_plots),  # SLOW: evolution tracking
         # "eval_embed": lambda exp: eval_embed(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "eval_interventions": lambda exp: eval_interventions(exp, show_plots=show_plots),
         # "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed

@@ -16,10 +16,40 @@
     - noise_aware architecture
 
 - Regularization & Training
-    - HSIC regularization (potentially with cross-splitting) with initial calibration in `staged_training` ✅
+
+We propose a paradigm composed of 3 steps (`staged_training`)
+1) **Calibration:** the gradient signals coming from HSIC (structural) and MSE (reconstructing) losses are balanced by
+    1) Finding a group LASSO coefficient
+    2) Finding regularization constant for HSIC (`lambda_hsic_self`, `lambda_hsic_cross`)
+
+2) **Causal initialization:** the model is initialized to a causally favorable configuration. A seed sweep wraps several short training sessions and the most promising is selected to start the real optimization.
+The problem is the following: the HSIC needs the residual, which comes from fitting the data
+
+ HSIC regularization (potentially with cross-splitting) with initial calibration in `staged_training` ✅
         TODO: plot gradient ratio VS sparsity lambda ⌛
     - L1 (sparsity) on scores (still don't know how to select it) ⌛
 
+
+### Backup Plan
+Show that the new attention architectures can perform better than SoftMax in estimating the ATE when the true DAG is provided.
+#### Proven that new attentions perform WORSE, when providing the new DAG.
+
+### Plan 14-04-2026
+The causal initialization is the crux and once we nail this, optimization should do the rest.
+- add something to evaluate the initialization to check whether it's working before running the optimization. Log SHD for example
+- revisit the idea of optimizing. Multiple restart with different seeds might be necessary as well as freezing some parameters (like linear, only optimize the structure).
+
+As the HSIC with adaptive $\sigma$ compensate the reduction of HSIC during training, we can use the causal initialization to be more focussed on the HSIC. For example with double learning rates, etc....
+
+### Elastic weight
+Note:
+This should now (with the adaptive bandwidth of the HSIC) be less of a problem: once the model is fitted on the reconstruction error, the only one left to optimize is the HSIC, which acts on the causal structure.
+
+Original:
+Imagine weights that want to go back to the initialization if not updated anymore. They could be updated at the beginning of the training but then no longer be important and stuck into a suboptimal configuration for ever. By introducing a tension between update signal and elastic behavior, if their reset is not hurting the loss, it is highly beneficial because it could trigger new directions/causal structures.
+
+### Note on ATE
+Currently, we can only compare ATE errors between models but not within the same model ID vs OOD. The reason is that the absolute error depends on the intervention and whether is OOD or ID. We can achieve this by generating a dataset w/o houldout test split.
 
 ### Results
 
@@ -221,3 +251,4 @@ In the case of discrete $S$ sampling we can leave out one choice for testing. Th
 - make many loggins ON by default and delete option, always log
 - trim very long comments/explanations
 - adjust config templates
+- remove NOTEARS as our partial causal ordering explicitly avoids cycles by construction.

@@ -175,7 +175,8 @@ class ReadingNoiseHead(nn.Module):
         num_nodes: int, 
         out_dim: int = 1,
         init_sigma_R: float = 0.05,
-        learn_variance: bool = True
+        learn_variance: bool = True,
+        head_mu: nn.Module = None,
     ):
         super().__init__()
         
@@ -185,7 +186,12 @@ class ReadingNoiseHead(nn.Module):
         self.learn_variance = learn_variance
         
         # Mean prediction head
-        self.head_mu = nn.Linear(d_model, out_dim, bias=False)
+        # If an external head_mu is provided (e.g., MLPHead), use it.
+        # Otherwise, fall back to a single linear layer (backward compatible).
+        if head_mu is not None:
+            self.head_mu = head_mu
+        else:
+            self.head_mu = nn.Linear(d_model, out_dim, bias=False)
         
         # Per-node reading noise: σ_R[i]
         # Initialize with log(init_sigma_R) for positivity via exp()

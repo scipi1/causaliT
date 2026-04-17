@@ -228,11 +228,42 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     
     try:
         arch_config = get_architecture_config(architecture)
-        blocks_to_eval = arch_config["blocks_to_eval"]
+        blocks_to_eval = list(arch_config["blocks_to_eval"])  # copy to allow extension
         mec_keys = arch_config["mec_keys"]
     except ValueError:
         print(f"Warning: Unknown architecture {architecture}, skipping DAG metrics")
         return {}
+    
+    # Extend blocks_to_eval with per-layer entries when multi-layer data is available
+    if architecture in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+        import re as _re
+        layer_phi_self = sorted(
+            [k for k in final_scores_dict.phi_tensors.keys() if _re.match(r'^decoder_L\d+$', k)],
+            key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+        )
+        layer_phi_cross = sorted(
+            [k for k in final_scores_dict.phi_tensors.keys() if _re.match(r'^decoder_cross_L\d+$', k)],
+            key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+        )
+        layer_att_self = sorted(
+            [k for k in final_scores_dict.attention_weights.keys() if _re.match(r'^dec_self_L\d+$', k)],
+            key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+        )
+        layer_att_cross = sorted(
+            [k for k in final_scores_dict.attention_weights.keys() if _re.match(r'^dec_cross_L\d+$', k)],
+            key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+        )
+        
+        has_multi_layer = len(layer_phi_self) > 1 or len(layer_phi_cross) > 1
+        
+        if has_multi_layer:
+            # Replace backward-compat blocks with per-layer blocks
+            blocks_to_eval = []
+            for att_key, phi_key in zip(layer_att_cross, layer_phi_cross):
+                blocks_to_eval.append((att_key, phi_key, "dec_cross"))
+            for att_key, phi_key in zip(layer_att_self, layer_phi_self):
+                blocks_to_eval.append((att_key, phi_key, "dec_self"))
+            print(f"  Multi-layer: evaluating {len(blocks_to_eval)} per-layer blocks")
     
     dag_metrics = {
         "dataset": dataset_name,
@@ -538,6 +569,7 @@ def _load_attention_evolution_data(
         pd.DataFrame with attention evolution data
     """
     import traceback
+    import re as _re
     
     if datadir_path is None:
         datadir_path = join(root_path, "data")
@@ -614,9 +646,14 @@ def _load_attention_evolution_data(
                     model = _load_model_from_checkpoint(checkpoint_path, architecture_type)
                     phi_dict = extract_phi_from_model(model, architecture_type)
                     
-                    # Process attention weights
+                    # Process attention weights (backward-compat + per-layer keys)
                     if att_weights is not None:
-                        for att_key in attention_keys:
+                        # Build list of all attention keys to track: backward-compat + per-layer
+                        all_att_keys = list(attention_keys)
+                        per_layer_att_keys = [k for k in att_weights.keys() if _re.match(r'^(dec_self|dec_cross)_L\d+$', k)]
+                        all_att_keys.extend(sorted(per_layer_att_keys))
+                        
+                        for att_key in all_att_keys:
                             att_tensor = att_weights.get(att_key)
                             if att_tensor is None:
                                 continue
@@ -649,8 +686,12 @@ def _load_attention_evolution_data(
                                         record[f"{att_key}_{i}{j}_diff_mean"] = diff_mean[i, j]
                                         record[f"{att_key}_{i}{j}_diff_std"] = diff_std[i, j]
                     
-                    # Process phi tensors
-                    for phi_key in phi_keys:
+                    # Process phi tensors (backward-compat + per-layer keys)
+                    all_phi_keys = list(phi_keys)
+                    per_layer_phi_keys = [k for k in phi_dict.keys() if _re.match(r'^(decoder|decoder_cross)_L\d+$', k)]
+                    all_phi_keys.extend(sorted(per_layer_phi_keys))
+                    
+                    for phi_key in all_phi_keys:
                         phi_tensor = phi_dict.get(phi_key)
                         if phi_tensor is None:
                             continue

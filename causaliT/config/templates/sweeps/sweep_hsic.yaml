@@ -29,6 +29,7 @@ training:
   
   # HSIC kernel bandwidth (usually 1.0 works well)
   hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false  # Use median heuristic for scale-invariant HSIC
   
   # Attention-weighted HSIC (weight residuals by attention strength)
   use_attention_weighted_hsic: false

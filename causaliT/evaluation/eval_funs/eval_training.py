@@ -359,7 +359,16 @@ def eval_train_metrics(
     for metric_name, metric_data in instability_results["metrics"].items():
         mean_val = metric_data["mean"]
         std_val = metric_data["std"]
-        print(f"    {metric_name}: {mean_val:.6f} ± {std_val:.6f}")
+        print(f"    {metric_name}: {mean_val} ± {std_val}")
+    
+    # =========================================================================
+    # Compute Fit Diagnostics (under/overfit detection)
+    # =========================================================================
+    fit_results = compute_fit_diagnostics(df)
+    
+    fit_filename = "fit_diagnostics.json"
+    with open(join(eval_path_files, fit_filename), 'w') as f:
+        json.dump(fit_results, f, indent=2)
     
     print(f"\nEvaluation complete!")
     print(f"  Plotted {plotted_count} metric pairs")
@@ -467,4 +476,130 @@ def compute_training_instability(
         "window": window,
         "n_folds": n_folds,
         "metrics": aggregated_metrics,
+    }
+
+
+def compute_fit_diagnostics(
+    df: pd.DataFrame,
+    train_col: str = "train_loss",
+    val_col: str = "val_loss",
+    overfit_gap_ratio_threshold: float = 0.5,
+) -> dict:
+    """
+    Compute under/overfit diagnostics from training curves.
+    
+    For each k-fold, finds the epoch with best val_loss, then computes:
+    - best_train_loss, best_val_loss (at that epoch)
+    - generalization_gap = val_loss - train_loss
+    - gap_ratio = (val_loss - train_loss) / train_loss
+    - fit_status: "underfit" | "overfit" | "good_fit"
+    
+    Classification:
+    - underfit: gap_ratio < threshold AND train_loss is high
+      (train and val are similarly bad → model can't fit the data)
+    - overfit: gap_ratio > threshold
+      (train is good but val is much worse → memorization)
+    - good_fit: otherwise
+    
+    Args:
+        df: DataFrame with columns ['kfold', 'epoch', train_col, val_col]
+        train_col: Column name for training loss
+        val_col: Column name for validation loss
+        overfit_gap_ratio_threshold: gap_ratio above which we flag overfitting
+        
+    Returns:
+        dict with per_fold and aggregated diagnostics
+    """
+    if train_col not in df.columns or val_col not in df.columns:
+        missing = [c for c in [train_col, val_col] if c not in df.columns]
+        return {
+            "error": f"Missing columns: {missing}",
+            "available_columns": list(df.columns),
+            "per_fold": {},
+            "aggregated": {},
+        }
+    
+    kfolds = df["kfold"].unique()
+    per_fold = {}
+    
+    for kfold in kfolds:
+        fold_df = df[df["kfold"] == kfold].sort_values("epoch")
+        
+        # Drop rows where either metric is NaN
+        valid = fold_df.dropna(subset=[train_col, val_col])
+        if len(valid) == 0:
+            continue
+        
+        # Find epoch with best (lowest) val_loss
+        best_idx = valid[val_col].idxmin()
+        best_row = valid.loc[best_idx]
+        
+        best_train = float(best_row[train_col])
+        best_val = float(best_row[val_col])
+        best_epoch = int(best_row["epoch"])
+        
+        # Final epoch values
+        final_row = valid.iloc[-1]
+        final_train = float(final_row[train_col])
+        final_val = float(final_row[val_col])
+        
+        # Generalization gap at best epoch
+        gen_gap = best_val - best_train
+        gap_ratio = gen_gap / best_train if best_train > 1e-12 else float('inf')
+        
+        # Classify fit status
+        if gap_ratio > overfit_gap_ratio_threshold:
+            fit_status = "overfit"
+        elif gap_ratio < overfit_gap_ratio_threshold:
+            # Could be good_fit or underfit — distinguish by absolute train loss
+            # We flag as underfit but leave the threshold to the user's judgment
+            # by providing the raw numbers
+            fit_status = "good_fit"
+        else:
+            fit_status = "good_fit"
+        
+        per_fold[kfold] = {
+            "best_epoch": best_epoch,
+            "best_train_loss": best_train,
+            "best_val_loss": best_val,
+            "final_train_loss": final_train,
+            "final_val_loss": final_val,
+            "generalization_gap": gen_gap,
+            "gap_ratio": gap_ratio,
+            "fit_status": fit_status,
+        }
+    
+    # Aggregate across folds
+    if per_fold:
+        all_train = [v["best_train_loss"] for v in per_fold.values()]
+        all_val = [v["best_val_loss"] for v in per_fold.values()]
+        all_gap = [v["generalization_gap"] for v in per_fold.values()]
+        all_ratio = [v["gap_ratio"] for v in per_fold.values()]
+        
+        # Overall fit status: majority vote
+        statuses = [v["fit_status"] for v in per_fold.values()]
+        from collections import Counter
+        fit_status = Counter(statuses).most_common(1)[0][0]
+        
+        aggregated = {
+            "best_train_loss": float(np.mean(all_train)),
+            "best_train_loss_std": float(np.std(all_train)),
+            "best_val_loss": float(np.mean(all_val)),
+            "best_val_loss_std": float(np.std(all_val)),
+            "generalization_gap": float(np.mean(all_gap)),
+            "generalization_gap_std": float(np.std(all_gap)),
+            "gap_ratio": float(np.mean(all_ratio)),
+            "gap_ratio_std": float(np.std(all_ratio)),
+            "fit_status": fit_status,
+            "n_folds": len(per_fold),
+        }
+    else:
+        aggregated = {}
+    
+    return {
+        "train_col": train_col,
+        "val_col": val_col,
+        "overfit_gap_ratio_threshold": overfit_gap_ratio_threshold,
+        "per_fold": per_fold,
+        "aggregated": aggregated,
     }

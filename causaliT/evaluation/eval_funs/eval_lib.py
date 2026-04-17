@@ -312,31 +312,32 @@ def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[
         phi_dict["encoder"] = None  # No encoder in StageCausal
         phi_dict["decoder"] = None  # For compatibility
         
-    elif architecture_type == "SingleCausalForecaster":
-        # Decoder self-attention DAG (X -> X structure)
-        dec_self_inner = model.model.decoder.layers[0].global_self_attention.inner_attention
-        phi_dict["decoder"] = _get_dag_probs(dec_self_inner)
+    elif architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+        # Iterate all decoder layers for multi-layer support
+        n_layers = len(model.model.decoder.layers)
         
-        # Decoder cross-attention DAG (S -> X structure)
-        dec_cross_inner = model.model.decoder.layers[0].global_cross_attention.inner_attention
-        phi_dict["decoder_cross"] = _get_dag_probs(dec_cross_inner)
+        for layer_idx, layer in enumerate(model.model.decoder.layers):
+            # Self-attention DAG (X -> X structure)
+            dec_self_inner = layer.global_self_attention.inner_attention
+            phi_dict[f"decoder_L{layer_idx}"] = _get_dag_probs(dec_self_inner)
+            
+            # Cross-attention DAG (S -> X structure)
+            dec_cross_inner = layer.global_cross_attention.inner_attention
+            phi_dict[f"decoder_cross_L{layer_idx}"] = _get_dag_probs(dec_cross_inner)
+        
+        # Backward-compat keys: layer 0 for single-layer, average for multi-layer
+        if n_layers == 1:
+            phi_dict["decoder"] = phi_dict.get("decoder_L0")
+            phi_dict["decoder_cross"] = phi_dict.get("decoder_cross_L0")
+        else:
+            # Average across layers (only for non-None entries)
+            self_phis = [phi_dict[f"decoder_L{i}"] for i in range(n_layers) if phi_dict.get(f"decoder_L{i}") is not None]
+            cross_phis = [phi_dict[f"decoder_cross_L{i}"] for i in range(n_layers) if phi_dict.get(f"decoder_cross_L{i}") is not None]
+            phi_dict["decoder"] = np.mean(self_phis, axis=0) if self_phis else None
+            phi_dict["decoder_cross"] = np.mean(cross_phis, axis=0) if cross_phis else None
         
         # Compatibility keys
-        phi_dict["encoder"] = None  # No encoder in SingleCausal
-        phi_dict["cross"] = phi_dict["decoder_cross"]  # Alias for compatibility
-    
-    elif architecture_type == "NoiseAwareCausalForecaster":
-        # Same structure as SingleCausalForecaster
-        # Decoder self-attention DAG (X -> X structure)
-        dec_self_inner = model.model.decoder.layers[0].global_self_attention.inner_attention
-        phi_dict["decoder"] = _get_dag_probs(dec_self_inner)
-        
-        # Decoder cross-attention DAG (S -> X structure)
-        dec_cross_inner = model.model.decoder.layers[0].global_cross_attention.inner_attention
-        phi_dict["decoder_cross"] = _get_dag_probs(dec_cross_inner)
-        
-        # Compatibility keys
-        phi_dict["encoder"] = None  # No encoder in NoiseAware
+        phi_dict["encoder"] = None
         phi_dict["cross"] = phi_dict["decoder_cross"]  # Alias for compatibility
     
     return phi_dict
@@ -744,22 +745,21 @@ def load_attention_data(
                 result.attention_weights["encoder"].append(None)
                 result.attention_weights["decoder"].append(att_weights.get("dec2_self"))
                 result.attention_weights["cross"].append(att_weights.get("dec2_cross"))
-            elif architecture_type == "SingleCausalForecaster":
-                # SingleCausalPredictor returns keys: dec_cross, dec_self
+            elif architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+                # Predictors return backward-compat keys + per-layer keys (dec_cross_L0, etc.)
                 result.attention_weights["dec_self"].append(att_weights.get("dec_self"))
                 result.attention_weights["dec_cross"].append(att_weights.get("dec_cross"))
                 # For compatibility with notebook code expecting encoder/decoder/cross
                 result.attention_weights["encoder"].append(None)
                 result.attention_weights["decoder"].append(att_weights.get("dec_self"))
                 result.attention_weights["cross"].append(att_weights.get("dec_cross"))
-            elif architecture_type == "NoiseAwareCausalForecaster":
-                # NoiseAwareCausalPredictor returns keys: dec_cross, dec_self (same as SingleCausal)
-                result.attention_weights["dec_self"].append(att_weights.get("dec_self"))
-                result.attention_weights["dec_cross"].append(att_weights.get("dec_cross"))
-                # For compatibility with notebook code expecting encoder/decoder/cross
-                result.attention_weights["encoder"].append(None)
-                result.attention_weights["decoder"].append(att_weights.get("dec_self"))
-                result.attention_weights["cross"].append(att_weights.get("dec_cross"))
+                # Also collect per-layer keys (dec_cross_L0, dec_self_L0, etc.)
+                for key in att_weights.keys():
+                    if '_L' in key:
+                        if key not in result.attention_weights:
+                            # Initialize with None for previous folds
+                            result.attention_weights[key] = [None] * (len(result.attention_weights["dec_self"]) - 1)
+                        result.attention_weights[key].append(att_weights[key])
             
             # Load model and extract phi tensors
             if architecture_type == "TransformerForecaster":

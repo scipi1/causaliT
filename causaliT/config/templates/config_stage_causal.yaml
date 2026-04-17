@@ -163,6 +163,14 @@ model:
     Y_seq_len: ${data.Y_seq_len}
     
     # =========================================================================
+    # OUTPUT MLP HEAD
+    # =========================================================================
+    output_mlp_layers: 1               # 1 = linear (backward compat), 2 = MLP
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+    
+    # =========================================================================
     # DROPOUT
     # =========================================================================
     dropout_emb: ${experiment.dropout}
@@ -231,6 +239,7 @@ training:
   # HSIC
   lambda_hsic: 0.0
   hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false  # Use median heuristic for scale-invariant HSIC
   
   # Decisiveness
   lambda_decisive: 0.0

@@ -42,6 +42,69 @@ def _parse_intervention_value(intervention: str) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
+def _extract_fit_diagnostics(run_path: str) -> Optional[Dict[str, float]]:
+    """
+    Extract fit diagnostics (train_loss, generalization gap) from a seed run.
+    
+    Reads the training CSV log from k_0/logs/csv/version_0/metrics.csv,
+    finds the epoch with best val_loss, and computes:
+    - best_train_loss: train_loss at the best val_loss epoch
+    - best_val_loss: best validation loss achieved
+    - generalization_gap: val_loss - train_loss at best epoch
+    - gap_ratio: (val_loss - train_loss) / train_loss
+    
+    Returns None if training CSV is not found or metrics are missing.
+    """
+    # Find the k-fold directory (typically k_0 for single-fold)
+    kfold_dirs = sorted([
+        d for d in listdir(run_path)
+        if isdir(join(run_path, d)) and d.startswith("k_")
+    ])
+    
+    if not kfold_dirs:
+        return None
+    
+    # Use first fold
+    metrics_path = join(run_path, kfold_dirs[0], "logs", "csv", "version_0", "metrics.csv")
+    if not exists(metrics_path):
+        return None
+    
+    try:
+        df = pd.read_csv(metrics_path)
+    except Exception:
+        return None
+    
+    if "train_loss" not in df.columns or "val_loss" not in df.columns:
+        return None
+    
+    # Group by epoch, take first non-NaN for each metric
+    if "epoch" in df.columns:
+        df_epoch = df.groupby("epoch").first().reset_index()
+    else:
+        df_epoch = df
+    
+    # Drop rows where either is NaN
+    valid = df_epoch.dropna(subset=["train_loss", "val_loss"])
+    if len(valid) == 0:
+        return None
+    
+    # Find best val_loss epoch
+    best_idx = valid["val_loss"].idxmin()
+    best_row = valid.loc[best_idx]
+    
+    best_train = float(best_row["train_loss"])
+    best_val = float(best_row["val_loss"])
+    gen_gap = best_val - best_train
+    gap_ratio = gen_gap / best_train if best_train > 1e-12 else float('inf')
+    
+    return {
+        "best_train_loss": best_train,
+        "best_val_loss": best_val,
+        "generalization_gap": gen_gap,
+        "gap_ratio": gap_ratio,
+    }
+
+
 def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Evaluate a seed sweep experiment and compute mean ± std over seeds.
@@ -85,7 +148,7 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
             continue
         
         # Load data sources
-        ate_data = _load_json(join(run_path, "eval", "eval_ate", "files", "ate_metrics.json"))
+        ate_data = _load_json(join(run_path, "eval", "eval_ate_mc", "files", "ate_metrics_mc.json"))
         kfold_data = _load_json(join(run_path, "kfold_summary.json"))
         dag_data = _load_json(join(run_path, "eval", "eval_attention_scores", "files", "dag_metrics.json"))
         
@@ -96,6 +159,15 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
             stats = kfold_data.get("statistics", {})
             if "test_x_mae" in stats:
                 exp_record["test_mae"] = stats["test_x_mae"].get("mean")
+            if "val_x_mae" in stats:
+                exp_record["val_mae"] = stats["val_x_mae"].get("mean")
+            if "val_loss_x" in stats:
+                exp_record["val_loss"] = stats["val_loss_x"].get("mean")
+        
+        # Extract fit diagnostics from training CSV logs
+        fit_diag = _extract_fit_diagnostics(run_path)
+        if fit_diag:
+            exp_record.update(fit_diag)
         
         if dag_data:
             if "soft_hamming_cross" in dag_data:
@@ -168,7 +240,9 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
     # Aggregate experiment-wide metrics
     # =========================================================================
     exp_summary = {}
-    for col in ["test_mae", "shd_cross", "mec_distance"]:
+    for col in ["test_mae", "val_mae", "val_loss",
+                "best_train_loss", "best_val_loss", "generalization_gap", "gap_ratio",
+                "shd_cross", "mec_distance"]:
         if col in df_exp.columns:
             values = df_exp[col].dropna()
             if len(values) > 0:
