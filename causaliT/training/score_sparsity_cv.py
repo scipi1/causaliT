@@ -147,8 +147,9 @@ def _extract_learned_dag(model: pl.LightningModule) -> Dict[str, Optional[np.nda
     for those blocks.
 
     Returns:
-        Dict with keys "cross" and "self", each mapping to a 2D numpy
-        array of edge probabilities in [0, 1], or None if not available.
+        Dict with per-layer keys like "cross_L0", "self_L0", "cross_L1", etc.
+        Each maps to a 2D numpy array of edge probabilities in [0, 1], or None.
+        Also includes backward-compat keys "cross" and "self" (layer 0 or average).
     """
     from causaliT.evaluation.eval_funs.eval_lib import extract_phi_from_model
 
@@ -157,21 +158,42 @@ def _extract_learned_dag(model: pl.LightningModule) -> Dict[str, Optional[np.nda
 
     phi_dict = extract_phi_from_model(model, arch_type)
 
-    # Normalize to standard keys: "cross" (S→X) and "self" (X→X)
-    dag = {"cross": None, "self": None}
+    dag = {}
 
-    # Try standard keys first (SingleCausalForecaster, NoiseAwareCausalForecaster)
-    if phi_dict.get("decoder_cross") is not None:
-        dag["cross"] = phi_dict["decoder_cross"]
-    elif phi_dict.get("cross") is not None:
-        dag["cross"] = phi_dict["cross"]
-    elif phi_dict.get("decoder_cross_L0") is not None:
-        dag["cross"] = phi_dict["decoder_cross_L0"]
+    # Collect per-layer keys
+    layer_idx = 0
+    while True:
+        cross_key = f"decoder_cross_L{layer_idx}"
+        self_key = f"decoder_L{layer_idx}"
+        has_cross = phi_dict.get(cross_key) is not None
+        has_self = phi_dict.get(self_key) is not None
+        if not has_cross and not has_self:
+            break
+        dag[f"cross_L{layer_idx}"] = phi_dict.get(cross_key)
+        dag[f"self_L{layer_idx}"] = phi_dict.get(self_key)
+        layer_idx += 1
 
-    if phi_dict.get("decoder") is not None:
-        dag["self"] = phi_dict["decoder"]
-    elif phi_dict.get("decoder_L0") is not None:
-        dag["self"] = phi_dict["decoder_L0"]
+    n_layers = layer_idx
+
+    # If no per-layer keys found, try backward-compat single-layer keys
+    if n_layers == 0:
+        cross_val = phi_dict.get("decoder_cross") or phi_dict.get("cross")
+        self_val = phi_dict.get("decoder") or phi_dict.get("decoder_L0")
+        dag["cross_L0"] = cross_val
+        dag["self_L0"] = self_val
+        n_layers = 1
+
+    # Backward-compat summary keys (layer 0 for single-layer, average for multi)
+    if n_layers == 1:
+        dag["cross"] = dag.get("cross_L0")
+        dag["self"] = dag.get("self_L0")
+    else:
+        cross_arrays = [dag[f"cross_L{i}"] for i in range(n_layers) if dag.get(f"cross_L{i}") is not None]
+        self_arrays = [dag[f"self_L{i}"] for i in range(n_layers) if dag.get(f"self_L{i}") is not None]
+        dag["cross"] = np.mean(cross_arrays, axis=0) if cross_arrays else None
+        dag["self"] = np.mean(self_arrays, axis=0) if self_arrays else None
+
+    dag["n_layers"] = n_layers
 
     return dag
 
@@ -188,8 +210,9 @@ def _plot_lasso_path_edges(
     """
     Plot LASSO-path of individual edge probabilities vs λ_score.
 
-    Two subplots: cross-attention (S→X) and self-attention (X→X).
-    Each edge is a separate colored line, showing how it shrinks as λ increases.
+    Creates one row of subplots per decoder layer, each with cross-attention
+    (S→X) and self-attention (X→X) panels. For single-layer models, this
+    produces the same layout as before (1 row, 2 columns).
 
     Args:
         all_results:  Per-lambda result dicts (must include "best_fold_dag").
@@ -200,96 +223,144 @@ def _plot_lasso_path_edges(
 
     # Collect edge paths from best fold per lambda
     lambdas = []
-    cross_edges_per_lambda = []  # list of 2D arrays (n_targets × n_sources)
-    self_edges_per_lambda = []
+    dag_data_per_lambda = []
 
     for r in all_results:
         dag_data = r.get("best_fold_dag", {})
         if not dag_data:
             continue
         lambdas.append(r["lambda_score"])
-        cross_edges_per_lambda.append(
-            np.array(dag_data["cross"]) if dag_data.get("cross") is not None else None
-        )
-        self_edges_per_lambda.append(
-            np.array(dag_data["self"]) if dag_data.get("self") is not None else None
-        )
+        dag_data_per_lambda.append(dag_data)
 
     if not lambdas:
         logger.warning("No DAG data available for LASSO-path edge plot.")
         return
 
-    has_cross = any(e is not None for e in cross_edges_per_lambda)
-    has_self = any(e is not None for e in self_edges_per_lambda)
+    # Determine number of layers from first available DAG data
+    n_layers = dag_data_per_lambda[0].get("n_layers", 1)
+    # Also check for per-layer keys
+    if n_layers <= 1:
+        for dag_data in dag_data_per_lambda:
+            layer_idx = 0
+            while f"cross_L{layer_idx}" in dag_data or f"self_L{layer_idx}" in dag_data:
+                layer_idx += 1
+            if layer_idx > n_layers:
+                n_layers = layer_idx
+    if n_layers == 0:
+        n_layers = 1  # Fallback: use summary keys
 
-    n_panels = int(has_cross) + int(has_self)
-    if n_panels == 0:
+    # For each layer, collect cross and self edge arrays
+    def _get_edges(dag_data, att_type, layer_idx):
+        """Get edge array for a given attention type and layer."""
+        # Try per-layer key first
+        key = f"{att_type}_L{layer_idx}"
+        if dag_data.get(key) is not None:
+            return np.array(dag_data[key])
+        # For single-layer, fall back to summary key
+        if layer_idx == 0 and dag_data.get(att_type) is not None:
+            return np.array(dag_data[att_type])
+        return None
+
+    # Check which panels are needed per layer
+    layer_has_cross = []
+    layer_has_self = []
+    for layer_idx in range(n_layers):
+        has_cross = any(_get_edges(d, "cross", layer_idx) is not None for d in dag_data_per_lambda)
+        has_self = any(_get_edges(d, "self", layer_idx) is not None for d in dag_data_per_lambda)
+        layer_has_cross.append(has_cross)
+        layer_has_self.append(has_self)
+
+    n_cols = max(int(any(layer_has_cross)) + int(any(layer_has_self)), 1)
+    n_rows = n_layers
+
+    if n_cols == 0 or not any(layer_has_cross + layer_has_self):
         logger.warning("No phi/DAG probabilities found — skipping edge path plot.")
         return
 
-    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
-    ax_idx = 0
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows), squeeze=False)
 
-    # --- Cross-attention subplot ---
-    if has_cross:
-        ax = axes[0, ax_idx]
-        ax_idx += 1
-        ref = next(e for e in cross_edges_per_lambda if e is not None)
-        n_targets, n_sources = ref.shape
+    use_symlog = len(lambdas) > 2 and lambdas[-1] / max(lambdas[0], 1e-10) > 20
+    min_lambda = min(lambdas)
 
-        for i in range(n_targets):
-            for j in range(n_sources):
-                vals = []
-                lams = []
-                for k, e in enumerate(cross_edges_per_lambda):
-                    if e is not None:
-                        vals.append(e[i, j])
-                        lams.append(lambdas[k])
-                if vals:
-                    ax.plot(lams, vals, marker="o", markersize=3,
-                            label=f"X{i+1}←S{j+1}", linewidth=1.2)
+    for layer_idx in range(n_layers):
+        col_idx = 0
 
-        ax.axvline(best_lambda, color="green", linestyle="--", alpha=0.7,
-                   label=f"λ*={best_lambda}")
-        ax.set_xlabel("λ_score")
-        ax.set_ylabel("Edge probability")
-        ax.set_title("Cross-attention (S→X)")
-        ax.set_ylim(-0.05, 1.05)
-        ax.legend(fontsize=7, ncol=max(1, n_sources), loc="best")
-        ax.grid(True, alpha=0.3)
-        if len(lambdas) > 2 and lambdas[-1] / max(lambdas[0], 1e-10) > 20:
-            ax.set_xscale("symlog", linthresh=min(l for l in lambdas if l > 0) if any(l > 0 for l in lambdas) else 0.001)
+        # --- Cross-attention subplot ---
+        if any(layer_has_cross):
+            ax = axes[layer_idx, col_idx]
+            col_idx += 1
 
-    # --- Self-attention subplot ---
-    if has_self:
-        ax = axes[0, ax_idx]
-        ref = next(e for e in self_edges_per_lambda if e is not None)
-        n_nodes = ref.shape[0]
+            if layer_has_cross[layer_idx]:
+                ref = next(_get_edges(d, "cross", layer_idx) for d in dag_data_per_lambda
+                           if _get_edges(d, "cross", layer_idx) is not None)
+                n_targets, n_sources = ref.shape
 
-        for i in range(n_nodes):
-            for j in range(n_nodes):
-                if i == j:
-                    continue  # skip diagonal (self-loops)
-                vals = []
-                lams = []
-                for k, e in enumerate(self_edges_per_lambda):
-                    if e is not None:
-                        vals.append(e[i, j])
-                        lams.append(lambdas[k])
-                if vals:
-                    ax.plot(lams, vals, marker="o", markersize=3,
-                            label=f"X{i+1}←X{j+1}", linewidth=1.2)
+                for i in range(n_targets):
+                    for j in range(n_sources):
+                        vals, lams = [], []
+                        for k, d in enumerate(dag_data_per_lambda):
+                            e = _get_edges(d, "cross", layer_idx)
+                            if e is not None:
+                                vals.append(e[i, j])
+                                lams.append(lambdas[k])
+                        if vals:
+                            ax.plot(lams, vals, marker="o", markersize=3,
+                                    label=f"X{i+1}←S{j+1}", linewidth=1.2)
 
-        ax.axvline(best_lambda, color="green", linestyle="--", alpha=0.7,
-                   label=f"λ*={best_lambda}")
-        ax.set_xlabel("λ_score")
-        ax.set_ylabel("Edge probability")
-        ax.set_title("Self-attention (X→X)")
-        ax.set_ylim(-0.05, 1.05)
-        ax.legend(fontsize=7, ncol=max(1, n_nodes - 1), loc="best")
-        ax.grid(True, alpha=0.3)
-        if len(lambdas) > 2 and lambdas[-1] / max(lambdas[0], 1e-10) > 20:
-            ax.set_xscale("symlog", linthresh=min(l for l in lambdas if l > 0) if any(l > 0 for l in lambdas) else 0.001)
+                ax.axvline(best_lambda, color="green", linestyle="--", alpha=0.7,
+                           label=f"λ*={best_lambda}")
+                ax.set_ylabel("Edge probability")
+                layer_label = f" (Layer {layer_idx})" if n_layers > 1 else ""
+                ax.set_title(f"Cross-attention (S→X){layer_label}")
+                ax.set_ylim(-0.05, 1.05)
+                ax.legend(fontsize=7, ncol=max(1, n_sources), loc="best")
+                ax.grid(True, alpha=0.3)
+                if use_symlog:
+                    ax.set_xscale("symlog", linthresh=min(l for l in lambdas if l > 0) if any(l > 0 for l in lambdas) else 0.001)
+                ax.set_xlim(left=min_lambda)
+            else:
+                ax.set_visible(False)
+
+            ax.set_xlabel("λ_score")
+
+        # --- Self-attention subplot ---
+        if any(layer_has_self):
+            ax = axes[layer_idx, col_idx]
+
+            if layer_has_self[layer_idx]:
+                ref = next(_get_edges(d, "self", layer_idx) for d in dag_data_per_lambda
+                           if _get_edges(d, "self", layer_idx) is not None)
+                n_nodes = ref.shape[0]
+
+                for i in range(n_nodes):
+                    for j in range(n_nodes):
+                        if i == j:
+                            continue
+                        vals, lams = [], []
+                        for k, d in enumerate(dag_data_per_lambda):
+                            e = _get_edges(d, "self", layer_idx)
+                            if e is not None:
+                                vals.append(e[i, j])
+                                lams.append(lambdas[k])
+                        if vals:
+                            ax.plot(lams, vals, marker="o", markersize=3,
+                                    label=f"X{i+1}←X{j+1}", linewidth=1.2)
+
+                ax.axvline(best_lambda, color="green", linestyle="--", alpha=0.7,
+                           label=f"λ*={best_lambda}")
+                ax.set_ylabel("Edge probability")
+                layer_label = f" (Layer {layer_idx})" if n_layers > 1 else ""
+                ax.set_title(f"Self-attention (X→X){layer_label}")
+                ax.set_ylim(-0.05, 1.05)
+                ax.legend(fontsize=7, ncol=max(1, n_nodes - 1), loc="best")
+                ax.grid(True, alpha=0.3)
+                if use_symlog:
+                    ax.set_xscale("symlog", linthresh=min(l for l in lambdas if l > 0) if any(l > 0 for l in lambdas) else 0.001)
+                ax.set_xlim(left=min_lambda)
+            else:
+                ax.set_visible(False)
+
+            ax.set_xlabel("λ_score")
 
     plt.suptitle("LASSO Path: Edge Probabilities vs λ_score", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -335,6 +406,7 @@ def _plot_lasso_path_metrics(
 
     # Use symlog if lambda range is wide
     use_symlog = len(lambdas) > 2 and lambdas[-1] / max(lambdas[0], 1e-10) > 20
+    min_lambda = min(lambdas)
 
     # --- HSIC subplot ---
     if has_hsic:
@@ -360,6 +432,7 @@ def _plot_lasso_path_metrics(
         ax.grid(True, alpha=0.3)
         if use_symlog:
             ax.set_xscale("symlog", linthresh=min(l for l in lams_h if l > 0) if any(l > 0 for l in lams_h) else 0.001)
+        ax.set_xlim(left=min_lambda)
 
     # --- Reconstruction subplot ---
     if has_recon:
@@ -384,6 +457,7 @@ def _plot_lasso_path_metrics(
         ax.grid(True, alpha=0.3)
         if use_symlog:
             ax.set_xscale("symlog", linthresh=min(l for l in lams_r if l > 0) if any(l > 0 for l in lams_r) else 0.001)
+        ax.set_xlim(left=min_lambda)
 
     plt.suptitle("Score Sparsity CV: Validation Metrics vs λ_score", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -532,8 +606,14 @@ def _run_cv_for_single_lambda(
         # Extract learned DAG from the trained model (lightweight, no forward pass)
         try:
             dag = _extract_learned_dag(model)
-            fold_metrics["dag_cross"] = dag["cross"].tolist() if dag["cross"] is not None else None
-            fold_metrics["dag_self"] = dag["self"].tolist() if dag["self"] is not None else None
+            # Save backward-compat summary keys
+            fold_metrics["dag_cross"] = dag["cross"].tolist() if dag.get("cross") is not None else None
+            fold_metrics["dag_self"] = dag["self"].tolist() if dag.get("self") is not None else None
+            # Save per-layer keys for multi-layer plotting
+            fold_metrics["dag_n_layers"] = dag.get("n_layers", 1)
+            for key, val in dag.items():
+                if key.startswith(("cross_L", "self_L")) and val is not None:
+                    fold_metrics[f"dag_{key}"] = val.tolist() if hasattr(val, 'tolist') else val
         except Exception as e:
             logger.debug(f"Could not extract DAG for fold {fold}: {e}")
             fold_metrics["dag_cross"] = None
@@ -582,11 +662,19 @@ def _run_cv_for_single_lambda(
             best_fold = min(folds_with_recon, key=lambda r: r["val_recon"])
         else:
             best_fold = folds_with_dag[0]
-        result["best_fold_dag"] = {
+        best_fold_dag = {
             "cross": best_fold.get("dag_cross"),
             "self": best_fold.get("dag_self"),
             "fold": best_fold["fold"],
+            "n_layers": best_fold.get("dag_n_layers", 1),
         }
+        # Include per-layer data
+        for key in best_fold:
+            if key.startswith("dag_cross_L") or key.startswith("dag_self_L"):
+                # Strip "dag_" prefix to get "cross_L0", "self_L0", etc.
+                plot_key = key[4:]  # "dag_cross_L0" -> "cross_L0"
+                best_fold_dag[plot_key] = best_fold[key]
+        result["best_fold_dag"] = best_fold_dag
     else:
         result["best_fold_dag"] = {}
 

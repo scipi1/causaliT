@@ -252,10 +252,10 @@ training:
   # All metrics are always logged - no log_* flags needed
   # =========================================================================
   
-  # Acyclicity (NOTEARS) - enforces DAG structure
+  # DEPRECATED: Acyclicity (NOTEARS) — partial causal ordering prevents cycles by construction.
   kappa: 0.0
   
-  # DAG Sparsity - L1 on edge probabilities (phi)
+  # DEPRECATED: DAG Sparsity — L1 on phi edge probabilities. No longer used with SVFA attention.
   lambda_sparse: 0.0
   lambda_sparse_cross: 0.0
   
@@ -305,13 +305,13 @@ training:
   hsic_lambda_self_start: null   # null = use lambda_hsic_self
   hsic_lambda_self_end: 0.0      # Final self-attention HSIC weight
   
-  # Decisiveness - pushes edge probabilities away from 0.5
+  # DEPRECATED: Decisiveness — pushes phi edge probabilities away from 0.5.
   lambda_decisive: 0.0
   lambda_decisive_cross: 0.0
   lambda_tau: 0.0
   target_tau: 0.0
   
-  # KL prior regularization
+  # DEPRECATED: KL prior regularization on phi running averages.
   lambda_kl: 0.0
   adaptive_z_scaling: true
   
