@@ -192,6 +192,13 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         output_mlp_hidden: int = None,       # None = d_ff
         output_mlp_activation: str = "relu",
         output_mlp_dropout: float = 0.0,
+        
+        # Shared structure across layers
+        # When True and dec_layers > 1, Q/K projections and inner attention
+        # mechanism are shared across all decoder layers. This enforces a
+        # consistent causal structure across layers while allowing each layer
+        # to learn different value transformations for improved reconstruction.
+        share_structure_across_layers: bool = False,
     ):
         super().__init__()
         
@@ -329,8 +336,40 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         # NOISE-AWARE DECODER
         # =====================================================================
         
-        self.decoder = NoiseAwareReversedDecoder(
-            decoder_layers=[
+        # Build decoder layers, optionally sharing Q/K/inner_attention across layers
+        if share_structure_across_layers and dec_layers > 1:
+            # Create first layer's attention (owns the structural parameters)
+            cross_att_0 = self._attn(**(attn_shared_kwargs | attn_dec_cross_kwargs))
+            self_att_0 = self._attn(**(attn_shared_kwargs | attn_dec_self_kwargs))
+            
+            # Extract shared structural components
+            shared_cross = cross_att_0.get_shared_qk_inner()
+            shared_self = self_att_0.get_shared_qk_inner()
+            
+            # Build decoder layers: layer 0 owns params, layers 1..N-1 share them
+            decoder_layers = []
+            for i in range(dec_layers):
+                if i == 0:
+                    cross_att = cross_att_0
+                    self_att = self_att_0
+                else:
+                    cross_att = self._attn(**(attn_shared_kwargs | attn_dec_cross_kwargs), shared_qk_inner=shared_cross)
+                    self_att = self._attn(**(attn_shared_kwargs | attn_dec_self_kwargs), shared_qk_inner=shared_self)
+                
+                decoder_layers.append(NoiseAwareReversedDecoderLayer(
+                    global_cross_attention=cross_att,
+                    global_self_attention=self_att,
+                    ambient_noise_layer=self.ambient_noise,
+                    d_model_dec=d_model,
+                    d_ff=d_ff,
+                    dropout_ff=dropout_ff,
+                    dropout_attn_out=dropout_attn_out,
+                    activation=activation,
+                    norm=norm,
+                ))
+        else:
+            # Standard: each layer has independent attention (existing behavior)
+            decoder_layers = [
                 NoiseAwareReversedDecoderLayer(
                     global_cross_attention=self._attn(**(attn_shared_kwargs | attn_dec_cross_kwargs)),
                     global_self_attention=self._attn(**(attn_shared_kwargs | attn_dec_self_kwargs)),
@@ -342,7 +381,10 @@ class NoiseAwareSingleCausalLayer(nn.Module):
                     activation=activation,
                     norm=norm,
                 ) for _ in range(dec_layers)
-            ],
+            ]
+        
+        self.decoder = NoiseAwareReversedDecoder(
+            decoder_layers=decoder_layers,
             norm_layer=Normalization(norm, d_model=d_model) if use_final_norm else None,
             emb_dropout=dropout_emb,
         )
@@ -554,8 +596,14 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         key_projection_type: str = "linear",
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
+        shared_qk_inner: dict = None,
     ):
-        """Create an attention layer with specified configuration."""
+        """Create an attention layer with specified configuration.
+        
+        Args:
+            shared_qk_inner: Optional dict of shared Q/K/inner_attention components.
+                When provided, the layer reuses these instead of creating its own.
+        """
         
         assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
         
@@ -595,6 +643,7 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             key_projection_type=key_projection_type,
             orthogonal_scale=orthogonal_scale,
             orthogonal_init_scale=orthogonal_init_scale,
+            shared_qk_inner=shared_qk_inner,
             # Pass Toeplitz-specific parameters (used only when attention_type is ToeplitzLieAttention)
             **self._toeplitz_params
         )

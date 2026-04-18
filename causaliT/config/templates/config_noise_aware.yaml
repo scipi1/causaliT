@@ -220,6 +220,13 @@ model:
     dag_parameterization_cross: null
     
     # =========================================================================
+    # SHARED STRUCTURE ACROSS LAYERS
+    # =========================================================================
+    # When True and dec_layers > 1, Q/K projections and inner attention
+    # mechanism are shared across all decoder layers. See docs/SHARED_STRUCTURE.md.
+    share_structure_across_layers: false
+    
+    # =========================================================================
     # KEY PROJECTION TYPE
     # =========================================================================
     # Options: "linear" (standard), "orthogonal" (rotation + optional scaling)
@@ -356,6 +363,9 @@ training:
   # No longer used with SVFA attention. Remove in future cleanup.
   lambda_kl: 0.0
   adaptive_z_scaling: true
+
+  # Gradient routing: HSIC updates θ_S only, recon updates θ_R only
+  use_gradient_routing: false
   
   # =========================================================================
   # NOISE-SPECIFIC REGULARIZATION

@@ -39,6 +39,7 @@ from causaliT.core.architectures.noise_aware import NoiseAwareSingleCausalLayer
 from causaliT.core.modules.noise_layers import GaussianNLLLoss
 from causaliT.core.utils import load_dag_masks
 from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted
+from causaliT.training.gradient_routing import classify_parameters
 
 
 class NoiseAwareCausalForecaster(pl.LightningModule):
@@ -139,6 +140,18 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.hsic_lambda_cross_end = config["training"].get("hsic_lambda_cross_end", 0.0)
         self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
         self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
+        
+        # =====================================================================
+        # GRADIENT ROUTING (dual optimizer for structure vs reconstruction)
+        # =====================================================================
+        self.use_gradient_routing = config["training"].get("use_gradient_routing", False)
+        if self.use_gradient_routing:
+            self.automatic_optimization = False
+            structural_params, reconstruction_params = classify_parameters(
+                self.model, verbose=True
+            )
+            self._structural_params = structural_params
+            self._reconstruction_params = reconstruction_params
         
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
@@ -522,6 +535,12 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                      noise_prior_regularizer +
                      group_l1_regularizer)
         
+        # Store decomposed losses for gradient routing (used by training_step)
+        self._last_loss_components = {
+            "loss_recon": loss_nll + noise_prior_regularizer,
+            "loss_structural": hsic_regularizer + score_sparsity_regularizer + group_l1_regularizer,
+        }
+        
         # =====================================================================
         # LOGGING
         # =====================================================================
@@ -611,10 +630,49 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
-        """Training step."""
-        loss, _, _, _ = self._step(batch=batch, stage="train")
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        return loss
+        """Training step with optional gradient routing."""
+        if self.use_gradient_routing:
+            opt_recon, opt_struct = self.optimizers()
+            
+            total_loss, _, _, _ = self._step(batch=batch, stage="train")
+            loss_recon = self._last_loss_components["loss_recon"]
+            loss_structural = self._last_loss_components["loss_structural"]
+            
+            # Zero all gradients
+            opt_recon.zero_grad()
+            opt_struct.zero_grad()
+            
+            # Backward 1: recon loss (retain graph for second backward)
+            self.manual_backward(loss_recon, retain_graph=True)
+            
+            # Save recon gradients for reconstruction params
+            _saved_recon_grads = {}
+            for p in self._reconstruction_params:
+                if p.grad is not None:
+                    _saved_recon_grads[id(p)] = p.grad.clone()
+            
+            # Zero all gradients
+            self.zero_grad()
+            
+            # Backward 2: structural loss (graph consumed)
+            self.manual_backward(loss_structural)
+            
+            # Restore recon grads on reconstruction params
+            for p in self._reconstruction_params:
+                if id(p) in _saved_recon_grads:
+                    p.grad = _saved_recon_grads[id(p)]
+            
+            # Now step both optimizers (graph fully consumed, safe)
+            opt_recon.step()
+            opt_struct.step()
+            
+            self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("train_loss_recon_routed", loss_recon, on_step=False, on_epoch=True)
+            self.log("train_loss_structural_routed", loss_structural, on_step=False, on_epoch=True)
+        else:
+            loss, _, _, _ = self._step(batch=batch, stage="train")
+            self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+            return loss
     
     def validation_step(self, batch, batch_idx):
         """Validation step."""
@@ -629,45 +687,37 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        """Configure optimizer with optional learning rate scheduler."""
-        
+        """Configure optimizer(s) with optional gradient routing."""
         learning_rate = self.config["training"].get("lr", 1e-4)
         weight_decay = self.config["training"].get("weight_decay", 0.01)
         optimizer_type = self.config["training"].get("optimizer", "adamw").lower()
         
-        if optimizer_type == "sgd":
-            momentum = self.config["training"].get("momentum", 0.0)
-            optimizer = torch.optim.SGD(
-                self.parameters(),
-                lr=learning_rate,
-                momentum=momentum,
-                weight_decay=weight_decay
-            )
-        elif optimizer_type == "adamw":
-            optimizer = torch.optim.AdamW(
-                self.parameters(),
-                lr=learning_rate,
-                weight_decay=weight_decay
-            )
+        def _make_optimizer(params):
+            if optimizer_type == "sgd":
+                momentum = self.config["training"].get("momentum", 0.0)
+                return torch.optim.SGD(params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
+            elif optimizer_type == "adamw":
+                return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+            else:
+                raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+        
+        if self.use_gradient_routing:
+            opt_recon = _make_optimizer(self._reconstruction_params)
+            opt_struct = _make_optimizer(self._structural_params)
+            return [opt_recon, opt_struct]
         else:
-            raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
-        
-        if self.config["training"].get("use_scheduler", False):
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=0.5,
-                patience=10,
-            )
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "val_loss",
-                },
-            }
-        
-        return optimizer
+            optimizer = _make_optimizer(self.parameters())
+            
+            if self.config["training"].get("use_scheduler", False):
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer, mode='min', factor=0.5, patience=10,
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+                }
+            
+            return optimizer
     
     def _compute_group_l1(self) -> tuple:
         """

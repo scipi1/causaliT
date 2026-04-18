@@ -695,6 +695,12 @@ def calibrate_group_l1(
     print(f"  Final checkpoint: {verify_checkpoint}")
     print(f"{'='*70}\n")
 
+    # Generate diagnostic plot (non-critical; wrapped in try/except)
+    try:
+        _plot_calibration_diagnostic(trials, lambda_optimal, balance_threshold, cal_dir)
+    except Exception as e:
+        logger.warning(f"Could not generate calibration diagnostic plot: {e}")
+
     return CalibrationResult(
         lambda_group_optimal=lambda_optimal,
         lambda_hsic_cross_suggested=suggested_lambda_hsic_cross,
@@ -708,3 +714,80 @@ def calibrate_group_l1(
         phase2_converged=verification_converged,
         converged=converged,
     )
+
+
+# =============================================================================
+# DIAGNOSTIC PLOT
+# =============================================================================
+
+def _plot_calibration_diagnostic(
+    trials: List[Dict],
+    lambda_optimal: float,
+    balance_threshold: float,
+    cal_dir: Path,
+) -> None:
+    """
+    Generate a diagnostic plot summarizing calibration Phase 1 results.
+
+    Shows gradient ratios (cross, self, min) as a function of λ_group,
+    with the convergence band and selected λ_group* highlighted.
+
+    Saved to ``cal_dir / calibration_diagnostic.png`` and closed.
+
+    Args:
+        trials:             List of per-iteration trial dicts from Phase 1,
+                            each containing ``lambda_group``, ``ratio_cross``,
+                            ``ratio_self``, and ``ratio_min``.
+        lambda_optimal:     The selected λ_group value.
+        balance_threshold:  The convergence threshold (band = [1/thr, thr]).
+        cal_dir:            Directory to save the figure.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend (safe for cluster/CI)
+    import matplotlib.pyplot as plt
+
+    if not trials:
+        logger.warning("No calibration trials to plot.")
+        return
+
+    # Sort trials by lambda_group for a clean line plot
+    sorted_trials = sorted(trials, key=lambda t: t["lambda_group"])
+
+    lambdas = [t["lambda_group"] for t in sorted_trials]
+    ratio_cross = [t["ratio_cross"] for t in sorted_trials]
+    ratio_self = [t["ratio_self"] for t in sorted_trials]
+    ratio_min = [t["ratio_min"] for t in sorted_trials]
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+
+    # Convergence band
+    ax.axhspan(
+        1.0 / balance_threshold, balance_threshold,
+        color="green", alpha=0.10, label=f"Balance band [{1/balance_threshold:.1f}, {balance_threshold:.1f}]",
+    )
+    ax.axhline(1.0, color="gray", linestyle=":", linewidth=0.8, label="Perfect balance (1.0)")
+
+    # Ratio lines
+    ax.plot(lambdas, ratio_cross, "o-", color="tab:blue", linewidth=1.5,
+            markersize=5, label="Ratio cross (S→X)")
+    ax.plot(lambdas, ratio_self, "s-", color="tab:orange", linewidth=1.5,
+            markersize=5, label="Ratio self (X→X)")
+    ax.plot(lambdas, ratio_min, "D-", color="tab:red", linewidth=2.0,
+            markersize=6, label="Ratio min", zorder=5)
+
+    # Selected λ_group*
+    ax.axvline(lambda_optimal, color="green", linestyle="--", linewidth=1.5,
+               alpha=0.8, label=f"λ_group* = {lambda_optimal:.2e}")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("λ_group")
+    ax.set_ylabel("Gradient Ratio  (||∇Recon|| / ||∇HSIC||)")
+    ax.set_title("Calibration: Gradient Ratio vs λ_group")
+    ax.legend(fontsize=8, loc="best")
+    ax.grid(True, alpha=0.3, which="both")
+
+    plt.tight_layout()
+    fig.savefig(str(cal_dir / "calibration_diagnostic.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved diagnostic plot: {cal_dir / 'calibration_diagnostic.png'}")

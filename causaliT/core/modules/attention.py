@@ -1661,6 +1661,14 @@ class AttentionLayer(nn.Module):
         - query, key: Structure embeddings (for Q, K projections)
         - value: Value embeddings (for V projection)
     
+    Shared Structure Mode:
+        When `shared_qk_inner` is provided (a dict with keys "query_projection",
+        "key_projection", "inner_attention"), the layer reuses these components
+        instead of creating its own. This enables sharing the causal structure
+        (Q/K projections and attention mechanism) across multiple decoder layers
+        while each layer maintains independent V projections, output projections,
+        and dropout for reconstruction.
+    
     Args:
         attention: Attention class (LieAttention, CausalCrossAttention, PhiSoftMax, etc.)
         dag_parameterization: str, one of:
@@ -1680,6 +1688,11 @@ class AttentionLayer(nn.Module):
         toeplitz_init_tau_gate: Initial temperature for ToeplitzLieAttention gate (default: 0.5)
         toeplitz_init_tau_dir: Initial temperature for ToeplitzLieAttention direction (default: 0.3)
         toeplitz_max_gain: Maximum allowed gain for ToeplitzLieAttention (default: 20.0)
+        shared_qk_inner: Optional dict with shared components. Keys:
+            - "query_projection": nn.Linear or similar
+            - "key_projection": nn.Linear or OrthogonalLinear
+            - "inner_attention": inner attention module instance
+            When provided, these are reused (not created). Default: None.
     """
     def __init__(
         self,
@@ -1708,104 +1721,145 @@ class AttentionLayer(nn.Module):
         toeplitz_init_tau_gate: float = 0.5,
         toeplitz_init_tau_dir: float = 0.3,
         toeplitz_max_gain: float = 20.0,
+        # Shared structure components (for weight sharing across layers)
+        shared_qk_inner: dict = None,
         ):
         
         super(AttentionLayer, self).__init__()
         
-        # Attention types that require square attention (self-attention only)
-        SELF_ATTENTION_ONLY = (LieAttention, ToeplitzLieAttention, ToeplitzAttention)
+        # Track whether this layer uses shared structure
+        self._uses_shared_structure = shared_qk_inner is not None
         
-        # Check square attention requirement for self-attention-only modules
-        if attention in SELF_ATTENTION_ONLY and query_seq_len is not None and key_seq_len is not None:
-            if query_seq_len != key_seq_len:
-                raise ValueError(
-                    f"{attention.__name__} requires square attention (self-attention) but got "
-                    f"query_seq_len={query_seq_len} != key_seq_len={key_seq_len}. "
-                    f"Use CausalCrossAttention or ScaledDotAttention for cross-attention instead."
-                )
-        
-        # Attention types that support DAG learning
-        DAG_LEARNING_ATTENTION = (LieAttention, CausalCrossAttention, PhiSoftMax, ToeplitzLieAttention)
-        
-        # Centralized DAGMask creation
-        dag_mask = None
-        if attention in DAG_LEARNING_ATTENTION and query_seq_len is not None and key_seq_len is not None:
-            dag_mask = self._create_dag_mask(
-                dag_parameterization=dag_parameterization,
-                n_heads=n_heads,
-                query_seq_len=query_seq_len,
-                key_seq_len=key_seq_len,
-                phi_init_std=phi_init_std
-            )
-        
-        # Create inner attention - pass dag_mask and attention-specific parameters
-        if attention == ToeplitzLieAttention:
-            self.inner_attention = attention(
-                dag_mask=dag_mask,
-                attention_dropout=attention_dropout,
-                register_entropy=register_entropy,
-                layer_name=layer_name,
-                init_gain_gate=toeplitz_init_gain_gate,
-                init_gain_dir=toeplitz_init_gain_dir,
-                init_tau_gate=toeplitz_init_tau_gate,
-                init_tau_dir=toeplitz_init_tau_dir,
-                max_gain=toeplitz_max_gain,
-            )
-        elif attention == ToeplitzAttention:
-            # ToeplitzAttention: Clean Toeplitz decomposition with single temperature
-            # Does not use dag_mask - derives DAG directly from attention scores
-            self.inner_attention = attention(
-                dag_mask=None,  # Not used
-                attention_dropout=attention_dropout,
-                register_entropy=register_entropy,
-                layer_name=layer_name,
-                init_tau=toeplitz_init_tau_gate,  # Reuse gate tau as the single temperature
-                tau_min=0.1,
-                tau_max=5.0,
+        if shared_qk_inner is not None:
+            # ===== SHARED MODE =====
+            # Reuse Q/K projections and inner attention from another layer.
+            # These are references (not copies) — parameters are shared.
+            # Only V projection, output projection, and dropout are per-layer.
+            self.query_projection = shared_qk_inner["query_projection"]
+            self.key_projection = shared_qk_inner["key_projection"]
+            self.inner_attention = shared_qk_inner["inner_attention"]
+            self.key_projection_type = getattr(
+                shared_qk_inner.get("_source_layer", None), 
+                "key_projection_type", "linear"
             )
         else:
-            self.inner_attention = attention(
-                dag_mask=dag_mask,
-                attention_dropout=attention_dropout,
-                register_entropy=register_entropy,
-                layer_name=layer_name
-            )
-        
-        # Projection layers
-        self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
-        
-        # Key projection: supports orthogonal projection for preserving embedding orthogonality
-        self.key_projection_type = key_projection_type
-        if key_projection_type == "linear":
-            self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
-        elif key_projection_type == "orthogonal":
-            # Orthogonal projection preserves inner products: ⟨W_k x, W_k y⟩ = ⟨x, y⟩
-            # Requires d_queries_keys >= d_model_keys (more output dims than input)
-            # For multi-head, we need d_queries_keys * n_heads >= d_model_keys
-            out_features = d_queries_keys * n_heads
-            in_features = d_model_keys
-            if out_features < in_features:
-                raise ValueError(
-                    f"Orthogonal key projection requires d_queries_keys * n_heads >= d_model_keys, "
-                    f"got {out_features} < {in_features}. "
-                    f"Either increase d_queries_keys or use key_projection_type='linear'."
+            # ===== STANDARD MODE (existing behavior) =====
+            # Attention types that require square attention (self-attention only)
+            SELF_ATTENTION_ONLY = (LieAttention, ToeplitzLieAttention, ToeplitzAttention)
+            
+            # Check square attention requirement for self-attention-only modules
+            if attention in SELF_ATTENTION_ONLY and query_seq_len is not None and key_seq_len is not None:
+                if query_seq_len != key_seq_len:
+                    raise ValueError(
+                        f"{attention.__name__} requires square attention (self-attention) but got "
+                        f"query_seq_len={query_seq_len} != key_seq_len={key_seq_len}. "
+                        f"Use CausalCrossAttention or ScaledDotAttention for cross-attention instead."
+                    )
+            
+            # Attention types that support DAG learning
+            DAG_LEARNING_ATTENTION = (LieAttention, CausalCrossAttention, PhiSoftMax, ToeplitzLieAttention)
+            
+            # Centralized DAGMask creation
+            dag_mask = None
+            if attention in DAG_LEARNING_ATTENTION and query_seq_len is not None and key_seq_len is not None:
+                dag_mask = self._create_dag_mask(
+                    dag_parameterization=dag_parameterization,
+                    n_heads=n_heads,
+                    query_seq_len=query_seq_len,
+                    key_seq_len=key_seq_len,
+                    phi_init_std=phi_init_std
                 )
-            self.key_projection = OrthogonalLinear(
-                in_features=in_features,
-                out_features=out_features,
-                use_scale=orthogonal_scale,
-                init_scale=orthogonal_init_scale
-            )
-        else:
-            raise ValueError(
-                f"Invalid key_projection_type='{key_projection_type}'. "
-                f"Must be one of: 'linear', 'orthogonal'"
-            )
+            
+            # Create inner attention - pass dag_mask and attention-specific parameters
+            if attention == ToeplitzLieAttention:
+                self.inner_attention = attention(
+                    dag_mask=dag_mask,
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_gain_gate=toeplitz_init_gain_gate,
+                    init_gain_dir=toeplitz_init_gain_dir,
+                    init_tau_gate=toeplitz_init_tau_gate,
+                    init_tau_dir=toeplitz_init_tau_dir,
+                    max_gain=toeplitz_max_gain,
+                )
+            elif attention == ToeplitzAttention:
+                # ToeplitzAttention: Clean Toeplitz decomposition with single temperature
+                # Does not use dag_mask - derives DAG directly from attention scores
+                self.inner_attention = attention(
+                    dag_mask=None,  # Not used
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=toeplitz_init_tau_gate,  # Reuse gate tau as the single temperature
+                    tau_min=0.1,
+                    tau_max=5.0,
+                )
+            else:
+                self.inner_attention = attention(
+                    dag_mask=dag_mask,
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name
+                )
+            
+            # Q and K projection layers (owned by this layer)
+            self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
+            
+            # Key projection: supports orthogonal projection for preserving embedding orthogonality
+            self.key_projection_type = key_projection_type
+            if key_projection_type == "linear":
+                self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
+            elif key_projection_type == "orthogonal":
+                out_features = d_queries_keys * n_heads
+                in_features = d_model_keys
+                if out_features < in_features:
+                    raise ValueError(
+                        f"Orthogonal key projection requires d_queries_keys * n_heads >= d_model_keys, "
+                        f"got {out_features} < {in_features}. "
+                        f"Either increase d_queries_keys or use key_projection_type='linear'."
+                    )
+                self.key_projection = OrthogonalLinear(
+                    in_features=in_features,
+                    out_features=out_features,
+                    use_scale=orthogonal_scale,
+                    init_scale=orthogonal_init_scale
+                )
+            else:
+                raise ValueError(
+                    f"Invalid key_projection_type='{key_projection_type}'. "
+                    f"Must be one of: 'linear', 'orthogonal'"
+                )
         
+        # V projection, output projection, and dropout are ALWAYS per-layer
         self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
+    
+    def get_shared_qk_inner(self) -> dict:
+        """
+        Extract the shareable structural components from this layer.
+        
+        Returns a dict that can be passed as `shared_qk_inner` to other
+        AttentionLayer instances to share Q/K projections and inner attention.
+        
+        Should only be called on layers that OWN their structural components
+        (i.e., layers created without shared_qk_inner).
+        
+        Returns:
+            dict with keys "query_projection", "key_projection", "inner_attention"
+        """
+        if self._uses_shared_structure:
+            raise ValueError(
+                "Cannot extract shared components from a layer that itself uses shared structure. "
+                "Extract from the original (owning) layer instead."
+            )
+        return {
+            "query_projection": self.query_projection,
+            "key_projection": self.key_projection,
+            "inner_attention": self.inner_attention,
+        }
     
     def _create_dag_mask(
         self,
