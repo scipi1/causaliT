@@ -65,8 +65,14 @@ Layer 0 (owns parameters):
   self_att.W_V   (independent)    Layer 1 self_att.W_V (independent)
   self_att.W_out (independent)    Layer 1 self_att.W_out (independent)
 
-  FF, LayerNorm  (independent)    Layer 1 FF, LayerNorm (independent)
+  FF, LayerNorm (val) (independent)  Layer 1 FF, LayerNorm (val) (independent)
+  LayerNorm (struct)  ←── shared ──→  Layer 1 LayerNorm (struct) (same object)
 ```
+
+**SVFA struct norms**: In SVFA mode, `norm1_struct` and `norm2_struct` normalize the
+structure embedding before it enters the shared Q/K projections. These norms are also
+shared across layers — otherwise, per-layer norm parameters would produce different
+Q/K inputs and therefore different DAGs, defeating the purpose of structure sharing.
 
 ### How Sharing Works
 
@@ -103,7 +109,9 @@ When `share_structure_across_layers: false` (default), behavior is identical to 
 ## Files Modified
 
 - `causaliT/core/modules/attention.py` — `AttentionLayer`: added `shared_qk_inner` parameter and `get_shared_qk_inner()` method
-- `causaliT/core/architectures/single_causal/model.py` — `SingleCausalLayer`: added `share_structure_across_layers` parameter
-- `causaliT/core/architectures/noise_aware/model.py` — `NoiseAwareSingleCausalLayer`: added `share_structure_across_layers` parameter
+- `causaliT/core/architectures/stage_causal/decoder.py` — `ReversedDecoderLayer`: added `shared_struct_norms` parameter for SVFA norm sharing
+- `causaliT/core/architectures/noise_aware/decoder.py` — `NoiseAwareReversedDecoderLayer`: added `shared_struct_norms` parameter for SVFA norm sharing
+- `causaliT/core/architectures/single_causal/model.py` — `SingleCausalLayer`: shares struct norms when `share_structure_across_layers=true` + SVFA
+- `causaliT/core/architectures/noise_aware/model.py` — `NoiseAwareSingleCausalLayer`: shares struct norms when `share_structure_across_layers=true`
 - `causaliT/config/templates/config_single_causal_svfa.yaml` — added config key
 - `causaliT/config/templates/config_noise_aware.yaml` — added config key

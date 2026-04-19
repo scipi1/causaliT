@@ -70,17 +70,14 @@ class SingleCausalForecaster(pl.LightningModule):
         # =====================================================================
         # UNIFIED SCORE SPARSITY REGULARIZATION
         # Applied to ALL decoder layers (averaged)
+        # Auto-detects L1 vs entropy based on attention type:
+        #   - L1 (score_tensor_for_sparsity) for non-softmax attention
+        #   - Entropy fallback for softmax-based attention only
+        # Config keys self_sparsity_regularizer / cross_sparsity_regularizer
+        # are DEPRECATED and ignored.
         # =====================================================================
         self.lambda_self_score_sparse = config["training"].get("lambda_self_score_sparse", 0.0)
         self.lambda_cross_score_sparse = config["training"].get("lambda_cross_score_sparse", 0.0)
-        
-        # Mode selection: "l1" or "entropy"
-        self.self_sparsity_regularizer = config["training"].get("self_sparsity_regularizer", "l1")
-        self.cross_sparsity_regularizer = config["training"].get("cross_sparsity_regularizer", "entropy")
-        
-        # Track if fallback was triggered (for warning once)
-        self._self_sparsity_fallback_warned = False
-        self._cross_sparsity_fallback_warned = False
         
         # =====================================================================
         # HSIC REGULARIZATION
@@ -286,35 +283,32 @@ class SingleCausalForecaster(pl.LightningModule):
         self_mode_used = "entropy"
         cross_mode_used = "entropy"
         
-        def _compute_score_sparsity(mode: str, inner_attention, entropy_value, device, is_self: bool):
+        def _compute_score_sparsity(inner_attention, entropy_value, device):
             """
-            Compute unified score sparsity regularization.
+            Compute score sparsity regularization with auto-detection.
+            
+            Auto-selects the method based on what the attention module supports:
+            - L1 on score_tensor_for_sparsity if available (non-softmax attention)
+            - Entropy fallback for softmax-based attention (no score tensor)
+            
+            Config keys self_sparsity_regularizer / cross_sparsity_regularizer
+            are DEPRECATED and ignored.
             
             Args:
-                mode: "l1" or "entropy"
-                inner_attention: Inner attention module with score_tensor_for_sparsity property
-                entropy_value: Pre-computed attention entropy (scalar)
+                inner_attention: Inner attention module (may have score_tensor_for_sparsity)
+                entropy_value: Pre-computed attention entropy (scalar, used as fallback)
                 device: Device for tensors
-                is_self: True for self-attention, False for cross-attention
                 
             Returns:
                 Tuple of (sparsity_value, actual_mode_used)
             """
-            if mode == "l1":
-                # Try L1 first
-                score_tensor = getattr(inner_attention, 'score_tensor_for_sparsity', None)
-                if score_tensor is not None:
-                    return score_tensor.mean(), "l1"
-                else:
-                    # Fallback to entropy for softmax-based attention
-                    if is_self and not self._self_sparsity_fallback_warned:
-                        print("Warning: L1 sparsity unavailable for self-attention (softmax-based). Using entropy fallback.")
-                        self._self_sparsity_fallback_warned = True
-                    elif not is_self and not self._cross_sparsity_fallback_warned:
-                        print("Warning: L1 sparsity unavailable for cross-attention (softmax-based). Using entropy fallback.")
-                        self._cross_sparsity_fallback_warned = True
-                    return entropy_value, "entropy"
-            else:  # entropy
+            # Auto-detect: always prefer L1 if available, fall back to entropy
+            score_tensor = getattr(inner_attention, 'score_tensor_for_sparsity', None)
+            if score_tensor is not None:
+                # L1 norm: use absolute values since attention activations (e.g., GeLU(Tanh))
+                # can produce negative values. Without .abs(), mean(A) can be negative.
+                return score_tensor.abs().mean(), "l1"
+            else:
                 return entropy_value, "entropy"
         
         for layer_idx in range(n_layers):
@@ -326,12 +320,12 @@ class SingleCausalForecaster(pl.LightningModule):
             layer_self_ent = dec_self_ent[layer_idx].mean()
             layer_cross_ent = dec_cross_ent[layer_idx].mean()
             
-            # Compute score sparsity for this layer
+            # Compute score sparsity for this layer (auto-detected)
             layer_self_sparse, self_mode_used = _compute_score_sparsity(
-                self.self_sparsity_regularizer, dec_self_inner, layer_self_ent, X.device, is_self=True
+                dec_self_inner, layer_self_ent, X.device
             )
             layer_cross_sparse, cross_mode_used = _compute_score_sparsity(
-                self.cross_sparsity_regularizer, dec_cross_inner, layer_cross_ent, X.device, is_self=False
+                dec_cross_inner, layer_cross_ent, X.device
             )
             
             total_self_score_sparse = total_self_score_sparse + layer_self_sparse

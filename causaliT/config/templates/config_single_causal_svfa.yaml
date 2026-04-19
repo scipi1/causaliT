@@ -278,10 +278,13 @@ training:
   lambda_self_score_sparse: 0.0
   # Weight for cross-attention score sparsity
   lambda_cross_score_sparse: 0.0
-  # Mode: "l1" (uses score_tensor_for_sparsity) or "entropy" (uses attention entropy)
-  # If "l1" is selected but attention type doesn't support it, falls back to entropy
-  self_sparsity_regularizer: "l1"
-  cross_sparsity_regularizer: "entropy"
+  # DEPRECATED: self_sparsity_regularizer / cross_sparsity_regularizer
+  # Sparsity mode is now auto-detected from the attention module:
+  #   - L1 (score_tensor_for_sparsity) for non-softmax attention (Toeplitz, Lie, CC)
+  #   - Entropy fallback for softmax-based attention (ScaledDotProduct, PhiSoftMax)
+  # These keys are ignored if present in old configs.
+  # self_sparsity_regularizer: "l1"     # DEPRECATED — auto-detected
+  # cross_sparsity_regularizer: "entropy"  # DEPRECATED — auto-detected
   
   # HSIC - encourages independence between residuals and parents
   # lambda_hsic_cross: Weight for S→X HSIC (cross-attention)

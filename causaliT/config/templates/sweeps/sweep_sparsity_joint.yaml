@@ -26,5 +26,6 @@ training:
   seed: [0, 1, 2]
   
   # Fix regularizer type (L1 for Toeplitz, entropy fallback for others)
-  self_sparsity_regularizer: "l1"
-  cross_sparsity_regularizer: "l1"
+  # DEPRECATED: self_sparsity_regularizer / cross_sparsity_regularizer — auto-detected
+  # self_sparsity_regularizer: "l1"
+  # cross_sparsity_regularizer: "l1"

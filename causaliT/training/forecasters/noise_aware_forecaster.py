@@ -84,12 +84,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # =====================================================================
         self.lambda_self_score_sparse = config["training"].get("lambda_self_score_sparse", 0.0)
         self.lambda_cross_score_sparse = config["training"].get("lambda_cross_score_sparse", 0.0)
-        self.self_sparsity_regularizer = config["training"].get("self_sparsity_regularizer", "l1")
-        self.cross_sparsity_regularizer = config["training"].get("cross_sparsity_regularizer", "entropy")
-        
-        # Track if fallback was triggered (for warning once)
-        self._self_sparsity_fallback_warned = False
-        self._cross_sparsity_fallback_warned = False
+        # Config keys self_sparsity_regularizer / cross_sparsity_regularizer
+        # are DEPRECATED and ignored — auto-detection is used instead.
         
         # =====================================================================
         # HSIC REGULARIZATION
@@ -311,20 +307,22 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self_mode_used = "entropy"
         cross_mode_used = "entropy"
         
-        def _compute_score_sparsity(mode: str, inner_attention, entropy_value, device, is_self: bool):
-            """Compute unified score sparsity regularization."""
-            if mode == "l1":
-                score_tensor = getattr(inner_attention, 'score_tensor_for_sparsity', None)
-                if score_tensor is not None:
-                    return score_tensor.mean(), "l1"
-                else:
-                    if is_self and not self._self_sparsity_fallback_warned:
-                        print("Warning: L1 sparsity unavailable for self-attention (softmax-based). Using entropy fallback.")
-                        self._self_sparsity_fallback_warned = True
-                    elif not is_self and not self._cross_sparsity_fallback_warned:
-                        print("Warning: L1 sparsity unavailable for cross-attention (softmax-based). Using entropy fallback.")
-                        self._cross_sparsity_fallback_warned = True
-                    return entropy_value, "entropy"
+        def _compute_score_sparsity(inner_attention, entropy_value, device):
+            """
+            Compute score sparsity regularization with auto-detection.
+            
+            Auto-selects the method based on what the attention module supports:
+            - L1 on score_tensor_for_sparsity if available (non-softmax attention)
+            - Entropy fallback for softmax-based attention (no score tensor)
+            
+            Config keys self_sparsity_regularizer / cross_sparsity_regularizer
+            are DEPRECATED and ignored.
+            """
+            score_tensor = getattr(inner_attention, 'score_tensor_for_sparsity', None)
+            if score_tensor is not None:
+                # L1 norm: use absolute values since attention activations (e.g., GeLU(Tanh))
+                # can produce negative values. Without .abs(), mean(A) can be negative.
+                return score_tensor.abs().mean(), "l1"
             else:
                 return entropy_value, "entropy"
         
@@ -337,12 +335,12 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             layer_self_ent = dec_self_ent[layer_idx].mean()
             layer_cross_ent = dec_cross_ent[layer_idx].mean()
             
-            # Compute score sparsity for this layer
+            # Compute score sparsity for this layer (auto-detected)
             layer_self_sparse, self_mode_used = _compute_score_sparsity(
-                self.self_sparsity_regularizer, dec_self_inner, layer_self_ent, X.device, is_self=True
+                dec_self_inner, layer_self_ent, X.device
             )
             layer_cross_sparse, cross_mode_used = _compute_score_sparsity(
-                self.cross_sparsity_regularizer, dec_cross_inner, layer_cross_ent, X.device, is_self=False
+                dec_cross_inner, layer_cross_ent, X.device
             )
             
             total_self_score_sparse = total_self_score_sparse + layer_self_sparse

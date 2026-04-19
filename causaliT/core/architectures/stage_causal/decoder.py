@@ -42,7 +42,8 @@ class ReversedDecoderLayer(nn.Module):
         d_ff,
         dropout_ff,
         dropout_attn_out,
-        factorization: str = "standard"
+        factorization: str = "standard",
+        shared_struct_norms: dict = None,
     ):
         super(ReversedDecoderLayer, self).__init__()
         
@@ -57,9 +58,15 @@ class ReversedDecoderLayer(nn.Module):
         self.norm3 = Normalization(method=norm, d_model=d_model_dec)
         
         # For SVFA: separate normalization for structure embeddings
+        # When shared_struct_norms is provided, reuse norms from layer 0
+        # to ensure identical DAGs across layers with share_structure_across_layers
         if factorization == "svfa":
-            self.norm1_struct = Normalization(method=norm, d_model=d_model_dec)
-            self.norm2_struct = Normalization(method=norm, d_model=d_model_dec)
+            if shared_struct_norms is not None:
+                self.norm1_struct = shared_struct_norms["norm1_struct"]
+                self.norm2_struct = shared_struct_norms["norm2_struct"]
+            else:
+                self.norm1_struct = Normalization(method=norm, d_model=d_model_dec)
+                self.norm2_struct = Normalization(method=norm, d_model=d_model_dec)
 
         # Feedforward layers (linear)
         self.linear1 = nn.Linear(in_features=d_model_dec, out_features=d_ff, bias=True)

@@ -202,8 +202,9 @@ training:
   lambda_sparse_cross: 0.0
   lambda_self_score_sparse: 0.0
   lambda_cross_score_sparse: 0.0
-  self_sparsity_regularizer: "l1"
-  cross_sparsity_regularizer: "entropy"
+  # DEPRECATED: self_sparsity_regularizer / cross_sparsity_regularizer — auto-detected
+  # self_sparsity_regularizer: "l1"
+  # cross_sparsity_regularizer: "entropy"
   lambda_hsic_cross: 0.0
   lambda_hsic_self: 0.0
   use_attention_weighted_hsic: false

@@ -348,6 +348,7 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             
             # Build decoder layers: layer 0 owns params, layers 1..N-1 share them
             decoder_layers = []
+            shared_struct_norms = None  # Will be extracted from layer 0
             for i in range(dec_layers):
                 if i == 0:
                     cross_att = cross_att_0
@@ -366,7 +367,17 @@ class NoiseAwareSingleCausalLayer(nn.Module):
                     dropout_attn_out=dropout_attn_out,
                     activation=activation,
                     norm=norm,
+                    shared_struct_norms=shared_struct_norms,
                 ))
+                
+                # After creating layer 0, extract its struct norms for sharing
+                # This ensures identical DAGs across layers (same Q/K + same norm = same attention)
+                if i == 0:
+                    layer_0 = decoder_layers[0]
+                    shared_struct_norms = {
+                        "norm1_struct": layer_0.norm1_struct,
+                        "norm2_struct": layer_0.norm2_struct,
+                    }
         else:
             # Standard: each layer has independent attention (existing behavior)
             decoder_layers = [

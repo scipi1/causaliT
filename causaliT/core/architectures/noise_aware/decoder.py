@@ -86,6 +86,7 @@ class NoiseAwareReversedDecoderLayer(nn.Module):
         dropout_attn_out: float,
         activation: str,
         norm: str,
+        shared_struct_norms: dict = None,
     ):
         super().__init__()
         
@@ -102,8 +103,14 @@ class NoiseAwareReversedDecoderLayer(nn.Module):
         self.norm3 = Normalization(method=norm, d_model=d_model_dec)
         
         # Separate normalization for structure embeddings (SVFA)
-        self.norm1_struct = Normalization(method=norm, d_model=d_model_dec)
-        self.norm2_struct = Normalization(method=norm, d_model=d_model_dec)
+        # When shared_struct_norms is provided, reuse norms from layer 0
+        # to ensure identical DAGs across layers with share_structure_across_layers
+        if shared_struct_norms is not None:
+            self.norm1_struct = shared_struct_norms["norm1_struct"]
+            self.norm2_struct = shared_struct_norms["norm2_struct"]
+        else:
+            self.norm1_struct = Normalization(method=norm, d_model=d_model_dec)
+            self.norm2_struct = Normalization(method=norm, d_model=d_model_dec)
         
         # Feedforward layers
         self.linear1 = nn.Linear(d_model_dec, d_ff, bias=True)
