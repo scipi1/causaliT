@@ -228,7 +228,7 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
     adapted for causality, with learnable DAG structure.
     
     Features:
-    - GeLU(Tanh) activation instead of Softmax for causality-friendly attention
+    - ReLU(Tanh) activation instead of Softmax for causality-friendly attention
     - Learnable DAG mask (phi) via Gumbel-Softmax trick
     - Running averages for KL prior regularization
     - Decoupled attention scores and causal structure
@@ -387,8 +387,11 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         gain = torch.exp(self.log_gain).clamp(1e-3, self.max_gain)
         tau_act = torch.exp(self.log_tau_act).clamp(1e-3, 10.0)
         
-        # Causality-friendly activation: GeLU(Tanh(scores))
-        att = F.gelu(F.tanh((gain / tau_act) * scores))
+        # Causality-friendly activation: ReLU(Tanh(scores))
+        # Note: GeLU was used previously but produces negative values (~-0.17),
+        # which violates the non-negativity assumption for attention weights.
+        # ReLU ensures strictly non-negative attention for interpretability.
+        att = F.relu(F.tanh((gain / tau_act) * scores))
         
         # Handle NaN from all-masked rows
         att = torch.nan_to_num(att, nan=0.0)

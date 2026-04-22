@@ -34,6 +34,7 @@ from .eval_utils import (
     find_all_checkpoints,
     _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
+    _compute_zeroness_metrics,
     _load_true_dag_mask,
     _compute_dag_confidence,
     _get_learned_dag_per_fold,
@@ -290,20 +291,30 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             print(f"    No true DAG mask found for {mask_type}")
             continue
         
-        # Compute per-fold soft Hamming distances
+        # Compute per-fold soft Hamming distances and zeroness metrics
         per_fold_values = {}
+        per_fold_zeroness = {}
         fold_sh_list = []
+        fold_zeroness_list = []
         
         for fold_name, learned_dag in fold_dags:
             if learned_dag is None or learned_dag.shape != true_dag.shape:
                 per_fold_values[fold_name] = None
+                per_fold_zeroness[fold_name] = None
                 continue
             
             soft_hamming = _compute_soft_hamming(learned_dag, true_dag)
-            per_fold_values[fold_name] = soft_hamming
-            fold_sh_list.append(soft_hamming)
+            zeroness = _compute_zeroness_metrics(learned_dag, true_dag)
             
-            print(f"    {fold_name}: Soft Hamming ({source}) = {soft_hamming:.4f}")
+            per_fold_values[fold_name] = soft_hamming
+            per_fold_zeroness[fold_name] = zeroness
+            fold_sh_list.append(soft_hamming)
+            fold_zeroness_list.append(zeroness)
+            
+            print(f"    {fold_name}: Soft Hamming ({source}) = {soft_hamming:.4f}"
+                  f"  | contrast={zeroness['contrast']:.3f}"
+                  f"  mean_nonedge={zeroness['mean_nonedge']:.3f}"
+                  f"  min_edge={zeroness['min_edge']:.3f}")
             
             per_fold_comparison_data.append({
                 "fold_name": fold_name,
@@ -314,11 +325,13 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "source": source,
             })
         
-        # Compute statistics
+        # Derive metric key from mask_type (remove prefixes)
+        base_key = mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')
+        
+        # Compute soft Hamming statistics
         if fold_sh_list:
             fold_sh_array = np.array(fold_sh_list)
-            # Derive metric key from mask_type (remove prefixes)
-            metric_key = f"soft_hamming_{mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')}"
+            metric_key = f"soft_hamming_{base_key}"
             
             dag_metrics[metric_key] = {
                 "best": float(np.min(fold_sh_array)),
@@ -328,6 +341,16 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "per_fold": per_fold_values,
             }
             dag_metrics[f"{metric_key}_source"] = source
+        
+        # Compute zeroness statistics (aggregate across folds)
+        if fold_zeroness_list:
+            zeroness_key = f"zeroness_{base_key}"
+            zeroness_agg = {}
+            for field in ['mean_nonedge', 'max_nonedge', 'mean_edge', 'min_edge', 'contrast']:
+                values = [z[field] for z in fold_zeroness_list]
+                zeroness_agg[field] = float(np.mean(values))
+            zeroness_agg['per_fold'] = per_fold_zeroness
+            dag_metrics[zeroness_key] = zeroness_agg
         
         # Compute DAG confidence
         valid_fold_dags = [dag for _, dag in fold_dags if dag is not None]

@@ -681,6 +681,67 @@ if __name__ == "__main__":
     print("="*60)
     
     # =========================================================================
+    # DIAGNOSTIC: Continuous S sampling (for HSIC kernel analysis)
+    # =========================================================================
+    # Same SCM structures but with uniform S instead of discrete.
+    # Used to test whether discrete S is causing HSIC optimization instability.
+    # See: docs/CRITICAL_EXP.md — "D1 Extended: Discrete vs Continuous"
+    
+    print("\n" + "="*60)
+    print("Generating SCM1 Continuous: Linear Gaussian (uniform S, ratio split)")
+    print("="*60)
+    ds_scm1.generate_ds(
+        mode="flat", 
+        n=50_000, 
+        save_dir=join(ROOT_DIR, "data/scm1_continuous"), 
+        normalize_method="minmax", 
+        shared_embedding=False,
+        test_split_method={
+            "method": "ratio",
+            "kwargs": {
+                "test_ratio": 0.2,
+                "seed": 42,
+            }
+        }
+    )
+    
+    print("\n" + "="*60)
+    print("Generating SCM2 Continuous: Non-linear Gaussian (uniform S, ratio split)")
+    print("="*60)
+    ds_scm2.generate_ds(
+        mode="flat", 
+        n=50_000, 
+        save_dir=join(ROOT_DIR, "data/scm2_continuous"), 
+        normalize_method="minmax", 
+        shared_embedding=False,
+        test_split_method={
+            "method": "ratio",
+            "kwargs": {
+                "test_ratio": 0.2,
+                "seed": 42,
+            }
+        }
+    )
+    
+    print("\n" + "="*60)
+    print("Generating SCM3 Continuous: Non-linear Non-Gaussian (uniform S, ratio split)")
+    print("="*60)
+    ds_scm3.generate_ds(
+        mode="flat", 
+        n=50_000, 
+        save_dir=join(ROOT_DIR, "data/scm3_continuous"), 
+        normalize_method="minmax", 
+        shared_embedding=False,
+        test_split_method={
+            "method": "ratio",
+            "kwargs": {
+                "test_ratio": 0.2,
+                "seed": 42,
+            }
+        }
+    )
+    
+    # =========================================================================
     # LEGACY: Uniform S sampling (not used for paper)
     # =========================================================================
     # ds_scm1.generate_ds(

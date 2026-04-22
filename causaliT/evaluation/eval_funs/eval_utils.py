@@ -412,6 +412,62 @@ def _compute_soft_hamming(learned: np.ndarray, true: np.ndarray) -> float:
     return float(np.mean(np.abs(learned - true)))
 
 
+def _compute_zeroness_metrics(learned: np.ndarray, true: np.ndarray) -> dict:
+    """
+    Compute zero-ness metrics: how close to 0 are the non-edges?
+    
+    Measures the quality of the learned DAG in terms of edge/non-edge separation.
+    For Toeplitz self-attention (initialized at 0.5), non-edges must be actively
+    driven towards 0 — this metric captures that progress.
+    
+    Args:
+        learned: Learned adjacency matrix with values in [0, 1]
+        true: True binary adjacency matrix with values in {0, 1}
+        
+    Returns:
+        dict with keys:
+            - mean_nonedge: Mean |att| where true=0 (lower = better "blackness")
+            - max_nonedge: Max |att| where true=0 (worst false positive)
+            - mean_edge: Mean att where true=1 (higher = better "whiteness")
+            - min_edge: Min att where true=1 (weakest true edge)
+            - contrast: mean_edge - mean_nonedge (higher = better separation)
+            - n_edges: Number of true edges
+            - n_nonedges: Number of true non-edges
+            
+    Example:
+        >>> learned = np.array([[0.9, 0.05], [0.02, 0.85]])
+        >>> true = np.array([[1, 0], [0, 1]])
+        >>> m = _compute_zeroness_metrics(learned, true)
+        >>> m['mean_nonedge']  # ~0.035
+        >>> m['contrast']      # ~0.84
+    """
+    if learned.shape != true.shape:
+        raise ValueError(f"Shape mismatch: learned {learned.shape} vs true {true.shape}")
+    
+    edge_mask = true.astype(bool)
+    nonedge_mask = ~edge_mask
+    
+    nonedge_vals = np.abs(learned[nonedge_mask])
+    edge_vals = learned[edge_mask]
+    
+    mean_nonedge = float(nonedge_vals.mean()) if len(nonedge_vals) > 0 else float('nan')
+    max_nonedge = float(nonedge_vals.max()) if len(nonedge_vals) > 0 else float('nan')
+    mean_edge = float(edge_vals.mean()) if len(edge_vals) > 0 else float('nan')
+    min_edge = float(edge_vals.min()) if len(edge_vals) > 0 else float('nan')
+    
+    contrast = mean_edge - mean_nonedge
+    
+    return {
+        'mean_nonedge': mean_nonedge,
+        'max_nonedge': max_nonedge,
+        'mean_edge': mean_edge,
+        'min_edge': min_edge,
+        'contrast': contrast,
+        'n_edges': int(edge_mask.sum()),
+        'n_nonedges': int(nonedge_mask.sum()),
+    }
+
+
 def load_dataset_metadata(
     datadir_path: str,
     dataset: str,

@@ -332,6 +332,14 @@ training:
   normalize_hsic_by_loss: true   # Enable for noise-aware models!
   hsic_sigma: 1.0
   hsic_adaptive_bandwidth: false  # Use median heuristic for scale-invariant HSIC
+  # Kernel for source variables in cross-attention HSIC
+  # "rbf" (default) — Gaussian kernel, best for continuous S
+  # "dirac" — Delta kernel, best for discrete S (categorical/few levels)
+  hsic_kernel_source: "rbf"
+  # HSIC estimator mode: "biased" (standard) or "normalized" (nHSIC, Ma et al. 2020)
+  # "normalized" uses Tikhonov regularization to reduce noise floor at small batch sizes
+  hsic_mode: "biased"
+  nhsic_epsilon: 0.01            # Regularization strength for normalized HSIC
   
   # =========================================================================
   # HSIC ANNEALING

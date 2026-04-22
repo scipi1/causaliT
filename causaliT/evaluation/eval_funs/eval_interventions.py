@@ -59,13 +59,22 @@ def get_scm_for_dataset(dataset_name: str):
         ds_scm1_discrete_sampling,
         ds_scm2_discrete_sampling,
         ds_scm3_discrete_sampling,
+        ds_scm1,
+        ds_scm2,
+        ds_scm3,
     )
     
     # Registry mapping dataset names to SCM objects
+    # Discrete variants use rng.choice() for S; continuous use rng.uniform()
     SCM_REGISTRY = {
+        # Discrete S (paper defaults)
         "scm1": ds_scm1_discrete_sampling,
         "scm2": ds_scm2_discrete_sampling,
         "scm3": ds_scm3_discrete_sampling,
+        # Continuous S (uniform) — for HSIC kernel analysis
+        "scm1_continuous": ds_scm1,
+        "scm2_continuous": ds_scm2,
+        "scm3_continuous": ds_scm3,
     }
     
     if dataset_name not in SCM_REGISTRY:

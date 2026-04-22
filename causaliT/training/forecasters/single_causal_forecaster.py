@@ -26,7 +26,7 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.single_causal import SingleCausalLayer
 from causaliT.core.utils import load_dag_masks
-from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted
+from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted, hsic_cross_per_pair
 from causaliT.training.gradient_routing import classify_parameters
 
 
@@ -88,6 +88,15 @@ class SingleCausalForecaster(pl.LightningModule):
         self.use_attention_weighted_hsic = config["training"].get("use_attention_weighted_hsic", False)
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.hsic_adaptive_bandwidth = config["training"].get("hsic_adaptive_bandwidth", False)
+        # HSIC estimator: "biased" (standard) or "normalized" (nHSIC, Ma et al. 2020)
+        self.hsic_mode = config["training"].get("hsic_mode", "biased")
+        self.nhsic_epsilon = config["training"].get("nhsic_epsilon", 0.01)
+        # HSIC cross-attention mode: "averaged" (legacy) or "per_variable" (edge-level)
+        # "averaged": HSIC(S_i, mean(residuals)) — weak, diluted signal
+        # "per_variable": HSIC(S_i, res_j) for all (i,j) pairs — edge-specific signal
+        self.hsic_cross_mode = config["training"].get("hsic_cross_mode", "averaged")
+        # Source kernel: "rbf" (default, for continuous S) or "dirac" (for discrete S)
+        self.hsic_kernel_source = config["training"].get("hsic_kernel_source", "rbf")
         
         # =====================================================================
         # GROUP L1 REGULARIZATION (L2,1 norm on embedding columns)
@@ -363,11 +372,28 @@ class SingleCausalForecaster(pl.LightningModule):
                 sigma=self.hsic_sigma,
                 exclude_diagonal=False,
                 adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
+            )
+        elif self.hsic_cross_mode == "per_variable" and residuals_per_x.dim() > 1:
+            # Per-variable HSIC: HSIC(S_i, res_j) for all (i,j) pairs
+            # Provides edge-level gradient signal for cross-attention DAG learning
+            hsic_cross_value = hsic_cross_per_pair(
+                s_values, residuals_per_x,
+                sigma=self.hsic_sigma,
+                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
             )
         else:
+            # Legacy averaged HSIC: HSIC(S_i, mean(residuals)) — weak signal
             mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
             hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma,
-                                              adaptive_bandwidth=self.hsic_adaptive_bandwidth)
+                                              adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                                              mode=self.hsic_mode, nhsic_epsilon=self.nhsic_epsilon,
+                                              source_kernel=self.hsic_kernel_source)
         
         hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
         
@@ -384,11 +410,15 @@ class SingleCausalForecaster(pl.LightningModule):
                     sigma=self.hsic_sigma,
                     exclude_diagonal=True,
                     adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                    mode=self.hsic_mode,
+                    nhsic_epsilon=self.nhsic_epsilon,
                 )
             else:
                 hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x,
                                                   sigma=self.hsic_sigma,
-                                                  adaptive_bandwidth=self.hsic_adaptive_bandwidth)
+                                                  adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                                                  mode=self.hsic_mode,
+                                                  nhsic_epsilon=self.nhsic_epsilon)
             
             hsic_regularizer += self.lambda_hsic_self * hsic_self_value
         
