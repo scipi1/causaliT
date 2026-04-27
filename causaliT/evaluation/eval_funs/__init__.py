@@ -28,6 +28,7 @@ from .eval_utils import (
     find_all_checkpoints,
     _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
+    _compute_standard_shd,
     _load_true_dag_mask,
     load_dataset_metadata,
     _get_learned_dag,

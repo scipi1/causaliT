@@ -59,7 +59,7 @@ class PerRunManifest(pl.Callback):
         epochs_run = trainer.current_epoch
         self._append({
             "val_loss"      : float(m.get("val_loss", float("nan"))),
-            "val_mae"       : float(m.get("val_mae",  float("nan"))),
+            "val_x_mae"       : float(m.get("val_x_mae",  float("nan"))),
             "val_r2"        : float(m.get("val_r2",   float("nan"))),
             "val_rmse"      : float(m.get("val_rmse", float("nan"))),
             "train_seconds" : round(self._elapsed(), 2),
@@ -77,13 +77,60 @@ class PerRunManifest(pl.Callback):
         self._write_manifest()
 
 
+# DEPRECATED: Module-level early stopping instance.
+# Use get_early_stopping_callback(config) for config-driven early stopping.
 early_stopping_callbacks = EarlyStopping(
-    monitor="val_mae",
+    monitor="val_x_mae",
     min_delta=1E-5,
     patience=50,
     verbose=True, 
     mode="min"
-)         
+)
+
+
+def get_early_stopping_callback(config: dict):
+    """
+    Create an EarlyStopping callback from the training config.
+
+    Reads ``config["training"]["early_stopping"]`` and returns an
+    ``EarlyStopping`` instance, or ``None`` if early stopping is disabled.
+
+    Config example::
+
+        training:
+          early_stopping:
+            enabled: true
+            monitor: "val_x_mae"
+            patience: 50
+            min_delta: 1.0e-5
+            mode: "min"
+
+    Falls back to the legacy ``special.mode: ["early_stopping"]`` check
+    for backward compatibility.
+
+    Args:
+        config: Full experiment configuration dict.
+
+    Returns:
+        ``EarlyStopping`` callback or ``None``.
+    """
+    # New config-driven approach
+    es_config = config.get("training", {}).get("early_stopping", {})
+    if es_config.get("enabled", False):
+        return EarlyStopping(
+            monitor=es_config.get("monitor", "val_x_mae"),
+            min_delta=float(es_config.get("min_delta", 1e-5)),
+            patience=int(es_config.get("patience", 50)),
+            verbose=True,
+            mode=es_config.get("mode", "min"),
+        )
+
+    # Legacy fallback: special.mode list
+    special_modes = config.get("special", {}).get("mode", [])
+    if "early_stopping" in (special_modes or []):
+        return early_stopping_callbacks
+
+    return None
 
 
 def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
@@ -97,6 +144,7 @@ def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
         save_top_k = -1,
         monitor    = "val_loss",
         mode       = "min",
+        save_last  = True,
     )
 
     class SaveInitial(Callback):
@@ -141,10 +189,24 @@ class MemoryLoggerCallback(Callback):
         logger_memory.info(f"Max reserved GPU: {torch.cuda.max_memory_reserved() / 1e9:.2f} GB")
 
 
-class BestCheckpointCallback(Callback):
-    """Callback to save the best checkpoint based on val_mae and store associated metrics."""
+# Backward-compatible alias
+BestCheckpointCallback = None  # Removed — use BestReconstructionCheckpoint
+
+
+class BestReconstructionCheckpoint(Callback):
+    """
+    Save the checkpoint with the best reconstruction quality (lowest val_x_mae).
+
+    Saves ``best_reconstruction_checkpoint.ckpt`` whenever the monitored
+    metric improves, and writes ``best_reconstruction_metrics.json`` at
+    test end.
+
+    This is the counterpart of ``BestCausalCheckpoint`` (which tracks HSIC).
+    For baseline models (no HSIC), this is the primary checkpoint for ATE
+    evaluation.  For causal models, use ``BestCausalCheckpoint`` instead.
+    """
     
-    def __init__(self, save_dir: str, monitor: str = "val_mae", mode: str = "min"):
+    def __init__(self, save_dir: str, monitor: str = "val_x_mae", mode: str = "min"):
         super().__init__()
         self.save_dir = save_dir
         self.monitor = monitor
@@ -180,7 +242,9 @@ class BestCheckpointCallback(Callback):
                     for key, value in current_metrics.items()
                 }
                 
-                self.best_checkpoint_path = join(self.checkpoint_dir, "best_checkpoint.ckpt")
+                self.best_checkpoint_path = join(
+                    self.checkpoint_dir, "best_reconstruction_checkpoint.ckpt"
+                )
                 trainer.save_checkpoint(self.best_checkpoint_path)
     
     def on_test_end(self, trainer, pl_module):
@@ -191,7 +255,7 @@ class BestCheckpointCallback(Callback):
             
             final_best_metrics = {**self.best_metrics, **test_metrics}
             
-            best_metrics_path = join(self.save_dir, "best_metrics.json")
+            best_metrics_path = join(self.save_dir, "best_reconstruction_metrics.json")
             metrics_to_save = {
                 **final_best_metrics,
                 "best_epoch": self.best_epoch,
@@ -199,6 +263,92 @@ class BestCheckpointCallback(Callback):
             }
             
             with open(best_metrics_path, 'w') as f:
+                json.dump(metrics_to_save, f, indent=2)
+
+
+class BestCausalCheckpoint(Callback):
+    """
+    Save the checkpoint with the lowest HSIC (best causal structure) during training.
+
+    Monitors HSIC metrics in priority order: val_hsic_reg → val_hsic_cross → val_hsic.
+    Saves ``best_causal_checkpoint.ckpt`` whenever the monitored HSIC improves,
+    and writes ``best_causal_metrics.json`` at test end.
+
+    This is the counterpart of ``BestCheckpointCallback`` (which tracks val_x_mae).
+    The best-causal checkpoint is useful for downstream tasks like ATE estimation,
+    where the model with the most accurate causal structure is preferred over the
+    model with the lowest prediction error.
+    """
+
+    # HSIC metrics to try, in order of preference
+    HSIC_METRICS_PRIORITY = ["val_hsic_reg", "val_hsic_cross", "val_hsic"]
+
+    def __init__(self, save_dir: str):
+        super().__init__()
+        self.save_dir = save_dir
+        self.best_hsic_value = float('inf')
+        self.best_metrics = {}
+        self.best_epoch = 0
+        self.best_checkpoint_path = None
+        self.monitor_key = None  # resolved on first validation
+
+        self.checkpoint_dir = join(save_dir, 'checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+    def _resolve_monitor_key(self, metric_names):
+        """Find the first available HSIC metric from the logged metrics."""
+        for key in self.HSIC_METRICS_PRIORITY:
+            if key in metric_names:
+                return key
+        return None
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Save checkpoint if current epoch has the lowest HSIC so far."""
+        current_metrics = trainer.logged_metrics
+
+        # Lazily resolve which HSIC metric is available
+        if self.monitor_key is None:
+            self.monitor_key = self._resolve_monitor_key(current_metrics.keys())
+        if self.monitor_key is None:
+            return  # no HSIC metric logged — nothing to do
+
+        if self.monitor_key not in current_metrics:
+            return
+
+        current_value = float(current_metrics[self.monitor_key])
+        if current_value < self.best_hsic_value:
+            self.best_hsic_value = current_value
+            self.best_epoch = trainer.current_epoch
+
+            self.best_metrics = {
+                key: float(value) if isinstance(value, torch.Tensor) else value
+                for key, value in current_metrics.items()
+            }
+
+            self.best_checkpoint_path = join(
+                self.checkpoint_dir, "best_causal_checkpoint.ckpt"
+            )
+            trainer.save_checkpoint(self.best_checkpoint_path)
+
+    def on_test_end(self, trainer, pl_module):
+        """Save best-causal metrics JSON after testing is complete."""
+        if self.best_metrics:
+            current_metrics = trainer.logged_metrics
+            test_metrics = {
+                k: float(v) for k, v in current_metrics.items() if k.startswith('test_')
+            }
+
+            final_best_metrics = {**self.best_metrics, **test_metrics}
+
+            best_causal_path = join(self.save_dir, "best_causal_metrics.json")
+            metrics_to_save = {
+                **final_best_metrics,
+                "best_causal_epoch": self.best_epoch,
+                "monitor_key": self.monitor_key,
+                "best_causal_checkpoint_path": self.best_checkpoint_path,
+            }
+
+            with open(best_causal_path, 'w') as f:
                 json.dump(metrics_to_save, f, indent=2)
 
 
@@ -231,7 +381,7 @@ class KFoldResultsTracker:
     
     Best fold selection strategy (for causal inference):
     - Primary: Minimum val_hsic_reg (independence between residuals and parents)
-    - Fallback: val_hsic_cross, val_hsic, then val_mae if no HSIC available
+    - Fallback: val_hsic_cross, val_hsic, then val_x_mae if no HSIC available
     
     Rationale: Within a seed, CV fold results are clustered together. Minimum 
     validation HSIC rarely corresponds to worst SHD (structural Hamming distance),
@@ -285,7 +435,7 @@ class KFoldResultsTracker:
         
         Strategy:
         1. Try to select by minimum HSIC (causal quality proxy)
-        2. Fall back to minimum val_mae (prediction quality)
+        2. Fall back to minimum val_x_mae (prediction quality)
         
         Returns:
             dict: Best fold info with selection_criterion field
@@ -313,22 +463,22 @@ class KFoldResultsTracker:
                     "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
                 }
         
-        # Fallback to val_mae (prediction-based selection)
-        if "val_mae" in metric_names:
+        # Fallback to val_x_mae (prediction-based selection)
+        if "val_x_mae" in metric_names:
             valid_folds = [
                 fold for fold in self.fold_results.keys()
-                if self.fold_results[fold]["metrics"].get("val_mae") is not None
-                and isinstance(self.fold_results[fold]["metrics"].get("val_mae"), (int, float))
-                and not np.isnan(self.fold_results[fold]["metrics"].get("val_mae"))
+                if self.fold_results[fold]["metrics"].get("val_x_mae") is not None
+                and isinstance(self.fold_results[fold]["metrics"].get("val_x_mae"), (int, float))
+                and not np.isnan(self.fold_results[fold]["metrics"].get("val_x_mae"))
             ]
             
             if valid_folds:
                 best_fold = min(valid_folds,
-                               key=lambda x: self.fold_results[x]["metrics"]["val_mae"])
+                               key=lambda x: self.fold_results[x]["metrics"]["val_x_mae"])
                 return {
                     "fold_number": best_fold,
-                    "selection_criterion": "val_mae",
-                    "selection_value": self.fold_results[best_fold]["metrics"]["val_mae"],
+                    "selection_criterion": "val_x_mae",
+                    "selection_value": self.fold_results[best_fold]["metrics"]["val_x_mae"],
                     "metrics": self.fold_results[best_fold]["metrics"],
                     "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
                 }

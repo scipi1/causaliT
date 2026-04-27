@@ -689,16 +689,18 @@ class SCMDataset:
         >>> ate_gt = scm_ds.compute_ate_ground_truth()
         >>> ate_gt["ate"]["S1=0.5"]["X1"]  # ATE = E[X1|do(S1=0.5)] - E[X1|do(S1=0)] = 0
         """
-        # Paper-specific intervention values:
+        # Paper-specific intervention values (unified for discrete & continuous):
         # - S1: dangling (no children) - negative control
-        # - S2: one-to-one → X1 - positive control  
-        # - S3: one-to-many → X2, X3 - structure test (1.0 is OOD holdout)
-        # - S5: many-to-one → X4 - confounding test (2.5 is OOD holdout)
+        # - S2: one-to-one → X1 → X5 - positive control
+        # - S3: one-to-many → X2, X3; propagates to X4, X5 - structure test
+        # - S5: many-to-one → X4 - confounding test
+        # ID values: ±0.5 (safely inside continuous support [-1,1])
+        # OOD value: 1.5 (clearly outside [-1,1], not in any discrete support)
         PAPER_INTERVENTIONS = {
-            "S1": [0.5],           # In-distribution only (dangling, null effect expected)
-            "S2": [-1.7],          # In-distribution only (one-to-one, positive control)
-            "S3": [-0.5, 1.0],     # In-distribution (-0.5) + OOD holdout (1.0)
-            "S5": [-0.8, 2.5],     # In-distribution (-0.8) + OOD holdout (2.5)
+            "S1": [0.5],           # ID only (dangling, null effect expected)
+            "S2": [0.5, 1.5],     # ID (0.5) + OOD (1.5) - positive control
+            "S3": [-0.5, 1.5],    # ID (-0.5) + OOD (1.5) - structure test
+            "S5": [-0.5, 1.5],    # ID (-0.5) + OOD (1.5) - confounding test
         }
         
         if do_values is None:
@@ -1351,12 +1353,8 @@ class SCMDataset:
         # Export ATE ground truth for intervention evaluation (Monte Carlo only)
         if self.source_labels:
             try:
-                # Paper-specific intervention values (matched with eval_interventions.py):
-                # - S1: [0.5] - dangling (no children) - negative control
-                # - S2: [-1.7] - one-to-one → X1 - positive control  
-                # - S3: [-0.5, 1.0] - one-to-many → X2, X3 - structure test (1.0 is OOD)
-                # - S5: [-0.8, 2.5] - many-to-one → X4 - confounding test (2.5 is OOD)
                 # Uses default PAPER_INTERVENTIONS from compute_ate_ground_truth()
+                # Unified scheme: ID=±0.5, OOD=1.5 (see PAPER_INTERVENTIONS)
                 
                 # Compute Monte Carlo ground truth (used for both ground truth and model evaluation)
                 ate_ground_truth = self.compute_ate_ground_truth(
@@ -1371,9 +1369,9 @@ class SCMDataset:
                     "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] via Monte Carlo sampling",
                     "interventions": {
                         "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
-                        "S2": {"values": [-1.7], "type": "in_distribution", "role": "positive_control"},
-                        "S3": {"values": [-0.5, 1.0], "type": "mixed", "role": "structure_test", "ood_values": [1.0]},
-                        "S5": {"values": [-0.8, 2.5], "type": "mixed", "role": "confounding_test", "ood_values": [2.5]},
+                        "S2": {"values": [0.5, 1.5], "type": "mixed", "role": "positive_control", "ood_values": [1.5]},
+                        "S3": {"values": [-0.5, 1.5], "type": "mixed", "role": "structure_test", "ood_values": [1.5]},
+                        "S5": {"values": [-0.5, 1.5], "type": "mixed", "role": "confounding_test", "ood_values": [1.5]},
                     },
                     "computation_method": "monte_carlo",
                     "n_samples": 50000,

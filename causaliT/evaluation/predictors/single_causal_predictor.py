@@ -12,7 +12,7 @@ from tqdm import tqdm
 from .base_predictor import BasePredictor, PredictionResult
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
-from causaliT.core.utils import load_dag_masks
+from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 
 
 class SingleCausalPredictor(BasePredictor):
@@ -86,15 +86,74 @@ class SingleCausalPredictor(BasePredictor):
         
         # Load masks
         masks = load_dag_masks(dataset_dir, mask_files, device='cpu')
-        
+
         if masks is not None:
+            # Honor the wrong-DAG oracle corruption used at training time so the
+            # inference forward pass replays the same corrupted masks. Read the
+            # SHD knobs from the (possibly checkpoint-restored) model first to
+            # be robust to config drift; fall back to self.config otherwise.
+            corruption_seed = getattr(model, "hard_masks_corruption_seed", None)
+            if corruption_seed is None:
+                corruption_seed = self.config["training"].get("hard_masks_corruption_seed", None)
+            cross_shd = getattr(model, "cross_control_shd", None)
+            if cross_shd is None:
+                cross_shd = self.config["training"].get("cross_control_shd", 0)
+            self_shd = getattr(model, "self_control_shd", None)
+            if self_shd is None:
+                self_shd = self.config["training"].get("self_control_shd", 0)
+            cross_shd = int(cross_shd or 0)
+            self_shd = int(self_shd or 0)
+            preserve_sparsity = getattr(model, "hard_masks_preserve_sparsity", None)
+            if preserve_sparsity is None:
+                preserve_sparsity = self.config["training"].get(
+                    "hard_masks_preserve_sparsity", False
+                )
+            preserve_sparsity = bool(preserve_sparsity)
+
+            corruption_info = None
+            if (
+                corruption_seed not in (None, 0)
+                and (cross_shd > 0 or self_shd > 0)
+            ):
+                X_len = int(self.config["data"]["X_seq_len"])
+                masks, corruption_info = corrupt_dag_masks(
+                    masks,
+                    seed=corruption_seed,
+                    cross_shd=cross_shd,
+                    self_shd=self_shd,
+                    X_len=X_len,
+                    preserve_sparsity=preserve_sparsity,
+                )
+                print(
+                    f"✓ Hard masks CORRUPTED "
+                    f"(seed={int(corruption_seed)}, "
+                    f"cross_shd={cross_shd}, self_shd={self_shd}, "
+                    f"preserve_sparsity={preserve_sparsity}) "
+                    f"— wrong-DAG oracle (replayed for inference)."
+                )
+                for _name, _info in corruption_info.items():
+                    cyc = _info.get("has_cycles")
+                    cyc_str = (
+                        "N/A" if cyc is None else ("⚠ cycles" if cyc else "✓ acyclic")
+                    )
+                    fb = " [fallback all-edges-wrong]" if _info.get("fallback_used") else ""
+                    print(
+                        f"    - {_name}: shd_req={_info['shd_requested']}, "
+                        f"shd_real={_info['shd_realised']}, "
+                        f"k_true={_info['num_true_edges']}, "
+                        f"pool={_info['eligible_pool_size']}, "
+                        f"{cyc_str}{fb}"
+                    )
+            # Persist on the model so downstream code (notebooks, eval) can read it.
+            model.hard_mask_corruption_info = corruption_info
+
             model._hard_masks = masks
             model._hard_masks_loaded = True
-            
+
             # Register masks as buffers (ensures correct device handling)
             for name, mask in masks.items():
                 model.register_buffer(f'hard_mask_{name}', mask)
-            
+
             print(f"✓ Hard masks loaded from data directory for inference.")
         else:
             print("Warning: Failed to load hard masks from data directory.")

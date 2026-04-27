@@ -34,6 +34,7 @@ from .eval_utils import (
     find_all_checkpoints,
     _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
+    _compute_standard_shd,
     _compute_zeroness_metrics,
     _load_true_dag_mask,
     _compute_dag_confidence,
@@ -67,7 +68,8 @@ from .eval_lib import (
     get_architecture_type,
     extract_phi_from_model,
 )
-from .eval_plot_lib import plot_attention_scores, plot_attention_evolution
+from .eval_interventions import infer_checkpoint_type
+from .eval_plot_lib import plot_attention_scores, plot_attention_evolution, plot_shd_evolution
 
 
 # =============================================================================
@@ -157,6 +159,13 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     if not metadata:
         raise ValueError(f"Dataset metadata not found for '{dataset_name}'.")
     
+    # =========================================================================
+    # Determine checkpoint type (same logic as ATE evaluation)
+    # Causal models → best_causal, baselines → best_reconstruction
+    # =========================================================================
+    ckpt_type = infer_checkpoint_type(config)
+    print(f"  Checkpoint type: {ckpt_type}")
+
     print(f"  Dataset: {dataset_name}")
     
     # =========================================================================
@@ -204,13 +213,34 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     # =========================================================================
     # Load or compute final attention scores
     # =========================================================================
-    if exists(join(eval_path_files, final_scores_dirname)):
-        final_scores_dict = load_attention_data_from_file(join(eval_path_files, final_scores_dirname))
+    cache_dir = join(eval_path_files, final_scores_dirname)
+    cache_valid = False
+    if exists(cache_dir):
+        # Verify cached data was computed with the same checkpoint type
+        cache_meta_path = join(cache_dir, "metadata.json")
+        if exists(cache_meta_path):
+            with open(cache_meta_path) as f:
+                cache_meta = json.load(f)
+            if cache_meta.get("checkpoint_type") == ckpt_type:
+                cache_valid = True
+            else:
+                cached_type = cache_meta.get("checkpoint_type", "last (legacy)")
+                print(f"  Cache checkpoint_type mismatch (cached: {cached_type}, needed: {ckpt_type}). Recomputing...")
+    
+    if cache_valid:
+        final_scores_dict = load_attention_data_from_file(cache_dir)
         print("  Loaded cached attention data.")
     else:
-        final_scores_dict = load_attention_data(experiment)
-        save_attention_data(final_scores_dict, join(eval_path_files, final_scores_dirname), save_predictions=True)
-        print("  Computed and saved attention data.")
+        final_scores_dict = load_attention_data(experiment, checkpoint_type=ckpt_type)
+        save_attention_data(final_scores_dict, cache_dir, save_predictions=True)
+        # Store checkpoint_type in metadata for future cache validation
+        meta_path = join(cache_dir, "metadata.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["checkpoint_type"] = ckpt_type
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"  Computed and saved attention data (checkpoint_type={ckpt_type}).")
     
     # Plot attention score heatmaps
     fig = plot_attention_scores(final_scores_dict, cmap='viridis', annotation_fontsize=8, scale_mode="row")
@@ -291,11 +321,14 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             print(f"    No true DAG mask found for {mask_type}")
             continue
         
-        # Compute per-fold soft Hamming distances and zeroness metrics
+        # Compute per-fold soft Hamming distances, standard SHD, and zeroness metrics
         per_fold_values = {}
         per_fold_zeroness = {}
+        per_fold_standard_shd = {}
         fold_sh_list = []
         fold_zeroness_list = []
+        fold_standard_shd_list = []
+        is_cross = ("cross" in mask_type)
         
         for fold_name, learned_dag in fold_dags:
             if learned_dag is None or learned_dag.shape != true_dag.shape:
@@ -308,10 +341,17 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             
             per_fold_values[fold_name] = soft_hamming
             per_fold_zeroness[fold_name] = zeroness
+            # Standard SHD (integer, literature-compatible metric)
+            std_shd_result = _compute_standard_shd(learned_dag, true_dag, threshold=0.5, is_cross_attention=is_cross)
+            per_fold_standard_shd[fold_name] = std_shd_result
+            fold_standard_shd_list.append(std_shd_result['shd'])
+            
             fold_sh_list.append(soft_hamming)
             fold_zeroness_list.append(zeroness)
             
             print(f"    {fold_name}: Soft Hamming ({source}) = {soft_hamming:.4f}"
+                  f"  | Standard SHD = {std_shd_result['shd']}"
+                  f"  (miss={std_shd_result['missing']}, extra={std_shd_result['extra']}, rev={std_shd_result['reversed']})"
                   f"  | contrast={zeroness['contrast']:.3f}"
                   f"  mean_nonedge={zeroness['mean_nonedge']:.3f}"
                   f"  min_edge={zeroness['min_edge']:.3f}")
@@ -351,6 +391,21 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 zeroness_agg[field] = float(np.mean(values))
             zeroness_agg['per_fold'] = per_fold_zeroness
             dag_metrics[zeroness_key] = zeroness_agg
+        
+        # Compute standard SHD statistics (integer metric, literature-compatible)
+        if fold_standard_shd_list:
+            fold_std_shd_array = np.array(fold_standard_shd_list)
+            std_shd_key = f"standard_shd_{base_key}"
+            
+            dag_metrics[std_shd_key] = {
+                "best": int(np.min(fold_std_shd_array)),
+                "mean": float(np.mean(fold_std_shd_array)),
+                "worst": int(np.max(fold_std_shd_array)),
+                "std": float(np.std(fold_std_shd_array)),
+                "per_fold": {k: v['shd'] if v else None for k, v in per_fold_standard_shd.items()},
+                "per_fold_details": {k: v for k, v in per_fold_standard_shd.items()},
+            }
+            print(f"    Standard SHD ({base_key}): mean={np.mean(fold_std_shd_array):.1f} ± {np.std(fold_std_shd_array):.1f}")
         
         # Compute DAG confidence
         valid_fold_dags = [dag for _, dag in fold_dags if dag is not None]
@@ -515,10 +570,14 @@ def eval_attention_evolution(
             - {block}_{i}{j}_mean: mean attention score across samples
             - {block}_{i}{j}_std: std of attention scores
             - phi_{block}_{i}{j}: learned DAG probability (sigmoid(phi))
+            - shd_cross: Soft Hamming Distance for cross-attention (S→X)
+            - shd_self: Soft Hamming Distance for self-attention (X→X)
+            - shd_cross_L{i}, shd_self_L{i}: Per-layer SHD (multi-layer models)
             
     Output Files:
         - fig/attention_drift_{exp_id}.png: Attention evolution over training
-        - files/scores_evol.csv: Attention evolution data
+        - fig/shd_evolution_{exp_id}.png: SHD evolution over training (one per layer)
+        - files/scores_evol.csv: Attention evolution data (includes SHD columns)
         
     Example:
         >>> # Track evolution with 10 checkpoints (default, ~2-5 min)
@@ -550,17 +609,25 @@ def eval_attention_evolution(
     
     _create_cline_template(eval_path_cline, "eval_attention_evolution", exp_id)
     
-    # Check for cached results
-    if exists(join(eval_path_files, scores_evolution_filename)):
-        df = pd.read_csv(join(eval_path_files, scores_evolution_filename))
-        print(f"  Loaded cached evolution data: {len(df)} rows")
+    # Check for cached results (recompute if SHD columns are missing)
+    cached_path = join(eval_path_files, scores_evolution_filename)
+    if exists(cached_path):
+        df = pd.read_csv(cached_path)
+        has_shd = any(c.startswith("shd_") for c in df.columns)
+        if has_shd:
+            print(f"  Loaded cached evolution data: {len(df)} rows")
+        else:
+            print(f"  Cached data missing SHD columns, recomputing...")
+            df = _load_attention_evolution_data(experiment, n_evaluations)
+            df.to_csv(cached_path, index=False)
+            print(f"  Recomputed and saved evolution data: {len(df)} rows")
     else:
         # Compute evolution data
         df = _load_attention_evolution_data(experiment, n_evaluations)
-        df.to_csv(join(eval_path_files, scores_evolution_filename), index=False)
+        df.to_csv(cached_path, index=False)
         print(f"  Computed and saved evolution data: {len(df)} rows")
     
-    # Plot evolution
+    # Plot attention evolution
     if len(df) > 0:
         fig = plot_attention_evolution(df, aggregate_folds=False, include_phi=True)
         plt.savefig(join(eval_path_fig, f"attention_drift_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
@@ -568,6 +635,44 @@ def eval_attention_evolution(
             plt.show()
         else:
             plt.close()
+    
+    # =========================================================================
+    # Plot SHD evolution (one figure per layer, cross & self on same axes)
+    # =========================================================================
+    if len(df) > 0:
+        import re as _re
+        shd_cols = [c for c in df.columns if c.startswith("shd_")]
+        if shd_cols:
+            # Group SHD columns by layer: layer_id -> {"cross": col, "self": col}
+            layers = {}
+            for col in shd_cols:
+                layer_m = _re.search(r'_L(\d+)$', col)
+                layer_id = layer_m.group(1) if layer_m else "default"
+                if layer_id not in layers:
+                    layers[layer_id] = {}
+                if "cross" in col:
+                    layers[layer_id]["cross"] = col
+                elif "self" in col:
+                    layers[layer_id]["self"] = col
+            
+            for layer_id, cols_map in sorted(layers.items()):
+                layer_suffix = f" - Layer {layer_id}" if layer_id != "default" else ""
+                fig = plot_shd_evolution(
+                    df,
+                    shd_columns=cols_map,
+                    aggregate_folds=False,
+                    title=f"SHD Evolution{layer_suffix}",
+                )
+                file_suffix = f"_L{layer_id}" if layer_id != "default" else ""
+                plt.savefig(join(eval_path_fig, f"shd_evolution{file_suffix}_{exp_id}.{DEFAULT_PLOT_FORMAT}"))
+                if show_plots:
+                    plt.show()
+                else:
+                    plt.close()
+            
+            print(f"  Plotted SHD evolution for {len(layers)} layer(s)")
+        else:
+            print("  No SHD columns found in evolution data (true DAG masks may be unavailable)")
     
     print(f"\n✓ eval_attention_evolution complete!")
     return df
@@ -609,10 +714,25 @@ def _load_attention_evolution_data(
         arch_config = get_architecture_config(architecture_type)
         attention_keys = arch_config["attention_keys"]
         phi_keys = arch_config["phi_keys"]
+        blocks_to_eval = list(arch_config["blocks_to_eval"])
     except ValueError:
         # Fallback for unknown architecture
         attention_keys = ["decoder", "cross"]
         phi_keys = ["decoder", "cross"]
+        blocks_to_eval = []
+    
+    # Load true DAG masks for SHD computation
+    dataset_name = config.get("data", {}).get("dataset")
+    true_dag_masks = {}
+    if dataset_name and blocks_to_eval:
+        unique_mask_types = set(mt for _, _, mt in blocks_to_eval)
+        for mask_type in unique_mask_types:
+            true_dag = _load_true_dag_mask(datadir_path, dataset_name, mask_type)
+            if true_dag is not None:
+                true_dag_masks[mask_type] = true_dag
+                print(f"  Loaded true DAG mask '{mask_type}': shape {true_dag.shape}")
+        if not true_dag_masks:
+            print("  Warning: No true DAG masks found, SHD will not be computed")
     
     # Find k-fold directories
     kfold_dirs = sorted([
@@ -732,6 +852,52 @@ def _load_attention_evolution_data(
                             for i in range(n_rows):
                                 for j in range(n_cols):
                                     record[f"phi_{phi_key}_{i}{j}_diff"] = phi_diff[i, j]
+                    
+                    # ==========================================================
+                    # Compute SHD (Soft Hamming Distance) per evaluation block
+                    # ==========================================================
+                    if true_dag_masks:
+                        # Build extended blocks list including per-layer if multi-layer
+                        shd_blocks = list(blocks_to_eval)
+                        if architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+                            _pl_phi_self = sorted(
+                                [k for k in phi_dict.keys() if _re.match(r'^decoder_L\d+$', k)],
+                                key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+                            )
+                            _pl_phi_cross = sorted(
+                                [k for k in phi_dict.keys() if _re.match(r'^decoder_cross_L\d+$', k)],
+                                key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+                            )
+                            _pl_att_self = sorted(
+                                [k for k in (att_weights or {}).keys() if _re.match(r'^dec_self_L\d+$', k)],
+                                key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+                            )
+                            _pl_att_cross = sorted(
+                                [k for k in (att_weights or {}).keys() if _re.match(r'^dec_cross_L\d+$', k)],
+                                key=lambda k: int(_re.search(r'L(\d+)', k).group(1))
+                            )
+                            if len(_pl_phi_self) > 1 or len(_pl_phi_cross) > 1:
+                                shd_blocks = []
+                                for _ak, _pk in zip(_pl_att_cross, _pl_phi_cross):
+                                    shd_blocks.append((_ak, _pk, "dec_cross"))
+                                for _ak, _pk in zip(_pl_att_self, _pl_phi_self):
+                                    shd_blocks.append((_ak, _pk, "dec_self"))
+                        
+                        for _att_key, _phi_key, _mask_type in shd_blocks:
+                            _true_dag = true_dag_masks.get(_mask_type)
+                            if _true_dag is None:
+                                continue
+                            # Prefer phi (learned DAG), fall back to mean attention
+                            _learned = phi_dict.get(_phi_key)
+                            if _learned is None and att_weights is not None:
+                                _att_t = att_weights.get(_att_key)
+                                if _att_t is not None:
+                                    _learned = _att_t.mean(axis=0) if _att_t.ndim == 3 else _att_t
+                            if _learned is not None and _learned.shape == _true_dag.shape:
+                                _base = _mask_type.replace('dec_', '').replace('dec1_', '').replace('dec2_', '')
+                                _lm = _re.search(r'_L(\d+)$', _att_key)
+                                _col = f"shd_{_base}_L{_lm.group(1)}" if _lm else f"shd_{_base}"
+                                record[_col] = _compute_soft_hamming(_learned, _true_dag)
                     
                     all_records.append(record)
                     print(f"    ✓ epoch {epoch}")

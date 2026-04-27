@@ -69,7 +69,13 @@ class LieAttention(DAGLearningMixin, nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            raise NotImplementedError(
+                "Oracle attention mode is not implemented for LieAttention. "
+                "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
+            )
         """
         Forward pass for Lie Attention.
         
@@ -343,7 +349,33 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            # Oracle mode: bypass QK^T and use the hard mask directly as scores.
+            # We still need V via the value projection done in AttentionLayer.
+            is_multihead = query.dim() == 4
+            if is_multihead:
+                B, _, H, _ = query.shape
+                _, S_len, _, _ = key.shape
+                L = query.shape[1]
+            else:
+                B, L, _ = query.shape
+                _, S_len, _ = key.shape
+                H = 1
+            V_out, A_out, ent = _oracle_attention_forward(
+                value=value,
+                hard_mask=hard_mask,
+                is_multihead=is_multihead,
+                batch_size=B,
+                n_heads=H,
+                query_seq_len=L,
+                key_seq_len=S_len,
+                entropy_enabled=self.entropy_enabled,
+            )
+            # Bookkeeping for downstream loggers / regularizers
+            self._score_tensor_for_sparsity = A_out.detach().mean(dim=0)
+            return V_out, A_out, ent
         """
         Forward pass for Causal Cross-Attention with DAG learning.
         
@@ -561,7 +593,38 @@ class ToeplitzAttention(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
     ):
+        if oracle:
+            # Oracle mode: bypass QK^T and use the hard mask directly as scores.
+            is_multihead = query.dim() == 4
+            if is_multihead:
+                B, _, H, _ = query.shape
+                _, S_len, _, _ = key.shape
+                L = query.shape[1]
+            else:
+                B, L, _ = query.shape
+                _, S_len, _ = key.shape
+                H = 1
+            V_out, A_out, ent = _oracle_attention_forward(
+                value=value,
+                hard_mask=hard_mask,
+                is_multihead=is_multihead,
+                batch_size=B,
+                n_heads=H,
+                query_seq_len=L,
+                key_seq_len=S_len,
+                entropy_enabled=self.entropy_enabled,
+            )
+            # Bookkeeping: surface the oracle mask as if it were the learned
+            # P_edge / last_att, so existing eval/logging code keeps working.
+            mask_avg = A_out.detach().mean(dim=0)
+            self.last_att = mask_avg
+            self.last_P_edge = mask_avg
+            self.last_S = torch.zeros_like(mask_avg)
+            self.last_A = torch.zeros_like(mask_avg)
+            self.P_edge_for_reg = A_out.mean(dim=0)
+            return V_out, A_out, ent
         """
         Forward pass for Toeplitz Attention.
         
@@ -807,7 +870,13 @@ class ToeplitzLieAttention(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            raise NotImplementedError(
+                "Oracle attention mode is not implemented for ToeplitzLieAttention. "
+                "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
+            )
         """
         Forward pass for Toeplitz-Lie Attention.
         
@@ -1113,7 +1182,13 @@ class PhiSoftMax(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            raise NotImplementedError(
+                "Oracle attention mode is not implemented for PhiSoftMax. "
+                "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
+            )
         """
         Forward pass for PhiSoftMax Attention with learnable DAG.
         
@@ -1306,7 +1381,13 @@ class ScaledDotAttention(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            raise NotImplementedError(
+                "Oracle attention mode is not implemented for ScaledDotAttention. "
+                "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
+            )
         """
         Forward pass for Scaled Dot-Product Attention.
         
@@ -1448,7 +1529,13 @@ class ScaledDotAttentionNAIM(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
+        if oracle:
+            raise NotImplementedError(
+                "Oracle attention mode is not implemented for ScaledDotAttentionNAIM. "
+                "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
+            )
         """
         Forward pass for Scaled Dot-Product Attention with NAIM missing data handling.
         
@@ -1553,6 +1640,72 @@ class ScaledDotAttentionNAIM(nn.Module):
             V = torch.einsum("bls,bsd->bld", A, value)
         
         return V.contiguous(), A, entropy
+
+
+def _oracle_attention_forward(
+    value: torch.Tensor,
+    hard_mask: torch.Tensor,
+    is_multihead: bool,
+    batch_size: int,
+    n_heads: int,
+    query_seq_len: int,
+    key_seq_len: int,
+    entropy_enabled: bool = True,
+):
+    """
+    Oracle attention forward: bypass QK^T entirely and use the hard mask directly
+    as the attention score matrix for the values.
+
+    This implements the "real oracle" mode used to characterize the noise floor
+    of structural regularizers (HSIC etc.). The alignment is GIVEN (not learned),
+    so the model only learns embeddings, V projection, FF, MLP head via the
+    reconstruction loss.
+
+    The mask is used as-is (not row-normalized): if a node has k allowed parents,
+    each contributes its V with weight 1.0 (sum aggregation).
+
+    Args:
+        value: V tensor (B, S, D) for single-head, (B, S, H, D) for multi-head
+        hard_mask: Mask tensor (L, S) / (H, L, S) / (B, L, S) / (B, H, L, S)
+        is_multihead: Whether multi-head attention is used
+        batch_size: Effective batch size (B)
+        n_heads: Number of attention heads (H)
+        query_seq_len: Query sequence length (L)
+        key_seq_len: Key sequence length (S)
+        entropy_enabled: Whether to compute entropy (for logging only)
+
+    Returns:
+        Tuple of (V_out, att, entropy) matching the inner-attention contract.
+    """
+    if hard_mask is None:
+        raise ValueError(
+            "Oracle attention mode requires hard_mask to be provided. "
+            "Set training.use_hard_masks=true and provide hard_mask_files."
+        )
+
+    # Expand mask to (B, [H,] L, S)
+    att = expand_hard_mask(hard_mask, is_multihead, batch_size).to(value.dtype)
+
+    if is_multihead:
+        # Make sure batch and head dims are fully materialized for einsum
+        if att.shape[0] == 1:
+            att = att.expand(batch_size, *att.shape[1:])
+        if att.shape[1] == 1:
+            att = att.expand(att.shape[0], n_heads, *att.shape[2:])
+        # Final shape: (B, H, L, S)
+        V_out = torch.einsum("bhls,bshd->blhd", att, value)
+    else:
+        if att.shape[0] == 1:
+            att = att.expand(batch_size, *att.shape[1:])
+        # Final shape: (B, L, S)
+        V_out = torch.einsum("bls,bsd->bld", att, value)
+
+    if entropy_enabled:
+        entropy = calculate_attention_entropy(att)
+    else:
+        entropy = None
+
+    return V_out.contiguous(), att, entropy
 
 
 def expand_hard_mask(hard_mask: torch.Tensor, is_multihead: bool, batch_size: int) -> torch.Tensor:
@@ -1939,6 +2092,7 @@ class AttentionLayer(nn.Module):
         pos: torch.Tensor,
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
+        oracle: bool = False,
         ):
         """
         Forward pass through attention layer.
@@ -1981,6 +2135,7 @@ class AttentionLayer(nn.Module):
             pos=pos,
             causal_mask=causal_mask,
             hard_mask=hard_mask,
+            oracle=oracle,
             )
         
         # Reshape output and apply final projection if multi-head

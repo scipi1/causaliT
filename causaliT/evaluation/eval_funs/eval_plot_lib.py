@@ -531,6 +531,105 @@ def plot_attention_evolution(
     return fig
 
 
+def plot_shd_evolution(
+    df: pd.DataFrame,
+    shd_columns: Dict[str, str],
+    aggregate_folds: bool = False,
+    figsize: tuple = None,
+    alpha: float = 0.3,
+    title: str = "SHD Evolution",
+    save_path: str = None,
+    dpi: int = 100,
+) -> plt.Figure:
+    """
+    Plot Soft Hamming Distance (SHD) evolution over training epochs.
+    
+    Shows cross-attention SHD and self-attention SHD on the same plot so their
+    convergence behaviour can be compared directly.  Each k-fold can be shown
+    as a separate line (default) or aggregated into mean ± std.
+    
+    Args:
+        df: DataFrame from _load_attention_evolution_data() with columns:
+            - epoch: epoch number
+            - kfold: fold identifier
+            - shd_cross (or shd_cross_L0, etc.): SHD for cross-attention
+            - shd_self (or shd_self_L0, etc.): SHD for self-attention
+        shd_columns: Dict mapping block type to column name,
+                     e.g. {"cross": "shd_cross", "self": "shd_self"}
+        aggregate_folds: If True, plot mean across folds with std as shaded area.
+                        If False (default), plot each fold as a separate line.
+        figsize: Figure size as (width, height). If None, auto-calculated.
+        alpha: Transparency for confidence interval shading (0-1)
+        title: Overall figure title
+        save_path: Optional path to save the figure
+        dpi: DPI for the figure
+        
+    Returns:
+        matplotlib Figure object
+        
+    Example:
+        >>> fig = plot_shd_evolution(df, {"cross": "shd_cross", "self": "shd_self"})
+        >>> plt.show()
+    """
+    if figsize is None:
+        figsize = (8, 5)
+    
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=dpi)
+    
+    # Colour and label mapping for block types
+    block_styles = {
+        "cross": {"color": "tab:blue", "label": "Cross-attention SHD (S→X)"},
+        "self":  {"color": "tab:red",  "label": "Self-attention SHD (X→X)"},
+    }
+    
+    kfolds = df['kfold'].unique()
+    n_folds = len(kfolds)
+    
+    for block_type, col_name in shd_columns.items():
+        if col_name not in df.columns:
+            continue
+        
+        style = block_styles.get(block_type, {"color": "tab:gray", "label": f"{block_type} SHD"})
+        color = style["color"]
+        label = style["label"]
+        
+        if aggregate_folds:
+            grouped = df.groupby('epoch')[col_name].agg(['mean', 'std']).reset_index()
+            epochs = grouped['epoch'].values
+            mean_vals = grouped['mean'].values
+            std_vals = grouped['std'].fillna(0).values
+            
+            ax.plot(epochs, mean_vals, '-', color=color, linewidth=2, label=label)
+            ax.fill_between(epochs, mean_vals - std_vals, mean_vals + std_vals,
+                           alpha=alpha, color=color)
+        else:
+            for i, kfold in enumerate(kfolds):
+                fold_df = df[df['kfold'] == kfold].sort_values('epoch')
+                epochs = fold_df['epoch'].values
+                values = fold_df[col_name].values
+                
+                # Label only the first fold line per block type to keep legend clean
+                fold_label = label if i == 0 else None
+                line_alpha = 0.9 if n_folds <= 3 else 0.6
+                ax.plot(epochs, values, '-', color=color, linewidth=1.5,
+                       alpha=line_alpha, label=fold_label)
+    
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Soft Hamming Distance')
+    ax.set_title(title)
+    ax.set_ylim(bottom=0)
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+    
+    return fig
+
+
 def plot_phi_evolution(
     df: pd.DataFrame,
     columns: List[str] = None,

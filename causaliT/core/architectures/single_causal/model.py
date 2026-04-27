@@ -336,6 +336,7 @@ class SingleCausalLayer(nn.Module):
         source_tensor,
         intermediate_tensor_blanked,
         hard_masks: dict = None,
+        oracle: bool = False,
     ):
         """
         Forward pass through the single decoder.
@@ -407,6 +408,7 @@ class SingleCausalLayer(nn.Module):
                 causal_mask=self.dec_causal_mask,
                 cross_hard_mask=dec_cross_hard,
                 self_hard_mask=dec_self_hard,
+                oracle=oracle,
             )
         
         # De-embed to get predicted X

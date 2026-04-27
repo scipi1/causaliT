@@ -395,6 +395,15 @@ training:
   # Used in staged training calibration to balance reconstruction vs HSIC gradients.
   lambda_group_l1: 0.0
   
+  # GROUP L1 ANNEALING
+  # Start high to constrain capacity (forces structure learning via HSIC),
+  # then decay to lambda_group_l1 to release capacity for reconstruction.
+  # Schedule: [0, idle) = start_value; [idle, idle+transient) = linear decay; rest = lambda_group_l1
+  # Set start_value to null to disable annealing (default).
+  lambda_group_l1_anneal_start_value: null   # Initial high value (e.g., 0.5)
+  lambda_group_l1_anneal_idle_epochs: 0      # Epochs to hold at start_value
+  lambda_group_l1_anneal_transient_epochs: 0 # Epochs for linear decay to lambda_group_l1
+  
   # =========================================================================
   # GRADIENT NORM LOGGING (for calibration stage)
   # =========================================================================

@@ -16,16 +16,20 @@ Deprecated (removed):
 - Decisiveness — no explicit phi parametrization in SVFA
 """
 
+import json
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 from os.path import join
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torchmetrics as tm
 
 from causaliT.core.architectures.single_causal import SingleCausalLayer
-from causaliT.core.utils import load_dag_masks
+from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted, hsic_cross_per_pair
 from causaliT.training.gradient_routing import classify_parameters
 
@@ -105,9 +109,38 @@ class SingleCausalForecaster(pl.LightningModule):
                                    config["training"].get("lambda_embed_l1", 0.0))
         
         # =====================================================================
+        # RECONSTRUCTION-LOSS WEIGHT (knob to disable recon for HSIC-only runs)
+        # =====================================================================
+        # `lambda_recon` ∈ [0, ∞) scales the MSE reconstruction term in the
+        # total loss. Default 1.0 = legacy behaviour. Setting to 0.0 (with
+        # `use_gradient_routing=False` and a non-zero `lambda_hsic_*`) yields
+        # an HSIC-only single-loss training, useful as a dependence-only
+        # ablation against the joint MSE+HSIC training.
+        self.lambda_recon = float(config["training"].get("lambda_recon", 1.0))
+        if self.lambda_recon < 0.0:
+            raise ValueError(
+                f"lambda_recon must be non-negative, got {self.lambda_recon}"
+            )
+
+        # =====================================================================
+        # STRUCTURAL LOSS RECON ANCHOR (convex mix)
+        # =====================================================================
+        # alpha in [0, 1]: convex combination weight on the structural pathway.
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg
+        # Reconstruction loss is unchanged (alpha leaks recon into structure only).
+        # Default 0.0 → exact backward compatibility (pure HSIC).
+        self.lambda_struct_recon = float(config["training"].get("lambda_struct_recon", 0.0))
+        if not (0.0 <= self.lambda_struct_recon <= 1.0):
+            raise ValueError(
+                f"lambda_struct_recon must be in [0, 1], got {self.lambda_struct_recon}"
+            )
+        
+        # =====================================================================
         # GRADIENT NORM LOGGING (for calibration stage)
         # =====================================================================
         self.log_gradient_norms = config["training"].get("log_gradient_norms", False)
+
         
         # =====================================================================
         # ANNEALING CONFIGURATION
@@ -130,6 +163,46 @@ class SingleCausalForecaster(pl.LightningModule):
         self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
         self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
         
+        # 2b. Unified attention temperature annealing (self + cross attentions)
+        #     Mirrors the group-L1 anneal pattern.
+        #     Schedule:
+        #       [0, idle)                 -> tau = tau_start  (frozen)
+        #       [idle, idle+transient)    -> tau linearly decays start -> end (frozen)
+        #       [idle+transient, end)     -> tau is unfrozen and learnable from `end`
+        #     Targets the following parameters when present on each attention module:
+        #       - Toeplitz self-attention: `log_tau`            (single sigmoid temp)
+        #       - CausalCrossAttention   : `log_tau_act`        (tanh activation temp)
+        #       - ToeplitzLieAttention   : `log_tau_gate`, `log_tau_dir`
+        #     freeze_tau_during_anneal=True: requires_grad disabled during idle+transient,
+        #     re-enabled exactly once at the boundary.
+        self.use_tau_annealing = config["training"].get("use_tau_annealing", False)
+        self.tau_anneal_start = float(config["training"].get("tau_anneal_start", 1.0))
+        self.tau_anneal_end = float(config["training"].get("tau_anneal_end", 0.2))
+        self.tau_anneal_idle_epochs = int(config["training"].get("tau_anneal_idle_epochs", 0))
+        self.tau_anneal_transient_epochs = int(
+            config["training"].get("tau_anneal_transient_epochs", 0)
+        )
+        self.freeze_tau_during_anneal = bool(
+            config["training"].get("freeze_tau_during_anneal", True)
+        )
+        # Tracks whether log_tau* params have been re-enabled (avoid repeated work)
+        self._tau_unfrozen = False
+        
+        # 3. Group L1 Annealing — start high, decay to lambda_group_l1
+
+        #    Schedule: [0, idle) = start_value; [idle, idle+transient) = linear decay; rest = lambda_group_l1
+        self._group_l1_anneal_start = config["training"].get("lambda_group_l1_anneal_start_value", None)
+        self._group_l1_anneal_idle = config["training"].get("lambda_group_l1_anneal_idle_epochs", 0)
+        self._group_l1_anneal_transient = config["training"].get("lambda_group_l1_anneal_transient_epochs", 0)
+        self._use_group_l1_annealing = (
+            self._group_l1_anneal_start is not None
+            and self._group_l1_anneal_start != self.lambda_group_l1
+        )
+        if self._use_group_l1_annealing:
+            # Store the final target (what's in lambda_group_l1) and set current to start
+            self._group_l1_final = self.lambda_group_l1
+            self.lambda_group_l1 = float(self._group_l1_anneal_start)
+        
         # =====================================================================
         # GRADIENT ROUTING (dual optimizer for structure vs reconstruction)
         # =====================================================================
@@ -146,6 +219,35 @@ class SingleCausalForecaster(pl.LightningModule):
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
         self._hard_masks = None
+
+        # Oracle attention configuration
+        # When True, the model bypasses QK^T entirely and uses the hard mask
+        # directly as the attention score matrix for the values. The alignment
+        # is given (not learned), and the model only learns the rest from the
+        # reconstruction loss. Requires use_hard_masks=True.
+        self.use_oracle_attention = config["training"].get("use_oracle_attention", False)
+        if self.use_oracle_attention and not self.use_hard_masks:
+            raise ValueError(
+                "training.use_oracle_attention=True requires training.use_hard_masks=True. "
+                "The oracle uses the hard mask itself as the attention score matrix."
+            )
+
+        # Wrong-DAG oracle controls (replaces the legacy `permute_hard_masks_seed`).
+        # `hard_masks_corruption_seed` in {None, 0}  OR  both SHDs == 0
+        # disable corruption and the ground-truth masks are used unchanged.
+        # See `causaliT.core.utils.corrupt_dag_masks` for full semantics
+        # (incl. the "shd > num_true_edges → all-edges-must-be-wrong" fallback).
+        self.hard_masks_corruption_seed = config["training"].get("hard_masks_corruption_seed", None)
+        self.cross_control_shd = int(config["training"].get("cross_control_shd", 0) or 0)
+        self.self_control_shd = int(config["training"].get("self_control_shd", 0) or 0)
+        # When True, corruption is restricted to one-for-one edge swaps so the
+        # corrupted mask retains the SAME number of edges as the ground truth.
+        # See `causaliT.core.utils.corrupt_dag_masks` for full semantics.
+        self.hard_masks_preserve_sparsity = bool(
+            config["training"].get("hard_masks_preserve_sparsity", False)
+        )
+        # Filled in by `_load_hard_masks` when corruption is applied.
+        self.hard_mask_corruption_info: Optional[Dict[str, dict]] = None
         
         # Register placeholder buffers if hard masks are enabled
         if self.use_hard_masks:
@@ -184,14 +286,54 @@ class SingleCausalForecaster(pl.LightningModule):
         dataset_dir = join(data_dir, dataset_name)
         
         masks = load_dag_masks(dataset_dir, mask_files, device='cpu')
-        
+
         if masks is not None:
+            # Optional wrong-DAG oracle: corrupt each mask by exactly `shd`
+            # entries (off-diagonal pool for self masks). Cycle status of the
+            # corrupted self mask is detected and stashed for later logging.
+            corruption_info = None
+            if (
+                self.hard_masks_corruption_seed not in (None, 0)
+                and (self.cross_control_shd > 0 or self.self_control_shd > 0)
+            ):
+                X_len = int(self.config["data"]["X_seq_len"])
+                masks, corruption_info = corrupt_dag_masks(
+                    masks,
+                    seed=self.hard_masks_corruption_seed,
+                    cross_shd=self.cross_control_shd,
+                    self_shd=self.self_control_shd,
+                    X_len=X_len,
+                    preserve_sparsity=self.hard_masks_preserve_sparsity,
+                )
+                print(
+                    f"✓ Hard masks CORRUPTED "
+                    f"(seed={int(self.hard_masks_corruption_seed)}, "
+                    f"cross_shd={self.cross_control_shd}, "
+                    f"self_shd={self.self_control_shd}, "
+                    f"preserve_sparsity={self.hard_masks_preserve_sparsity}) "
+                    f"— wrong-DAG oracle."
+                )
+                for _name, _info in corruption_info.items():
+                    cyc = _info.get("has_cycles")
+                    cyc_str = (
+                        "N/A" if cyc is None else ("⚠ cycles" if cyc else "✓ acyclic")
+                    )
+                    fb = " [fallback all-edges-wrong]" if _info.get("fallback_used") else ""
+                    print(
+                        f"    - {_name}: shd_req={_info['shd_requested']}, "
+                        f"shd_real={_info['shd_realised']}, "
+                        f"k_true={_info['num_true_edges']}, "
+                        f"pool={_info['eligible_pool_size']}, "
+                        f"{cyc_str}{fb}"
+                    )
+            self.hard_mask_corruption_info = corruption_info
+
             self._hard_masks = masks
             self._hard_masks_loaded = True
-            
+
             for name, mask in masks.items():
                 self.register_buffer(f'hard_mask_{name}', mask)
-            
+
             print(f"✓ Hard masks loaded and registered for training.")
         else:
             print("Warning: No hard masks were loaded.")
@@ -233,12 +375,18 @@ class SingleCausalForecaster(pl.LightningModule):
         # Determine whether to use hard masks
         apply_hard_masks = self.use_hard_masks and not disable_hard_masks
         hard_masks = self.get_hard_masks() if apply_hard_masks else None
+
+        # Oracle mode follows the same gating as hard masks: if hard masks are
+        # disabled (e.g. evaluation w/o GT), oracle is also disabled so the
+        # forward pass falls back to the learned attention.
+        oracle = self.use_oracle_attention and apply_hard_masks
         
         # Model forward pass
         pred_x, attention_weights, masks, entropies = self.model.forward(
             source_tensor=data_source,
             intermediate_tensor_blanked=x_blanked,
             hard_masks=hard_masks,
+            oracle=oracle,
         )
         
         return pred_x, attention_weights, masks, entropies
@@ -362,6 +510,72 @@ class SingleCausalForecaster(pl.LightningModule):
         
         # S→X HSIC (cross-attention)
         s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
+
+        # =====================================================================
+        # KERNEL DIAGNOSTICS: residual scale & median pairwise distances.
+        # Cheap (subsampled) per-step diagnostics; aggregated to epoch by Lightning.
+        # Used to diagnose HSIC kernel collapse:
+        #   * fixed-σ:   residual_std ≪ σ  →  L kernel collapses to all-ones
+        #   * adaptive:  σ tracks pairdist_med, so |σ_S − pairdist_med_X| informs scale-mismatch
+        # Names:
+        #   {stage}_residual_std         : std over all (batch, X) residual entries
+        #   {stage}_residual_pairdist_med: mean over X dims of median |r_i − r_j| (subsampled)
+        #   {stage}_s_pairdist_med       : same for S values (subsampled)
+        # =====================================================================
+        with torch.no_grad():
+            res_det = residuals_per_x.detach()
+            self.log(
+                f"{stage}_residual_std",
+                res_det.float().std(),
+                on_step=False, on_epoch=True,
+            )
+            B = res_det.shape[0]
+            n_sub = min(B, 256)
+            if n_sub > 1:
+                if B > n_sub:
+                    idx = torch.randperm(B, device=res_det.device)[:n_sub]
+                    res_sub = res_det[idx]
+                    s_sub = s_values.detach()[idx]
+                else:
+                    res_sub = res_det
+                    s_sub = s_values.detach()
+
+                # Build the upper-triangular index mask on CPU because the
+                # subsequent median is computed on CPU as well — see _med_pairdist.
+                triu_mask_cpu = torch.triu(
+                    torch.ones(n_sub, n_sub, dtype=torch.bool),
+                    diagonal=1,
+                )
+
+                def _med_pairdist(t: torch.Tensor) -> torch.Tensor:
+                    """Median |t_i − t_j| (i<j), averaged across feature dim if any.
+
+                    Computed on CPU because `torch.median(dim=...)` is non-deterministic
+                    on CUDA when ``torch.use_deterministic_algorithms(True)`` is set
+                    (Lightning's default in this project) — it would otherwise raise
+                    `RuntimeError: median CUDA with indices output does not have a
+                    deterministic implementation`. Subsample is ≤256 rows so the CPU
+                    detour is sub-millisecond.
+                    """
+                    t_cpu = t.detach().cpu()
+                    if t_cpu.dim() == 1:
+                        d = (t_cpu.unsqueeze(0) - t_cpu.unsqueeze(1)).abs()
+                        return d[triu_mask_cpu].median()
+                    # t: (n, F) → diffs: (n, n, F)
+                    d = (t_cpu.unsqueeze(0) - t_cpu.unsqueeze(1)).abs()
+                    triu_vals = d[triu_mask_cpu]  # (n*(n-1)/2, F)
+                    return triu_vals.median(dim=0).values.mean()
+
+                self.log(
+                    f"{stage}_residual_pairdist_med",
+                    _med_pairdist(res_sub),
+                    on_step=False, on_epoch=True,
+                )
+                self.log(
+                    f"{stage}_s_pairdist_med",
+                    _med_pairdist(s_sub),
+                    on_step=False, on_epoch=True,
+                )
         
         if self.use_attention_weighted_hsic:
             att_cross_mean = dec_cross_att[0].mean(dim=0)  # (seq_len_x, seq_len_s)
@@ -506,16 +720,30 @@ class SingleCausalForecaster(pl.LightningModule):
         # =====================================================================
         # TOTAL LOSS
         # =====================================================================
-        total_loss = (loss_x + 
+        # `lambda_recon` (default 1.0) scales the recon term so that setting
+        # it to 0 yields a pure-HSIC training objective. The MSE/MAE/R² metrics
+        # still log the unscaled recon for monitoring.
+        total_loss = (self.lambda_recon * loss_x +
                      score_sparsity_regularizer +
                      hsic_regularizer +
                      group_l1_regularizer)
         
-        # Store decomposed losses for gradient routing (used by training_step)
+        # Store decomposed losses for gradient routing (used by training_step).
+        # Convex mix on the structural pathway only:
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg
+        # Reconstruction loss (loss_recon) is unchanged.
+        alpha = self.lambda_struct_recon
         self._last_loss_components = {
             "loss_recon": loss_x,
-            "loss_structural": hsic_regularizer + score_sparsity_regularizer + group_l1_regularizer,
+            "loss_structural": (
+                (1.0 - alpha) * hsic_regularizer
+                + alpha * loss_x
+                + score_sparsity_regularizer
+                + group_l1_regularizer
+            ),
         }
+
         
         # =====================================================================
         # LOGGING
@@ -556,6 +784,72 @@ class SingleCausalForecaster(pl.LightningModule):
         progress = min(1.0, epoch / max(1, total_epochs))
         return start + progress * (end - start)
     
+    # ------------------------------------------------------------------
+    # Used-mask dump (fires once per fit)
+    # ------------------------------------------------------------------
+    def on_fit_start(self):
+        """Persist the *actual* hard masks used in training to disk.
+
+        Always runs when ``use_hard_masks=True``, regardless of corruption.
+        Output goes to ``<run_dir_k>/used_masks/`` so that GT, corrupted, and
+        any future programmatic mask is always reproducible from the run dir.
+
+        Also writes a ``mask_summary.json`` with corruption metadata (if any).
+        """
+        if not self.use_hard_masks or not self._hard_masks_loaded:
+            return
+
+        # Resolve run directory: CSVLogger.log_dir is "<save_dir_k>/logs/csv/version_X"
+        # so parents[2] = "<save_dir_k>".
+        try:
+            log_dir = getattr(self.trainer, "log_dir", None)
+            if log_dir is None:
+                return
+            out_dir = Path(log_dir).resolve().parents[2] / "used_masks"
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[on_fit_start] could not resolve run dir for mask dump: {e}")
+            return
+
+        masks = self.get_hard_masks() or {}
+        for name, mask in masks.items():
+            arr = mask.detach().cpu().numpy()
+            np.savetxt(out_dir / f"{name}_used.csv", arr, fmt="%.6g", delimiter=",")
+
+        # Build a small json summary
+        summary: Dict[str, Any] = {
+            "use_oracle_attention": bool(self.use_oracle_attention),
+            "hard_masks_corruption_seed": self.hard_masks_corruption_seed,
+            "cross_control_shd_requested": int(self.cross_control_shd),
+            "self_control_shd_requested": int(self.self_control_shd),
+            "hard_masks_preserve_sparsity": bool(self.hard_masks_preserve_sparsity),
+            "corruption_applied": self.hard_mask_corruption_info is not None,
+            "per_mask": {},
+        }
+        for name, mask in masks.items():
+            arr = mask.detach().cpu().numpy()
+            entry = {
+                "shape": list(arr.shape),
+                "num_active_edges": int((arr != 0).sum()),
+                "density": float((arr != 0).mean()),
+            }
+            if (
+                self.hard_mask_corruption_info is not None
+                and name in self.hard_mask_corruption_info
+            ):
+                # Surface corrupt_dag_masks metadata verbatim
+                entry["corruption"] = {
+                    k: (v if not isinstance(v, (np.bool_, np.integer))
+                        else (bool(v) if isinstance(v, np.bool_) else int(v)))
+                    for k, v in self.hard_mask_corruption_info[name].items()
+                }
+            summary["per_mask"][name] = entry
+
+        with open(out_dir / "mask_summary.json", "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+        print(f"[on_fit_start] wrote used masks to {out_dir}")
+
     def on_train_epoch_start(self):
         """Apply annealing schedules at the start of each training epoch."""
         epoch = self.current_epoch
@@ -595,6 +889,80 @@ class SingleCausalForecaster(pl.LightningModule):
             
             self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
             self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
+        
+        # 3. Group L1 annealing — start high, decay to final value
+        if self._use_group_l1_annealing:
+            idle = self._group_l1_anneal_idle
+            transient = self._group_l1_anneal_transient
+            start_val = float(self._group_l1_anneal_start)
+            final_val = self._group_l1_final
+            
+            if epoch < idle:
+                self.lambda_group_l1 = start_val
+            elif epoch < idle + transient:
+                self.lambda_group_l1 = self._linear_anneal(
+                    start_val, final_val, epoch - idle, transient
+                )
+            else:
+                self.lambda_group_l1 = final_val
+            
+            self.log("annealed_lambda_group_l1", self.lambda_group_l1, on_step=False, on_epoch=True)
+        
+        # 4. Unified attention temperature annealing (self + cross)
+        #    Schedule overrides log_tau* params during [0, idle+transient).
+        #    After the schedule ends: requires_grad is re-enabled (Option A).
+        if self.use_tau_annealing:
+            idle = self.tau_anneal_idle_epochs
+            transient = self.tau_anneal_transient_epochs
+            tau_start = self.tau_anneal_start
+            tau_end = self.tau_anneal_end
+            schedule_end = idle + transient
+            
+            in_schedule = epoch < schedule_end
+            
+            if in_schedule:
+                if epoch < idle:
+                    new_tau = tau_start
+                else:
+                    new_tau = self._linear_anneal(
+                        tau_start, tau_end, epoch - idle, transient
+                    )
+                
+                # Walk all decoder layers, set log_tau* on self + cross attention
+                # Names match: ToeplitzAttention.log_tau, ToeplitzLieAttention.log_tau_gate/_dir,
+                # CausalCrossAttention.log_tau_act
+                tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+                log_new_tau = float(torch.log(torch.tensor(new_tau)))
+                
+                for layer in self.model.decoder.layers:
+                    for inner in (layer.global_self_attention.inner_attention,
+                                  layer.global_cross_attention.inner_attention):
+                        for pname in tau_param_names:
+                            p = getattr(inner, pname, None)
+                            if p is None:
+                                continue
+                            with torch.no_grad():
+                                p.fill_(log_new_tau)
+                            if self.freeze_tau_during_anneal:
+                                p.requires_grad = False
+                
+                self.log("annealed_tau", new_tau, on_step=False, on_epoch=True)
+            elif self.freeze_tau_during_anneal and not self._tau_unfrozen:
+                # One-shot unfreeze at boundary
+                tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+                for layer in self.model.decoder.layers:
+                    for inner in (layer.global_self_attention.inner_attention,
+                                  layer.global_cross_attention.inner_attention):
+                        for pname in tau_param_names:
+                            p = getattr(inner, pname, None)
+                            if p is None:
+                                continue
+                            p.requires_grad = True
+                self._tau_unfrozen = True
+                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
+            else:
+                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
+
     
     def training_step(self, batch, batch_idx):
         """Training step with optional gradient routing.
@@ -642,6 +1010,16 @@ class SingleCausalForecaster(pl.LightningModule):
                 if id(p) in _saved_recon_grads:
                     p.grad = _saved_recon_grads[id(p)]
             
+            # Inject gradient noise for structural params (Langevin-style exploration)
+            noise_std = getattr(self, '_structural_grad_noise_std', 0.0)
+            if noise_std > 0.0:
+                decay = getattr(self, '_structural_grad_noise_decay', 1.0)
+                current_std = noise_std * (decay ** self.current_epoch)
+                for p in self._structural_params:
+                    if p.grad is not None:
+                        p.grad.add_(torch.randn_like(p.grad) * current_std)
+                self.log("structural_grad_noise_std", current_std, on_step=False, on_epoch=True)
+            
             # Now step both optimizers (graph fully consumed, safe)
             opt_recon.step()
             opt_struct.step()
@@ -672,37 +1050,59 @@ class SingleCausalForecaster(pl.LightningModule):
         
         When gradient routing is enabled, creates two optimizers:
         - opt_recon: updates reconstruction parameters (θ_R) with reconstruction loss
-        - opt_struct: updates structural parameters (θ_S) with structural loss (HSIC + sparsity + group L1)
+        - opt_struct: updates structural parameters (θ_S) with structural loss
         
-        Both use the same learning rate and optimizer type, relying on AdamW's
-        adaptive per-parameter learning rates to handle the different objectives.
+        Structure optimizer can be configured independently via:
+            structural_optimizer, structural_lr, structural_weight_decay,
+            structural_optimizer_kwargs, structural_scheduler,
+            structural_scheduler_kwargs, structural_gradient_noise
         
         When gradient routing is disabled (default), creates a single optimizer
         over all parameters (backward compatible).
         """
-        learning_rate = self.config["training"].get("lr", 1e-4)
-        weight_decay = self.config["training"].get("weight_decay", 0.01)
-        optimizer_type = self.config["training"].get("optimizer", "adamw").lower()
+        from causaliT.training.optimizer_factory import (
+            make_optimizer, make_scheduler,
+            get_recon_optimizer_config, get_structural_optimizer_config,
+            get_structural_scheduler_config, get_gradient_noise_config,
+        )
         
-        def _make_optimizer(params):
-            if optimizer_type == "sgd":
-                momentum = self.config["training"].get("momentum", 0.0)
-                return torch.optim.SGD(params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
-            elif optimizer_type == "adamw":
-                return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-            else:
-                raise ValueError(f"Unsupported optimizer type: {optimizer_type}. Choose 'adamw' or 'sgd'.")
+        tc = self.config["training"]
+        max_epochs = tc.get("max_epochs", 1000)
         
         if self.use_gradient_routing:
-            # Dual optimizer mode: reconstruction + structural
-            opt_recon = _make_optimizer(self._reconstruction_params)
-            opt_struct = _make_optimizer(self._structural_params)
+            # --- Dual optimizer mode ---
+            recon_cfg = get_recon_optimizer_config(tc)
+            struct_cfg = get_structural_optimizer_config(tc)
+            
+            opt_recon = make_optimizer(self._reconstruction_params, **recon_cfg)
+            opt_struct = make_optimizer(self._structural_params, **struct_cfg)
+            
+            # Store gradient noise config for use in training_step
+            noise_cfg = get_gradient_noise_config(tc)
+            self._structural_grad_noise_std = noise_cfg["noise_std"]
+            self._structural_grad_noise_decay = noise_cfg["noise_decay"]
+            
+            # Structural scheduler (optional)
+            sched_cfg = get_structural_scheduler_config(tc)
+            struct_scheduler = make_scheduler(
+                opt_struct, **sched_cfg, max_epochs=max_epochs
+            )
+            
+            if struct_scheduler is not None:
+                return (
+                    [opt_recon, opt_struct],
+                    [
+                        {"scheduler": torch.optim.lr_scheduler.LambdaLR(opt_recon, lr_lambda=lambda e: 1.0)},
+                        {"scheduler": struct_scheduler},
+                    ],
+                )
             return [opt_recon, opt_struct]
         else:
-            # Standard single optimizer
-            optimizer = _make_optimizer(self.parameters())
+            # --- Standard single optimizer (backward compatible) ---
+            recon_cfg = get_recon_optimizer_config(tc)
+            optimizer = make_optimizer(self.parameters(), **recon_cfg)
             
-            if self.config["training"].get("use_scheduler", False):
+            if tc.get("use_scheduler", False):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, mode='min', factor=0.5, patience=10, verbose=True
                 )

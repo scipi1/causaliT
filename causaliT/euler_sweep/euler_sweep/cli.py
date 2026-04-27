@@ -33,6 +33,7 @@ from causaliT.euler_sweep.euler_sweep.sweeper import run_sequential_sweep, run_p
 
 # Import causaliT training components
 from causaliT.training.trainer import trainer
+from causaliT.training.staged_trainer import staged_trainer
 from causaliT.training.experiment_control import update_config
 
 # =============================================================================
@@ -67,6 +68,45 @@ def train_function_for_sweep(
     
     # Call causaliT trainer
     return trainer(
+        config=config_updated,
+        save_dir=str(save_dir),
+        data_dir=str(data_dir),
+        cluster=cluster,
+        **kwargs
+    )
+
+
+def staged_train_function_for_sweep(
+    config: OmegaConf,
+    save_dir: Path,
+    data_dir: Path,
+    cluster: bool,
+    **kwargs
+):
+    """
+    Staged training function wrapper for calibrated parameter sweeps.
+
+    Like ``train_function_for_sweep`` but delegates to
+    ``staged_trainer`` which runs:
+    1. (Optional) causal initialization
+    2. Main training with warm-start from init checkpoint
+
+    Use this for experiments that require score-sparsity CV or
+    causal initialization before the main training loop.
+
+    Args:
+        config: Configuration object (OmegaConf) with all hyperparameters
+        save_dir: Directory to save outputs (checkpoints, logs, results)
+        data_dir: Directory containing training data
+        cluster: Whether running on a cluster (affects num_workers, etc.)
+        **kwargs: Additional arguments passed to staged_trainer
+
+    Returns:
+        pd.DataFrame: DataFrame containing metrics for each fold
+    """
+    config_updated = update_config(config)
+
+    return staged_trainer(
         config=config_updated,
         save_dir=str(save_dir),
         data_dir=str(data_dir),
@@ -325,25 +365,31 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 
 
 # =============================================================================
-# CALIBRATED SWEEP COMMAND
+# CALISWEEP COMMAND — mirrors `sweep` but uses staged_trainer
 # =============================================================================
 @click.command()
 @click.option(
     "--exp_id",
     required=True,
-    help="Experiment ID (folder containing config.yaml and sweeper/sweep.yaml)"
+    help="Experiment ID (folder name containing config.yaml and sweep.yaml)"
 )
 @click.option(
-    "--cluster",
-    default=False,
-    is_flag=True,
-    help="Running on cluster (affects paths and resource usage)"
+    "--sweep_mode",
+    required=True,
+    type=click.Choice(['independent', 'combination']),
+    help="Sweep mode: 'independent' (one param at a time) or 'combination' (all combinations)"
 )
 @click.option(
     "--parallel",
     default=False,
     is_flag=True,
     help="Run in parallel using SLURM job arrays (cluster only)"
+)
+@click.option(
+    "--cluster",
+    default=False,
+    is_flag=True,
+    help="Running on cluster (affects paths and resource usage)"
 )
 @click.option(
     "--scratch_path",
@@ -378,83 +424,38 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     is_flag=True,
     help="Actually submit jobs (False for dry run)"
 )
-@click.option(
-    "--seed",
-    default=42,
-    type=int,
-    help="Random seed for calibration (default: 42)"
-)
-@click.option(
-    "--skip_calibration",
-    default=False,
-    is_flag=True,
-    help="Skip calibration (use existing pre_sweep_calibration.json if found)"
-)
-@click.option(
-    "--analysis_only",
-    default=False,
-    is_flag=True,
-    help="Only run post-sweep analysis (skip training sweep)"
-)
-@click.option(
-    "--selection_rule",
-    default="1se",
-    type=click.Choice(["1se", "min_hsic"]),
-    help="Lambda selection rule for post-sweep analysis (default: 1se)"
-)
-def calisweep(exp_id, cluster, parallel, scratch_path,
-              max_concurrent_jobs, walltime, gpu_mem, mem_per_cpu, submit_jobs,
-              seed, skip_calibration, analysis_only, selection_rule):
+def calisweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
+              max_concurrent_jobs, walltime, gpu_mem, mem_per_cpu, submit_jobs):
     """
-    Run a score-sparsity sweep with automatic group-L1 calibration.
+    Run parameter sweeps using the staged trainer (causal init → main training).
 
-    This command implements the full lambda_score selection pipeline:
+    Identical to the ``sweep`` command but uses ``staged_trainer`` instead of
+    ``trainer``.  The staged trainer runs:
+    1. (Optional) causal initialization stage
+    2. Main training with warm-start from the init checkpoint
 
-    1. CALIBRATION (pre-sweep): Finds optimal lambda_group s.t. ||grad_Recon|| ~ ||grad_HSIC||.
-       This is dataset-specific and must run before the score-sparsity grid.
-       Output: lambda_group*, lambda_hsic_cross*, lambda_hsic_self*
+    Use this for experiments whose config includes staged training settings
+    (e.g. ``use_score_sparsity_cv``, ``causal_initialization``).
 
-    2. SCORE-SPARSITY SWEEP: Sweeps lambda_cross_score_sparse over the grid
-       defined in sweeper/sweep.yaml.  Every combination inherits the calibrated
-       lambda_group from step 1.
-
-    3. ANALYSIS: Produces the LASSO-path plots and selects lambda* using the
-       specified rule (1se or min_hsic).
+    Sweep Modes:
+      - independent: Vary one parameter at a time (baseline comparison)
+      - combination: Explore all combinations (Cartesian product)
 
     Execution Modes:
       - Sequential (default): Run combinations one after another
-      - Parallel (--parallel): Use SLURM job arrays for cluster parallelization.
-        Calibration runs on the submit node, then each sweep combination is
-        dispatched as a SLURM array task.  Post-sweep analysis is skipped
-        automatically; run with --analysis_only after all jobs complete.
+      - Parallel (--parallel): Use SLURM job arrays for cluster parallelization
 
-    sweep.yaml format for this command::
+    Examples::
 
-        training:
-          lambda_cross_score_sparse: [0.0, 0.001, 0.005, 0.01, 0.05, 0.1]
-          # optionally also sweep seed for robustness:
-          # seed: [0, 1, 2, 3, 4]
+      # Sequential combination sweep with staged trainer
+      python cli.py calisweep --exp_id my_exp --sweep_mode combination
 
-    After running, inspect:
-      - sweeper/score_sparsity_path.png
-      - sweeper/variable_importance_path.png
-      - sweeper/score_sparsity_analysis.json  (contains selected lambda)
-
-    Example::
-
-      # Sequential (local or single-node)
-      python cli.py calisweep --exp_id my_score_sparsity_exp
-      python cli.py calisweep --exp_id my_score_sparsity_exp --skip_calibration
-
-      # Parallel on cluster (SLURM job arrays)
-      python cli.py calisweep --exp_id my_score_sparsity_exp \\
-          --parallel --cluster --scratch_path $SCRATCH/my_score_sparsity_exp \\
+      # Parallel combination sweep on cluster
+      python cli.py calisweep --exp_id my_exp --sweep_mode combination \\
+          --parallel --cluster --scratch_path $SCRATCH/my_exp \\
           --max_concurrent_jobs 10
-
-      # Post-sweep analysis (after parallel jobs finish)
-      python cli.py calisweep --exp_id my_score_sparsity_exp --analysis_only
     """
-    print(f"Starting calibrated score-sparsity sweep: exp_id={exp_id}")
+    print(f"Starting staged parameter sweep: exp_id={exp_id}, mode={sweep_mode}, parallel={parallel}")
 
     # =============================================================================
     # Validate execution mode
@@ -467,7 +468,7 @@ def calisweep(exp_id, cluster, parallel, scratch_path,
         )
 
     # =============================================================================
-    # Set up directories (mirrors sweep command logic)
+    # Set up directories for causaliT project
     # =============================================================================
     if scratch_path is None:
         exp_dir = join(ROOT_DIR, "experiments", exp_id)
@@ -476,155 +477,113 @@ def calisweep(exp_id, cluster, parallel, scratch_path,
         exp_dir = scratch_path
         home_exp_dir = join(ROOT_DIR, "experiments", exp_id)
 
+    # Data directory
     data_dir = join(ROOT_DIR, "data")
 
+    # Check if experiment directory exists
     check_dir = home_exp_dir if scratch_path is not None else exp_dir
     if not exists(check_dir):
         raise ValueError(f"Experiment directory does not exist: {check_dir}")
 
-    # ── BUILD PRE-SWEEP HOOK ─────────────────────────────────────────────────
-    from causaliT.euler_sweep.euler_sweep.pre_sweep_actions import (
-        make_calibration_pre_sweep,
-        make_noop_pre_sweep,
-        load_pre_sweep_calibration,
-    )
+    # Check for required config files (supports config*.yaml pattern)
+    import glob
+    config_pattern = join(check_dir, "config*.yaml")
+    config_files = glob.glob(config_pattern)
+    sweeper_dir = join(check_dir, "sweeper")
+    sweep_path = join(sweeper_dir, "sweep.yaml")
 
-    if skip_calibration:
-        # Try to load existing calibration
-        existing = load_pre_sweep_calibration(check_dir)
-        if existing is not None:
-            print("Using existing calibration from pre_sweep_calibration.json")
-            pre_fn = lambda config, data_dir, save_dir: existing
-        else:
-            print("No existing calibration found. Running noop pre-sweep.")
-            pre_fn = make_noop_pre_sweep()
-    else:
-        pre_fn = make_calibration_pre_sweep(seed=seed)
-
-    # ── RUN SWEEP (skip if analysis_only) ───────────────────────────────────
-    if not analysis_only:
-        if not parallel:
-            # ── SEQUENTIAL execution ────────────────────────────────────────
-            print(f"\nRunning sequential score-sparsity sweep (combination mode)...")
-            run_sequential_sweep(
-                exp_dir=exp_dir,
-                sweep_mode="combination",
-                train_fn=train_function_for_sweep,
-                data_dir=data_dir,
-                cluster=cluster,
-                experiment_id=exp_id,
-                pre_sweep_fn=pre_fn,
-            )
-            print("\nScore-sparsity sweep complete.")
-
-        else:
-            # ── PARALLEL execution (SLURM job arrays) ──────────────────────
-            # Step 1: Run calibration on the submit node BEFORE dispatching
-            # the parallel sweep.  The calibration overrides are baked into
-            # the base config that run_parallel_sweep serialises to JSON,
-            # so every SLURM worker inherits the calibrated values.
-            from causaliT.euler_sweep.euler_sweep.sweeper import find_config_files
-
-            config, _sweep_config = find_config_files(check_dir)
-
-            print("\nRunning pre-sweep calibration on submit node...")
-            overrides = pre_fn(
-                config=OmegaConf.to_container(config, resolve=False),
-                data_dir=data_dir,
-                save_dir=check_dir,
-            )
-            if overrides:
-                config = OmegaConf.merge(config, OmegaConf.create(overrides))
-                print(f"Pre-sweep overrides applied: {list(overrides.keys())}")
-
-            # Save the calibrated config back so run_parallel_sweep picks it up
-            # when it calls find_config_files(config_dir).
-            # We write to a temporary calibrated config in the sweeper dir and
-            # use it as the base config for the parallel sweep.
-            import glob
-            config_pattern = join(check_dir, "config*.yaml")
-            config_files = glob.glob(config_pattern)
-            config_files.sort()
-            calibrated_config_path = config_files[0]
-            # Save calibrated config (overwrite the original so workers use it)
-            OmegaConf.save(config, calibrated_config_path)
-            print(f"Calibrated config saved to: {calibrated_config_path}")
-
-            # Step 2: Dispatch parallel sweep
-            print(f"\nPreparing parallel score-sparsity sweep...")
-            print(f"Max concurrent jobs: {max_concurrent_jobs}")
-            print(f"Walltime: {walltime}")
-            print(f"GPU memory: {gpu_mem}")
-            print(f"CPU memory: {mem_per_cpu}\n")
-
-            slurm_params = {
-                'max_concurrent_jobs': max_concurrent_jobs,
-                'walltime': walltime,
-                'gpu_mem': gpu_mem,
-                'mem_per_cpu': mem_per_cpu,
-            }
-
-            train_fn_module = "causaliT.euler_sweep.euler_sweep.cli"
-            train_fn_name = "train_function_for_sweep"
-
-            run_parallel_sweep(
-                exp_dir=exp_dir,
-                home_exp_dir=home_exp_dir,
-                sweep_mode="combination",
-                train_fn_module=train_fn_module,
-                train_fn_name=train_fn_name,
-                experiment_id=exp_id,
-                data_dir=data_dir,
-                scratch_path=scratch_path,
-                slurm_params=slurm_params,
-                cluster=cluster,
-                submit_jobs=submit_jobs,
-            )
-
-            # Analysis is skipped for parallel — jobs haven't finished yet
-            print("\n" + "=" * 60)
-            print("PARALLEL CALIBRATED SWEEP DISPATCHED")
-            print("=" * 60)
-            print("SLURM jobs are running.  Post-sweep analysis is NOT run")
-            print("automatically because the jobs have not completed yet.")
-            print("\nOnce all jobs finish, run analysis with:")
-            print(f"  python cli.py calisweep --exp_id {exp_id} --analysis_only")
-            print("=" * 60 + "\n")
-            return  # Exit early — no analysis
-
-    # ── POST-SWEEP ANALYSIS ──────────────────────────────────────────────────
-    # Reached for: sequential sweep completion, or --analysis_only
-    print(f"\nRunning score-sparsity analysis...")
-    from causaliT.evaluation.eval_score_sparsity import run_score_sparsity_analysis
-
-    # For analysis, always use home_exp_dir (results may have been copied back)
-    analysis_dir = home_exp_dir if scratch_path is not None else exp_dir
-
-    try:
-        analysis_result = run_score_sparsity_analysis(
-            sweep_dir=analysis_dir,
-            rule=selection_rule,
-            show_plots=False,
-            save_dir=join(analysis_dir, "sweeper"),
+    if not config_files:
+        raise ValueError(
+            f"Config file not found in: {check_dir}\n"
+            "Create a config.yaml (or config_*.yaml) file in your experiment directory."
         )
-        lambda_star = analysis_result["lambda_cross_score_selected"]
+
+    if not exists(sweeper_dir):
+        raise ValueError(
+            f"Sweeper directory not found: {sweeper_dir}\n"
+            "Create a 'sweeper' subdirectory in your experiment folder.\n"
+            f"Expected structure: {check_dir}/sweeper/sweep.yaml"
+        )
+
+    if not exists(sweep_path):
+        raise ValueError(
+            f"Sweep file not found: {sweep_path}\n"
+            "Create a sweep.yaml file in the sweeper subdirectory.\n"
+            f"Expected location: {check_dir}/sweeper/sweep.yaml"
+        )
+
+    print(f"Experiment directory: {exp_dir}")
+    print(f"Data directory: {data_dir}")
+    print(f"Config: {config_files[0]}")
+    print(f"Sweep: {sweep_path}")
+    print(f"Training function: staged_train_function_for_sweep (staged_trainer)")
+
+    # =============================================================================
+    # CausaliT training function — staged variant
+    # =============================================================================
+    train_fn = staged_train_function_for_sweep
+
+    # =============================================================================
+    # Execute sweep based on mode
+    # =============================================================================
+    if not parallel:
+        # Sequential sweep
+        print(f"\nRunning sequential {sweep_mode} sweep (staged trainer)...")
+        print("This will run combinations one after another.\n")
+
+        run_sequential_sweep(
+            exp_dir=exp_dir,
+            sweep_mode=sweep_mode,
+            train_fn=train_fn,
+            data_dir=data_dir,
+            cluster=cluster,
+            experiment_id=exp_id
+        )
 
         print("\n" + "=" * 60)
-        print("CALIBRATED SWEEP COMPLETE")
+        print("Sequential staged sweep completed!")
         print("=" * 60)
-        print(f"  Selected lambda_cross_score = {lambda_star:.4f}")
-        print(f"  Selection rule: {selection_rule}")
-        print(f"  Analysis:  {analysis_dir}/sweeper/score_sparsity_analysis.json")
-        print(f"  LASSO plot: {analysis_dir}/sweeper/score_sparsity_path.png")
-        print(f"  Var plot:   {analysis_dir}/sweeper/variable_importance_path.png")
-        print("=" * 60)
-        print(
-            f"\nNext step: set training.lambda_cross_score_sparse = {lambda_star:.4f} "
-            "in your experiment config and run causal_initialization."
+
+        if sweep_mode == "independent":
+            print(f"Results: {exp_dir}/sweeps/")
+        else:
+            print(f"Results: {exp_dir}/combinations/")
+        print("=" * 60 + "\n")
+
+    else:
+        # Parallel sweep using SLURM job arrays
+        print(f"\nPreparing parallel {sweep_mode} sweep (staged trainer)...")
+        print(f"Max concurrent jobs: {max_concurrent_jobs}")
+        print(f"Walltime: {walltime}")
+        print(f"GPU memory: {gpu_mem}")
+        print(f"CPU memory: {mem_per_cpu}\n")
+
+        # Prepare SLURM parameters
+        slurm_params = {
+            'max_concurrent_jobs': max_concurrent_jobs,
+            'walltime': walltime,
+            'gpu_mem': gpu_mem,
+            'mem_per_cpu': mem_per_cpu
+        }
+
+        # For parallel execution, specify the training function by module and name
+        # so it can be imported by worker jobs on cluster nodes
+        train_fn_module = "causaliT.euler_sweep.euler_sweep.cli"
+        train_fn_name = "staged_train_function_for_sweep"
+
+        run_parallel_sweep(
+            exp_dir=exp_dir,
+            home_exp_dir=home_exp_dir,
+            sweep_mode=sweep_mode,
+            train_fn_module=train_fn_module,
+            train_fn_name=train_fn_name,
+            experiment_id=exp_id,
+            data_dir=data_dir,
+            scratch_path=scratch_path,
+            slurm_params=slurm_params,
+            cluster=cluster,
+            submit_jobs=submit_jobs
         )
-    except Exception as e:
-        print(f"\nWarning: Analysis failed: {e}")
-        print("The sweep results are saved. Run analysis manually if needed.")
 
 
 # =============================================================================

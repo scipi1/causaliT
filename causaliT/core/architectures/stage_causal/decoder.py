@@ -89,6 +89,7 @@ class ReversedDecoderLayer(nn.Module):
         causal_mask: bool,
         cross_hard_mask: torch.Tensor = None,
         self_hard_mask: torch.Tensor = None,
+        oracle: bool = False,
     ):
         """
         Forward pass with REVERSED attention order.
@@ -142,6 +143,7 @@ class ReversedDecoderLayer(nn.Module):
                 pos=None,
                 causal_mask=False,
                 hard_mask=cross_hard_mask,
+                oracle=oracle,
             )
             
             # Residual on VALUE only
@@ -161,6 +163,7 @@ class ReversedDecoderLayer(nn.Module):
                 pos=dec_input_pos,
                 causal_mask=causal_mask,
                 hard_mask=self_hard_mask,
+                oracle=oracle,
             )
             
             # Residual on VALUE only
@@ -191,6 +194,7 @@ class ReversedDecoderLayer(nn.Module):
                 pos=None,
                 causal_mask=False,
                 hard_mask=cross_hard_mask,
+                oracle=oracle,
             )
             
             X2 = X + self.dropout_attn_out(X1)
@@ -207,6 +211,7 @@ class ReversedDecoderLayer(nn.Module):
                 pos=dec_input_pos,
                 causal_mask=causal_mask,
                 hard_mask=self_hard_mask,
+                oracle=oracle,
             )
             
             X4 = X2 + self.dropout_attn_out(X3)
@@ -261,6 +266,7 @@ class ReversedDecoder(nn.Module):
         causal_mask: bool,
         cross_hard_mask: torch.Tensor = None,
         self_hard_mask: torch.Tensor = None,
+        oracle: bool = False,
     ):
         """
         Forward pass through all decoder layers.
@@ -309,6 +315,7 @@ class ReversedDecoder(nn.Module):
                 causal_mask=causal_mask,
                 cross_hard_mask=cross_hard_mask,
                 self_hard_mask=self_hard_mask,
+                oracle=oracle,
             )
             
             cross_att_list.append(cross_att)

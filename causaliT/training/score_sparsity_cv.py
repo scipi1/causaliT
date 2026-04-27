@@ -73,7 +73,7 @@ class ValidationMetricsTracker(pl.Callback):
         self.val_hsic_cross: Optional[float] = None
         self.val_hsic_self: Optional[float] = None
         self.val_recon: Optional[float] = None
-        self.val_mae: Optional[float] = None
+        self.val_x_mae: Optional[float] = None
         self.val_loss: Optional[float] = None
         self.train_hsic_cross: Optional[float] = None
         self.train_recon: Optional[float] = None
@@ -112,8 +112,8 @@ class ValidationMetricsTracker(pl.Callback):
                 break
 
         # Validation MAE
-        if "val_mae" in metrics:
-            self.val_mae = float(metrics["val_mae"].item())
+        if "val_x_mae" in metrics:
+            self.val_x_mae = float(metrics["val_x_mae"].item())
 
         # Total val loss
         if "val_loss" in metrics:
@@ -125,7 +125,7 @@ class ValidationMetricsTracker(pl.Callback):
             "val_hsic_cross": self.val_hsic_cross,
             "val_hsic_self": self.val_hsic_self,
             "val_recon": self.val_recon,
-            "val_mae": self.val_mae,
+            "val_x_mae": self.val_x_mae,
             "val_loss": self.val_loss,
             "train_hsic_cross": self.train_hsic_cross,
             "train_recon": self.train_recon,
@@ -629,7 +629,7 @@ def _run_cv_for_single_lambda(
     # Aggregate across folds
     hsic_values = [r["val_hsic_cross"] for r in fold_results if r["val_hsic_cross"] is not None]
     recon_values = [r["val_recon"] for r in fold_results if r["val_recon"] is not None]
-    mae_values = [r["val_mae"] for r in fold_results if r["val_mae"] is not None]
+    mae_values = [r["val_x_mae"] for r in fold_results if r["val_x_mae"] is not None]
 
     result = {
         "lambda_score": lambda_score,
@@ -646,8 +646,8 @@ def _run_cv_for_single_lambda(
         "min_val_recon": float(np.min(recon_values)) if recon_values else None,
         "max_val_recon": float(np.max(recon_values)) if recon_values else None,
         # MAE aggregation
-        "mean_val_mae": float(np.mean(mae_values)) if mae_values else None,
-        "std_val_mae": float(np.std(mae_values)) if mae_values else None,
+        "mean_val_x_mae": float(np.mean(mae_values)) if mae_values else None,
+        "std_val_x_mae": float(np.std(mae_values)) if mae_values else None,
     }
 
     # Pick best fold's DAG for LASSO-path edge plots

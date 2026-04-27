@@ -331,6 +331,15 @@ training:
   # - Capacity control for causal structure learning
   lambda_group_l1: 0.0
   
+  # GROUP L1 ANNEALING
+  # Start high to constrain capacity (forces structure learning via HSIC),
+  # then decay to lambda_group_l1 to release capacity for reconstruction.
+  # Schedule: [0, idle) = start_value; [idle, idle+transient) = linear decay; rest = lambda_group_l1
+  # Set start_value to null to disable annealing (default).
+  lambda_group_l1_anneal_start_value: null   # Initial high value (e.g., 0.5)
+  lambda_group_l1_anneal_idle_epochs: 0      # Epochs to hold at start_value
+  lambda_group_l1_anneal_transient_epochs: 0 # Epochs for linear decay to lambda_group_l1
+  
   # =========================================================================
   # HARD MASKS
   # =========================================================================
@@ -338,6 +347,42 @@ training:
   hard_mask_files:
     dec_cross: "dec1_cross_att_mask.csv"
     dec_self: "dec1_self_att_mask.csv"
+
+  # =========================================================================
+  # ORACLE ATTENTION
+  # =========================================================================
+  # When true, the attention mechanism BYPASSES the QK^T computation entirely
+  # and uses the hard mask itself as the attention score matrix applied to V.
+  # The DAG alignment is given (oracle), so the model only learns embeddings,
+  # value projections and FF/output components from the reconstruction loss.
+  # Requires use_hard_masks: true and supported attention types
+  # (currently ToeplitzAttention and CausalCrossAttention).
+  use_oracle_attention: false
+
+  # Wrong-DAG oracle (controlled SHD corruption of the hard masks).
+  # See `causaliT.core.utils.corrupt_dag_masks` for full semantics.
+  #
+  # Activation rule:
+  #   - hard_masks_corruption_seed in {null, 0}  → no corruption (ground truth)
+  #   - cross_control_shd == self_control_shd == 0 → no corruption
+  # Otherwise, exactly `cross_control_shd` entries of dec_cross and exactly
+  # `self_control_shd` entries of dec_self (off-diagonal pool) are flipped 0↔1.
+  # Cross uses RNG `seed`; self uses `seed + 1`, so the two SHD knobs are
+  # independent. If shd > num_true_edges, the function falls back to "all
+  # edges must be wrong" (every true edge removed; up to `shd - k_true` extra
+  # non-edges turned ON, capped by the available non-edge pool).
+  # The corrupted self mask may contain cycles — this is detected and logged.
+  hard_masks_corruption_seed: null
+  cross_control_shd: 0
+  self_control_shd: 0
+  # When True, corruption is constrained to one-for-one edge swaps so the
+  # corrupted mask has the SAME number of edges as the ground truth.
+  # Disentangles "wrong-edges" from "more-edges-to-mix" effects.
+  # Notes:
+  #   - Only even SHD values are achievable; odd requests are rounded DOWN.
+  #   - Capped at 2 * min(k_true, n_non_edges) in the eligible pool.
+  #   - Edge count is invariant: corrupted.sum() == ground_truth.sum().
+  hard_masks_preserve_sparsity: false
 
 
 

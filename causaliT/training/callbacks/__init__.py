@@ -10,11 +10,14 @@ This package contains callbacks for training and model monitoring:
 from .training_callbacks import (
     PerRunManifest,
     get_checkpoint_callback,
+    get_early_stopping_callback,
     MemoryLoggerCallback,
-    BestCheckpointCallback,
+    BestReconstructionCheckpoint,
+    BestCausalCheckpoint,
     DataIndexTracker,
     KFoldResultsTracker,
-    early_stopping_callbacks
+    # Deprecated — kept for backward compatibility
+    early_stopping_callbacks,
 )
 
 # Model monitoring callbacks
@@ -32,8 +35,10 @@ __all__ = [
     # Training callbacks
     'PerRunManifest',
     'get_checkpoint_callback',
+    'get_early_stopping_callback',
     'MemoryLoggerCallback',
-    'BestCheckpointCallback',
+    'BestReconstructionCheckpoint',
+    'BestCausalCheckpoint',
     'DataIndexTracker',
     'KFoldResultsTracker',
     'early_stopping_callbacks',

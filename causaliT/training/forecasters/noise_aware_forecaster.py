@@ -122,9 +122,26 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                                    config["training"].get("lambda_embed_l1", 0.0))
         
         # =====================================================================
+        # STRUCTURAL LOSS RECON ANCHOR (convex mix)
+        # =====================================================================
+        # alpha in [0, 1]: convex combination weight on the structural pathway.
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg
+        # Reconstruction loss is unchanged (alpha leaks recon into structure only).
+        # Default 0.0 → exact backward compatibility (pure HSIC).
+        # Note: for the noise-aware forecaster, "loss_recon" is the NLL + noise prior
+        # (mirrors what is routed via gradient routing).
+        self.lambda_struct_recon = float(config["training"].get("lambda_struct_recon", 0.0))
+        if not (0.0 <= self.lambda_struct_recon <= 1.0):
+            raise ValueError(
+                f"lambda_struct_recon must be in [0, 1], got {self.lambda_struct_recon}"
+            )
+        
+        # =====================================================================
         # GRADIENT NORM LOGGING (for calibration stage)
         # =====================================================================
         self.log_gradient_norms = config["training"].get("log_gradient_norms", False)
+
         
         # =====================================================================
         # ANNEALING CONFIGURATION
@@ -146,6 +163,35 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.hsic_lambda_cross_end = config["training"].get("hsic_lambda_cross_end", 0.0)
         self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
         self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
+        
+        # 2b. Unified attention temperature annealing (self + cross attentions)
+        #     See SingleCausalForecaster for the full description. Same schedule pattern.
+        self.use_tau_annealing = config["training"].get("use_tau_annealing", False)
+        self.tau_anneal_start = float(config["training"].get("tau_anneal_start", 1.0))
+        self.tau_anneal_end = float(config["training"].get("tau_anneal_end", 0.2))
+        self.tau_anneal_idle_epochs = int(config["training"].get("tau_anneal_idle_epochs", 0))
+        self.tau_anneal_transient_epochs = int(
+            config["training"].get("tau_anneal_transient_epochs", 0)
+        )
+        self.freeze_tau_during_anneal = bool(
+            config["training"].get("freeze_tau_during_anneal", True)
+        )
+        self._tau_unfrozen = False
+        
+        # 3. Group L1 Annealing — start high, decay to lambda_group_l1
+
+        #    Schedule: [0, idle) = start_value; [idle, idle+transient) = linear decay; rest = lambda_group_l1
+        self._group_l1_anneal_start = config["training"].get("lambda_group_l1_anneal_start_value", None)
+        self._group_l1_anneal_idle = config["training"].get("lambda_group_l1_anneal_idle_epochs", 0)
+        self._group_l1_anneal_transient = config["training"].get("lambda_group_l1_anneal_transient_epochs", 0)
+        self._use_group_l1_annealing = (
+            self._group_l1_anneal_start is not None
+            and self._group_l1_anneal_start != self.lambda_group_l1
+        )
+        if self._use_group_l1_annealing:
+            # Store the final target (what's in lambda_group_l1) and set current to start
+            self._group_l1_final = self.lambda_group_l1
+            self.lambda_group_l1 = float(self._group_l1_anneal_start)
         
         # =====================================================================
         # GRADIENT ROUTING (dual optimizer for structure vs reconstruction)
@@ -578,11 +624,23 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                      noise_prior_regularizer +
                      group_l1_regularizer)
         
-        # Store decomposed losses for gradient routing (used by training_step)
+        # Store decomposed losses for gradient routing (used by training_step).
+        # Convex mix on the structural pathway only (alpha leaks recon into struct):
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg
+        # loss_recon (NLL + noise prior) is unchanged.
+        alpha = self.lambda_struct_recon
+        loss_recon_for_struct = loss_nll + noise_prior_regularizer
         self._last_loss_components = {
-            "loss_recon": loss_nll + noise_prior_regularizer,
-            "loss_structural": hsic_regularizer + score_sparsity_regularizer + group_l1_regularizer,
+            "loss_recon": loss_recon_for_struct,
+            "loss_structural": (
+                (1.0 - alpha) * hsic_regularizer
+                + alpha * loss_recon_for_struct
+                + score_sparsity_regularizer
+                + group_l1_regularizer
+            ),
         }
+
         
         # =====================================================================
         # LOGGING
@@ -671,9 +729,79 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             
             self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
             self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
+        
+        # 3. Group L1 annealing — start high, decay to final value
+        if self._use_group_l1_annealing:
+            idle = self._group_l1_anneal_idle
+            transient = self._group_l1_anneal_transient
+            start_val = float(self._group_l1_anneal_start)
+            final_val = self._group_l1_final
+            
+            if epoch < idle:
+                self.lambda_group_l1 = start_val
+            elif epoch < idle + transient:
+                self.lambda_group_l1 = self._linear_anneal(
+                    start_val, final_val, epoch - idle, transient
+                )
+            else:
+                self.lambda_group_l1 = final_val
+            
+            self.log("annealed_lambda_group_l1", self.lambda_group_l1, on_step=False, on_epoch=True)
+        
+        # 4. Unified attention temperature annealing (self + cross)
+        #    Schedule overrides log_tau* params during [0, idle+transient).
+        #    After the schedule ends: requires_grad is re-enabled (Option A).
+        if self.use_tau_annealing:
+            idle = self.tau_anneal_idle_epochs
+            transient = self.tau_anneal_transient_epochs
+            tau_start = self.tau_anneal_start
+            tau_end = self.tau_anneal_end
+            schedule_end = idle + transient
+            
+            in_schedule = epoch < schedule_end
+            tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+            
+            if in_schedule:
+                if epoch < idle:
+                    new_tau = tau_start
+                else:
+                    new_tau = self._linear_anneal(
+                        tau_start, tau_end, epoch - idle, transient
+                    )
+                
+                log_new_tau = float(torch.log(torch.tensor(new_tau)))
+                
+                for layer in self.model.decoder.layers:
+                    for inner in (layer.global_self_attention.inner_attention,
+                                  layer.global_cross_attention.inner_attention):
+                        for pname in tau_param_names:
+                            p = getattr(inner, pname, None)
+                            if p is None:
+                                continue
+                            with torch.no_grad():
+                                p.fill_(log_new_tau)
+                            if self.freeze_tau_during_anneal:
+                                p.requires_grad = False
+                
+                self.log("annealed_tau", new_tau, on_step=False, on_epoch=True)
+            elif self.freeze_tau_during_anneal and not self._tau_unfrozen:
+                # One-shot unfreeze at boundary
+                for layer in self.model.decoder.layers:
+                    for inner in (layer.global_self_attention.inner_attention,
+                                  layer.global_cross_attention.inner_attention):
+                        for pname in tau_param_names:
+                            p = getattr(inner, pname, None)
+                            if p is None:
+                                continue
+                            p.requires_grad = True
+                self._tau_unfrozen = True
+                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
+            else:
+                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
     
     def training_step(self, batch, batch_idx):
         """Training step with optional gradient routing."""
+
         if self.use_gradient_routing:
             opt_recon, opt_struct = self.optimizers()
             
@@ -705,6 +833,16 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                 if id(p) in _saved_recon_grads:
                     p.grad = _saved_recon_grads[id(p)]
             
+            # Inject gradient noise for structural params (Langevin-style exploration)
+            noise_std = getattr(self, '_structural_grad_noise_std', 0.0)
+            if noise_std > 0.0:
+                decay = getattr(self, '_structural_grad_noise_decay', 1.0)
+                current_std = noise_std * (decay ** self.current_epoch)
+                for p in self._structural_params:
+                    if p.grad is not None:
+                        p.grad.add_(torch.randn_like(p.grad) * current_std)
+                self.log("structural_grad_noise_std", current_std, on_step=False, on_epoch=True)
+            
             # Now step both optimizers (graph fully consumed, safe)
             opt_recon.step()
             opt_struct.step()
@@ -730,28 +868,56 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         return loss
     
     def configure_optimizers(self):
-        """Configure optimizer(s) with optional gradient routing."""
-        learning_rate = self.config["training"].get("lr", 1e-4)
-        weight_decay = self.config["training"].get("weight_decay", 0.01)
-        optimizer_type = self.config["training"].get("optimizer", "adamw").lower()
+        """Configure optimizer(s) with optional gradient routing.
         
-        def _make_optimizer(params):
-            if optimizer_type == "sgd":
-                momentum = self.config["training"].get("momentum", 0.0)
-                return torch.optim.SGD(params, lr=learning_rate, momentum=momentum, weight_decay=weight_decay)
-            elif optimizer_type == "adamw":
-                return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
-            else:
-                raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+        Structure optimizer can be configured independently via:
+            structural_optimizer, structural_lr, structural_weight_decay,
+            structural_optimizer_kwargs, structural_scheduler,
+            structural_scheduler_kwargs, structural_gradient_noise
+        """
+        from causaliT.training.optimizer_factory import (
+            make_optimizer, make_scheduler,
+            get_recon_optimizer_config, get_structural_optimizer_config,
+            get_structural_scheduler_config, get_gradient_noise_config,
+        )
+        
+        tc = self.config["training"]
+        max_epochs = tc.get("max_epochs", 1000)
         
         if self.use_gradient_routing:
-            opt_recon = _make_optimizer(self._reconstruction_params)
-            opt_struct = _make_optimizer(self._structural_params)
+            # --- Dual optimizer mode ---
+            recon_cfg = get_recon_optimizer_config(tc)
+            struct_cfg = get_structural_optimizer_config(tc)
+            
+            opt_recon = make_optimizer(self._reconstruction_params, **recon_cfg)
+            opt_struct = make_optimizer(self._structural_params, **struct_cfg)
+            
+            # Store gradient noise config for use in training_step
+            noise_cfg = get_gradient_noise_config(tc)
+            self._structural_grad_noise_std = noise_cfg["noise_std"]
+            self._structural_grad_noise_decay = noise_cfg["noise_decay"]
+            
+            # Structural scheduler (optional)
+            sched_cfg = get_structural_scheduler_config(tc)
+            struct_scheduler = make_scheduler(
+                opt_struct, **sched_cfg, max_epochs=max_epochs
+            )
+            
+            if struct_scheduler is not None:
+                return (
+                    [opt_recon, opt_struct],
+                    [
+                        {"scheduler": torch.optim.lr_scheduler.LambdaLR(opt_recon, lr_lambda=lambda e: 1.0)},
+                        {"scheduler": struct_scheduler},
+                    ],
+                )
             return [opt_recon, opt_struct]
         else:
-            optimizer = _make_optimizer(self.parameters())
+            # --- Standard single optimizer (backward compatible) ---
+            recon_cfg = get_recon_optimizer_config(tc)
+            optimizer = make_optimizer(self.parameters(), **recon_cfg)
             
-            if self.config["training"].get("use_scheduler", False):
+            if tc.get("use_scheduler", False):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, mode='min', factor=0.5, patience=10,
                 )

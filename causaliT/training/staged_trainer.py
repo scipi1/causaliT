@@ -87,16 +87,21 @@ def staged_trainer(
     use_score_sparsity_cv = staged_config.get("use_score_sparsity_cv", False)
     seed = config["training"].get("seed", 42)
 
-    # Resume checkpoint skips Stages 0-1
+    # Resume checkpoint skips Stages 0-1 and does a full Lightning resume
+    # (model weights + optimizer state + epoch counter) — crash recovery.
+    # Pipeline-internal stage transitions use warm-start (weights only).
     if resume_ckpt is not None:
         if not cluster:
             print(f"\nResume checkpoint provided: {resume_ckpt}")
             print("Skipping staged training (calibration/causal_init).")
-        starting_checkpoint = resume_ckpt
+            print("Using full Lightning resume (weights + optimizer + epoch).")
+        starting_checkpoint = None   # no warm-start needed
+        full_resume_ckpt = resume_ckpt  # full Lightning resume for main training
         use_calibration = False
         use_causal_init = False
     else:
-        starting_checkpoint = None
+        starting_checkpoint = None   # warm-start checkpoint from pipeline stages
+        full_resume_ckpt = None      # no full resume
 
     # Populate sequence lengths once (all stages need this)
     config = populate_seq_lengths_from_dataset(config, data_dir)
@@ -245,7 +250,8 @@ def staged_trainer(
         save_dir=save_dir,
         cluster=cluster,
         experiment_tag=experiment_tag,
-        resume_ckpt=starting_checkpoint,
+        resume_ckpt=full_resume_ckpt,        # full Lightning resume (crash recovery)
+        warm_start_ckpt=starting_checkpoint,  # weights-only (stage transitions)
         plot_pred_check=plot_pred_check,
         debug=debug,
         best=best,

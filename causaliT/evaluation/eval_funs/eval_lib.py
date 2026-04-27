@@ -137,9 +137,28 @@ def find_best_or_last_checkpoint(
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoint files found in {checkpoints_dir}")
     
-    # If checkpoint_type is "best", try to find best_checkpoint.ckpt first
-    if checkpoint_type == "best" and 'best_checkpoint.ckpt' in checkpoint_files:
-        return join(checkpoints_dir, 'best_checkpoint.ckpt')
+    # If checkpoint_type is "best_causal", try best_causal_checkpoint.ckpt first,
+    # then fall back to best_reconstruction_checkpoint.ckpt, then to last epoch.
+    if checkpoint_type == "best_causal":
+        if 'best_causal_checkpoint.ckpt' in checkpoint_files:
+            return join(checkpoints_dir, 'best_causal_checkpoint.ckpt')
+        # Fallback: treat as "best_reconstruction"
+        checkpoint_type = "best_reconstruction"
+    
+    # If checkpoint_type is "best_reconstruction", try new name then legacy name
+    if checkpoint_type == "best_reconstruction":
+        if 'best_reconstruction_checkpoint.ckpt' in checkpoint_files:
+            return join(checkpoints_dir, 'best_reconstruction_checkpoint.ckpt')
+        if 'best_checkpoint.ckpt' in checkpoint_files:
+            return join(checkpoints_dir, 'best_checkpoint.ckpt')
+        # Fall through to last-epoch logic
+    
+    # Legacy "best" type: try both names for backward compatibility
+    if checkpoint_type == "best":
+        if 'best_reconstruction_checkpoint.ckpt' in checkpoint_files:
+            return join(checkpoints_dir, 'best_reconstruction_checkpoint.ckpt')
+        if 'best_checkpoint.ckpt' in checkpoint_files:
+            return join(checkpoints_dir, 'best_checkpoint.ckpt')
     
     # Otherwise (or for "last"), find the checkpoint with the highest epoch number
     epoch_pattern = re.compile(r'epoch=(\d+)')

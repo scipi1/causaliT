@@ -412,6 +412,92 @@ def _compute_soft_hamming(learned: np.ndarray, true: np.ndarray) -> float:
     return float(np.mean(np.abs(learned - true)))
 
 
+def _compute_standard_shd(
+    learned: np.ndarray,
+    true: np.ndarray,
+    threshold: float = 0.5,
+    is_cross_attention: bool = False,
+) -> dict:
+    """
+    Compute the standard Structural Hamming Distance (Tsamardinos et al., 2006).
+    
+    This is the metric used by NOTEARS, DAG-GNN, GraN-DAG, DCDI and other
+    causal discovery methods:
+    
+        SHD = missing_edges + extra_edges + reversed_edges
+    
+    The learned continuous adjacency is first binarized at `threshold`.
+    
+    Convention for reversed edges: each reversed edge counts as 1 mistake
+    (consistent with GraN-DAG / Lachapelle et al. 2020). Reversed edges are
+    only counted for square (self-attention) matrices where directionality
+    is meaningful. For cross-attention (S→X), edges are always directional
+    so only missing/extra are counted.
+    
+    Args:
+        learned: Learned adjacency matrix with values in [0, 1]
+        true: True binary adjacency matrix with values in {0, 1}
+        threshold: Binarization threshold (default: 0.5)
+        is_cross_attention: If True, skip reversal counting (not applicable
+                           for rectangular S→X matrices)
+        
+    Returns:
+        dict with keys:
+            - shd: Total standard SHD (int)
+            - missing: Number of true edges not predicted (int)
+            - extra: Number of predicted edges not in true graph (int)
+            - reversed: Number of reversed edges (int, 0 for cross-attention)
+            - n_true_edges: Number of edges in true graph (int)
+            - n_pred_edges: Number of edges in predicted graph (int)
+            - threshold: Threshold used for binarization
+            
+    Example:
+        >>> learned = np.array([[0.9, 0.1], [0.2, 0.8]])
+        >>> true = np.array([[1, 0], [0, 1]])
+        >>> result = _compute_standard_shd(learned, true)
+        >>> result['shd']
+        0  # Perfect after thresholding at 0.5
+    """
+    if learned.shape != true.shape:
+        raise ValueError(f"Shape mismatch: learned {learned.shape} vs true {true.shape}")
+    
+    pred = (learned >= threshold).astype(int)
+    true_bin = true.astype(int)
+    
+    n_true_edges = int(true_bin.sum())
+    n_pred_edges = int(pred.sum())
+    
+    # Missing: true edge absent in prediction
+    missing = int(((true_bin == 1) & (pred == 0)).sum())
+    # Extra: predicted edge absent in true graph
+    extra = int(((true_bin == 0) & (pred == 1)).sum())
+    
+    # Reversed edges: only for square self-attention matrices
+    reversed_edges = 0
+    if not is_cross_attention and pred.shape[0] == pred.shape[1]:
+        n = pred.shape[0]
+        for i in range(n):
+            for j in range(i + 1, n):
+                # pred has i→j but true has j→i
+                if pred[i, j] == 1 and pred[j, i] == 0 and true_bin[i, j] == 0 and true_bin[j, i] == 1:
+                    reversed_edges += 1
+                # pred has j→i but true has i→j
+                elif pred[j, i] == 1 and pred[i, j] == 0 and true_bin[j, i] == 0 and true_bin[i, j] == 1:
+                    reversed_edges += 1
+    
+    shd = missing + extra + reversed_edges
+    
+    return {
+        'shd': shd,
+        'missing': missing,
+        'extra': extra,
+        'reversed': reversed_edges,
+        'n_true_edges': n_true_edges,
+        'n_pred_edges': n_pred_edges,
+        'threshold': threshold,
+    }
+
+
 def _compute_zeroness_metrics(learned: np.ndarray, true: np.ndarray) -> dict:
     """
     Compute zero-ness metrics: how close to 0 are the non-edges?

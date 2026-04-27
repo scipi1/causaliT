@@ -67,6 +67,7 @@ class CausalInitProgressLogger(Callback):
     def __init__(self):
         super().__init__()
         self.hsic_values: List[float] = []
+        self.hsic_self_values: List[float] = []
         self.recon_values: List[float] = []
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: pl.LightningModule):
@@ -78,6 +79,10 @@ class CausalInitProgressLogger(Callback):
                 hsic = metrics[key].item()
                 break
 
+        hsic_self = None
+        if "train_hsic_self" in metrics:
+            hsic_self = metrics["train_hsic_self"].item()
+
         recon = None
         for key in ["train_loss_x", "train_recon", "train_loss"]:
             if key in metrics:
@@ -86,6 +91,8 @@ class CausalInitProgressLogger(Callback):
 
         if hsic is not None:
             self.hsic_values.append(hsic)
+        if hsic_self is not None:
+            self.hsic_self_values.append(hsic_self)
         if recon is not None:
             self.recon_values.append(recon)
 
@@ -568,14 +575,17 @@ def _run_single_seed_init(
 
     # Get final HSIC values
     final_hsic_cross = progress_logger.hsic_values[-1] if progress_logger.hsic_values else None
+    final_hsic_self = progress_logger.hsic_self_values[-1] if progress_logger.hsic_self_values else None
     final_recon = progress_logger.recon_values[-1] if progress_logger.recon_values else None
 
     result = {
         "seed": seed,
         "checkpoint_path": checkpoint_path,
         "final_hsic_cross": final_hsic_cross,
+        "final_hsic_self": final_hsic_self,
         "final_recon": final_recon,
         "hsic_history": progress_logger.hsic_values,
+        "hsic_self_history": progress_logger.hsic_self_values,
         "recon_history": progress_logger.recon_values,
         "pre_init_metrics": _metrics_to_serializable(pre_metrics),
         "post_init_metrics": _metrics_to_serializable(post_metrics),
@@ -745,8 +755,37 @@ def run_causal_initialization(
     # SEED SELECTION
     # =========================================================================
 
-    # Select the seed with the lowest final HSIC cross value
-    valid_results = [r for r in all_seed_results if r["final_hsic_cross"] is not None]
+    # =========================================================================
+    # SEED SELECTION: weighted total HSIC = λ_cross · final_hsic_cross
+    #                                       + λ_self  · final_hsic_self
+    # Falls back to cross-only when λ_self == 0 or self-HSIC is unavailable.
+    # Iter-5 fix: previously the criterion was `final_hsic_cross` alone, which
+    # ignored self-attention quality and biased selection toward seeds that had
+    # already started collapsing self-attention. See iter_5/README.md.
+    # =========================================================================
+    use_self_in_selection = (
+        lambda_hsic_self_init > 0.0
+        and any(r.get("final_hsic_self") is not None for r in all_seed_results)
+    )
+
+    def _selection_score(r: Dict[str, Any]) -> Optional[float]:
+        cross = r.get("final_hsic_cross")
+        if cross is None:
+            return None
+        score = float(lambda_hsic_cross_init) * float(cross)
+        if use_self_in_selection:
+            self_h = r.get("final_hsic_self")
+            if self_h is None:
+                # Skip seeds with missing self HSIC when self is part of the criterion
+                return None
+            score += float(lambda_hsic_self_init) * float(self_h)
+        return score
+
+    # Cache the score on every seed result for downstream JSON / diagnostics
+    for r in all_seed_results:
+        r["selection_score"] = _selection_score(r)
+
+    valid_results = [r for r in all_seed_results if r.get("selection_score") is not None]
 
     if not valid_results:
         logger.warning("No valid HSIC values found across seeds. Using first seed.")
@@ -754,10 +793,13 @@ def run_causal_initialization(
     elif len(valid_results) == 1:
         best_result = valid_results[0]
     else:
-        best_result = min(valid_results, key=lambda r: r["final_hsic_cross"])
+        best_result = min(valid_results, key=lambda r: r["selection_score"])
 
     best_seed = best_result["seed"]
     checkpoint_path = best_result["checkpoint_path"]
+    selection_criterion = (
+        "weighted_total_hsic" if use_self_in_selection else "weighted_cross_hsic"
+    )
 
     # =========================================================================
     # HSIC VARIANCE ANALYSIS
@@ -816,9 +858,11 @@ def run_causal_initialization(
         seed_results_serializable.append({
             "seed": r["seed"],
             "final_hsic_cross": r["final_hsic_cross"],
+            "final_hsic_self": r.get("final_hsic_self"),
             "final_recon": r["final_recon"],
             "checkpoint_path": r["checkpoint_path"],
             "hsic_history": r["hsic_history"],
+            "hsic_self_history": r.get("hsic_self_history", []),
             "recon_history": r["recon_history"],
             "pre_init_metrics": r["pre_init_metrics"],
             "post_init_metrics": r["post_init_metrics"],
@@ -840,9 +884,11 @@ def run_causal_initialization(
         "starting_checkpoint": starting_checkpoint,
         # Best seed info
         "best_seed": best_seed,
-        "selection_criterion": "final_hsic_cross",
+        "selection_criterion": selection_criterion,
+        "selection_score": best_result.get("selection_score"),
         "final_checkpoint": checkpoint_path,
         "final_hsic": best_result["final_hsic_cross"],
+        "final_hsic_self_best": best_result.get("final_hsic_self"),
         "final_recon": best_result["final_recon"],
         # Pre/post DAG comparison (best seed)
         "pre_init_metrics": pre_init_metrics,
@@ -869,7 +915,19 @@ def run_causal_initialization(
         if n_seeds > 1:
             print(f"\n  Multi-seed selection ({n_seeds} seeds):")
             print(f"    Best seed: {best_seed}")
-            print(f"    Selection criterion: lowest final HSIC cross")
+            if use_self_in_selection:
+                print(
+                    "    Selection criterion: lowest weighted total HSIC "
+                    "(λ_cross·HSIC_cross + λ_self·HSIC_self)"
+                )
+            else:
+                print(
+                    "    Selection criterion: lowest weighted cross HSIC "
+                    "(λ_cross·HSIC_cross)"
+                )
+            best_score = best_result.get("selection_score")
+            if best_score is not None:
+                print(f"    Best selection score: {best_score:.6f}")
             if hsic_variance:
                 print(f"\n  HSIC variance across seeds:")
                 print(f"    Mean:  {hsic_variance['mean']:.6f}")

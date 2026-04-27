@@ -34,6 +34,46 @@ from causaliT.training.dataloader import ProcessDataModule
 from .eval_lib import predict_from_experiment, find_config_file, find_best_or_last_checkpoint
 
 
+def infer_checkpoint_type(config) -> str:
+    """
+    Auto-detect which checkpoint type to use for ATE evaluation.
+
+    Causal models (HSIC > 0 or causal model object) → ``"best_causal"``
+    Baseline / vanilla models                       → ``"best_reconstruction"``
+
+    An explicit ``evaluation.checkpoint_type`` in the config always wins.
+
+    Args:
+        config: OmegaConf or dict configuration.
+
+    Returns:
+        One of ``"best_causal"``, ``"best_reconstruction"``, ``"best"``, ``"last"``.
+    """
+    # Explicit override from config
+    explicit = (
+        config.get("evaluation", {}).get("checkpoint_type", None)
+        if hasattr(config, "get") else None
+    )
+    if explicit is not None:
+        return str(explicit)
+
+    # Heuristic: any nonzero HSIC lambda → causal model
+    training = config.get("training", {}) if hasattr(config, "get") else {}
+    lambda_hsic_cross = float(training.get("lambda_hsic_cross", 0) or 0)
+    lambda_hsic_self = float(training.get("lambda_hsic_self", 0) or 0)
+
+    if lambda_hsic_cross > 0 or lambda_hsic_self > 0:
+        return "best_causal"
+
+    # Also check model_object for known causal types
+    model_obj = config.get("model", {}).get("model_object", "") if hasattr(config, "get") else ""
+    causal_models = {"StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer"}
+    if model_obj in causal_models:
+        return "best_causal"
+
+    return "best_reconstruction"
+
+
 # =============================================================================
 # SCM Registry - maps dataset names to SCM objects for MC sampling
 # =============================================================================
@@ -163,7 +203,7 @@ def run_mc_predictions(
     input_labels: List[str],
     n_samples: int = 50000,
     seed: int = 42,
-    checkpoint_type: str = "best",
+    checkpoint_type: str = "best_causal",
     batch_size: int = 64,
 ) -> pd.DataFrame:
     """
@@ -182,7 +222,7 @@ def run_mc_predictions(
         input_labels: List of input variable names (model outputs)
         n_samples: Number of MC samples (should match ground truth)
         seed: Random seed
-        checkpoint_type: "best" or "last" checkpoint
+        checkpoint_type: "best_causal" (default, lowest HSIC), "best", or "last" checkpoint
         batch_size: Batch size for model inference (default 64, same as training)
         
     Returns:
@@ -343,13 +383,13 @@ def get_interventions_from_ground_truth(ate_ground_truth: dict) -> Dict[str, Lis
     The ate_ground_truth.json contains an 'interventions' key with structure:
     {
         "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
-        "S2": {"values": [-1.7], "type": "in_distribution", "role": "positive_control"},
+        "S2": {"values": [0.5, 1.5], "type": "mixed", "role": "positive_control", "ood_values": [1.5]},
         ...
     }
     
     Returns:
         Dict mapping source variable names to lists of intervention values.
-        E.g., {"S1": [0.5], "S2": [-1.7], "S3": [-0.5, 1.0], "S5": [-0.8, 2.5]}
+        E.g., {"S1": [0.5], "S2": [0.5, 1.5], "S3": [-0.5, 1.5], "S5": [-0.5, 1.5]}
     """
     interventions_meta = ate_ground_truth.get("interventions", {})
     
@@ -394,7 +434,7 @@ def normalize_intervention_value(raw_value: float, norm_stats: dict) -> float:
     """
     Normalize an intervention value using source normalization statistics.
     
-    Intervention values from ate_ground_truth.json are in RAW scale (e.g., S2=-1.7).
+    Intervention values from ate_ground_truth.json are in RAW scale (e.g., S2=0.5).
     The model expects NORMALIZED inputs (e.g., minmax [0,1]).
     This function converts raw intervention values to normalized scale.
     
@@ -675,6 +715,9 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
             print(f"  Error loading cache: {e}, regenerating...")
     
     if not cache_valid:
+        # Auto-detect checkpoint type: causal models → best_causal, baselines → best_reconstruction
+        ckpt_type = infer_checkpoint_type(config)
+        print(f"  Checkpoint type: {ckpt_type}")
         print("  Running MC predictions...")
         df = run_mc_predictions(
             experiment_path=experiment,
@@ -687,6 +730,7 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
             input_labels=input_labels,
             n_samples=n_samples,
             seed=seed,
+            checkpoint_type=ckpt_type,
         )
         df.to_csv(predictions_file, index=False)
         print(f"  Saved MC predictions to {predictions_file}")

@@ -21,9 +21,9 @@ from sklearn.model_selection import KFold
 
 # Local imports
 from causaliT.training.callbacks import (
-    early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback, 
-    GradientLogger, MetricsAggregator, PerRunManifest, 
-    BestCheckpointCallback, DataIndexTracker, 
+    get_checkpoint_callback, get_early_stopping_callback, MemoryLoggerCallback,
+    GradientLogger, MetricsAggregator, PerRunManifest,
+    BestReconstructionCheckpoint, BestCausalCheckpoint, DataIndexTracker,
     KFoldResultsTracker, GradientJacobianLogger
 )
 from causaliT.training.forecasters import TransformerForecaster, StageCausalForecaster, SingleCausalForecaster, NoiseAwareCausalForecaster
@@ -52,6 +52,7 @@ def train_single_fold(
     trainable_params: int = 0,
     cluster: bool = False,
     resume_ckpt: str = None,
+    warm_start_ckpt: str = None,
     experiment_tag: str = "NA",
     debug: bool = False,
     best: bool = False,
@@ -82,7 +83,15 @@ def train_single_fold(
         save_dir:          Parent directory; a ``k_{fold}`` subfolder is created here.
         trainable_params:  Pre-computed parameter count (pass 0 if not needed).
         cluster:           If True, disables progress bar and uses 1 GPU device.
-        resume_ckpt:       Optional checkpoint path to resume from.
+        resume_ckpt:       Optional checkpoint path to **fully resume** training
+                           (model weights + optimizer state + epoch counter).
+                           Use for crash recovery or continuation of the same run.
+        warm_start_ckpt:   Optional checkpoint path to load **model weights only**.
+                           Optimizer state is reset, training starts at epoch 0.
+                           Use when transitioning between pipeline stages (e.g.
+                           causal init → main training) where the training config
+                           has changed and stale optimizer state would be harmful.
+                           Mutually exclusive with ``resume_ckpt``.
         experiment_tag:    Tag stored in the per-run manifest.
         debug:             Enables anomaly detection, memory logger, etc.
         best:              If True, return metrics from the best checkpoint rather
@@ -112,18 +121,21 @@ def train_single_fold(
         save_dir_k, config["training"]["save_ckpt_every_n_epochs"]
     )
     manifest_callback = PerRunManifest(config, path=save_dir_k, tag=experiment_tag)
-    best_checkpoint_callback = BestCheckpointCallback(
-        save_dir_k, monitor="val_mae", mode="min"
+    best_reconstruction_callback = BestReconstructionCheckpoint(
+        save_dir_k, monitor="val_x_mae", mode="min"
     )
+    best_causal_checkpoint = BestCausalCheckpoint(save_dir_k)
     data_index_tracker = DataIndexTracker(
         save_dir_k, fold, train_global_idx, val_global_idx, test_idx
     )
 
     callbacks_list = list(checkpoint_callback)
-    callbacks_list += [manifest_callback, best_checkpoint_callback, data_index_tracker]
+    callbacks_list += [manifest_callback, best_reconstruction_callback, best_causal_checkpoint, data_index_tracker]
 
-    if "early_stopping" in config["special"]["mode"]:
-        callbacks_list.append(early_stopping_callbacks)
+    # Early stopping: config-driven (new) with legacy fallback
+    es_callback = get_early_stopping_callback(config)
+    if es_callback is not None:
+        callbacks_list.append(es_callback)
 
     if debug:
         callbacks_list.append(MemoryLoggerCallback())
@@ -166,6 +178,25 @@ def train_single_fold(
         enable_model_summary=not cluster,
         detect_anomaly=debug,
     )
+
+    # ---- Warm-start: load model weights only (no optimizer / epoch restore) -----
+    if warm_start_ckpt is not None:
+        if resume_ckpt is not None:
+            raise ValueError(
+                "warm_start_ckpt and resume_ckpt are mutually exclusive. "
+                "Use warm_start_ckpt for stage transitions (weights only), "
+                "resume_ckpt for crash recovery (full state)."
+            )
+        logger_info.info(f"Warm-starting from: {warm_start_ckpt}")
+        checkpoint = torch.load(warm_start_ckpt, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger_info.warning(f"Warm-start missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if unexpected:
+            logger_info.warning(f"Warm-start unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        if not cluster:
+            print(f"  ✓ Warm-started model weights from: {warm_start_ckpt}")
 
     # ---- Training ---------------------------------------------------------------
     start_time = time.time()
@@ -366,6 +397,7 @@ def trainer(
     cluster: bool,
     experiment_tag: str = "NA",
     resume_ckpt: str = None,
+    warm_start_ckpt: str = None,
     plot_pred_check: bool = False,
     debug: bool = False,
     best: bool = False,
@@ -388,7 +420,13 @@ def trainer(
         save_dir:        Path to save outputs (checkpoints, logs, results).
         cluster:         Whether running on a compute cluster.
         experiment_tag:  Tag for experiment tracking.
-        resume_ckpt:     Optional checkpoint path to resume training from.
+        resume_ckpt:     Optional checkpoint path to **fully resume** training
+                         (model weights + optimizer state + epoch counter).
+                         Use for crash recovery.
+        warm_start_ckpt: Optional checkpoint path to load **model weights only**
+                         (fresh optimizer, epoch 0). Use for stage transitions
+                         (e.g. causal init → main training).
+                         Mutually exclusive with ``resume_ckpt``.
         plot_pred_check: Whether to plot prediction checks (currently unused).
         debug:           Enable debug mode (anomaly detection, memory logging).
         best:            If True, use metrics from best checkpoint; otherwise
@@ -445,6 +483,7 @@ def trainer(
             trainable_params=trainable_params,
             cluster=cluster,
             resume_ckpt=resume_ckpt,
+            warm_start_ckpt=warm_start_ckpt,
             experiment_tag=experiment_tag,
             debug=debug,
             best=best,
