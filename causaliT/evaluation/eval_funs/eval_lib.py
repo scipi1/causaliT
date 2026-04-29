@@ -29,6 +29,7 @@ from causaliT.evaluation.predict import predict_test_from_ckpt
 from causaliT.training.forecasters.transformer_forecaster import TransformerForecaster
 from causaliT.training.forecasters.stage_causal_forecaster import StageCausalForecaster
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
+from causaliT.training.forecasters.single_causal_res_forecaster import SingleCausalResForecaster
 from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
 
 # Import root_path from eval_utils (relative import)
@@ -258,6 +259,12 @@ def get_architecture_type(config: dict) -> str:
         return "StageCausalForecaster"
     elif model_obj == "SingleCausalLayer":
         return "SingleCausalForecaster"
+    elif model_obj == "SingleCausalLayerRes":
+        # Treated identically to SingleCausalForecaster except for the
+        # checkpoint loader (different forecaster class wraps the dual-
+        # residual model). Returning a distinct tag keeps the loader
+        # branches readable.
+        return "SingleCausalResForecaster"
     elif model_obj == "NoiseAwareSingleCausalLayer":
         return "NoiseAwareCausalForecaster"
     else:
@@ -331,7 +338,11 @@ def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[
         phi_dict["encoder"] = None  # No encoder in StageCausal
         phi_dict["decoder"] = None  # For compatibility
         
-    elif architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+    elif architecture_type in (
+        "SingleCausalForecaster",
+        "SingleCausalResForecaster",
+        "NoiseAwareCausalForecaster",
+    ):
         # Iterate all decoder layers for multi-layer support
         n_layers = len(model.model.decoder.layers)
         
@@ -515,7 +526,7 @@ def extract_embeddings_from_model(model, architecture_type: str) -> Dict[str, Di
         if hasattr(model.model, 'forecaster'):
             _extract_forecaster(model.model.forecaster, "forecaster")
             
-    elif architecture_type == "SingleCausalForecaster":
+    elif architecture_type in ("SingleCausalForecaster", "SingleCausalResForecaster"):
         # S embedding (orthogonal)
         if hasattr(model.model, 'embedding_S'):
             _extract_orthogonal_embedding(model.model.embedding_S, "embedding_S")
@@ -684,7 +695,7 @@ def load_attention_data(
             "decoder2": [],
             "decoder2_cross": [],  # Cross-attention DAG (X -> Y)
         }
-    elif architecture_type == "SingleCausalForecaster":
+    elif architecture_type in ("SingleCausalForecaster", "SingleCausalResForecaster"):
         result.attention_weights = {
             "encoder": [],  # Empty for compatibility
             "decoder": [],  # Mapped to dec_self for compatibility
@@ -764,7 +775,11 @@ def load_attention_data(
                 result.attention_weights["encoder"].append(None)
                 result.attention_weights["decoder"].append(att_weights.get("dec2_self"))
                 result.attention_weights["cross"].append(att_weights.get("dec2_cross"))
-            elif architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+            elif architecture_type in (
+                "SingleCausalForecaster",
+                "SingleCausalResForecaster",
+                "NoiseAwareCausalForecaster",
+            ):
                 # Predictors return backward-compat keys + per-layer keys (dec_cross_L0, etc.)
                 result.attention_weights["dec_self"].append(att_weights.get("dec_self"))
                 result.attention_weights["dec_cross"].append(att_weights.get("dec_cross"))
@@ -787,6 +802,8 @@ def load_attention_data(
                 model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
             elif architecture_type == "SingleCausalForecaster":
                 model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+            elif architecture_type == "SingleCausalResForecaster":
+                model = SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
             elif architecture_type == "NoiseAwareCausalForecaster":
                 model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
             
@@ -1223,6 +1240,8 @@ def load_embeddings_evolution(
                         model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
                     elif architecture_type == "SingleCausalForecaster":
                         model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+                    elif architecture_type == "SingleCausalResForecaster":
+                        model = SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
                     elif architecture_type == "NoiseAwareCausalForecaster":
                         model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
                     

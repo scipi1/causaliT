@@ -78,6 +78,23 @@ ARCHITECTURE_REGISTRY = {
             "self": ("dec_self", "decoder"),
         },
     },
+    "SingleCausalResForecaster": {
+        # SVFA dual-residual variant of SingleCausalForecaster.
+        # Attention/phi shape is identical: the dual-residual decoder only
+        # adds extra value/output projections (`value_projection_struct`,
+        # `out_projection_struct`) that affect the X_struct update path —
+        # the (Q, K)-derived attention pattern keys are unchanged.
+        "attention_keys": ["dec_self", "dec_cross"],
+        "phi_keys": ["decoder", "decoder_cross"],
+        "blocks_to_eval": [
+            ("dec_cross", "decoder_cross", "dec_cross"),
+            ("dec_self", "decoder", "dec_self"),
+        ],
+        "mec_keys": {
+            "cross": ("dec_cross", "decoder_cross"),
+            "self": ("dec_self", "decoder"),
+        },
+    },
     "StageCausalForecaster": {
         "attention_keys": ["dec1_self", "dec1_cross", "dec2_self", "dec2_cross"],
         "phi_keys": ["decoder1", "decoder1_cross", "decoder2", "decoder2_cross"],

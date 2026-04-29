@@ -26,7 +26,13 @@ from causaliT.training.callbacks import (
     BestReconstructionCheckpoint, BestCausalCheckpoint, DataIndexTracker,
     KFoldResultsTracker, GradientJacobianLogger
 )
-from causaliT.training.forecasters import TransformerForecaster, StageCausalForecaster, SingleCausalForecaster, NoiseAwareCausalForecaster
+from causaliT.training.forecasters import (
+    TransformerForecaster,
+    StageCausalForecaster,
+    SingleCausalForecaster,
+    SingleCausalResForecaster,
+    NoiseAwareCausalForecaster,
+)
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
 from causaliT.training.experiment_control import update_config
@@ -522,6 +528,7 @@ def get_model_class(config: dict):
     model_obj = config["model"]["model_object"]
     available_models = [
         "proT", "StageCausaliT", "SingleCausalLayer",
+        "SingleCausalLayerRes",
         "NoiseAwareSingleCausalLayer", "LSTM", "GRU", "TCN", "MLP",
     ]
     assert model_obj in available_models, (
@@ -531,6 +538,7 @@ def get_model_class(config: dict):
         "proT": TransformerForecaster,
         "StageCausaliT": StageCausalForecaster,
         "SingleCausalLayer": SingleCausalForecaster,
+        "SingleCausalLayerRes": SingleCausalResForecaster,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
     }
     return MODEL_REGISTRY[model_obj]
@@ -553,6 +561,8 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return StageCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "SingleCausalLayer":
         return SingleCausalForecaster(config, data_dir=data_dir)
+    elif model_obj == "SingleCausalLayerRes":
+        return SingleCausalResForecaster(config, data_dir=data_dir)
     elif model_obj == "NoiseAwareSingleCausalLayer":
         return NoiseAwareCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
@@ -580,6 +590,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "proT": ProcessDataModule,
         "StageCausaliT": StageCausalDataModule,
         "SingleCausalLayer": StageCausalDataModule,
+        "SingleCausalLayerRes": StageCausalDataModule,
         "NoiseAwareSingleCausalLayer": StageCausalDataModule,
         "LSTM": ProcessDataModule,
         "GRU": ProcessDataModule,
@@ -588,7 +599,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     }
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
 
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer"]:
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer"]:
         return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],

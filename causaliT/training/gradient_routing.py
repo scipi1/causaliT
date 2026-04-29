@@ -60,6 +60,14 @@ STRUCTURAL_PATTERNS = [
     # Q, K projections (structure determines attention pattern)
     "query_projection",
     "key_projection",
+    # Structural value & output projections (SVFA dual-residual /
+    # ``AttentionLayer(dual_value=True)``).  These produce the structural
+    # residual added to X_struct, so they belong to the structural group
+    # and are driven by HSIC / score-sparsity, not the reconstruction loss.
+    # The patterns must keep the trailing "_struct" so they are NOT
+    # confused with the reconstruction "value_projection" / "out_projection".
+    "value_projection_struct",
+    "out_projection_struct",
     # Structure embeddings in SVFA (nn_embedding for variable IDs)
     # In SVFAEmbedding, structure modules have "structure" in the path.
     # In the standard DataSetEmbedding with role="structure", the module

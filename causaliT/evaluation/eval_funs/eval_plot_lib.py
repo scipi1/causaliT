@@ -88,7 +88,11 @@ def plot_attention_scores(
         if any(x is not None for x in data.attention_weights.get("dec2_cross", [])):
             attention_blocks.append("dec2_cross")
             phi_mapping["dec2_cross"] = "decoder2_cross"  # Cross-attention DAG (X -> Y)
-    elif data.architecture_type in ["SingleCausalForecaster", "NoiseAwareCausalForecaster"]:
+    elif data.architecture_type in [
+        "SingleCausalForecaster",
+        "SingleCausalResForecaster",
+        "NoiseAwareCausalForecaster",
+    ]:
         # Detect per-layer keys (dec_self_L0, dec_cross_L0, etc.)
         import re
         layer_keys_self = sorted(

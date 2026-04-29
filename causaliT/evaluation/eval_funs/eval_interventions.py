@@ -67,7 +67,12 @@ def infer_checkpoint_type(config) -> str:
 
     # Also check model_object for known causal types
     model_obj = config.get("model", {}).get("model_object", "") if hasattr(config, "get") else ""
-    causal_models = {"StageCausaliT", "SingleCausalLayer", "NoiseAwareSingleCausalLayer"}
+    causal_models = {
+        "StageCausaliT",
+        "SingleCausalLayer",
+        "SingleCausalLayerRes",
+        "NoiseAwareSingleCausalLayer",
+    }
     if model_obj in causal_models:
         return "best_causal"
 

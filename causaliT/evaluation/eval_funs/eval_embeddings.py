@@ -594,6 +594,12 @@ def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> 
     if architecture == "SingleCausalForecaster":
         phi_key = "decoder_cross"
         att_key = "dec_cross"
+    elif architecture == "SingleCausalResForecaster":
+        # Same attention/phi key shape as SingleCausalForecaster — the dual-
+        # residual variant only adds extra V/out projections; the (Q,K)-derived
+        # cross-attention pattern keys are unchanged.
+        phi_key = "decoder_cross"
+        att_key = "dec_cross"
     elif architecture == "NoiseAwareCausalForecaster":
         phi_key = "decoder_cross"
         att_key = "dec_cross"

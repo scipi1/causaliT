@@ -57,6 +57,7 @@ from causaliT.evaluation.predict import predict_test_from_ckpt
 from causaliT.training.forecasters.transformer_forecaster import TransformerForecaster
 from causaliT.training.forecasters.stage_causal_forecaster import StageCausalForecaster
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
+from causaliT.training.forecasters.single_causal_res_forecaster import SingleCausalResForecaster
 from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
 
 # Import from local eval_funs modules (self-contained)
@@ -199,6 +200,8 @@ def _load_model_from_checkpoint(checkpoint_path: str, architecture_type: str):
         return StageCausalForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "SingleCausalForecaster":
         return SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
+    elif architecture_type == "SingleCausalResForecaster":
+        return SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "NoiseAwareCausalForecaster":
         return NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
     else:
@@ -383,7 +386,11 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         return {}
     
     # Extend blocks_to_eval with per-layer entries when multi-layer data is available
-    if architecture in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+    if architecture in (
+        "SingleCausalForecaster",
+        "SingleCausalResForecaster",
+        "NoiseAwareCausalForecaster",
+    ):
         import re as _re
         layer_phi_self = sorted(
             [k for k in final_scores_dict.phi_tensors.keys() if _re.match(r'^decoder_L\d+$', k)],
@@ -990,7 +997,11 @@ def _load_attention_evolution_data(
                     if true_dag_masks:
                         # Build extended blocks list including per-layer if multi-layer
                         shd_blocks = list(blocks_to_eval)
-                        if architecture_type in ("SingleCausalForecaster", "NoiseAwareCausalForecaster"):
+                        if architecture_type in (
+                            "SingleCausalForecaster",
+                            "SingleCausalResForecaster",
+                            "NoiseAwareCausalForecaster",
+                        ):
                             _pl_phi_self = sorted(
                                 [k for k in phi_dict.keys() if _re.match(r'^decoder_L\d+$', k)],
                                 key=lambda k: int(_re.search(r'L(\d+)', k).group(1))

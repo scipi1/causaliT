@@ -567,6 +567,7 @@ class SingleCausalLayer(nn.Module):
         shared_qk_inner: dict = None,
         init_tau: float = 3.0,
         shared_dag_across_heads: bool = True,
+        dual_value: bool = False,
     ):
         """Create an attention layer with specified configuration.
 
@@ -577,7 +578,12 @@ class SingleCausalLayer(nn.Module):
             shared_dag_across_heads: When True (default) the DAG / score is
                 shared across the n_heads value channels (SVFA semantics).
                 When False each head has its own DAG / score (legacy).
+            dual_value: When True, instantiate the AttentionLayer with a
+                second value/out projection on the structural pathway
+                (used by SingleCausalLayerRes / SVFA dual-residual).
+                Default ``False`` preserves legacy behavior.
         """
+
         
         assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
         
@@ -622,6 +628,7 @@ class SingleCausalLayer(nn.Module):
             shared_qk_inner=shared_qk_inner,
             init_tau=init_tau,
             shared_dag_across_heads=shared_dag_across_heads,
+            dual_value=dual_value,
         )
         
         return att

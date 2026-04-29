@@ -22,6 +22,7 @@ from causaliT.evaluation.predictors import (
     TransformerPredictor,
     StageCausalPredictor,
     SingleCausalPredictor,
+    SingleCausalResPredictor,
     NoiseAwareCausalPredictor,
 )
 
@@ -52,6 +53,7 @@ def create_predictor(
         "proT": TransformerPredictor,
         "StageCausaliT": StageCausalPredictor,
         "SingleCausalLayer": SingleCausalPredictor,
+        "SingleCausalLayerRes": SingleCausalResPredictor,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalPredictor,
     }
     

@@ -2241,6 +2241,15 @@ class AttentionLayer(nn.Module):
         #         flag was introduced.
         # At n_heads = 1 both modes are byte-identical.
         shared_dag_across_heads: bool = True,
+        # Dual-value mode (SVFA dual-residual). When True, the layer creates
+        # a SECOND value projection (`value_projection_struct`) — and, when
+        # n_heads > 1, a second output projection (`out_projection_struct`) —
+        # operating on the key-side input. Forward then runs the SAME
+        # Q,K-derived attention on a structural value path and returns a
+        # 4-tuple `(out_val, out_struct, attn, ent)`.
+        # Default `False` keeps the layer byte-identical to legacy behaviour
+        # and preserves the 3-tuple return signature.
+        dual_value: bool = False,
         ):
 
         
@@ -2375,6 +2384,27 @@ class AttentionLayer(nn.Module):
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
+
+        # ----- Dual-value (SVFA dual-residual) -----
+        # When enabled, a SECOND value path is created so that the SAME
+        # Q,K-derived attention score also produces a structural output
+        # that can be added as a residual to the structure stream.
+        # `value_projection_struct` operates on the key-side input
+        # (d_model_keys -> d_model_keys * n_heads) and `out_projection_struct`
+        # mixes its multi-head output back to d_model_keys (only needed
+        # when n_heads > 1, mirroring the value/out_projection logic).
+        self.dual_value = bool(dual_value)
+        if self.dual_value:
+            self.value_projection_struct = nn.Linear(d_model_keys, d_model_keys * n_heads)
+            if n_heads > 1:
+                self.out_projection_struct = nn.Linear(d_model_keys * n_heads, d_model_keys)
+            else:
+                self.out_projection_struct = None
+            # Cache the structural-side d_model so we can reshape correctly.
+            self._d_model_keys = d_model_keys
+        else:
+            self.value_projection_struct = None
+            self.out_projection_struct = None
     
     def get_shared_qk_inner(self) -> dict:
         """
@@ -2476,6 +2506,7 @@ class AttentionLayer(nn.Module):
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
         oracle: bool = False,
+        key_value: torch.Tensor = None,
         ):
         """
         Forward pass through attention layer.
@@ -2490,10 +2521,20 @@ class AttentionLayer(nn.Module):
             causal_mask: Whether to apply causal masking
             hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
                        Values in [0, 1], where 1 = attention allowed.
-                       
+            key_value: Optional source for the structural value path when
+                       ``dual_value=True``. Defaults to ``key`` (i.e. the same
+                       input used to build K). Ignored when ``dual_value=False``.
+
         Note for SVFA:
             The caller should pass structure embeddings for query/key and
             value embeddings for value. This layer is agnostic to factorization.
+
+        Returns:
+            By default: ``(out, attn, ent)`` (3-tuple).
+            When ``dual_value=True``: ``(out_val, out_struct, attn, ent)``
+            (4-tuple). The structural output is produced by running the SAME
+            Q,K-derived attention on a second value path
+            (``value_projection_struct`` applied to ``key_value``).
         """
         B, L, _ = query.shape
         _, S, _ = key.shape
@@ -2546,6 +2587,56 @@ class AttentionLayer(nn.Module):
         else:
             # out shape is already (B, L, d_v)
             out = out.view(B, L, -1)
+
+        # ---- Structural value path (dual-value / SVFA dual-residual) ----
+        # When enabled, project a SECOND value tensor from the key-side input
+        # and run the SAME inner attention to obtain a structural output that
+        # the caller can add as a residual to the structure stream X_struct.
+        # The Q, K (and hence the softmax pattern α) are exactly the ones
+        # used above; only the V tensor differs. We temporarily disable the
+        # inner attention's entropy registration so we don't double-log, and
+        # we DO accept that attention dropout is sampled twice (independent
+        # samples) — both samples have identical expectation and identical
+        # support over the score, so the structural pathway sees the same
+        # average attention pattern as the value pathway.
+        if self.dual_value:
+            kv_source = key_value if key_value is not None else key
+
+            if H > 1:
+                v_struct = self.dropout_qkv(
+                    self.value_projection_struct(kv_source)
+                ).view(B, S, H, -1)
+            else:
+                v_struct = self.dropout_qkv(
+                    self.value_projection_struct(kv_source)
+                ).view(B, S, -1)
+
+            prev_register = getattr(self.inner_attention, "register_entropy", None)
+            if prev_register is not None:
+                self.inner_attention.register_entropy = False
+            try:
+                out_struct, _, _ = self.inner_attention(
+                    query=q,
+                    key=k,
+                    value=v_struct,
+                    mask_miss_k=mask_miss_k,
+                    mask_miss_q=mask_miss_q,
+                    pos=pos,
+                    causal_mask=causal_mask,
+                    hard_mask=hard_mask,
+                    oracle=oracle,
+                )
+            finally:
+                if prev_register is not None:
+                    self.inner_attention.register_entropy = prev_register
+
+            if H > 1:
+                out_struct = out_struct.contiguous().view(B, L, -1)
+                out_struct = self.out_projection_struct(out_struct)
+            else:
+                out_struct = out_struct.view(B, L, -1)
+
+            return out, out_struct, attn, ent
 
         return out, attn, ent
     
