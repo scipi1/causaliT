@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer,
     ModularEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -466,7 +466,7 @@ class StageCausaliT(nn.Module):
         """
         
         # Choose attention type
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
@@ -474,6 +474,8 @@ class StageCausaliT(nn.Module):
             attention_module = LieAttention
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
+        elif attention_type == "SigmoidCrossAttention":
+            attention_module = SigmoidCrossAttention
         elif attention_type == "PhiSoftMax":
             attention_module = PhiSoftMax
         

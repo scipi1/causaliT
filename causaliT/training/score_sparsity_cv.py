@@ -481,7 +481,13 @@ def _build_cv_config(
 
     Changes applied:
     - ``training.lambda_cross_score_sparse`` = lambda_score
-    - ``training.lambda_self_score_sparse``  = lambda_score  (same for both)
+    - ``training.lambda_self_score_sparse``  = ratio · lambda_score
+      where ``ratio = staged_training.lambda_self_to_cross_score_ratio``
+      (default ``1.0`` for full backward compatibility). For attention
+      stacks where the self branch carries a structural double-sigmoid
+      handicap (Toeplitz; see ``docs/ATTENTION_MAGNITUDE_BALANCE.md``),
+      a value of ``0.5`` calibrates the L1 weight to the per-branch
+      magnitude.
     - ``training.max_epochs``                = epochs
     - ``training.k_fold``                    = k_fold
     - ``training.use_hsic_annealing``        = False  (constant HSIC during CV)
@@ -489,7 +495,8 @@ def _build_cv_config(
 
     Args:
         config:       Base configuration dict.
-        lambda_score: Score sparsity lambda to test.
+        lambda_score: Score sparsity lambda to test (interpreted as the
+                      cross-attention λ).
         epochs:       Number of CV training epochs.
         k_fold:       Number of cross-validation folds.
 
@@ -497,8 +504,12 @@ def _build_cv_config(
         A deep copy of ``config`` with the above overrides applied.
     """
     config_cv = copy.deepcopy(config)
+    ratio = float(
+        config_cv.get("staged_training", {})
+                 .get("lambda_self_to_cross_score_ratio", 1.0)
+    )
     config_cv["training"]["lambda_cross_score_sparse"] = float(lambda_score)
-    config_cv["training"]["lambda_self_score_sparse"] = float(lambda_score)
+    config_cv["training"]["lambda_self_score_sparse"] = float(ratio * lambda_score)
     config_cv["training"]["max_epochs"] = int(epochs)
     config_cv["training"]["k_fold"] = int(k_fold)
     config_cv["training"]["use_hsic_annealing"] = False
@@ -506,6 +517,7 @@ def _build_cv_config(
     # Override to avoid running post-training evaluations during CV
     config_cv.setdefault("evaluation", {})["functions"] = []
     return config_cv
+
 
 
 def _load_weights_from_checkpoint(

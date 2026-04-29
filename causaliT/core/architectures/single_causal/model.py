@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer,ToeplitzLieAttention, ToeplitzAttention,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer,ToeplitzLieAttention, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask,
     MLPHead
@@ -143,7 +143,21 @@ class SingleCausalLayer(nn.Module):
         # consistent causal structure across layers while allowing each layer
         # to learn different value transformations for improved reconstruction.
         share_structure_across_layers: bool = False,
+
+        # Constant attention temperature (iter_10+) for ToeplitzAttention,
+        # CausalCrossAttention and SigmoidCrossAttention. Default 3.0.
+        # Non-learnable, not annealed (same value used in self & cross).
+        init_tau: float = 3.0,
+
+        # Multi-head semantics (see `AttentionLayer` docstring):
+        #   True  (default) — single DAG / score (B, L, S) is shared across
+        #         the n_heads value channels (SVFA semantics).
+        #   False           — legacy per-head DAG / score (B, H, L, S),
+        #         used by vanilla-transformer baselines.
+        # At n_heads = 1 both modes are byte-identical to single-head code.
+        shared_dag_across_heads: bool = True,
     ):
+
         super().__init__()
         
         # Store configuration
@@ -207,7 +221,13 @@ class SingleCausalLayer(nn.Module):
         attn_shared_kwargs = {
             "n_heads": n_heads,
             "d_queries_keys": d_qk,
+            # iter_10+: constant non-learnable activation temperature, threaded
+            # to ToeplitzAttention / CausalCrossAttention / SigmoidCrossAttention.
+            "init_tau": init_tau,
+            # SVFA shared-DAG / multi-head-V semantics.
+            "shared_dag_across_heads": shared_dag_across_heads,
         }
+
         
         # Decoder cross-attention configuration (S → X)
         # S keys are orthogonal, so use key_projection_type_cross (can be "orthogonal")
@@ -545,15 +565,21 @@ class SingleCausalLayer(nn.Module):
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
         shared_qk_inner: dict = None,
+        init_tau: float = 3.0,
+        shared_dag_across_heads: bool = True,
     ):
         """Create an attention layer with specified configuration.
+
         
         Args:
             shared_qk_inner: Optional dict of shared Q/K/inner_attention components.
                 When provided, the layer reuses these instead of creating its own.
+            shared_dag_across_heads: When True (default) the DAG / score is
+                shared across the n_heads value channels (SVFA semantics).
+                When False each head has its own DAG / score (legacy).
         """
         
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
@@ -561,6 +587,8 @@ class SingleCausalLayer(nn.Module):
             attention_module = LieAttention
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
+        elif attention_type == "SigmoidCrossAttention":
+            attention_module = SigmoidCrossAttention
         elif attention_type == "PhiSoftMax":
             attention_module = PhiSoftMax
         elif attention_type == "ToeplitzLieAttention":
@@ -592,9 +620,12 @@ class SingleCausalLayer(nn.Module):
             orthogonal_scale=orthogonal_scale,
             orthogonal_init_scale=orthogonal_init_scale,
             shared_qk_inner=shared_qk_inner,
+            init_tau=init_tau,
+            shared_dag_across_heads=shared_dag_across_heads,
         )
         
         return att
+
     
     # =========================================================================
     # FREEZING UTILITIES

@@ -155,7 +155,9 @@ def configure_main_training_from_staged(config: dict) -> dict:
     Also propagates unconditionally (when the staged value is not None):
     - ``staged_training.lambda_group_l1``      → ``training.lambda_group_l1``
     - ``staged_training.lambda_score_suggested``→ ``training.lambda_cross_score_sparse``
-      and ``training.lambda_self_score_sparse``
+      and ``training.lambda_self_score_sparse`` (the latter is multiplied by
+      ``staged_training.lambda_self_to_cross_score_ratio``, default 1.0)
+
 
     Args:
         config: Configuration dict (not modified in-place).
@@ -172,11 +174,16 @@ def configure_main_training_from_staged(config: dict) -> dict:
     if lambda_group is not None:
         training["lambda_group_l1"] = float(lambda_group)
 
-    # Propagate score sparsity lambda from CV (Stage 2) if present
+    # Propagate score sparsity lambda from CV (Stage 2) if present.
+    # The self-attention λ is scaled by ``lambda_self_to_cross_score_ratio``
+    # (default 1.0) to compensate for the structural Toeplitz double-sigmoid
+    # handicap; see ``docs/ATTENTION_MAGNITUDE_BALANCE.md``.
     lambda_score = staged.get("lambda_score_suggested", None)
     if lambda_score is not None:
+        ratio = float(staged.get("lambda_self_to_cross_score_ratio", 1.0))
         training["lambda_cross_score_sparse"] = float(lambda_score)
-        training["lambda_self_score_sparse"] = float(lambda_score)
+        training["lambda_self_score_sparse"] = float(ratio * lambda_score)
+
 
     use_causal_init = staged.get("use_causal_init", False)
     if use_causal_init:

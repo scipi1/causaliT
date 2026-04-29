@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention, ToeplitzAttention,
+    LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzLieAttention, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask,
     MLPHead
@@ -608,15 +608,19 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
         shared_qk_inner: dict = None,
+        shared_dag_across_heads: bool = True,
     ):
         """Create an attention layer with specified configuration.
         
         Args:
             shared_qk_inner: Optional dict of shared Q/K/inner_attention components.
                 When provided, the layer reuses these instead of creating its own.
+            shared_dag_across_heads: When True (default) the DAG / score is
+                shared across the n_heads value channels (SVFA semantics).
+                When False each head has its own DAG / score (legacy).
         """
         
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
+        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
@@ -624,6 +628,8 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             attention_module = LieAttention
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
+        elif attention_type == "SigmoidCrossAttention":
+            attention_module = SigmoidCrossAttention
         elif attention_type == "PhiSoftMax":
             attention_module = PhiSoftMax
         elif attention_type == "ToeplitzLieAttention":
@@ -655,6 +661,7 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             orthogonal_scale=orthogonal_scale,
             orthogonal_init_scale=orthogonal_init_scale,
             shared_qk_inner=shared_qk_inner,
+            shared_dag_across_heads=shared_dag_across_heads,
             # Pass Toeplitz-specific parameters (used only when attention_type is ToeplitzLieAttention)
             **self._toeplitz_params
         )

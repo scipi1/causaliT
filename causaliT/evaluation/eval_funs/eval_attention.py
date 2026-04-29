@@ -76,6 +76,121 @@ from .eval_plot_lib import plot_attention_scores, plot_attention_evolution, plot
 # Model Loading Helper
 # =============================================================================
 
+# =============================================================================
+# Helpers for portable per-edge DAG export
+# =============================================================================
+
+def _write_learned_dag_edges_json(
+    eval_path_files: str,
+    per_fold_comparison_data: list,
+    metadata: dict,
+    dataset_name: str,
+    architecture: str,
+    filename: str = "learned_dag_edges.json",
+) -> None:
+    """
+    Persist per-fold learned DAG matrices in a portable JSON format
+    suitable for cross-seed aggregation and aggregate-DAG plotting.
+
+    For each evaluated attention block, we record:
+        - the true DAG mask
+        - the per-fold learned probability matrix
+        - the fold-mean and fold-std matrices
+        - row/column variable labels (from dataset metadata)
+
+    No architecture-specific knowledge is required to consume this file —
+    it's just nested numeric arrays + labels.
+    """
+    if not per_fold_comparison_data:
+        return
+
+    # --- Variable labels from dataset metadata ---------------------------
+    var_info = (metadata or {}).get("variable_info", {}) or {}
+    src_labels = list(var_info.get("source_labels", []))
+    inp_labels = list(var_info.get("input_labels", []))
+
+    def _labels_for(mask_type: str, n_rows: int, n_cols: int):
+        """
+        Cross-attention: rows = targets (X), cols = sources (S).
+        Self-attention:  rows = cols    = targets (X).
+        Falls back to row{i}/col{j} when metadata is incomplete.
+        """
+        is_cross = "cross" in (mask_type or "")
+        rows = (
+            inp_labels[:n_rows] if len(inp_labels) >= n_rows
+            else [f"row{i}" for i in range(n_rows)]
+        )
+        if is_cross:
+            cols = (
+                src_labels[:n_cols] if len(src_labels) >= n_cols
+                else [f"col{j}" for j in range(n_cols)]
+            )
+        else:
+            cols = (
+                inp_labels[:n_cols] if len(inp_labels) >= n_cols
+                else [f"col{j}" for j in range(n_cols)]
+            )
+        return rows, cols
+
+    # --- Group per-fold entries by block (att_key) -----------------------
+    blocks_data = defaultdict(list)
+    for entry in per_fold_comparison_data:
+        blocks_data[entry["block"]].append(entry)
+
+    blocks_out = {}
+    for block_name, fold_entries in blocks_data.items():
+        first = fold_entries[0]
+        true_dag = np.asarray(first["true"])
+        mask_type = first.get("mask_type", "")
+        n_rows, n_cols = true_dag.shape
+        rows, cols = _labels_for(mask_type, n_rows, n_cols)
+
+        learned_per_fold = {}
+        learned_stack = []
+        for entry in fold_entries:
+            arr = np.asarray(entry["learned"])
+            if arr.shape != true_dag.shape:
+                continue
+            learned_per_fold[entry["fold_name"]] = arr.tolist()
+            learned_stack.append(arr)
+
+        if not learned_stack:
+            continue
+
+        learned_stack = np.stack(learned_stack, axis=0)
+        learned_mean = learned_stack.mean(axis=0)
+        learned_std = (
+            learned_stack.std(axis=0)
+            if learned_stack.shape[0] > 1
+            else np.zeros_like(learned_mean)
+        )
+
+        blocks_out[block_name] = {
+            "att_key": block_name,
+            "mask_type": mask_type,
+            "source": first.get("source"),
+            "n_rows": int(n_rows),
+            "n_cols": int(n_cols),
+            "row_labels": rows,
+            "col_labels": cols,
+            "true": true_dag.astype(int).tolist(),
+            "learned_mean": learned_mean.tolist(),
+            "learned_std": learned_std.tolist(),
+            "learned_per_fold": learned_per_fold,
+        }
+
+    payload = {
+        "dataset": dataset_name,
+        "architecture": architecture,
+        "blocks": blocks_out,
+    }
+
+    out_path = join(eval_path_files, filename)
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"  Saved: {filename}")
+
+
 def _load_model_from_checkpoint(checkpoint_path: str, architecture_type: str):
     """Load model from checkpoint based on architecture type."""
     if architecture_type == "TransformerForecaster":
@@ -137,6 +252,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     final_scores_dirname = "final_scores"
     dag_metrics_filename = "dag_metrics.json"
     attention_labels_filename = "attention_labels.json"
+    learned_dag_edges_filename = "learned_dag_edges.json"
 
     print(f"Experiment ID: {exp_id}")
     
@@ -205,6 +321,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             final_scores_dirname: "Saved attention data (npz files) for fast reloading",
             dag_metrics_filename: "Soft Hamming distance and MEC metrics comparing learned DAG to true DAG (JSON)",
             attention_labels_filename: "Descriptions of attention blocks and interpretation guide (JSON)",
+            learned_dag_edges_filename: "Per-fold learned DAG probability matrices + true mask + variable labels (JSON, portable for cross-seed aggregation)",
         },
     )
     
@@ -359,6 +476,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             per_fold_comparison_data.append({
                 "fold_name": fold_name,
                 "block": att_key,
+                "mask_type": mask_type,
                 "learned": learned_dag,
                 "true": true_dag,
                 "soft_hamming": soft_hamming,
@@ -487,6 +605,19 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     with open(join(eval_path_files, dag_metrics_filename), 'w') as f:
         json.dump(dag_metrics, f, indent=2)
     print(f"\n  Saved: {dag_metrics_filename}")
+    
+    # =========================================================================
+    # Save portable per-edge learned DAG (for cross-seed aggregation in
+    # eval_seed_sweep, and for plotting the aggregate DAG in the paper).
+    # =========================================================================
+    _write_learned_dag_edges_json(
+        eval_path_files=eval_path_files,
+        per_fold_comparison_data=per_fold_comparison_data,
+        metadata=metadata,
+        dataset_name=dataset_name,
+        architecture=architecture,
+        filename=learned_dag_edges_filename,
+    )
     
     # =========================================================================
     # Plot DAG comparisons

@@ -759,7 +759,14 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             schedule_end = idle + transient
             
             in_schedule = epoch < schedule_end
-            tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+            # iter_10+: ``log_tau`` (ToeplitzAttention) and ``log_tau_act``
+            # (CausalCross/SigmoidCrossAttention) are no longer learnable
+            # Parameters — they collapsed to a constant ``self.tau`` Python
+            # float. iter_11+ re-enables annealing of that constant float
+            # via path (b) below. Only ToeplitzLieAttention's gate/direction
+            # taus remain learnable Parameters (path (a)).
+            tau_param_names = ("log_tau_gate", "log_tau_dir")
+
             
             if in_schedule:
                 if epoch < idle:
@@ -774,6 +781,7 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                 for layer in self.model.decoder.layers:
                     for inner in (layer.global_self_attention.inner_attention,
                                   layer.global_cross_attention.inner_attention):
+                        # (a) learnable log_tau* Parameters
                         for pname in tau_param_names:
                             p = getattr(inner, pname, None)
                             if p is None:
@@ -782,8 +790,13 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
                                 p.fill_(log_new_tau)
                             if self.freeze_tau_during_anneal:
                                 p.requires_grad = False
-                
+                        # (b) constant float ``tau`` (iter_10+ attentions)
+                        tau_attr = getattr(inner, "tau", None)
+                        if tau_attr is not None and not isinstance(tau_attr, torch.Tensor):
+                            inner.tau = float(new_tau)
+
                 self.log("annealed_tau", new_tau, on_step=False, on_epoch=True)
+
             elif self.freeze_tau_during_anneal and not self._tau_unfrozen:
                 # One-shot unfreeze at boundary
                 for layer in self.model.decoder.layers:

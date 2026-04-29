@@ -8,9 +8,13 @@ Active regularizers:
 - Score sparsity (L1/entropy on attention scores) — applied to ALL decoder layers
 - HSIC (independence between residuals and parents)
 - Group L1 (embedding bottleneck)
+- Acyclicity (NOTEARS, ``training.kappa``) — applied to the directed
+  edge matrix of every decoder layer's self-attention. Closes the cycle
+  hole inherent to ToeplitzAttention (which only suppresses 2-cycles by
+  construction). Uses ``inner_attention.score_tensor_for_sparsity`` as
+  the directed att matrix; falls back to ``inner_attention.phi``.
 
 Deprecated (removed):
-- Acyclicity (NOTEARS) — partial causal ordering prevents cycles by construction
 - KL divergence prior — no explicit phi parametrization in SVFA
 - DAG sparsity (L1 on phi) — no explicit phi parametrization in SVFA
 - Decisiveness — no explicit phi parametrization in SVFA
@@ -107,6 +111,21 @@ class SingleCausalForecaster(pl.LightningModule):
         # =====================================================================
         self.lambda_group_l1 = config["training"].get("lambda_group_l1", 
                                    config["training"].get("lambda_embed_l1", 0.0))
+
+        # =====================================================================
+        # ACYCLICITY REGULARIZATION (NOTEARS) — applied to self-attention only
+        # =====================================================================
+        # Closes the cycle hole inherent to ToeplitzAttention: while Toeplitz
+        # guarantees att[i,j] + att[j,i] = sigmoid(S/τ) (suppressing 2-cycles),
+        # nothing prevents 3-cycles or longer in X self-attention. NOTEARS
+        # adds tr(exp(A ⊙ A)) − d, which is 0 iff A induces a DAG.
+        # Applied to every decoder layer's self-attention directed edge matrix
+        # (sourced from `score_tensor_for_sparsity`, falling back to `phi`).
+        # Cross-attention is bipartite (S → X) and inherently acyclic, so no
+        # NOTEARS term is added there.
+        self.kappa = float(config["training"].get("kappa", 0.0))
+        if self.kappa < 0.0:
+            raise ValueError(f"kappa must be non-negative, got {self.kappa}")
         
         # =====================================================================
         # RECONSTRUCTION-LOSS WEIGHT (knob to disable recon for HSIC-only runs)
@@ -170,9 +189,11 @@ class SingleCausalForecaster(pl.LightningModule):
         #       [idle, idle+transient)    -> tau linearly decays start -> end (frozen)
         #       [idle+transient, end)     -> tau is unfrozen and learnable from `end`
         #     Targets the following parameters when present on each attention module:
-        #       - Toeplitz self-attention: `log_tau`            (single sigmoid temp)
-        #       - CausalCrossAttention   : `log_tau_act`        (tanh activation temp)
         #       - ToeplitzLieAttention   : `log_tau_gate`, `log_tau_dir`
+        #     Note (iter_10+): ``ToeplitzAttention.tau`` and the cross-attentions'
+        #     ``tau`` are now non-learnable Python floats (``init_tau``), so they
+        #     are NOT touched by this annealer.
+
         #     freeze_tau_during_anneal=True: requires_grad disabled during idle+transient,
         #     re-enabled exactly once at the boundary.
         self.use_tau_annealing = config["training"].get("use_tau_annealing", False)
@@ -641,6 +662,40 @@ class SingleCausalForecaster(pl.LightningModule):
         # =====================================================================
         group_l1_loss, effective_dims = self._compute_group_l1()
         group_l1_regularizer = self.lambda_group_l1 * group_l1_loss
+
+        # =====================================================================
+        # ACYCLICITY REGULARIZATION (NOTEARS) — self-attention only
+        # =====================================================================
+        # For each decoder layer's self-attention we read the directed edge
+        # matrix A (shape (L, L), batch-mean) from
+        #   inner.score_tensor_for_sparsity   (preferred — exposed by
+        #                                      ToeplitzAttention as the
+        #                                      directed att = sigmoid(S/τ)·sigmoid(A/τ))
+        # falling back to inner.phi for legacy DAG-learning attentions.
+        # h(A) = tr(exp(A ⊙ A)) − d   is 0 iff A induces a DAG.
+        # We sum over layers and divide by the number of layers that
+        # actually contributed a 2-D matrix (single-head only — for
+        # multi-head the matrix becomes (H, L, L) and is skipped, mirroring
+        # the constraint in stage_causal_forecaster).
+        if self.kappa > 0.0:
+            acyclic_regularizer = torch.tensor(0.0, device=X.device)
+            n_acyclic_layers = 0
+            for layer_idx in range(n_layers):
+                layer = self.model.decoder.layers[layer_idx]
+                inner = layer.global_self_attention.inner_attention
+                A_self = getattr(inner, "score_tensor_for_sparsity", None)
+                if A_self is None:
+                    A_self = getattr(inner, "phi", None)
+                if A_self is None or A_self.dim() != 2:
+                    continue
+                acyclic_regularizer = acyclic_regularizer + self._notears_acyclicity(A_self)
+                n_acyclic_layers += 1
+            if n_acyclic_layers > 0:
+                acyclic_regularizer = (
+                    self.kappa * acyclic_regularizer / n_acyclic_layers
+                )
+        else:
+            acyclic_regularizer = torch.tensor(0.0, device=X.device)
         
         # =====================================================================
         # GRADIENT AND UPDATE SIGNAL LOGGING (for two-step calibration)
@@ -726,13 +781,16 @@ class SingleCausalForecaster(pl.LightningModule):
         total_loss = (self.lambda_recon * loss_x +
                      score_sparsity_regularizer +
                      hsic_regularizer +
-                     group_l1_regularizer)
+                     group_l1_regularizer +
+                     acyclic_regularizer)
         
         # Store decomposed losses for gradient routing (used by training_step).
         # Convex mix on the structural pathway only:
         #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
-        #              + score_sparsity_reg + group_l1_reg
+        #              + score_sparsity_reg + group_l1_reg + acyclic_reg
         # Reconstruction loss (loss_recon) is unchanged.
+        # NOTEARS rides on the structural pathway since its only effect is on
+        # the self-attention edge matrix (= structural params).
         alpha = self.lambda_struct_recon
         self._last_loss_components = {
             "loss_recon": loss_x,
@@ -741,6 +799,7 @@ class SingleCausalForecaster(pl.LightningModule):
                 + alpha * loss_x
                 + score_sparsity_regularizer
                 + group_l1_regularizer
+                + acyclic_regularizer
             ),
         }
 
@@ -775,6 +834,9 @@ class SingleCausalForecaster(pl.LightningModule):
         self.log(f"{stage}_group_l1_reg", group_l1_regularizer, on_step=False, on_epoch=True)
         if effective_dims is not None:
             self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
+
+        # NOTEARS acyclicity (auto-discovered by eval_training.py via "notears" key)
+        self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
         
         return total_loss, pred_x, X
     
@@ -783,6 +845,17 @@ class SingleCausalForecaster(pl.LightningModule):
         """Linear annealing from start to end over total_epochs."""
         progress = min(1.0, epoch / max(1, total_epochs))
         return start + progress * (end - start)
+
+    @staticmethod
+    def _notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
+        """NOTEARS acyclicity penalty h(A) = tr(exp(A ⊙ A)) - d.
+
+        Zero iff A induces a directed acyclic graph (Zheng et al., 2018).
+        Single-head only — caller is responsible for ensuring A is 2-D
+        (shape (L, L)). Mirrors ``stage_causal_forecaster._notears_acyclicity``.
+        """
+        d = A.shape[-1]
+        return torch.trace(torch.matrix_exp(A * A)) - d
     
     # ------------------------------------------------------------------
     # Used-mask dump (fires once per fit)
@@ -928,15 +1001,24 @@ class SingleCausalForecaster(pl.LightningModule):
                         tau_start, tau_end, epoch - idle, transient
                     )
                 
-                # Walk all decoder layers, set log_tau* on self + cross attention
-                # Names match: ToeplitzAttention.log_tau, ToeplitzLieAttention.log_tau_gate/_dir,
-                # CausalCrossAttention.log_tau_act
-                tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+                # Walk all decoder layers, set tau on self + cross attention.
+                # Two paths, applied side-by-side:
+                #   (a) Learnable log_tau Parameters of ToeplitzLieAttention
+                #       (``log_tau_gate`` / ``log_tau_dir``) — fill with the
+                #       log of the new tau.
+                #   (b) Constant Python-float ``tau`` attributes of
+                #       ToeplitzAttention / CausalCrossAttention /
+                #       SigmoidCrossAttention (introduced in iter_10) —
+                #       overwrite the float in place. No autograd, no
+                #       requires_grad games. iter_11+ uses this path to
+                #       anneal the constant taus from beginning to end.
+                tau_param_names = ("log_tau_gate", "log_tau_dir")
                 log_new_tau = float(torch.log(torch.tensor(new_tau)))
-                
+
                 for layer in self.model.decoder.layers:
                     for inner in (layer.global_self_attention.inner_attention,
                                   layer.global_cross_attention.inner_attention):
+                        # (a) learnable log_tau* Parameters
                         for pname in tau_param_names:
                             p = getattr(inner, pname, None)
                             if p is None:
@@ -945,11 +1027,17 @@ class SingleCausalForecaster(pl.LightningModule):
                                 p.fill_(log_new_tau)
                             if self.freeze_tau_during_anneal:
                                 p.requires_grad = False
-                
+                        # (b) constant float ``tau`` (iter_10+ attentions)
+                        tau_attr = getattr(inner, "tau", None)
+                        if tau_attr is not None and not isinstance(tau_attr, torch.Tensor):
+                            inner.tau = float(new_tau)
+
                 self.log("annealed_tau", new_tau, on_step=False, on_epoch=True)
+
             elif self.freeze_tau_during_anneal and not self._tau_unfrozen:
-                # One-shot unfreeze at boundary
-                tau_param_names = ("log_tau", "log_tau_act", "log_tau_gate", "log_tau_dir")
+                # One-shot unfreeze at boundary (iter_10+ list — see above)
+                tau_param_names = ("log_tau_gate", "log_tau_dir")
+
                 for layer in self.model.decoder.layers:
                     for inner in (layer.global_self_attention.inner_attention,
                                   layer.global_cross_attention.inner_attention):

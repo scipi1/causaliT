@@ -14,7 +14,29 @@ from causaliT.utils.entropy_utils import register_attention_entropy, calculate_a
 from typing import List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Backward-compat helper for state_dict loading
+# ---------------------------------------------------------------------------
+# In iter_10+, the cross-attention modules (`CausalCrossAttention`,
+# `SigmoidCrossAttention`) and the self-attention `ToeplitzAttention` no
+# longer carry the parameters ``log_gain`` / ``log_tau_act`` / ``log_tau``
+# (and the scalar ``max_gain``). When loading checkpoints saved by earlier
+# iterations these keys would otherwise be flagged as ``unexpected_keys``
+# and (with ``strict=True`` loading) abort the run. This pre-hook silently
+# drops them so older checkpoints can still be loaded for evaluation.
+_LEGACY_ATTENTION_KEYS = ("log_gain", "log_tau_act", "log_tau", "max_gain")
+
+
+def _drop_legacy_attention_keys(
+    state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+):
+    for key in _LEGACY_ATTENTION_KEYS:
+        full = prefix + key
+        state_dict.pop(full, None)
+
+
 class LieAttention(DAGLearningMixin, nn.Module):
+
     """
     Lie Attention mechanism with DAG mask learning.
     
@@ -245,14 +267,30 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
     
     Note: Cross-attention DAGs are bipartite (query → key), inherently acyclic,
           so NOTEARS regularization is not needed.
-    
+
+    Activation parameterization (iter_10+):
+        ``att = ReLU(Tanh(scores / tau))`` where ``tau`` is a *constant* scalar
+        (default 3.0). It is NOT a learnable parameter and is NOT updated by
+        any annealing scheduler. Pass ``init_tau`` to override the default.
+        Previous ``log_gain`` / ``log_tau_act`` parameters have been removed —
+        the gain and temperature collapsed to a single redundant slope, so we
+        keep only ``tau`` and drop the gain entirely.
+
     Args:
         dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None (passed from AttentionLayer)
         attention_dropout: Dropout rate for attention weights
         register_entropy: Whether to register entropy for logging
         layer_name: Name for logging purposes
+        init_tau: Constant temperature for the activation (default: 3.0)
     """
-    def __init__(self, dag_mask: Optional[nn.Module], attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(
+        self,
+        dag_mask: Optional[nn.Module],
+        attention_dropout: float,
+        register_entropy: bool,
+        layer_name: str,
+        init_tau: float = 3.0,
+    ):
         
         super(CausalCrossAttention, self).__init__()
         
@@ -266,12 +304,17 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         
         # Initialize DAG learning via mixin (handles all DAGMask types)
         self._init_dag_learning(dag_mask)
-        
-        # Gain/temperature parameters for GeLU(Tanh) activation
-        # log_tau_act controls the sharpness of the tanh activation (not the DAG mask)
-        self.log_gain = nn.Parameter(torch.tensor(log(1.0)))
-        self.log_tau_act = nn.Parameter(torch.tensor(log(0.2)))  # tanh activation temperature
-        self.max_gain = 10.0
+
+        # Constant activation temperature. Stored as a plain Python float so it
+        # is NOT a learnable parameter, NOT a registered buffer, and therefore
+        # NOT touched by any tau annealing scheduler. Override via ``init_tau``.
+        self.tau = float(init_tau)
+
+        # Drop legacy attention parameters (``log_gain``, ``log_tau_act``,
+        # ``max_gain``, ``log_tau``) when loading checkpoints from earlier
+        # iterations so we don't break backward checkpoint compatibility.
+        self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
+
     
     @property
     def phi(self) -> torch.Tensor:
@@ -392,15 +435,18 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
                        Applied AFTER the learned DAG mask as element-wise product.
         """
         is_multihead = query.dim() == 4
-        
+        # Shared-DAG / multi-head-V: Q,K are 3-D, V is 4-D, score is 3-D and
+        # broadcast over the V head dim. See AttentionLayer docstring.
+        is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
+
         if is_multihead:
             B, L, H, E = query.shape
             _, S, _, _ = key.shape
         else:
             B, L, E = query.shape
             _, S, _ = key.shape
-            H = 1
-        
+            H = value.shape[2] if is_shared_mh_v else 1
+
         scale = 1.0 / sqrt(E)
         
         # Compute attention scores
@@ -412,19 +458,18 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         scores = scale * scores
         
         # Apply causal mask (additive, before activation)
+        # In shared-mh-v the score is single-head, so we broadcast the causal
+        # mask with H_score=1 (the V heads see the same causal structure).
         if pos is not None and causal_mask:
-            M_causal = build_causal_mask(pos, n_heads=H)
+            H_score = H if is_multihead else 1
+            M_causal = build_causal_mask(pos, n_heads=H_score)
             scores = scores + M_causal
-        
-        gain = torch.exp(self.log_gain).clamp(1e-3, self.max_gain)
-        tau_act = torch.exp(self.log_tau_act).clamp(1e-3, 10.0)
-        
-        # Causality-friendly activation: ReLU(Tanh(scores))
-        # Note: GeLU was used previously but produces negative values (~-0.17),
-        # which violates the non-negativity assumption for attention weights.
-        # ReLU ensures strictly non-negative attention for interpretability.
-        att = F.relu(F.tanh((gain / tau_act) * scores))
-        
+
+        # Causality-friendly activation: ReLU(Tanh(scores / tau)) with ``tau`` a
+        # constant scalar (no learnable gain, no learnable temperature, no
+        # annealing). See class docstring for the iter_10 simplification.
+        att = F.relu(F.tanh(scores / self.tau))
+
         # Handle NaN from all-masked rows
         att = torch.nan_to_num(att, nan=0.0)
         
@@ -468,12 +513,290 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
         A = self.dropout(att)
         
         # Store attention scores for L1 regularization (mean over batch)
-        # Shape: (L, S) for single-head, (H, L, S) for multi-head
+        # Shape: (L, S) for single-head / shared-mh-v, (H, L, S) for legacy multi-head
         self._score_tensor_for_sparsity = A.mean(dim=0)
         
         # Compute output values
         if is_multihead:
             V = torch.einsum("bhls,bshd->blhd", A, value)
+        elif is_shared_mh_v:
+            # Shared-DAG multi-head V: same (B, L, S) score broadcast across V heads
+            V = torch.einsum("bls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+        
+        return V.contiguous(), A, entropy
+    
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """
+        Returns the attention scores suitable for L1 sparsity regularization.
+        
+        For CausalCrossAttention, this returns the batch-averaged attention scores
+        from the last forward pass. Shape: (L, S) or (H, L, S) for multi-head.
+        
+        Returns None if forward() has not been called yet.
+        """
+        return getattr(self, '_score_tensor_for_sparsity', None)
+    
+    
+class SigmoidCrossAttention(DAGLearningMixin, nn.Module):
+    """
+    Causal Cross-Attention with DAG mask learning (sigmoid activation variant).
+
+    This module is identical to ``CausalCrossAttention`` but uses
+    ``sigmoid(scores / tau)`` as the attention activation instead of
+    ``ReLU(Tanh(scores / tau))``. Both share the iter_10 simplification of
+    a *constant* (non-learnable, non-annealed) temperature ``tau`` and no
+    multiplicative gain.
+
+    Args:
+        dag_mask: DAGMask, DAGMaskAntisym, DAGMaskGated, or None (passed from AttentionLayer)
+        attention_dropout: Dropout rate for attention weights
+        register_entropy: Whether to register entropy for logging
+        layer_name: Name for logging purposes
+        init_tau: Constant temperature for the activation (default: 3.0)
+    """
+    def __init__(
+        self,
+        dag_mask: Optional[nn.Module],
+        attention_dropout: float,
+        register_entropy: bool,
+        layer_name: str,
+        init_tau: float = 3.0,
+    ):
+        
+        super(SigmoidCrossAttention, self).__init__()
+        
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+        
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+        
+        # Initialize DAG learning via mixin (handles all DAGMask types)
+        self._init_dag_learning(dag_mask)
+
+        # Constant activation temperature. Stored as a plain Python float so it
+        # is NOT a learnable parameter, NOT a registered buffer, and therefore
+        # NOT touched by any tau annealing scheduler. Override via ``init_tau``.
+        self.tau = float(init_tau)
+
+        # Drop legacy attention parameters (``log_gain``, ``log_tau_act``,
+        # ``max_gain``, ``log_tau``) when loading checkpoints from earlier
+        # iterations so we don't break backward checkpoint compatibility.
+        self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
+
+    
+    @property
+    def phi(self) -> torch.Tensor:
+        """Access phi through dag_mask to support both DAGMask and DAGMaskAntisym."""
+        if self.dag_mask is not None:
+            return self.dag_mask.phi
+        return None
+    
+    def get_dag_probabilities(self) -> torch.Tensor:
+        """
+        Returns the posterior probability of each edge being active in the learned DAG.
+        
+        This is useful for:
+        - Inference: Extract the learned causal structure
+        - Visualization: Plot the learned DAG
+        - Evaluation: Compare against ground-truth DAG
+        
+        Returns:
+            torch.Tensor: Edge probabilities in [0, 1], shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned (phi is None).
+        """
+        if self.phi is not None:
+            return torch.sigmoid(self.phi)
+        return None
+    
+    def get_dag_logits(self) -> torch.Tensor:
+        """
+        Returns the raw logits (phi) of the learned DAG.
+        
+        Returns:
+            torch.Tensor: Raw logits, shape (L, S) or (H, L, S) for multi-head.
+                         Returns None if no DAG is being learned.
+        """
+        return self.phi
+    
+    def _update_running_average(self, att):
+        """
+        Update running averages of attention statistics.
+        
+        Args:
+            att: Attention evidence tensor (batch_size, ...)
+            
+        Returns:
+            tuple: (batch_mean, batch_snr) with gradients attached for regularization
+        """
+        alpha = 0.9
+        
+        # Compute batch statistics (keep gradients for regularization)
+        batch_mean = torch.mean(att, dim=0)
+        batch_std = torch.std(att, dim=0)
+        batch_snr = batch_mean / (batch_std + 1e-6)
+        
+        # Update running averages (no gradients, in-place operations on buffers)
+        if self.runav_att_mean is not None:
+            with torch.no_grad():
+                if (self.runav_att_mean != 0).any():
+                    # EMA update using in-place operations
+                    self.runav_att_mean.mul_(alpha).add_(batch_mean, alpha=1-alpha)
+                    self.runav_att_snr.mul_(alpha).add_(batch_snr, alpha=1-alpha)
+                else:
+                    # First update: initialize with batch statistics
+                    self.runav_att_mean.copy_(batch_mean)
+                    self.runav_att_snr.copy_(batch_snr)
+        
+        # Return batch statistics with gradients for immediate use in regularization
+        return batch_mean, batch_snr
+        
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+        oracle: bool = False,
+        ):
+        if oracle:
+            # Oracle mode: bypass QK^T and use the hard mask directly as scores.
+            # We still need V via the value projection done in AttentionLayer.
+            is_multihead = query.dim() == 4
+            if is_multihead:
+                B, _, H, _ = query.shape
+                _, S_len, _, _ = key.shape
+                L = query.shape[1]
+            else:
+                B, L, _ = query.shape
+                _, S_len, _ = key.shape
+                H = 1
+            V_out, A_out, ent = _oracle_attention_forward(
+                value=value,
+                hard_mask=hard_mask,
+                is_multihead=is_multihead,
+                batch_size=B,
+                n_heads=H,
+                query_seq_len=L,
+                key_seq_len=S_len,
+                entropy_enabled=self.entropy_enabled,
+            )
+            # Bookkeeping for downstream loggers / regularizers
+            self._score_tensor_for_sparsity = A_out.detach().mean(dim=0)
+            return V_out, A_out, ent
+        """
+        Forward pass for Causal Cross-Attention with DAG learning.
+        
+        Args:
+            query: Query tensor (B, L, E) or (B, L, H, E) for multi-head
+            key: Key tensor (B, S, E) or (B, S, H, E) for multi-head
+            value: Value tensor (B, S, E) or (B, S, H, E) for multi-head
+            mask_miss_k: Missing key mask (unused in simplified version)
+            mask_miss_q: Missing query mask (unused in simplified version)
+            pos: Positional encoding for causal masking
+            causal_mask: Whether to apply causal masking
+            hard_mask: Optional hard mask tensor of shape (L, S) or (H, L, S).
+                       Values in [0, 1], where 1 = attention allowed.
+                       Applied AFTER the learned DAG mask as element-wise product.
+        """
+        is_multihead = query.dim() == 4
+        # Shared-DAG / multi-head-V: Q,K are 3-D, V is 4-D, score is 3-D and
+        # broadcast over the V head dim. See AttentionLayer docstring.
+        is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
+
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S, _ = key.shape
+            H = value.shape[2] if is_shared_mh_v else 1
+
+        scale = 1.0 / sqrt(E)
+        
+        # Compute attention scores
+        if is_multihead:
+            scores = torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            scores = torch.einsum("ble,bse->bls", query, key)
+        
+        scores = scale * scores
+        
+        # Apply causal mask (additive, before activation)
+        # In shared-mh-v the score is single-head, so we broadcast the causal
+        # mask with H_score=1 (the V heads see the same causal structure).
+        if pos is not None and causal_mask:
+            H_score = H if is_multihead else 1
+            M_causal = build_causal_mask(pos, n_heads=H_score)
+            scores = scores + M_causal
+
+        # Sigmoid activation with constant temperature ``tau`` (no learnable
+        # gain, no learnable temperature, no annealing). See class docstring
+        # for the iter_10 simplification.
+        att = torch.sigmoid(scores / self.tau)
+
+        # Handle NaN from all-masked rows
+        att = torch.nan_to_num(att, nan=0.0)
+
+        
+        # Update running average for monitoring and store batch statistics for regularization
+        evidence = att
+        batch_mean, batch_snr = self._update_running_average(evidence)
+        
+        # Store batch statistics as attributes for access by forecaster (with gradients)
+        self.batch_att_mean = batch_mean
+        self.batch_att_snr = batch_snr
+        
+        # Apply learned DAG mask if phi is available
+        if self.phi is not None:
+            # Get learnable temperature (clamped to safe range)
+            tau_gs = torch.exp(self.log_tau_gs).clamp(self.tau_gs_min, self.tau_gs_max)
+            
+            # Sample batch DAG logits using Gumbel-Softmax trick
+            u = torch.rand_like(self.phi)
+            m_relaxed = torch.sigmoid((torch.log(u + 1e-8) - torch.log(1 - u + 1e-8) + self.phi) / tau_gs)
+            M = m_relaxed
+            
+            # Add batch dimension
+            # For single-head: phi shape is (L, S) -> M becomes (1, L, S)
+            # For multi-head: phi shape is (H, L, S) -> M becomes (1, H, L, S)
+            M = M.unsqueeze(0)
+            
+            att = att * M
+        
+        # Apply hard mask if provided (ground-truth DAG structure)
+        if hard_mask is not None:
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
+            att = att * hard_mask_expanded
+        
+        # Calculate entropy before dropout
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+        
+        # Apply dropout
+        A = self.dropout(att)
+        
+        # Store attention scores for L1 regularization (mean over batch)
+        # Shape: (L, S) for single-head / shared-mh-v, (H, L, S) for legacy multi-head
+        self._score_tensor_for_sparsity = A.mean(dim=0)
+        
+        # Compute output values
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        elif is_shared_mh_v:
+            # Shared-DAG multi-head V: same (B, L, S) score broadcast across V heads
+            V = torch.einsum("bls,bshd->blhd", A, value)
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
         
@@ -496,72 +819,75 @@ class CausalCrossAttention(DAGLearningMixin, nn.Module):
 class ToeplitzAttention(nn.Module):
     """
     Clean Toeplitz Attention for DAG learning.
-    
-    Decomposes attention scores into symmetric and antisymmetric parts:
-        S = (QK^T + KQ^T) / 2   # Symmetric: edge existence probability
-        A = (QK^T - KQ^T) / 2   # Antisymmetric: direction split
-    
+
+    Decomposes attention scores into symmetric and antisymmetric parts using
+    *orthogonal* projectors (the iter_10 fix to match self/cross magnitudes):
+
+        S = (QK^T + KQ^T) / sqrt(2)   # Symmetric: edge existence
+        A = (QK^T - KQ^T) / sqrt(2)   # Antisymmetric: direction split
+
+    Using ``/ sqrt(2)`` instead of the legacy ``/ 2`` preserves variance:
+    if ``Var(QK^T) ≈ 1`` then ``Var(S) = Var(A) ≈ 1`` as well, which makes
+    the pre-activations of the two sigmoids comparable in magnitude to the
+    pre-activation of a single sigmoid in cross-attention. The legacy ``/ 2``
+    halved the variance, contributing to the magnitude gap between
+    self-attention and cross-attention scores observed in iter_9.
+
     Computes attention as:
-        att[i,j] = sigmoid(S[i,j] / τ) × sigmoid(A[i,j] / τ)
-    
-    Properties:
-        - att[i,j] + att[j,i] = sigmoid(S[i,j] / τ)  (budget constraint)
-        - att[i,i] = 0                                 (no self-loops)
-        - sigmoid(S[i,j]) = sigmoid(S[j,i])           (symmetric edge probability)
-        - sigmoid(A[i,j]) + sigmoid(A[j,i]) = 1       (complementary direction split)
-    
-    The budget constraint is mathematically guaranteed:
-        att[i,j] + att[j,i] = σ(S/τ) × σ(A/τ) + σ(S/τ) × σ(-A/τ)
-                            = σ(S/τ) × [σ(A/τ) + σ(-A/τ)]
-                            = σ(S/τ) × 1
-                            = σ(S/τ) = P_edge[i,j]
-    
-    Temperature τ controls exploration vs exploitation:
-        - High τ: Probabilities closer to 0.5 (exploration)
-        - Low τ: Probabilities closer to 0 or 1 (exploitation)
-    
+        att[i,j] = sigmoid(S[i,j] / tau) * sigmoid(A[i,j] / tau)
+
+    Budget constraint (still satisfied):
+        att[i,j] + att[j,i] = sigmoid(S[i,j] / tau) = P_edge[i,j]
+
+    Temperature ``tau`` (iter_10+):
+        ``tau`` is now a *constant* scalar (default 3.0). It is NOT a
+        learnable parameter and is NOT touched by any annealing scheduler.
+        Pass ``init_tau`` to override.
+
     Args:
         dag_mask: Not used (kept for interface compatibility), should be None
         attention_dropout: Dropout rate for attention weights
         register_entropy: Whether to register entropy for logging
         layer_name: Name for logging purposes
-        init_tau: Initial temperature (default: 1.0)
-        tau_min: Minimum temperature (default: 0.1)
-        tau_max: Maximum temperature (default: 5.0)
+        init_tau: Constant temperature (default: 3.0)
     """
     def __init__(
-        self, 
-        dag_mask: Optional[nn.Module], 
-        attention_dropout: float, 
-        register_entropy: bool, 
+        self,
+        dag_mask: Optional[nn.Module],
+        attention_dropout: float,
+        register_entropy: bool,
         layer_name: str,
-        init_tau: float = 1.0,
-        tau_min: float = 0.1,
-        tau_max: float = 5.0,
+        init_tau: float = 3.0,
+        # Legacy kwargs: kept for backward-compat in callers that still pass
+        # them (e.g. older configs threaded via AttentionLayer). They are
+        # IGNORED — tau is no longer learnable, so there is nothing to clamp.
+        tau_min: float = None,
+        tau_max: float = None,
     ):
         super(ToeplitzAttention, self).__init__()
-        
+
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
         self.entropy_enabled = True
-        
+
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
-        
+
         # dag_mask is not used - kept for interface compatibility
         self.dag_mask = None
-        
-        # Single temperature parameter for exploration → exploitation
-        self.log_tau = nn.Parameter(torch.tensor(log(init_tau)))
-        self.tau_min = tau_min
-        self.tau_max = tau_max
-    
-    @property
-    def tau(self) -> torch.Tensor:
-        """Get the current temperature, clamped to valid range."""
-        return torch.exp(self.log_tau).clamp(self.tau_min, self.tau_max)
-    
+
+        # Constant temperature. Stored as a plain Python float so it is NOT a
+        # learnable parameter, NOT a registered buffer, and therefore NOT
+        # touched by any tau annealing scheduler. Override via ``init_tau``.
+        self.tau = float(init_tau)
+
+        # Drop legacy attention parameters (``log_tau``, ``log_gain``, etc.)
+        # when loading checkpoints from earlier iterations so we don't break
+        # backward checkpoint compatibility.
+        self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
+
+
     def get_dag_probabilities(self) -> torch.Tensor:
         """
         Returns the edge probabilities from the last forward pass.
@@ -640,32 +966,42 @@ class ToeplitzAttention(nn.Module):
                        Values in [0, 1], where 1 = attention allowed.
         """
         is_multihead = query.dim() == 4
-        
+        # Shared-DAG / multi-head-V mode: Q, K are single-head (3-D) but V is
+        # multi-head (4-D). Score is computed once and shared across V heads.
+        is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
+
         if is_multihead:
             B, L, H, E = query.shape
             _, S_len, _, _ = key.shape
         else:
             B, L, E = query.shape
             _, S_len, _ = key.shape
-            H = 1
-        
+            H = value.shape[2] if is_shared_mh_v else 1
+
         scale = 1.0 / sqrt(E)
         
         # Compute raw attention scores (no scaling - rely on normalization)
         if is_multihead:
             scores = torch.einsum("blhe,bshe->bhls", query, key)
         else:
+            # Both single-head and shared-mh-v use 3-D Q, K -> 3-D scores
             scores = torch.einsum("ble,bse->bls", query, key)
         
         # Scale scores
         scores = scale * scores
-        
-        # Toeplitz decomposition
-        S = (scores + scores.transpose(-1, -2)) / 2  # Symmetric: edge existence
-        A = (scores - scores.transpose(-1, -2)) / 2  # Antisymmetric: direction
-        
-        # Get temperature
+
+        # Toeplitz decomposition (variance-preserving / sqrt(2) split — see
+        # class docstring). Using ``/ sqrt(2)`` instead of ``/ 2`` so that
+        # ``Var(S) = Var(A) ≈ Var(scores)`` and the pre-activations entering
+        # the two sigmoids have the *same* scale as a single sigmoid in
+        # cross-attention (closes the iter_9 magnitude gap).
+        _inv_sqrt2 = 1.0 / sqrt(2.0)
+        S = (scores + scores.transpose(-1, -2)) * _inv_sqrt2
+        A = (scores - scores.transpose(-1, -2)) * _inv_sqrt2
+
+        # Get temperature (constant scalar; see class docstring)
         tau = self.tau
+
         
         # Compute edge existence probability (symmetric)
         P_edge = torch.sigmoid(S / tau)  # P_edge[i,j] = P_edge[j,i]
@@ -712,7 +1048,14 @@ class ToeplitzAttention(nn.Module):
         
         # Compute output values
         if is_multihead:
+            # Legacy multi-head: per-head score, per-head V
             V_out = torch.einsum("bhls,bshd->blhd", A_out, value)
+        elif is_shared_mh_v:
+            # Shared-DAG multi-head V: same (B, L, S) score broadcast over V's
+            # head dim. Output is (B, L, H, d_v); AttentionLayer flattens and
+            # mixes heads via the output projection (linear, hence
+            # score-sparsity preserving).
+            V_out = torch.einsum("bls,bshd->blhd", A_out, value)
         else:
             V_out = torch.einsum("bls,bsd->bld", A_out, value)
         
@@ -1877,14 +2220,40 @@ class AttentionLayer(nn.Module):
         toeplitz_init_tau_gate: float = 0.5,
         toeplitz_init_tau_dir: float = 0.3,
         toeplitz_max_gain: float = 20.0,
+        # Constant temperature for ToeplitzAttention / CausalCrossAttention /
+        # SigmoidCrossAttention (iter_10+ simplification — non-learnable, not
+        # annealed). Default 3.0; override from the model factory / config.
+        init_tau: float = 3.0,
         # Shared structure components (for weight sharing across layers)
         shared_qk_inner: dict = None,
+        # Multi-head semantics:
+        #   True  (default, SVFA-DAG semantics): a SINGLE DAG / score (B, L, S)
+        #         is shared across the n_heads value channels. Q/K projections
+        #         produce a single-head tensor of size d_qk; V is per-head
+        #         (d_v * n_heads); the output projection mixes the head dim
+        #         back to d_model. The score-imposed sparsity is preserved
+        #         because the post-output-projection is linear in V (see
+        #         docstring at the top of the file). Used by ToeplitzAttention,
+        #         CausalCrossAttention, SigmoidCrossAttention.
+        #   False (legacy / vanilla baselines): each head has its own
+        #         Q, K, V and its OWN DAG / score (B, H, L, S). This is the
+        #         standard transformer behaviour and what existed before this
+        #         flag was introduced.
+        # At n_heads = 1 both modes are byte-identical.
+        shared_dag_across_heads: bool = True,
         ):
+
         
         super(AttentionLayer, self).__init__()
         
         # Track whether this layer uses shared structure
         self._uses_shared_structure = shared_qk_inner is not None
+        # Number of HEADS used for the DAG mask / Q,K projections / inner
+        # attention scores. Equals 1 in shared-DAG mode, n_heads in legacy mode.
+        # See class docstring for the semantics of the two modes.
+        self.shared_dag_across_heads = bool(shared_dag_across_heads)
+        n_heads_struct = 1 if self.shared_dag_across_heads else n_heads
+        self._n_heads_struct = n_heads_struct
         
         if shared_qk_inner is not None:
             # ===== SHARED MODE =====
@@ -1913,14 +2282,16 @@ class AttentionLayer(nn.Module):
                     )
             
             # Attention types that support DAG learning
-            DAG_LEARNING_ATTENTION = (LieAttention, CausalCrossAttention, PhiSoftMax, ToeplitzLieAttention)
+            DAG_LEARNING_ATTENTION = (LieAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, ToeplitzLieAttention)
             
             # Centralized DAGMask creation
+            # In shared-DAG mode the structure is shared across heads, so the
+            # DAGMask is single-head regardless of n_heads.
             dag_mask = None
             if attention in DAG_LEARNING_ATTENTION and query_seq_len is not None and key_seq_len is not None:
                 dag_mask = self._create_dag_mask(
                     dag_parameterization=dag_parameterization,
-                    n_heads=n_heads,
+                    n_heads=n_heads_struct,
                     query_seq_len=query_seq_len,
                     key_seq_len=key_seq_len,
                     phi_init_std=phi_init_std
@@ -1940,16 +2311,24 @@ class AttentionLayer(nn.Module):
                     max_gain=toeplitz_max_gain,
                 )
             elif attention == ToeplitzAttention:
-                # ToeplitzAttention: Clean Toeplitz decomposition with single temperature
-                # Does not use dag_mask - derives DAG directly from attention scores
+                # ToeplitzAttention (iter_10+): constant tau, sqrt(2) split.
+                # Does not use dag_mask. Tau is non-learnable and not annealed.
                 self.inner_attention = attention(
                     dag_mask=None,  # Not used
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
                     layer_name=layer_name,
-                    init_tau=toeplitz_init_tau_gate,  # Reuse gate tau as the single temperature
-                    tau_min=0.1,
-                    tau_max=5.0,
+                    init_tau=init_tau,
+                )
+            elif attention in (CausalCrossAttention, SigmoidCrossAttention):
+                # Cross-attentions (iter_10+): constant tau, no gain.
+                # Tau is non-learnable and not annealed.
+                self.inner_attention = attention(
+                    dag_mask=dag_mask,
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
                 )
             else:
                 self.inner_attention = attention(
@@ -1958,20 +2337,24 @@ class AttentionLayer(nn.Module):
                     register_entropy=register_entropy,
                     layer_name=layer_name
                 )
+
             
             # Q and K projection layers (owned by this layer)
-            self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
+            # In shared-DAG mode the score (and therefore Q/K) is single-head;
+            # the head dim only lives on V. In legacy mode each head has its
+            # own Q/K block. n_heads_struct encodes this choice.
+            self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads_struct)
             
             # Key projection: supports orthogonal projection for preserving embedding orthogonality
             self.key_projection_type = key_projection_type
             if key_projection_type == "linear":
-                self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
+                self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads_struct)
             elif key_projection_type == "orthogonal":
-                out_features = d_queries_keys * n_heads
+                out_features = d_queries_keys * n_heads_struct
                 in_features = d_model_keys
                 if out_features < in_features:
                     raise ValueError(
-                        f"Orthogonal key projection requires d_queries_keys * n_heads >= d_model_keys, "
+                        f"Orthogonal key projection requires d_queries_keys * n_heads_struct >= d_model_keys, "
                         f"got {out_features} < {in_features}. "
                         f"Either increase d_queries_keys or use key_projection_type='linear'."
                     )
@@ -2115,17 +2498,28 @@ class AttentionLayer(nn.Module):
         B, L, _ = query.shape
         _, S, _ = key.shape
         H = self.n_heads
-        
-        # Apply projections and reshape for multi-head attention
-        if H > 1:
-            q = self.dropout_qkv(self.query_projection(query)).view(B, L, H, -1)
-            k = self.dropout_qkv(self.key_projection(key)).view(B, S, H, -1)
-            v = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)
+        H_struct = self._n_heads_struct  # 1 in shared mode, H in legacy mode
+
+        # ---- Q, K projections ----
+        # Shape depends on the structural mode:
+        #   shared-DAG (H_struct == 1):  q -> (B, L, d_qk),  k -> (B, S, d_qk)
+        #   legacy   (H_struct == H >1): q -> (B, L, H, d_qk), k -> (B, S, H, d_qk)
+        if H_struct > 1:
+            q = self.dropout_qkv(self.query_projection(query)).view(B, L, H_struct, -1)
+            k = self.dropout_qkv(self.key_projection(key)).view(B, S, H_struct, -1)
         else:
             q = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
             k = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
+
+        # ---- V projection ----
+        # V is ALWAYS multi-head when n_heads > 1 (independent of the
+        # structural mode). The inner attention detects "shared multi-head V"
+        # via `query.dim() == 3 and value.dim() == 4`.
+        if H > 1:
+            v = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)
+        else:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
-            
+
         out, attn, ent = self.inner_attention(
             query=q,
             key=k,
@@ -2137,16 +2531,22 @@ class AttentionLayer(nn.Module):
             hard_mask=hard_mask,
             oracle=oracle,
             )
-        
-        # Reshape output and apply final projection if multi-head
+
+        # ---- Output projection ----
+        # When H > 1, `out` is (B, L, H, d_v) regardless of mode and is
+        # flattened to (B, L, H*d_v) and then mixed back to d_model by
+        # `out_projection`. This linear mixing preserves the score-imposed
+        # sparsity (see class docstring): the attention pattern only gates
+        # which positions can contribute, and the output projection acts
+        # within each position.
         if H > 1:
             # out shape is (B, L, H, d_v) -> reshape to (B, L, H*d_v)
-            out = out.view(B, L, -1)
+            out = out.contiguous().view(B, L, -1)
             out = self.out_projection(out)
         else:
             # out shape is already (B, L, d_v)
             out = out.view(B, L, -1)
-        
+
         return out, attn, ent
     
     
