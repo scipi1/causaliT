@@ -14,7 +14,7 @@ import torch.distributions as pyd
 # ROOT_DIR = dirname(abspath(__file__))
 # sys.path.append(ROOT_DIR)
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, AttentionLayer,
+    ScaledDotAttention, AttentionLayer,
     Decoder, DecoderLayer,
     ModularEmbedding,
     Encoder, EncoderLayer,
@@ -305,13 +305,10 @@ class ProT(nn.Module):
         ):
 
         # choose attention type
-        assert attention_type in ["ScaledDotProduct", "LieAttention"]
+        assert attention_type in ["ScaledDotProduct"]
             
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
-            
-        if attention_type == "LieAttention":
-            attention_module = LieAttention
             
         # choose mask type (currently only uniform)
         mask_layer = None # init

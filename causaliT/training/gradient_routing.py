@@ -14,20 +14,20 @@ This prevents the gradient conflict where HSIC noise drowns out the
 reconstruction signal and vice versa.
 
 Parameter Classification:
-    Structural (θ_S):
+    Structural (theta_S):
         - Structure embeddings (nn_embedding for variable IDs)
         - Q, K projections in all attention layers
         - Attention internal params (log_gain, log_tau, etc.)
         - Structure-path layer norms (norm1_struct, norm2_struct)
     
-    Reconstruction (θ_R):
+    Reconstruction (theta_R):
         - Value embeddings (linear for values)
         - V projection in all attention layers
         - Output projection in attention layers
         - FF layers (linear1, linear2)
         - MLP head / forecaster
         - Value-path layer norms (norm1, norm2, norm3, norm_layer)
-        - Noise parameters (σ_A, σ_R) for noise-aware models
+        - Noise parameters (sigma_A, sigma_R) for noise-aware models
 
 References:
     - PCGrad (Yu et al., NeurIPS 2020): Gradient surgery for multi-task learning
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Patterns that identify structural parameters (Q, K, structure embeddings,
-# attention internals, structure norms).  Order doesn't matter — we check
+# attention internals, structure norms).  Order doesn't matter - we check
 # with substring matching.
 STRUCTURAL_PATTERNS = [
     # Q, K projections (structure determines attention pattern)
@@ -169,10 +169,10 @@ def classify_parameters(
             print(msg)
             print("\n  Structural parameters:")
             for n in structural_names:
-                print(f"    θ_S: {n}")
+                print(f"    theta_S: {n}")
             print("\n  Reconstruction parameters:")
             for n in reconstruction_names:
-                print(f"    θ_R: {n}")
+                print(f"    theta_R: {n}")
         logger.debug(msg)
     
     if len(structural_params) == 0:

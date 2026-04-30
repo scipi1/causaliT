@@ -12,12 +12,7 @@ Active regularizers:
   edge matrix of every decoder layer's self-attention. Closes the cycle
   hole inherent to ToeplitzAttention (which only suppresses 2-cycles by
   construction). Uses ``inner_attention.score_tensor_for_sparsity`` as
-  the directed att matrix; falls back to ``inner_attention.phi``.
-
-Deprecated (removed):
-- KL divergence prior — no explicit phi parametrization in SVFA
-- DAG sparsity (L1 on phi) — no explicit phi parametrization in SVFA
-- Decisiveness — no explicit phi parametrization in SVFA
+  the directed att matrix.
 """
 
 import json
@@ -120,7 +115,7 @@ class SingleCausalForecaster(pl.LightningModule):
         # nothing prevents 3-cycles or longer in X self-attention. NOTEARS
         # adds tr(exp(A ⊙ A)) − d, which is 0 iff A induces a DAG.
         # Applied to every decoder layer's self-attention directed edge matrix
-        # (sourced from `score_tensor_for_sparsity`, falling back to `phi`).
+        # (sourced from `score_tensor_for_sparsity`).
         # Cross-attention is bipartite (S → X) and inherently acyclic, so no
         # NOTEARS term is added there.
         self.kappa = float(config["training"].get("kappa", 0.0))
@@ -189,9 +184,9 @@ class SingleCausalForecaster(pl.LightningModule):
         #       [idle, idle+transient)    -> tau linearly decays start -> end (frozen)
         #       [idle+transient, end)     -> tau is unfrozen and learnable from `end`
         #     Targets the following parameters when present on each attention module:
-        #       - ToeplitzLieAttention   : `log_tau_gate`, `log_tau_dir`
+        #       - (legacy) log_tau_gate / log_tau_dir — no-op for current attention types
         #     Note (iter_10+): ``ToeplitzAttention.tau`` and the cross-attentions'
-        #     ``tau`` are now non-learnable Python floats (``init_tau``), so they
+        #     ``tau`` are non-learnable Python floats (``init_tau``), so they
         #     are NOT touched by this annealer.
 
         #     freeze_tau_during_anneal=True: requires_grad disabled during idle+transient,
@@ -670,8 +665,7 @@ class SingleCausalForecaster(pl.LightningModule):
         # matrix A (shape (L, L), batch-mean) from
         #   inner.score_tensor_for_sparsity   (preferred — exposed by
         #                                      ToeplitzAttention as the
-        #                                      directed att = sigmoid(S/τ)·sigmoid(A/τ))
-        # falling back to inner.phi for legacy DAG-learning attentions.
+        #                                      directed att = sigmoid(S/τ)·sigmoid(A/τ)).
         # h(A) = tr(exp(A ⊙ A)) − d   is 0 iff A induces a DAG.
         # We sum over layers and divide by the number of layers that
         # actually contributed a 2-D matrix (single-head only — for
@@ -684,8 +678,6 @@ class SingleCausalForecaster(pl.LightningModule):
                 layer = self.model.decoder.layers[layer_idx]
                 inner = layer.global_self_attention.inner_attention
                 A_self = getattr(inner, "score_tensor_for_sparsity", None)
-                if A_self is None:
-                    A_self = getattr(inner, "phi", None)
                 if A_self is None or A_self.dim() != 2:
                     continue
                 acyclic_regularizer = acyclic_regularizer + self._notears_acyclicity(A_self)
@@ -1003,7 +995,7 @@ class SingleCausalForecaster(pl.LightningModule):
                 
                 # Walk all decoder layers, set tau on self + cross attention.
                 # Two paths, applied side-by-side:
-                #   (a) Learnable log_tau Parameters of ToeplitzLieAttention
+                #   (a) Legacy learnable log_tau parameters
                 #       (``log_tau_gate`` / ``log_tau_dir``) — fill with the
                 #       log of the new tau.
                 #   (b) Constant Python-float ``tau`` attributes of

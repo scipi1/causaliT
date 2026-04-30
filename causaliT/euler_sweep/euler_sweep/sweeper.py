@@ -360,7 +360,15 @@ def run_sequential_sweep(
             from causaliT.training.config_utils import populate_seq_lengths_from_dataset
             logger.info(f"Populating dataset metadata from: {data_dir}")
             config_copy = populate_seq_lengths_from_dataset(config_copy, data_dir)
-        
+
+        # Apply update_config BEFORE resolving interpolations so that derived
+        # fields such as experiment.d_ff / experiment.d_qk (computed from
+        # d_ff_mult * d_model_set) are written into the config BEFORE
+        # ${experiment.d_ff} is resolved. Without this the interpolations
+        # resolve to null and the saved config.yaml still contains null values.
+        from causaliT.training.experiment_control import update_config
+        config_copy = update_config(config_copy)
+
         # Now resolve interpolations - references will use the updated parameter values
         config_copy = OmegaConf.create(OmegaConf.to_container(config_copy, resolve=True))
         

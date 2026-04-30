@@ -1,4 +1,4 @@
-# NoiseAwareSingleCausalLayer Template — SVFA for S and X with learned noise parameters.
+# SingleCausalLayer Template — Learnable summation embeddings for S and X.
 
 experiment:
   d_model_set: 24
@@ -19,7 +19,7 @@ experiment:
 
 
 model:
-  model_object: "NoiseAwareSingleCausalLayer"
+  model_object: "SingleCausalLayer"
 
   embed_dim:
     d_model_set: ${experiment.d_model_set}
@@ -37,14 +37,12 @@ model:
         - idx: ${data.feature_indices.value}
           embed: "linear"
           label: "value"
-          role: "value"
           kwargs:
             input_dim: 1
             embedding_dim: ${model.embed_dim.val_emb_hidden}
         - idx: ${data.feature_indices.variable}
           embed: "nn_embedding"
           label: "variable"
-          role: "structure"
           kwargs:
             num_embeddings: ${data.num_embeddings_S}
             embedding_dim: ${model.embed_dim.var_emb_hidden}
@@ -56,7 +54,7 @@ model:
           label: "value_missing"
           kwargs: {}
 
-    comps_embed_S: "svfa"
+    comps_embed_S: "summation"
 
     ds_embed_X:
       setting:
@@ -66,14 +64,12 @@ model:
         - idx: ${data.feature_indices.value}
           embed: "linear"
           label: "value"
-          role: "value"
           kwargs:
             input_dim: 1
             embedding_dim: ${model.embed_dim.val_emb_hidden}
         - idx: ${data.feature_indices.variable}
           embed: "nn_embedding"
           label: "variable"
-          role: "structure"
           kwargs:
             num_embeddings: ${data.num_embeddings_X}
             embedding_dim: ${model.embed_dim.var_emb_hidden}
@@ -85,7 +81,7 @@ model:
           label: "value_missing"
           kwargs: {}
 
-    comps_embed_X: "svfa"
+    comps_embed_X: "summation"
 
     dec_cross_attention_type: ${experiment.dec_cross_attention_type}
     dec_cross_mask_type: "Uniform"
@@ -121,29 +117,15 @@ model:
     dec_self_dropout_qkv: ${experiment.dropout}
     dec_self_attention_dropout: ${experiment.dropout}
 
-    share_structure_across_layers: false
-
-    key_projection_type_cross: "linear"
-    key_projection_type_self: "linear"
-    orthogonal_scale: true
-    orthogonal_init_scale: 1.0
-
-    # Noise-aware parameters
-    init_sigma_A: 0.01
-    init_sigma_R: 0.05
-    noise_per_dimension: false
-    track_variance: false
-
+    
 
 training:
   optimizer: "adamw"
   lr: ${experiment.lr}
   weight_decay: 0.01
-  use_scheduler: true
+  use_scheduler: false
 
-  loss_fn: "gaussian_nll"
-  nll_eps: 1.0e-6
-  nll_full: false
+  loss_fn: "mse"
 
   batch_size: ${experiment.batch_size}
   max_epochs: ${experiment.max_epochs}
@@ -159,7 +141,7 @@ training:
   lambda_hsic_cross: 0.0
   lambda_hsic_self: 0.0
   use_attention_weighted_hsic: false
-  normalize_hsic_by_loss: true
+  normalize_hsic_by_loss: false
   hsic_sigma: 1.0
   hsic_adaptive_bandwidth: false
   hsic_kernel_source: "rbf"
@@ -173,23 +155,21 @@ training:
   hsic_lambda_self_start: null
   hsic_lambda_self_end: 0.0
 
-  use_gradient_routing: false
-
-  lambda_noise_prior: 0.0
-  prior_sigma_A: 0.01
-  prior_sigma_R: 0.05
-
   lambda_group_l1: 0.0
   lambda_group_l1_anneal_start_value: null
   lambda_group_l1_anneal_idle_epochs: 0
   lambda_group_l1_anneal_transient_epochs: 0
 
-  log_gradient_norms: false
-
   use_hard_masks: false
   hard_mask_files:
     dec_cross: "dec1_cross_att_mask.csv"
     dec_self: "dec1_self_att_mask.csv"
+
+  use_oracle_attention: false
+  hard_masks_corruption_seed: null
+  cross_control_shd: 0
+  self_control_shd: 0
+  hard_masks_preserve_sparsity: false
 
 
 staged_training:
@@ -199,7 +179,7 @@ staged_training:
 
   calibration_epochs: 10
   calibration_balance_threshold: 2.0
-  calibration_lambda_group_range: [1.0e-3, 10]
+  calibration_lambda_group_range: [1.0e-5, 1.0e-1]
   calibration_max_iterations: 10
 
   causal_init_epochs: 20
@@ -246,7 +226,6 @@ data:
 
 evaluation:
   functions: []
-
 
 special:
   mode: []

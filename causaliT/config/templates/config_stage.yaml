@@ -1,0 +1,186 @@
+# StageCausaliT Template — Shared embeddings for S, X, Y (SCM datasets).
+
+experiment:
+  d_model_set: 24
+  d1_layers: 1
+  d2_layers: 1
+  n_heads: 1
+  d_ff_mult: 2.0
+  d_qk_mult: 0.5
+  d_ff: null
+  d_qk: null
+  dropout: 0.0
+
+  lr: 0.0005
+  batch_size: 64
+  max_epochs: 100
+
+  loss_weight_x: 1.0
+  loss_weight_y: 1.0
+
+
+model:
+  model_object: "StageCausaliT"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+    time_emb_hidden: ${experiment.d_model_set}
+
+  kwargs:
+    model: ${model.model_object}
+
+    comps_embed_shared: "summation"
+
+    ds_embed_shared:
+      setting:
+        d_model: ${experiment.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_shared}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_shared.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    dec1_cross_attention_type: "ScaledDotProduct"
+    dec1_cross_mask_type: "Uniform"
+    dec1_self_attention_type: "ScaledDotProduct"
+    dec1_self_mask_type: "Uniform"
+
+    dec2_cross_attention_type: "ScaledDotProduct"
+    dec2_cross_mask_type: "Uniform"
+    dec2_self_attention_type: "ScaledDotProduct"
+    dec2_self_mask_type: "Uniform"
+
+    n_heads: ${experiment.n_heads}
+
+    dec1_causal_mask: false
+    dec2_causal_mask: false
+
+    d1_layers: ${experiment.d1_layers}
+    d2_layers: ${experiment.d2_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${experiment.d_model_set}
+    d_qk: ${experiment.d_qk}
+
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    Y_seq_len: ${data.Y_seq_len}
+
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+
+    dec1_cross_dropout_qkv: ${experiment.dropout}
+    dec1_cross_attention_dropout: ${experiment.dropout}
+    dec1_self_dropout_qkv: ${experiment.dropout}
+    dec1_self_attention_dropout: ${experiment.dropout}
+
+    dec2_cross_dropout_qkv: ${experiment.dropout}
+    dec2_cross_attention_dropout: ${experiment.dropout}
+    dec2_self_dropout_qkv: ${experiment.dropout}
+    dec2_self_attention_dropout: ${experiment.dropout}
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+
+  loss_fn: "mse"
+  loss_weight_x: ${experiment.loss_weight_x}
+  loss_weight_y: ${experiment.loss_weight_y}
+
+  teacher_forcing: false
+
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+
+  lambda_entropy_self: 0.0
+  lambda_entropy_cross: 0.0
+
+  kappa: 0.0
+
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false
+
+  lambda_l1_self_scores: 0.0
+  lambda_l1_cross_scores: 0.0
+
+  lambda_embed_l1: 0.0
+
+  freeze_embeddings: false
+
+  use_hard_masks: false
+  hard_mask_files:
+    dec1_cross: "dec1_cross_att_mask.csv"
+    dec1_self: "dec1_self_att_mask.csv"
+    dec2_cross: "dec2_cross_att_mask.csv"
+    dec2_self: "dec2_self_att_mask.csv"
+
+
+data:
+  dataset: "scm1"
+  filename_input: "ds.npz"
+
+  train_file: "ds_train.npz"
+  test_file: "ds_test.npz"
+
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+
+  feature_indices:
+    value: null
+    variable: null
+
+
+evaluation:
+  functions: []
+
+
+special:
+  mode: []

@@ -41,9 +41,14 @@ def find_yml_files(dir:str)-> Tuple[dict]:
     if config is None:
         raise FileNotFoundError("No configuration file found")
     
+    # Always resolve multiplier-derived fields (d_ff, d_qk) on the base
+    # config, regardless of whether a sweep file is present.  Previously
+    # update_config was only called when no sweep was found, leaving d_ff /
+    # d_qk as ``null`` for every sweep run (causing a TypeError when the
+    # model tried to multiply ``None * int``).
     if sweep_config is None:
         warnings.warn("No available sweep found")
-        config = update_config(config) # update config anyways
+    config = update_config(config)
     
     return config, sweep_config
 
@@ -124,6 +129,7 @@ def combination_sweep(exp_dir, mode="combination"):
                                 # update the config file for the current sweep
                                 config_sweep = config.copy()
                                 config_sweep[cat][param] = val
+                                config_sweep = update_config(config_sweep)
                                 
                                 # update the saving dir
                                 save_dir = join(sweep_param_path, f"sweep_{param}_{val}")
@@ -221,27 +227,71 @@ def combination_sweep(exp_dir, mode="combination"):
 
 def update_config(config: dict)->dict:
     """
-    Updates the config file where placeholders are set 
+    Updates the config file where placeholders are set.
+
+    In addition to resolving the legacy proT ``d_model_enc/dec`` placeholders,
+    this function also resolves the *affine* relationship between
+    ``experiment.d_model_set`` and the transformer's two satellite dimensions
+    ``d_ff`` (feed-forward hidden) and ``d_qk`` (query/key rank), via two
+    multiplier fields:
+
+        experiment.d_ff_mult  ->  experiment.d_ff = round(d_ff_mult * d_model_set)
+        experiment.d_qk_mult  ->  experiment.d_qk = max(1, round(d_qk_mult * d_model_set))
+
+    Defaults follow the standard transformer literature ratios commonly used
+    in our small-model regime: ``d_ff = 2 * d_model``, ``d_qk = 0.5 * d_model``
+    (Vaswani et al. used 4x and 1/n_heads; here we use 2x and 1/2 to stay
+    within compute budget while retaining the FFN expansion / Q/K-bottleneck
+    *separation* between value-stream and structure-stream pathways).
+
+    The multiplier-driven values are written into ``experiment.d_ff`` /
+    ``experiment.d_qk`` ONLY when those fields are missing or set to ``null``,
+    so any explicit override in the YAML is preserved.
 
     Args:
         config (dict): config with placeholders
 
     Returns:
         dict: updated config
-    """    
-    
+    """
+
     if config.get("model", {}).get("model_object") == "proT":
-    
+
         if config.model.kwargs.comps_embed_enc == "concat":
             config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden
-            
-        if config.model.kwargs.comps_embed_dec == "concat":    
+
+        if config.model.kwargs.comps_embed_dec == "concat":
             config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden
-            
+
         if config.model.kwargs.comps_embed_enc == "summation":
             config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
-            
+
         if config.model.kwargs.comps_embed_dec == "summation":
             config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
-            
+
+    # ------------------------------------------------------------------
+    # Resolve d_ff / d_qk from d_model_set via multipliers (if provided).
+    # ------------------------------------------------------------------
+    exp = config.get("experiment", None)
+    if exp is not None:
+        d_model_set = exp.get("d_model_set", None)
+        if d_model_set is None:
+            # Fallback to model.embed_dim.d_model_set if defined there.
+            d_model_set = (
+                config.get("model", {})
+                .get("embed_dim", {})
+                .get("d_model_set", None)
+            )
+
+        if d_model_set is not None:
+            d_ff_mult = exp.get("d_ff_mult", None)
+            d_qk_mult = exp.get("d_qk_mult", None)
+            if d_ff_mult is not None and exp.get("d_ff", None) is None:
+                exp.d_ff = int(round(float(d_ff_mult) * float(d_model_set)))
+
+            if d_qk_mult is not None and exp.get("d_qk", None) is None:
+                exp.d_qk = max(1, int(round(float(d_qk_mult) * float(d_model_set))))
+
     return config
+
+

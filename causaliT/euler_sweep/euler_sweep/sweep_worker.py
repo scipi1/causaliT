@@ -88,7 +88,15 @@ def main(exp_dir, combinations_file, task_id):
     if data_dir is not None:
         print(f"[Worker] Populating dataset metadata from: {data_dir}")
         config = populate_seq_lengths_from_dataset(config, data_dir)
-    
+
+    # Apply update_config BEFORE resolving interpolations so that derived
+    # fields such as experiment.d_ff / experiment.d_qk (computed from
+    # d_ff_mult * d_model_set) are written into the config BEFORE
+    # ${experiment.d_ff} is resolved.  Without this the saved config.yaml
+    # still contains null for those fields.
+    from causaliT.training.experiment_control import update_config
+    config = update_config(config)
+
     # Now resolve interpolations - references will use the updated parameter values
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
     

@@ -16,12 +16,6 @@ Active regularizers:
 - Group L1 (embedding bottleneck)
 - Noise prior (optional, for identifiability)
 
-Deprecated (removed):
-- Acyclicity (NOTEARS) — partial causal ordering prevents cycles by construction
-- KL divergence prior — no explicit phi parametrization in SVFA
-- DAG sparsity (L1 on phi) — no explicit phi parametrization in SVFA
-- Decisiveness — no explicit phi parametrization in SVFA
-
 References:
 - docs/noise_aware_transformer_summary.md
 - docs/NOISE_LEARNING.md
@@ -763,8 +757,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             # (CausalCross/SigmoidCrossAttention) are no longer learnable
             # Parameters — they collapsed to a constant ``self.tau`` Python
             # float. iter_11+ re-enables annealing of that constant float
-            # via path (b) below. Only ToeplitzLieAttention's gate/direction
-            # taus remain learnable Parameters (path (a)).
+            # via path (b) below. Legacy log_tau_gate / log_tau_dir are
+            # no-ops for current attention types (path (a)).
             tau_param_names = ("log_tau_gate", "log_tau_dir")
 
             

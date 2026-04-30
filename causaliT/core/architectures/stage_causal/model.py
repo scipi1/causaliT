@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer,
+    ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer,
     ModularEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -452,7 +452,7 @@ class StageCausaliT(nn.Module):
             d_model_values: Dimension of value projections
             n_heads: Number of attention heads
             d_queries_keys: Dimension of queries and keys per head
-            attention_type: Type of attention mechanism ("ScaledDotProduct" or "LieAttention")
+            attention_type: Type of attention mechanism ("ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention")
             mask_type: Type of masking ("Uniform" or None)
             dropout_qkv: Dropout rate for query/key/value projections
             attention_dropout: Dropout rate for attention weights
@@ -466,18 +466,14 @@ class StageCausaliT(nn.Module):
         """
         
         # Choose attention type
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax"]
+        assert attention_type in ["ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention"]
         
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
-        elif attention_type == "LieAttention":
-            attention_module = LieAttention
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
         elif attention_type == "SigmoidCrossAttention":
             attention_module = SigmoidCrossAttention
-        elif attention_type == "PhiSoftMax":
-            attention_module = PhiSoftMax
         
         # Choose mask type
         mask_layer = None

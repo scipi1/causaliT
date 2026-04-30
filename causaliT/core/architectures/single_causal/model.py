@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer,ToeplitzLieAttention, ToeplitzAttention,
+    ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask,
     MLPHead
@@ -105,15 +105,6 @@ class SingleCausalLayer(nn.Module):
         # SVFA: factorization mode ("standard" or "svfa")
         factorization: str = "standard",
         
-        # DAG parameterization for self-attention: "independent", "antisymmetric", or "gated"
-        # "antisymmetric" enforces P(i→j) + P(j→i) = 1, preventing bidirectional edges
-        # "gated" adds symmetric gate + antisymmetric direction (requires square attention)
-        dag_parameterization_self: str = "independent",
-        
-        # DAG parameterization for cross-attention: must be "independent"
-        # Cross-attention is non-square (X queries, S keys), so only "independent" is valid
-        dag_parameterization_cross: str = "independent",
-        
         # Attention bypass mode for Attention Necessity Score (ANS) evaluation
         # When True, replaces learned attention with uniform attention
         # This tests if the model can fit data using only embeddings + MLP
@@ -165,8 +156,6 @@ class SingleCausalLayer(nn.Module):
         self.dec_causal_mask = dec_causal_mask
         self.d_model = d_model
         self.factorization = factorization
-        self.dag_parameterization_self = dag_parameterization_self
-        self.dag_parameterization_cross = dag_parameterization_cross
         self.attention_bypass = attention_bypass
         
         # Store sequence lengths for attention bypass
@@ -243,7 +232,6 @@ class SingleCausalLayer(nn.Module):
             "layer_name": "dec_cross_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": S_seq_len,
-            "dag_parameterization": dag_parameterization_cross,  # Non-square: must be "independent"
             "key_projection_type": key_projection_type_cross,    # Orthogonal for S keys
             "orthogonal_scale": orthogonal_scale,
             "orthogonal_init_scale": orthogonal_init_scale,
@@ -263,7 +251,6 @@ class SingleCausalLayer(nn.Module):
             "layer_name": "dec_self_att",
             "query_seq_len": X_seq_len,
             "key_seq_len": X_seq_len,
-            "dag_parameterization": dag_parameterization_self,  # Square: can use any
             "key_projection_type": key_projection_type_self,    # Linear for X keys
             "orthogonal_scale": orthogonal_scale,
             "orthogonal_init_scale": orthogonal_init_scale,
@@ -560,7 +547,6 @@ class SingleCausalLayer(nn.Module):
         layer_name: str,
         query_seq_len: int,
         key_seq_len: int,
-        dag_parameterization: str = "independent",
         key_projection_type: str = "linear",
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
@@ -585,20 +571,14 @@ class SingleCausalLayer(nn.Module):
         """
 
         
-        assert attention_type in ["ScaledDotProduct", "LieAttention", "CausalCrossAttention", "SigmoidCrossAttention", "PhiSoftMax", "ToeplitzLieAttention", "ToeplitzAttention"]
-        
+        assert attention_type in ["ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention"]
+
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention
-        elif attention_type == "LieAttention":
-            attention_module = LieAttention
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
         elif attention_type == "SigmoidCrossAttention":
             attention_module = SigmoidCrossAttention
-        elif attention_type == "PhiSoftMax":
-            attention_module = PhiSoftMax
-        elif attention_type == "ToeplitzLieAttention":
-            attention_module = ToeplitzLieAttention
         elif attention_type == "ToeplitzAttention":
             attention_module = ToeplitzAttention
         
@@ -621,7 +601,6 @@ class SingleCausalLayer(nn.Module):
             layer_name=layer_name,
             query_seq_len=query_seq_len,
             key_seq_len=key_seq_len,
-            dag_parameterization=dag_parameterization,
             key_projection_type=key_projection_type,
             orthogonal_scale=orthogonal_scale,
             orthogonal_init_scale=orthogonal_init_scale,

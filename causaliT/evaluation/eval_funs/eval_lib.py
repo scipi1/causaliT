@@ -279,9 +279,9 @@ def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[
     """
     Extract learned DAG probabilities (sigmoid(phi)) from a loaded model.
     
-    This function extracts the posterior DAG structure learned by LieAttention and
-    CausalCrossAttention modules. It uses `get_dag_probabilities()` which returns
-    sigmoid(phi), the actual edge probabilities, rather than raw phi logits.
+    This function extracts the posterior DAG structure learned by attention modules
+    with learnable phi (e.g. CausalCrossAttention). It uses `get_dag_probabilities()`
+    which returns sigmoid(phi), the actual edge probabilities, rather than raw phi logits.
     
     Args:
         model: Loaded model (TransformerForecaster, StageCausalForecaster, or SingleCausalForecaster)
@@ -629,7 +629,7 @@ def load_attention_data(
         >>> dec_self_att_list = data.attention_weights["decoder"]
         >>> cross_att_list = data.attention_weights["cross"]
         >>> 
-        >>> # Access phi tensors (for LieAttention)
+        >>> # Access phi tensors (for attention modules with learnable phi)
         >>> enc_phi_list = data.phi_tensors["encoder"]
         >>> dec_phi_list = data.phi_tensors["decoder"]
         >>> 

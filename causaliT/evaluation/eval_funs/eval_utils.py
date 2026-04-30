@@ -684,7 +684,7 @@ def _get_learned_dag(
     Extract the learned DAG from attention data (averaged across folds).
     
     Priority:
-    1. If phi tensor is available (LieAttention, CausalCrossAttention), use it
+    1. If phi tensor is available (attention modules with learnable phi), use it
     2. Otherwise, use mean attention scores across test samples
     
     Args:
@@ -1229,7 +1229,7 @@ def _get_learned_dag_per_fold(
     Extract learned DAG for each fold separately (no averaging).
     
     Priority:
-    1. If phi tensor is available (LieAttention, CausalCrossAttention), use it
+    1. If phi tensor is available (attention modules with learnable phi), use it
     2. Otherwise, use mean attention scores across test samples
     
     Args:

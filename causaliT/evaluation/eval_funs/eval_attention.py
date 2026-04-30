@@ -99,7 +99,7 @@ def _write_learned_dag_edges_json(
         - the fold-mean and fold-std matrices
         - row/column variable labels (from dataset metadata)
 
-    No architecture-specific knowledge is required to consume this file —
+    No architecture-specific knowledge is required to consume this file -
     it's just nested numeric arrays + labels.
     """
     if not per_fold_comparison_data:
@@ -230,10 +230,10 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         
     Returns:
         dict: DAG recovery metrics with keys:
-            - soft_hamming_cross: Soft Hamming distance for S→X edges (best/mean/worst/std/per_fold)
-            - soft_hamming_self: Soft Hamming distance for X→X edges (best/mean/worst/std/per_fold)
-            - dag_confidence_cross: DAG consistency across folds for S→X (1=identical, 0=max disagreement)
-            - dag_confidence_self: DAG consistency across folds for X→X (1=identical, 0=max disagreement)
+            - soft_hamming_cross: Soft Hamming distance for S->X edges (best/mean/worst/std/per_fold)
+            - soft_hamming_self: Soft Hamming distance for X->X edges (best/mean/worst/std/per_fold)
+            - dag_confidence_cross: DAG consistency across folds for S->X (1=identical, 0=max disagreement)
+            - dag_confidence_self: DAG consistency across folds for X->X (1=identical, 0=max disagreement)
             - mec_distance: MEC distance metrics (if computable)
         
     Output Files:
@@ -280,7 +280,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     
     # =========================================================================
     # Determine checkpoint type (same logic as ATE evaluation)
-    # Causal models → best_causal, baselines → best_reconstruction
+    # Causal models -> best_causal, baselines -> best_reconstruction
     # =========================================================================
     ckpt_type = infer_checkpoint_type(config)
     print(f"  Checkpoint type: {ckpt_type}")
@@ -311,7 +311,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         attention_labels["variable_mapping"] = metadata["variable_descriptions"]
     if "causal_structure" in metadata and "edges" in metadata["causal_structure"]:
         edges = metadata["causal_structure"]["edges"]
-        edge_strs = [f"{src}→{tgt}" for src, tgt in edges]
+        edge_strs = [f"{src}->{tgt}" for src, tgt in edges]
         attention_labels["dag_structure"] = ", ".join(edge_strs)
     
     _save_variable_labels(eval_path_files, attention_labels, attention_labels_filename)
@@ -530,7 +530,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
                 "per_fold": {k: v['shd'] if v else None for k, v in per_fold_standard_shd.items()},
                 "per_fold_details": {k: v for k, v in per_fold_standard_shd.items()},
             }
-            print(f"    Standard SHD ({base_key}): mean={np.mean(fold_std_shd_array):.1f} ± {np.std(fold_std_shd_array):.1f}")
+            print(f"    Standard SHD ({base_key}): mean={np.mean(fold_std_shd_array):.1f} +/- {np.std(fold_std_shd_array):.1f}")
         
         # Compute DAG confidence
         valid_fold_dags = [dag for _, dag in fold_dags if dag is not None]
@@ -673,7 +673,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             else:
                 plt.close()
     
-    print(f"\n✓ eval_attention_scores complete!")
+    print(f"\n[OK] eval_attention_scores complete!")
     return dag_metrics
 
 
@@ -708,8 +708,8 @@ def eval_attention_evolution(
             - {block}_{i}{j}_mean: mean attention score across samples
             - {block}_{i}{j}_std: std of attention scores
             - phi_{block}_{i}{j}: learned DAG probability (sigmoid(phi))
-            - shd_cross: Soft Hamming Distance for cross-attention (S→X)
-            - shd_self: Soft Hamming Distance for self-attention (X→X)
+            - shd_cross: Soft Hamming Distance for cross-attention (S->X)
+            - shd_self: Soft Hamming Distance for self-attention (X->X)
             - shd_cross_L{i}, shd_self_L{i}: Per-layer SHD (multi-layer models)
             
     Output Files:
@@ -812,7 +812,7 @@ def eval_attention_evolution(
         else:
             print("  No SHD columns found in evolution data (true DAG masks may be unavailable)")
     
-    print(f"\n✓ eval_attention_evolution complete!")
+    print(f"\n[OK] eval_attention_evolution complete!")
     return df
 
 
@@ -1042,14 +1042,14 @@ def _load_attention_evolution_data(
                                 record[_col] = _compute_soft_hamming(_learned, _true_dag)
                     
                     all_records.append(record)
-                    print(f"    ✓ epoch {epoch}")
+                    print(f"    [OK] epoch {epoch}")
                     
                 except Exception as e:
-                    print(f"    ✗ epoch {epoch}: {e}")
+                    print(f"    [FAIL] epoch {epoch}: {e}")
                     continue
             
         except Exception as e:
-            print(f"  ✗ {kfold_dir}: {e}")
+            print(f"  [FAIL] {kfold_dir}: {e}")
             continue
     
     if all_records:

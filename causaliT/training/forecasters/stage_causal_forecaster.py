@@ -328,46 +328,6 @@ class StageCausalForecaster(pl.LightningModule):
             dec2_cross_ent_batch = torch.concat(dec2_cross_ent, dim=0).mean()
             dec2_self_ent_batch = torch.concat(dec2_self_ent, dim=0).mean()
         
-        # Get learned DAG parameters for acyclicity and prior regularization
-        # Self-attention modules (LieAttention)
-        dec1_self_inner = self.model.decoder1.layers[0].global_self_attention.inner_attention
-        dec2_self_inner = self.model.decoder2.layers[0].global_self_attention.inner_attention
-        
-        # Cross-attention modules (CausalCrossAttention)
-        dec1_cross_inner = self.model.decoder1.layers[0].global_cross_attention.inner_attention
-        dec2_cross_inner = self.model.decoder2.layers[0].global_cross_attention.inner_attention
-        
-        # phi - learned DAGs for self-attention (only available for LieAttention)
-        dec1_self_phi = getattr(dec1_self_inner, 'phi', None)
-        dec2_self_phi = getattr(dec2_self_inner, 'phi', None)
-        
-        # phi - learned DAGs for cross-attention (only available for CausalCrossAttention with DAG learning)
-        dec1_cross_phi = getattr(dec1_cross_inner, 'phi', None)
-        dec2_cross_phi = getattr(dec2_cross_inner, 'phi', None)
-        
-        # Batch statistics for self-attention (with gradients for regularization)
-        dec1_self_batch_mean = getattr(dec1_self_inner, 'batch_att_mean', None)
-        dec1_self_batch_snr = getattr(dec1_self_inner, 'batch_att_snr', None)
-        dec2_self_batch_mean = getattr(dec2_self_inner, 'batch_att_mean', None)
-        dec2_self_batch_snr = getattr(dec2_self_inner, 'batch_att_snr', None)
-        
-        # Batch statistics for cross-attention (with gradients for regularization)
-        dec1_cross_batch_mean = getattr(dec1_cross_inner, 'batch_att_mean', None)
-        dec1_cross_batch_snr = getattr(dec1_cross_inner, 'batch_att_snr', None)
-        dec2_cross_batch_mean = getattr(dec2_cross_inner, 'batch_att_mean', None)
-        dec2_cross_batch_snr = getattr(dec2_cross_inner, 'batch_att_snr', None)
-        
-        # Running averages for self-attention (detached, used as priors)
-        dec1_self_runav_mean = getattr(dec1_self_inner, 'runav_att_mean', None)
-        dec1_self_runav_snr = getattr(dec1_self_inner, 'runav_att_snr', None)
-        dec2_self_runav_mean = getattr(dec2_self_inner, 'runav_att_mean', None)
-        dec2_self_runav_snr = getattr(dec2_self_inner, 'runav_att_snr', None)
-        
-        # Running averages for cross-attention (detached, used as priors)
-        dec1_cross_runav_mean = getattr(dec1_cross_inner, 'runav_att_mean', None)
-        dec1_cross_runav_snr = getattr(dec1_cross_inner, 'runav_att_snr', None)
-        dec2_cross_runav_mean = getattr(dec2_cross_inner, 'runav_att_mean', None)
-        dec2_cross_runav_snr = getattr(dec2_cross_inner, 'runav_att_snr', None)
         
         # Entropy regularizer - encourages focused attention (low entropy)
         # Higher entropy = more uniform attention = more exploration
@@ -380,96 +340,14 @@ class StageCausalForecaster(pl.LightningModule):
         else:
             entropy_regularizer = 0.0
         
-        # Acyclicity regularizer (only for self-attention DAGs, which are square)
-        # Note: Cross-attention DAGs are bipartite and inherently acyclic, so no NOTEARS needed
-        if self.kappa > 0:
-            acyclic_regularizer = 0.0
-            
-            if dec1_self_phi is not None:
-                if dec1_self_phi.dim() != 2:
-                    raise NotImplementedError(
-                        f"Acyclicity regularization only supports single-head attention. "
-                        f"Decoder 1 self-attention phi has shape {dec1_self_phi.shape}, expected 2D tensor."
-                    )
-                acyclic_regularizer += self._notears_acyclicity(dec1_self_phi)
-            
-            if dec2_self_phi is not None:
-                if dec2_self_phi.dim() != 2:
-                    raise NotImplementedError(
-                        f"Acyclicity regularization only supports single-head attention. "
-                        f"Decoder 2 self-attention phi has shape {dec2_self_phi.shape}, expected 2D tensor."
-                    )
-                acyclic_regularizer += self._notears_acyclicity(dec2_self_phi)
-            
-            acyclic_regularizer = self.kappa * acyclic_regularizer
-        else:
-            acyclic_regularizer = 0.0
+        # Acyclicity regularizer — not applied for stage_causal (no square self-attention DAG)
+        acyclic_regularizer = 0.0
         
-        # Prior regularizer - KL divergence between learned phi and empirical evidence
-        def _get_prior_reg(phi, evidence, alpha):
-            """KL divergence between learned phi and empirical evidence, weighted by |SNR|.
-            
-            Uses absolute value of SNR to ensure the regularizer is always non-negative.
-            SNR can be negative when batch_mean is negative (possible with GeLU activation),
-            but we only care about the magnitude of confidence, not its sign.
-            """
-            if phi is None or evidence is None or alpha is None:
-                return 0.0
-            _eps = 1E-6
-            p = torch.sigmoid(phi)
-            p0 = torch.sigmoid(evidence)
-            
-            # Use absolute value of alpha (SNR) to ensure non-negative weighting
-            # SNR magnitude indicates confidence; sign is irrelevant for weighting
-            alpha_abs = torch.abs(alpha)
-            
-            # Explicit KL divergence for two Bernoulli distributions p and p0
-            # KL(p || p0) is always >= 0, and alpha_abs >= 0, so result is always >= 0
-            kl = (alpha_abs * (p * (torch.log(p + _eps) - torch.log(p0 + _eps)) + 
-                              (1 - p) * (torch.log(1 - p + _eps) - torch.log(1 - p0 + _eps)))).mean()
-            return kl
+        # Prior regularizer — removed (no learnable phi parametrization)
+        prior_regularizer = 0.0
         
-        # Self-attention prior regularization (LieAttention)
-        self_attention_prior = (
-            _get_prior_reg(dec1_self_phi, dec1_self_runav_mean, dec1_self_runav_snr) + 
-            _get_prior_reg(dec2_self_phi, dec2_self_runav_mean, dec2_self_runav_snr)
-        )
-        
-        # Cross-attention prior regularization (CausalCrossAttention)
-        cross_attention_prior = (
-            _get_prior_reg(dec1_cross_phi, dec1_cross_runav_mean, dec1_cross_runav_snr) + 
-            _get_prior_reg(dec2_cross_phi, dec2_cross_runav_mean, dec2_cross_runav_snr)
-        )
-        
-        # Total prior regularizer
-        prior_regularizer = self_attention_prior + cross_attention_prior
-        
-        # Sparsity regularizer - L1 penalty on edge probabilities
-        # Encourages sparse DAG solutions by penalizing the expected number of edges
-        def _get_sparsity_reg(phi):
-            """L1-style sparsity penalty: sum of edge probabilities."""
-            if phi is None:
-                return 0.0
-            # Mean of sigmoid(phi) = expected density of the graph
-            return torch.sigmoid(phi).mean()
-        
-        # Self-attention sparsity (with lambda_sparse)
-        self_attention_sparsity = (
-            _get_sparsity_reg(dec1_self_phi) + 
-            _get_sparsity_reg(dec2_self_phi)
-        )
-        
-        # Cross-attention sparsity (with lambda_sparse_cross, which may be higher)
-        cross_attention_sparsity = (
-            _get_sparsity_reg(dec1_cross_phi) + 
-            _get_sparsity_reg(dec2_cross_phi)
-        )
-        
-        # Total sparsity regularizer (using separate coefficients if specified)
-        sparsity_regularizer = (
-            self.lambda_sparse * self_attention_sparsity +
-            self.lambda_sparse_cross * cross_attention_sparsity
-        )
+        # Sparsity regularizer — removed (no learnable phi parametrization)
+        sparsity_regularizer = 0.0
         
         # L1 regularization on attention SCORES
         # NOTE: This is INEFFECTIVE for ScaledDotProduct attention because post-softmax
@@ -573,11 +451,6 @@ class StageCausalForecaster(pl.LightningModule):
         if self.log_acyclicity:
             self.log(f"{stage}_notears", acyclic_regularizer, on_step=False, on_epoch=True)
         
-        # Log sparsity if requested
-        if self.log_sparsity:
-            self.log(f"{stage}_sparsity_self", self_attention_sparsity, on_step=False, on_epoch=True)
-            self.log(f"{stage}_sparsity_cross", cross_attention_sparsity, on_step=False, on_epoch=True)
-            self.log(f"{stage}_sparsity_total", sparsity_regularizer, on_step=False, on_epoch=True)
         
         # Log L1 scores regularization if requested
         if self.log_l1_scores:

@@ -8,24 +8,21 @@ This package contains the building blocks of the transformer architecture:
 - Extra utility layers
 """
 
-from .attention import LieAttention, ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, PhiSoftMax, AttentionLayer, ToeplitzAttention, ToeplitzLieAttention
+from .attention import ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer, ToeplitzAttention
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
 from .embedding import ModularEmbedding
 from .orthogonal_embedding import OrthogonalMaskEmbedding
 from .orthogonal_linear import OrthogonalLinear
 from .embedding_layers import *
-from .extra_layers import Normalization, UniformAttentionMask, DAGMask
+from .extra_layers import Normalization, UniformAttentionMask
 from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
 from .mlp_head import MLPHead
 
 __all__ = [
-    'LieAttention',
     'ScaledDotAttention',
     'CausalCrossAttention',
     'SigmoidCrossAttention',
-    'PhiSoftMax',
-    'ToeplitzLieAttention',
     'ToeplitzAttention',
     'AttentionLayer',
     'Encoder',
@@ -37,7 +34,6 @@ __all__ = [
     'OrthogonalLinear',
     'Normalization',
     'UniformAttentionMask',
-    'DAGMask',
     # Noise-aware modules
     'AmbientNoiseLayer',
     'ReadingNoiseHead',

@@ -339,13 +339,12 @@ def _get_batch_att_mean_from_model(
     """
     Extract ``batch_att_mean`` from a model's inner attention layer.
 
-    This is the fallback for attention types without explicit DAG
-    parameterization (``dag_mask=None``).  In SVFA mode the structure
-    embedding deterministically controls attention, so the batch-averaged
+    This is the fallback.  In SVFA mode the structure embedding
+    deterministically controls attention, so the batch-averaged
     attention scores *are* the soft DAG.
 
-    ``batch_att_mean`` is set by ``CausalCrossAttention``, ``LieAttention``,
-    and ``PhiSoftMax`` during every forward pass.  It is only available
+    ``batch_att_mean`` is no longer set by the attention classes
+    (phi/DAG learning removed).  It is only available
     after at least one forward pass (i.e. inside the trainer lifecycle).
 
     Values are normalized to [0, 1] via min-max scaling for comparability

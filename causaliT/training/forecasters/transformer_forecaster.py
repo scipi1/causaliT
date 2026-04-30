@@ -103,69 +103,17 @@ class TransformerForecaster(pl.LightningModule):
             dec_self_ent_batch = torch.concat(dec_self_ent, dim=0).mean()
             dec_cross_ent_batch = torch.concat(dec_cross_ent, dim=0).mean()
         
-        # Get batch statistics (with gradients) and running averages (detached) for prior regularization
-        enc_inner_att = self.model.encoder.layers[0].global_attention.inner_attention
-        dec_inner_att = self.model.decoder.layers[0].global_self_attention.inner_attention
-        
-        # phi - learned DAGs (only available for LieAttention)
-        enc_phi = getattr(enc_inner_att, 'phi', None)
-        dec_phi = getattr(dec_inner_att, 'phi', None)
-        
-        # Batch statistics (with gradients for regularization, only available for LieAttention)
-        enc_batch_mean = getattr(enc_inner_att, 'batch_att_mean', None)
-        enc_batch_snr = getattr(enc_inner_att, 'batch_att_snr', None)
-        dec_batch_mean = getattr(dec_inner_att, 'batch_att_mean', None)
-        dec_batch_snr = getattr(dec_inner_att, 'batch_att_snr', None)
-        
-        # Running averages (detached, used as priors, only available for LieAttention)
-        enc_runav_mean = getattr(enc_inner_att, 'runav_att_mean', None)
-        enc_runav_snr = getattr(enc_inner_att, 'runav_att_snr', None)
-        dec_runav_mean = getattr(dec_inner_att, 'runav_att_mean', None)
-        dec_runav_snr = getattr(dec_inner_att, 'runav_att_snr', None)
-        
         # entropy regularizer
         if self.gamma>0:
             entropy_regularizer = self.gamma * (1.0/enc_self_ent_batch + 1.0/dec_self_ent_batch + 1.0/dec_cross_ent_batch)
         else:
             entropy_regularizer = 0.0
         
-        # acyclicity regularizer    
-        if self.kappa > 0:
-            acyclic_regularizer = 0.0
-            
-            if enc_phi is not None:
-                # Check that phi is 2D (single-head)
-                if enc_phi.dim() != 2:
-                    raise NotImplementedError(f"Acyclicity regularization only supports single-head attention. "
-                                             f"Encoder phi has shape {enc_phi.shape}, expected 2D tensor.")
-                acyclic_regularizer += self._notears_acyclicity(enc_phi)
-            
-            if dec_phi is not None:
-                # Check that phi is 2D (single-head)
-                if dec_phi.dim() != 2:
-                    raise NotImplementedError(f"Acyclicity regularization only supports single-head attention. "
-                                             f"Decoder phi has shape {dec_phi.shape}, expected 2D tensor.")
-                acyclic_regularizer += self._notears_acyclicity(dec_phi)
-            
-            acyclic_regularizer = self.kappa * acyclic_regularizer
-        else:
-            acyclic_regularizer = 0.0
+        # Acyclicity regularizer — removed (no LieAttention)
+        acyclic_regularizer = 0.0
         
-        # prior regularizer - detach running averages to prevent gradient tracking
-        def _get_prior_reg(phi, evidence, alpha):
-            """KL divergence between learned phi and empirical evidence, weighted by SNR."""
-            if phi is None or evidence is None or alpha is None:
-                return 0.0
-            _eps = 1E-6
-            p = torch.sigmoid(phi)
-            p0 = torch.sigmoid(evidence)
-            
-            # explicit KL divergence for two Bernoulli distribution 0 and p0
-            kl = (alpha*(p*(torch.log(p+_eps)-torch.log(p0+_eps))+(1-p)*(torch.log(1-p+_eps)-torch.log(1-p0+_eps)))).mean()
-            return kl
-        
-        prior_regularizer = _get_prior_reg(enc_phi, enc_runav_mean, enc_runav_snr) + \
-                           _get_prior_reg(dec_phi, dec_runav_mean, dec_runav_snr)
+        # Prior regularizer — removed (no learnable phi)
+        prior_regularizer = 0.0
         
         # Calculate loss
         predicted_value = forecast_output
