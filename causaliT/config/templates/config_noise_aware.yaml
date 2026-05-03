@@ -128,6 +128,9 @@ model:
     orthogonal_scale: true
     orthogonal_init_scale: 1.0
 
+    toeplitz_init_gate_bias: -15.0
+    toeplitz_gate_bias_trainable: true
+
     # Noise-aware parameters
     init_sigma_A: 0.01
     init_sigma_R: 0.05

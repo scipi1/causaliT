@@ -443,7 +443,52 @@ class SingleCausalForecaster(pl.LightningModule):
         # Compute loss for X
         x_target = torch.nan_to_num(x_val)
         mse_x_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
-        loss_x = mse_x_per_elem.mean()
+
+        # ------------------------------------------------------------------
+        # Batch-consistent key dropout: retrieve per-attention active-query masks.
+        #
+        # ``_active_x_cross``: (L_X,) bool — Xj had ≥1 active Si key in
+        #   cross-attention this step.  Used to gate cross-HSIC residuals.
+        # ``_active_x_self`` : (L_X,) bool — Xj had ≥1 active Xk key in
+        #   self-attention this step.  Used to gate self-HSIC residuals.
+        # ``_active_x_any``  : union — used to gate the MSE loss so that Xj
+        #   contributes a reconstruction gradient whenever it received signal
+        #   from *either* S or another X (e.g. nodes caused only by X siblings
+        #   are excluded from cross-attention but should still be trained on).
+        #
+        # All three are None when the respective feature is disabled or in
+        # eval mode — fallback is to include all variables unchanged.
+        # ------------------------------------------------------------------
+        _bkd = getattr(
+            self.model.decoder.layers[0].global_cross_attention.inner_attention,
+            'batch_key_dropout', None,
+        )
+        _bkd_self = getattr(
+            self.model.decoder.layers[0].global_self_attention.inner_attention,
+            'batch_key_dropout', None,
+        )
+        _active_x_cross = _bkd.get_hsic_active_mask()      if _bkd      is not None else None
+        _active_x_self  = _bkd_self.get_hsic_active_mask() if _bkd_self is not None else None
+
+        # Union mask for MSE gate.
+        if _active_x_cross is not None or _active_x_self is not None:
+            _zero = torch.zeros(
+                mse_x_per_elem.shape[-1], dtype=torch.bool, device=X.device
+            )
+            c = _active_x_cross if _active_x_cross is not None else _zero
+            s = _active_x_self  if _active_x_self  is not None else _zero
+            _active_x_any = c | s
+        else:
+            _active_x_any = None
+
+        # Gate MSE: variables with no attending parents (from S or X) get
+        # weight 0 so their embedding-only prediction does not corrupt the
+        # structural parameters via the reconstruction gradient.
+        if _active_x_any is not None:
+            w = _active_x_any.float()   # (L_X,)
+            loss_x = (mse_x_per_elem * w.unsqueeze(0)).sum() / w.sum().clamp(min=1)
+        else:
+            loss_x = mse_x_per_elem.mean()
         
         # =====================================================================
         # SCORE SPARSITY REGULARIZATION (all decoder layers)
@@ -523,10 +568,37 @@ class SingleCausalForecaster(pl.LightningModule):
         
         # Compute per-X residuals: (batch, seq_len_x)
         residuals_per_x = x_target.squeeze() - pred_x.squeeze()
-        
+
+        # Gate cross-HSIC residuals: include only Xj that had ≥1 active Si key.
+        # None when all variables are disconnected (skip cross-HSIC that step).
+        if _active_x_cross is None or _active_x_cross.all():
+            residuals_for_cross_hsic = residuals_per_x
+        elif not _active_x_cross.any():
+            residuals_for_cross_hsic = None   # all disconnected — skip cross-HSIC
+        else:
+            residuals_for_cross_hsic = residuals_per_x[:, _active_x_cross]   # (B, n_active)
+
+        # Gate self-HSIC residuals: include only Xj that had ≥1 active Xk key.
+        # None when all variables are disconnected (skip self-HSIC that step).
+        if _active_x_self is None or _active_x_self.all():
+            residuals_for_self_hsic = residuals_per_x
+        elif not _active_x_self.any():
+            residuals_for_self_hsic = None    # all disconnected — skip self-HSIC
+        else:
+            residuals_for_self_hsic = residuals_per_x[:, _active_x_self]     # (B, n_active)
+
         # S→X HSIC (cross-attention)
         s_values = S[:, :, self.val_idx]  # (batch, seq_len_s)
 
+        # Filter to the Si that were NOT blanked by batch_key_dropout this step.
+        # _last_key_mask is (L_S,) bool: True = kept.  None when feature is off.
+        _key_mask = (
+            _bkd._last_key_mask
+            if _bkd is not None and _bkd._last_key_mask is not None
+            else None
+        )
+        s_values_for_cross_hsic = s_values[:, _key_mask] if _key_mask is not None else s_values
+        
         # =====================================================================
         # KERNEL DIAGNOSTICS: residual scale & median pairwise distances.
         # Cheap (subsampled) per-step diagnostics; aggregated to epoch by Lightning.
@@ -593,12 +665,17 @@ class SingleCausalForecaster(pl.LightningModule):
                     on_step=False, on_epoch=True,
                 )
         
-        if self.use_attention_weighted_hsic:
+        if residuals_for_cross_hsic is None:
+            # All variables disconnected this step — no informative HSIC signal.
+            hsic_cross_value = torch.tensor(0.0, device=X.device)
+        elif self.use_attention_weighted_hsic:
             att_cross_mean = dec_cross_att[0].mean(dim=0)  # (seq_len_x, seq_len_s)
+            # Filter attention columns to kept Si (same mask as s_values_for_cross_hsic).
+            att_cross_filtered = att_cross_mean[:, _key_mask] if _key_mask is not None else att_cross_mean
             hsic_cross_value = hsic_attention_weighted(
-                source_values=s_values,
-                residuals=residuals_per_x,
-                attention_weights=att_cross_mean,
+                source_values=s_values_for_cross_hsic,
+                residuals=residuals_for_cross_hsic,
+                attention_weights=att_cross_filtered,
                 sigma=self.hsic_sigma,
                 exclude_diagonal=False,
                 adaptive_bandwidth=self.hsic_adaptive_bandwidth,
@@ -606,11 +683,11 @@ class SingleCausalForecaster(pl.LightningModule):
                 nhsic_epsilon=self.nhsic_epsilon,
                 source_kernel=self.hsic_kernel_source,
             )
-        elif self.hsic_cross_mode == "per_variable" and residuals_per_x.dim() > 1:
+        elif self.hsic_cross_mode == "per_variable" and residuals_for_cross_hsic.dim() > 1:
             # Per-variable HSIC: HSIC(S_i, res_j) for all (i,j) pairs
             # Provides edge-level gradient signal for cross-attention DAG learning
             hsic_cross_value = hsic_cross_per_pair(
-                s_values, residuals_per_x,
+                s_values_for_cross_hsic, residuals_for_cross_hsic,
                 sigma=self.hsic_sigma,
                 adaptive_bandwidth=self.hsic_adaptive_bandwidth,
                 mode=self.hsic_mode,
@@ -619,24 +696,41 @@ class SingleCausalForecaster(pl.LightningModule):
             )
         else:
             # Legacy averaged HSIC: HSIC(S_i, mean(residuals)) — weak signal
-            mean_residuals = residuals_per_x.mean(dim=1) if residuals_per_x.dim() > 1 else residuals_per_x
-            hsic_cross_value = hsic_per_token(s_values, mean_residuals, sigma=self.hsic_sigma,
+            mean_residuals = residuals_for_cross_hsic.mean(dim=1) if residuals_for_cross_hsic.dim() > 1 else residuals_for_cross_hsic
+            hsic_cross_value = hsic_per_token(s_values_for_cross_hsic, mean_residuals, sigma=self.hsic_sigma,
                                               adaptive_bandwidth=self.hsic_adaptive_bandwidth,
                                               mode=self.hsic_mode, nhsic_epsilon=self.nhsic_epsilon,
                                               source_kernel=self.hsic_kernel_source)
-        
+
         hsic_regularizer += self.lambda_hsic_cross * hsic_cross_value
         
         # X→X HSIC (self-attention)
         x_values_for_hsic = x_target.squeeze()  # (batch, seq_len_x)
-        
-        if residuals_per_x.dim() > 1:
+
+        # Filter source Xk values to those NOT blanked by self-attention BKD.
+        _self_key_mask = (
+            _bkd_self._last_key_mask
+            if _bkd_self is not None and _bkd_self._last_key_mask is not None
+            else None
+        )
+        x_values_for_self_hsic = (
+            x_values_for_hsic[:, _self_key_mask]
+            if _self_key_mask is not None
+            else x_values_for_hsic
+        )
+
+        if residuals_for_self_hsic is not None and residuals_for_self_hsic.dim() > 1:
             if self.use_attention_weighted_hsic:
                 att_self_mean = dec_self_att[0].mean(dim=0)  # (seq_len_x, seq_len_x)
+                # Filter attention columns to kept Xk source positions.
+                att_self_filtered = att_self_mean[:, _self_key_mask] if _self_key_mask is not None else att_self_mean
+                # Also filter attention rows to the active query positions.
+                if _active_x_self is not None and not _active_x_self.all():
+                    att_self_filtered = att_self_filtered[_active_x_self, :]
                 hsic_self_value = hsic_attention_weighted(
-                    source_values=x_values_for_hsic,
-                    residuals=residuals_per_x,
-                    attention_weights=att_self_mean,
+                    source_values=x_values_for_self_hsic,
+                    residuals=residuals_for_self_hsic,
+                    attention_weights=att_self_filtered,
                     sigma=self.hsic_sigma,
                     exclude_diagonal=True,
                     adaptive_bandwidth=self.hsic_adaptive_bandwidth,
@@ -644,12 +738,12 @@ class SingleCausalForecaster(pl.LightningModule):
                     nhsic_epsilon=self.nhsic_epsilon,
                 )
             else:
-                hsic_self_value = hsic_per_x_pair(x_values_for_hsic, residuals_per_x,
+                hsic_self_value = hsic_per_x_pair(x_values_for_self_hsic, residuals_for_self_hsic,
                                                   sigma=self.hsic_sigma,
                                                   adaptive_bandwidth=self.hsic_adaptive_bandwidth,
                                                   mode=self.hsic_mode,
                                                   nhsic_epsilon=self.nhsic_epsilon)
-            
+
             hsic_regularizer += self.lambda_hsic_self * hsic_self_value
         
         # =====================================================================

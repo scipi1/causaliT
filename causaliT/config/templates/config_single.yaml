@@ -117,7 +117,9 @@ model:
     dec_self_dropout_qkv: ${experiment.dropout}
     dec_self_attention_dropout: ${experiment.dropout}
 
-    
+    toeplitz_init_gate_bias: -15.0
+    toeplitz_gate_bias_trainable: true
+
 
 training:
   optimizer: "adamw"

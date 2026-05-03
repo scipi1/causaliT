@@ -184,6 +184,14 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         # consistent causal structure across layers while allowing each layer
         # to learn different value transformations for improved reconstruction.
         share_structure_across_layers: bool = False,
+
+        # ToeplitzAttention gate bias settings (ignored for other attention types):
+        #   toeplitz_init_gate_bias  — initial value of the scalar gate bias (default -15.0,
+        #                              strongly negative ⟹ gate closed at init).
+        #   toeplitz_gate_bias_trainable — True (default): bias is learned during training.
+        #                                  False: bias is fixed at toeplitz_init_gate_bias forever.
+        toeplitz_init_gate_bias: float = -15.0,
+        toeplitz_gate_bias_trainable: bool = True,
     ):
         super().__init__()
         
@@ -264,6 +272,9 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         attn_shared_kwargs = {
             "n_heads": n_heads,
             "d_queries_keys": d_qk,
+            # ToeplitzAttention gate bias settings (ignored for other attention types).
+            "init_gate_bias": toeplitz_init_gate_bias,
+            "gate_bias_trainable": toeplitz_gate_bias_trainable,
         }
         
         # Decoder cross-attention configuration (S → X)
@@ -579,6 +590,8 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
         shared_qk_inner: dict = None,
+        init_gate_bias: float = -15.0,
+        gate_bias_trainable: bool = True,
         shared_dag_across_heads: bool = True,
     ):
         """Create an attention layer with specified configuration.
@@ -586,6 +599,8 @@ class NoiseAwareSingleCausalLayer(nn.Module):
         Args:
             shared_qk_inner: Optional dict of shared Q/K/inner_attention components.
                 When provided, the layer reuses these instead of creating its own.
+            init_gate_bias: Initial gate bias value for ToeplitzAttention (default -15.0).
+            gate_bias_trainable: Whether the gate bias is learnable (default True).
             shared_dag_across_heads: When True (default) the DAG / score is
                 shared across the n_heads value channels (SVFA semantics).
                 When False each head has its own DAG / score (legacy).
@@ -625,6 +640,8 @@ class NoiseAwareSingleCausalLayer(nn.Module):
             orthogonal_scale=orthogonal_scale,
             orthogonal_init_scale=orthogonal_init_scale,
             shared_qk_inner=shared_qk_inner,
+            init_gate_bias=init_gate_bias,
+            gate_bias_trainable=gate_bias_trainable,
             shared_dag_across_heads=shared_dag_across_heads,
         )
         

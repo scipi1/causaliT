@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from typing import Optional
 
 
 class ScaleNorm(nn.Module):
@@ -298,3 +299,175 @@ class MaskedBatchPowerNorm(nn.Module):
         x_norm = x / (pow_stat + self.eps)      # ← no centring
 
         return self.gamma * x_norm + self.beta
+
+
+class BatchConsistentKeyDropout(nn.Module):
+    """
+    Batch-consistent key (column) dropout for attention matrices.
+
+    Unlike ``nn.Dropout``, which drops individual elements independently per
+    sample, this module zeroes entire key positions (columns of the attention
+    matrix) using a **single binary mask drawn once per forward call**.
+    The same subset of keys is dropped for every sample in the batch, so that
+    all B samples experience the same simplified parent set — a requirement for
+    meaningful HSIC estimation over the batch.
+
+    The drop probability ``p`` can be linearly annealed over training steps::
+
+        p(t) = p_init + (p_final - p_init) * min(t / annealing_batches, 1)
+
+    where ``t`` counts the number of training-mode forward calls (one per batch
+    step).  The counter is saved in a registered buffer so checkpointing
+    preserves annealing progress.
+
+    No 1/(1-p) rescaling is applied: the goal is structural sparsification, not
+    expectation-preserving noise injection.
+
+    ``blanking_value`` controls how dropped keys are zeroed:
+
+    * ``0.0`` (default) — multiply the attention matrix by the key mask after
+      the activation (ReLU-Tanh, Sigmoid, Toeplitz).  Dropped positions become
+      exactly 0.
+    * ``float('-inf')`` — additive fill applied to **pre-softmax scores** before
+      ``torch.softmax``.  The caller must pass the *score* tensor, not the
+      post-softmax ``att``.  After softmax, dropped positions are exactly 0 and
+      the remaining probability mass renormalises automatically.
+
+    Attributes exposed after each training forward (``None`` in eval mode,
+    ``p == 0``, or before the first forward):
+
+    ``_last_key_mask``       : ``(L_S,)`` bool — True for kept keys.
+    ``_last_active_queries`` : ``(L_X,)`` bool — True for queries that received
+                               at least one non-zero key weight.
+
+    Args:
+        p_init            : Initial drop probability (0 → disabled).
+        p_final           : Final drop probability after annealing.
+                            ``None`` → constant ``p_init`` (no annealing).
+        annealing_batches : Number of training-forward calls over which to
+                            anneal from ``p_init`` to ``p_final``.
+                            ``None`` or ``0`` → no annealing.
+        blanking_value    : Value written into dropped key positions.
+                            ``0.0`` for post-activation matrices;
+                            ``float('-inf')`` for pre-softmax score tensors.
+    """
+
+    def __init__(
+        self,
+        p_init: float,
+        p_final: Optional[float] = None,
+        annealing_batches: Optional[int] = None,
+        blanking_value: float = 0.0,
+    ):
+        super().__init__()
+
+        if not (0.0 <= p_init <= 1.0):
+            raise ValueError(f"p_init must be in [0, 1], got {p_init}")
+        if p_final is not None and not (0.0 <= p_final <= 1.0):
+            raise ValueError(f"p_final must be in [0, 1], got {p_final}")
+
+        self.p_init = float(p_init)
+        self.p_final = float(p_final) if p_final is not None else None
+        self.annealing_batches = (
+            int(annealing_batches)
+            if annealing_batches is not None and int(annealing_batches) > 0
+            else None
+        )
+        self.blanking_value = float(blanking_value)
+        self._use_annealing = (
+            self.p_final is not None and self.annealing_batches is not None
+        )
+
+        # Current effective drop probability — updated each training step.
+        self.p = self.p_init
+
+        # Persistent step counter so checkpointing preserves annealing state.
+        self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
+
+        # Outputs of the most recent training forward (None in eval mode / p=0).
+        self._last_key_mask: Optional[torch.Tensor] = None
+        self._last_active_queries: Optional[torch.Tensor] = None
+
+    # ------------------------------------------------------------------
+    def _current_p(self) -> float:
+        """Return the linearly annealed drop probability at the current step."""
+        if not self._use_annealing:
+            return self.p_init
+        progress = min(1.0, self._step_count.item() / self.annealing_batches)
+        return self.p_init + progress * (self.p_final - self.p_init)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply batch-consistent key dropout.
+
+        Args:
+            x : Attention weight or score tensor.
+                Shape ``(B, L_X, L_S)`` or ``(B, H, L_X, L_S)``.
+                For ``blanking_value=0.0``  pass the post-activation ``att``.
+                For ``blanking_value=-inf`` pass the pre-softmax ``scores``.
+
+        Returns:
+            Tensor of the same shape with dropped key columns blanked.
+            Returned unchanged (no copy) when in eval mode or ``p == 0``.
+        """
+        if not self.training:
+            self._last_key_mask = None
+            self._last_active_queries = None
+            return x
+
+        # Advance step counter and recompute effective p before sampling.
+        self.p = self._current_p()
+        self._step_count += 1
+
+        if self.p <= 0.0:
+            self._last_key_mask = None
+            self._last_active_queries = None
+            return x
+
+        S_dim = x.shape[-1]
+        # One Boolean mask for the whole batch: True = keep, False = drop.
+        keep_mask = (torch.rand(S_dim, device=x.device) >= self.p)  # (L_S,)
+
+        if self.blanking_value == 0.0:
+            x = x * keep_mask.to(x.dtype)
+        else:
+            # Additive masking — used for pre-softmax scores with -inf blanking.
+            x = x.masked_fill(~keep_mask, self.blanking_value)
+
+        # Derive per-query activity (post-masking): which Xi had ≥1 active key?
+        # For -inf blanking the caller applies softmax afterwards, so the
+        # row-sum check is done on the raw (potentially -inf-filled) scores.
+        # Using finite-only sum: treat -inf entries as 0 for the activity check.
+        x_det = x.detach()
+        if self.blanking_value != 0.0:
+            x_det = torch.nan_to_num(x_det, neginf=0.0)
+
+        row_sums = x_det.sum(dim=-1)          # (B, [H,] L_X)
+        if row_sums.dim() == 3:               # multihead: average over H
+            row_sums = row_sums.mean(dim=1)   # (B, L_X)
+        # Batch-consistent → first sample is representative for all.
+        self._last_active_queries = row_sums[0] > 0   # (L_X,) bool
+        self._last_key_mask = keep_mask                # (L_S,) bool
+
+        return x
+
+    # ------------------------------------------------------------------
+    def get_hsic_active_mask(self) -> Optional[torch.Tensor]:
+        """
+        Return the ``(L_X,)`` bool mask of query variables that received at
+        least one active key in the most recent training forward pass.
+
+        Returns ``None`` when the feature is disabled (eval mode, ``p == 0``,
+        or no training forward has been called yet), signalling the forecaster
+        to include all variables in the HSIC computation unchanged.
+
+        Typical usage in the forecaster::
+
+            bcd = layer.global_cross_attention.inner_attention \\
+                       .batch_consistent_dropout
+            active_x = bcd.get_hsic_active_mask() if bcd is not None else None
+            if active_x is not None and not active_x.all():
+                residuals_for_hsic = residuals_per_x[:, active_x]
+        """
+        return self._last_active_queries

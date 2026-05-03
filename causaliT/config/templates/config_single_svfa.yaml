@@ -127,6 +127,9 @@ model:
 
     share_structure_across_layers: false
 
+    toeplitz_init_gate_bias: -15.0
+    toeplitz_gate_bias_trainable: true
+
 
 training:
   optimizer: "adamw"

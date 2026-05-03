@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from causaliT.core.modules.extra_layers import UniformAttentionMask
+from causaliT.core.modules.extra_layers import UniformAttentionMask, BatchConsistentKeyDropout
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List, Optional
@@ -56,6 +56,9 @@ class CausalCrossAttention(nn.Module):
         register_entropy: bool,
         layer_name: str,
         init_tau: float = 3.0,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super(CausalCrossAttention, self).__init__()
 
@@ -69,6 +72,18 @@ class CausalCrossAttention(nn.Module):
 
         # Constant activation temperature (non-learnable, not annealed).
         self.tau = float(init_tau)
+
+        # Batch-consistent key dropout (None = disabled, use standard nn.Dropout).
+        # blanking_value=0.0: applied post-activation (ReLU-Tanh output).
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=0.0,
+            )
+        else:
+            self.batch_key_dropout = None
 
         # Drop legacy attention parameters when loading older checkpoints.
         self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
@@ -150,6 +165,8 @@ class CausalCrossAttention(nn.Module):
             entropy = None
 
         A = self.dropout(att)
+        if self.batch_key_dropout is not None:
+            A = self.batch_key_dropout(A)
         self._score_tensor_for_sparsity = A.mean(dim=0)
 
         if is_multihead:
@@ -185,6 +202,9 @@ class SigmoidCrossAttention(nn.Module):
         register_entropy: bool,
         layer_name: str,
         init_tau: float = 3.0,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super(SigmoidCrossAttention, self).__init__()
 
@@ -197,6 +217,19 @@ class SigmoidCrossAttention(nn.Module):
             raise ValueError("If register_entropy is True, layer_name must be provided.")
 
         self.tau = float(init_tau)
+
+        # Batch-consistent key dropout (None = disabled).
+        # blanking_value=0.0: applied post-activation (Sigmoid output).
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=0.0,
+            )
+        else:
+            self.batch_key_dropout = None
+
         self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
 
     def forward(
@@ -273,6 +306,9 @@ class SigmoidCrossAttention(nn.Module):
             entropy = None
 
         A = self.dropout(att)
+        if self.batch_key_dropout is not None:
+            A = self.batch_key_dropout(A)
+            
         self._score_tensor_for_sparsity = A.mean(dim=0)
 
         if is_multihead:
@@ -304,16 +340,20 @@ class ToeplitzAttention(nn.Module):
 
     Temperature ``tau`` is a *constant* scalar (default 3.0, non-learnable, not annealed).
 
-    Gate bias ``b_gate``: learnable scalar bias on the symmetric (gate) sigmoid's
+    Gate bias ``b_gate``: scalar bias on the symmetric (gate) sigmoid's
     pre-activation. Initialized strongly negative (default -15.0) so the gate is
-    effectively closed at init.
+    effectively closed at init. Whether the bias is learnable or fixed is
+    controlled by ``gate_bias_trainable``.
 
     Args:
         attention_dropout: Dropout rate for attention weights
         register_entropy: Whether to register entropy for logging
         layer_name: Name for logging purposes
         init_tau: Constant temperature (default: 3.0)
-        init_gate_bias: Initial value of the learnable gate bias (default: -15.0)
+        init_gate_bias: Initial value of the gate bias (default: -15.0)
+        gate_bias_trainable: If True (default), gate_bias is a learnable
+            parameter updated during training. If False, it is registered as a
+            fixed constant (frozen at init_gate_bias for the whole run).
         tau_min: Legacy kwarg (ignored)
         tau_max: Legacy kwarg (ignored)
     """
@@ -324,8 +364,12 @@ class ToeplitzAttention(nn.Module):
         layer_name: str,
         init_tau: float = 3.0,
         init_gate_bias: float = -15.0,
+        gate_bias_trainable: bool = True,
         tau_min: float = None,
         tau_max: float = None,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super(ToeplitzAttention, self).__init__()
 
@@ -339,6 +383,20 @@ class ToeplitzAttention(nn.Module):
 
         self.tau = float(init_tau)
         self.gate_bias = nn.Parameter(torch.tensor(float(init_gate_bias)))
+        self.gate_bias.requires_grad = gate_bias_trainable
+
+        # Batch-consistent key dropout (None = disabled).
+        # blanking_value=0.0: applied post-activation (Toeplitz product output).
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=0.0,
+            )
+        else:
+            self.batch_key_dropout = None
+
         self._register_load_state_dict_pre_hook(_drop_legacy_attention_keys)
 
     def get_dag_probabilities(self) -> torch.Tensor:
@@ -447,7 +505,9 @@ class ToeplitzAttention(nn.Module):
 
         A_out = self.dropout(att)
         A_out = torch.nan_to_num(A_out)
-
+        if self.batch_key_dropout is not None:
+            A_out = self.batch_key_dropout(A_out)
+            
         if is_multihead:
             V_out = torch.einsum("bhls,bshd->blhd", A_out, value)
         elif is_shared_mh_v:
@@ -469,7 +529,15 @@ class ScaledDotAttention(nn.Module):
     Hard mask is applied BEFORE softmax to ensure masked positions don't
     influence the softmax normalization (preventing information leakage).
     """
-    def __init__(self, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(
+        self,
+        attention_dropout: float,
+        register_entropy: bool,
+        layer_name: str,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
+    ):
         super(ScaledDotAttention, self).__init__()
 
         self.dropout = nn.Dropout(attention_dropout)
@@ -479,6 +547,19 @@ class ScaledDotAttention(nn.Module):
 
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
+
+        # Batch-consistent key dropout (None = disabled).
+        # blanking_value=-inf: applied to pre-softmax scores so dropped keys
+        # get zero probability after softmax and remaining weights renormalise.
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=float('-inf'),
+            )
+        else:
+            self.batch_key_dropout = None
 
     def forward(
         self,
@@ -541,6 +622,10 @@ class ScaledDotAttention(nn.Module):
 
             scores = scores + hard_mask_additive
 
+        # Batch-consistent key dropout on pre-softmax scores (-inf blanking).
+        if self.batch_key_dropout is not None:
+            scores = self.batch_key_dropout(scores)
+
         att = torch.softmax(scale * scores, dim=-1)
 
         if all_masked_rows is not None and all_masked_rows.any():
@@ -576,7 +661,15 @@ class ScaledDotAttentionNAIM(nn.Module):
     NOTE: The hard_mask in this version is applied AFTER softmax, which can cause
     information leakage. Use ScaledDotAttention for proper causal masking.
     """
-    def __init__(self, attention_dropout: float, register_entropy: bool, layer_name: str):
+    def __init__(
+        self,
+        attention_dropout: float,
+        register_entropy: bool,
+        layer_name: str,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
+    ):
         super(ScaledDotAttentionNAIM, self).__init__()
 
         self.dropout = nn.Dropout(attention_dropout)
@@ -586,6 +679,18 @@ class ScaledDotAttentionNAIM(nn.Module):
 
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
+
+        # Batch-consistent key dropout (None = disabled).
+        # blanking_value=-inf: applied to pre-softmax scores.
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=float('-inf'),
+            )
+        else:
+            self.batch_key_dropout = None
 
     def forward(
         self,
@@ -654,6 +759,10 @@ class ScaledDotAttentionNAIM(nn.Module):
             M_q = torch.zeros_like(scores).masked_fill_(mask_miss_q_expanded, -torch.inf)
         else:
             M_q = torch.zeros_like(scores)
+
+        # Batch-consistent key dropout on pre-softmax scores (-inf blanking).
+        if self.batch_key_dropout is not None:
+            scores = self.batch_key_dropout(scores)
 
         att = torch.relu(torch.softmax(scale * (scores + M_k), dim=-1) + M_q)
 
@@ -826,6 +935,10 @@ class AttentionLayer(nn.Module):
         orthogonal_init_scale: Initial scale value for orthogonal projection
         init_tau: Constant temperature for CausalCrossAttention / SigmoidCrossAttention
                   / ToeplitzAttention (non-learnable, not annealed). Default 3.0.
+        init_gate_bias: Initial value of the gate bias in ToeplitzAttention (default: -15.0).
+            Ignored for other attention types.
+        gate_bias_trainable: If True (default), the gate bias is updated during training.
+            If False, it is frozen at init_gate_bias. Only applies to ToeplitzAttention.
         shared_qk_inner: Optional dict with shared Q/K/inner_attention components.
         shared_dag_across_heads: When True (default), a single score (B,L,S) is
             shared across n_heads value channels. When False, legacy per-head scores.
@@ -850,9 +963,14 @@ class AttentionLayer(nn.Module):
         orthogonal_scale: bool = True,
         orthogonal_init_scale: float = 1.0,
         init_tau: float = 3.0,
+        init_gate_bias: float = -15.0,
+        gate_bias_trainable: bool = True,
         shared_qk_inner: dict = None,
         shared_dag_across_heads: bool = True,
         dual_value: bool = False,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super(AttentionLayer, self).__init__()
 
@@ -875,18 +993,37 @@ class AttentionLayer(nn.Module):
 
             # Create inner attention module
             ATTENTION_WITH_TAU = (CausalCrossAttention, SigmoidCrossAttention, ToeplitzAttention)
-            if attention in ATTENTION_WITH_TAU:
+            if attention is ToeplitzAttention:
+                # ToeplitzAttention also accepts gate bias settings
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
                     layer_name=layer_name,
                     init_tau=init_tau,
+                    init_gate_bias=init_gate_bias,
+                    gate_bias_trainable=gate_bias_trainable,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                )
+            elif attention in ATTENTION_WITH_TAU:
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
             else:
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
                     layer_name=layer_name,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
 
             # Q and K projections
@@ -1006,29 +1143,21 @@ class AttentionLayer(nn.Module):
                     self.value_projection_struct(kv_source)
                 ).view(B, S, -1)
 
-            prev_register = getattr(self.inner_attention, "register_entropy", None)
-            if prev_register is not None:
-                self.inner_attention.register_entropy = False
-            try:
-                out_struct, _, _ = self.inner_attention(
-                    query=q,
-                    key=k,
-                    value=v_struct,
-                    mask_miss_k=mask_miss_k,
-                    mask_miss_q=mask_miss_q,
-                    pos=pos,
-                    causal_mask=causal_mask,
-                    hard_mask=hard_mask,
-                    oracle=oracle,
-                )
-            finally:
-                if prev_register is not None:
-                    self.inner_attention.register_entropy = prev_register
-
+            # Reuse the attention weights already computed in the first pass.
+            # Calling inner_attention a second time would:
+            #   (a) redundantly recompute Q/K and all activation logic,
+            #   (b) draw a fresh BatchConsistentKeyDropout mask, overwriting
+            #       _last_key_mask with a different sample and causing the
+            #       breakpoint to fire twice per step.
+            # The two value paths intentionally share the same masked attention
+            # matrix — that is the SVFA dual-residual design contract.
             if H > 1:
+                out_struct = torch.einsum("bhls,bshd->blhd", attn, v_struct)
                 out_struct = out_struct.contiguous().view(B, L, -1)
-                out_struct = self.out_projection_struct(out_struct)
+                if self.out_projection_struct is not None:
+                    out_struct = self.out_projection_struct(out_struct)
             else:
+                out_struct = torch.einsum("bls,bsd->bld", attn, v_struct)
                 out_struct = out_struct.view(B, L, -1)
 
             return out, out_struct, attn, ent

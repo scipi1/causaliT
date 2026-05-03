@@ -140,6 +140,14 @@ class SingleCausalLayer(nn.Module):
         # Non-learnable, not annealed (same value used in self & cross).
         init_tau: float = 3.0,
 
+        # ToeplitzAttention gate bias settings (ignored for other attention types):
+        #   toeplitz_init_gate_bias  — initial value of the scalar gate bias (default -15.0,
+        #                              strongly negative ⟹ gate closed at init).
+        #   toeplitz_gate_bias_trainable — True (default): bias is learned during training.
+        #                                  False: bias is fixed at toeplitz_init_gate_bias forever.
+        toeplitz_init_gate_bias: float = -15.0,
+        toeplitz_gate_bias_trainable: bool = True,
+
         # Multi-head semantics (see `AttentionLayer` docstring):
         #   True  (default) — single DAG / score (B, L, S) is shared across
         #         the n_heads value channels (SVFA semantics).
@@ -147,6 +155,13 @@ class SingleCausalLayer(nn.Module):
         #         used by vanilla-transformer baselines.
         # At n_heads = 1 both modes are byte-identical to single-head code.
         shared_dag_across_heads: bool = True,
+
+        # Batch-consistent key dropout for attention matrices.
+        # Set to a float p_init to enable; None disables (default = legacy behaviour).
+        # Applied to cross- and self-attention identically.
+        batch_key_dropout: float = None,
+        batch_key_dropout_p_final: float = None,
+        batch_key_dropout_annealing_batches: int = None,
     ):
 
         super().__init__()
@@ -213,8 +228,15 @@ class SingleCausalLayer(nn.Module):
             # iter_10+: constant non-learnable activation temperature, threaded
             # to ToeplitzAttention / CausalCrossAttention / SigmoidCrossAttention.
             "init_tau": init_tau,
+            # ToeplitzAttention gate bias settings (ignored for other attention types).
+            "init_gate_bias": toeplitz_init_gate_bias,
+            "gate_bias_trainable": toeplitz_gate_bias_trainable,
             # SVFA shared-DAG / multi-head-V semantics.
             "shared_dag_across_heads": shared_dag_across_heads,
+            # Batch-consistent key dropout.
+            "batch_key_dropout": batch_key_dropout,
+            "batch_key_dropout_p_final": batch_key_dropout_p_final,
+            "batch_key_dropout_annealing_batches": batch_key_dropout_annealing_batches,
         }
 
         
@@ -552,8 +574,13 @@ class SingleCausalLayer(nn.Module):
         orthogonal_init_scale: float = 1.0,
         shared_qk_inner: dict = None,
         init_tau: float = 3.0,
+        init_gate_bias: float = -15.0,
+        gate_bias_trainable: bool = True,
         shared_dag_across_heads: bool = True,
         dual_value: bool = False,
+        batch_key_dropout: float = None,
+        batch_key_dropout_p_final: float = None,
+        batch_key_dropout_annealing_batches: int = None,
     ):
         """Create an attention layer with specified configuration.
 
@@ -561,6 +588,8 @@ class SingleCausalLayer(nn.Module):
         Args:
             shared_qk_inner: Optional dict of shared Q/K/inner_attention components.
                 When provided, the layer reuses these instead of creating its own.
+            init_gate_bias: Initial gate bias value for ToeplitzAttention (default -15.0).
+            gate_bias_trainable: Whether the gate bias is learnable (default True).
             shared_dag_across_heads: When True (default) the DAG / score is
                 shared across the n_heads value channels (SVFA semantics).
                 When False each head has its own DAG / score (legacy).
@@ -606,8 +635,13 @@ class SingleCausalLayer(nn.Module):
             orthogonal_init_scale=orthogonal_init_scale,
             shared_qk_inner=shared_qk_inner,
             init_tau=init_tau,
+            init_gate_bias=init_gate_bias,
+            gate_bias_trainable=gate_bias_trainable,
             shared_dag_across_heads=shared_dag_across_heads,
             dual_value=dual_value,
+            batch_key_dropout=batch_key_dropout,
+            batch_key_dropout_p_final=batch_key_dropout_p_final,
+            batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
         )
         
         return att
