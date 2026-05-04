@@ -1,0 +1,834 @@
+"""
+ANM Staged Trainer: Flexible multi-stage training for Partial ANM Regression experiments.
+
+Implements the Subsequent Structure-Reconstruct schedule from:
+    docs/ideas/PARTIAL_ANM_REGRESSION.md
+
+Each stage is defined by a flat dict of config overrides in
+``config['anm_training']['stages']``.  Stages share the same data module and
+fold splits (consistent train/val partition across the full alternating
+schedule).  Checkpoints are chained: each stage warm-starts from the last
+checkpoint of the previous stage.
+
+Key differences from ``staged_trainer.py``:
+- Arbitrary number of stages (not a fixed pipeline)
+- Per-stage parameter freezing (structural or reconstruction)
+- Per-stage BKD dropout override implementing the dropout curriculum (H3)
+- Per-stage evaluation: DAG metrics and score-margin at stage end and/or
+  every N epochs within a stage (H1/H2/H3 diagnostics)
+
+Architecture compatibility — freeze flags:
+    When ``use_gradient_routing=True``:
+        ``freeze_structural_params=True`` → structural parameters get
+        ``requires_grad_(False)`` in ``on_fit_start``.
+        ``freeze_reconstruction_params=True`` → reconstruction parameters get
+        ``requires_grad_(False)`` in ``on_fit_start``.
+
+    When ``use_gradient_routing=False``:
+        Freezing falls back to *loss-level gating*:
+        - ``freeze_structural_params`` → set lambda_hsic_cross/self = 0.0
+        - ``freeze_reconstruction_params`` → set lambda_recon = 0.0
+        This is architecture-agnostic but less precise (zero-weighted gradients
+        still flow through the shared graph; parameters are not truly frozen).
+        TODO: per-architecture requires_grad freezing for non-routed models
+              could be added in ``_build_stage_config`` when needed.
+
+Example ``config['anm_training']`` block::
+
+    anm_training:
+      starting_checkpoint: null      # optional warm-start before stage 0
+      stages:
+        # H1: reconstruction warmup — measure residual-HSIC before structure opt
+        - name: recon_warmup
+          max_epochs: 30
+          lambda_hsic_cross: 0.0
+          lambda_hsic_self:  0.0
+          lambda_recon: 1.0
+          freeze_structural_params: true
+          batch_key_dropout_p: 0.8
+          eval_every_n_epochs: 5
+          eval_dag: true
+
+        # H2/H3: structure phase at current p level
+        - name: struct_phase_1
+          max_epochs: 20
+          lambda_hsic_cross: 0.1
+          lambda_recon: 0.0
+          freeze_reconstruction_params: true
+          batch_key_dropout_p: 0.8
+          eval_every_n_epochs: 5
+          eval_dag: true
+
+        # H5: structure phase with gate-bias drift
+        - name: struct_bias_drift
+          max_epochs: 30
+          lambda_hsic_cross: 0.1
+          freeze_reconstruction_params: true
+          batch_key_dropout_p: 0.4
+          use_gate_bias_annealing: true
+          gate_bias_start: 0.0
+          gate_bias_end: -20.0
+          gate_bias_anneal_epochs: 30
+          eval_dag: true
+
+        # Final joint fine-tuning
+        - name: joint_finetune
+          max_epochs: 10
+          batch_key_dropout_p: 0.0
+          eval_dag: true
+"""
+
+import copy
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import Callback
+
+logger = logging.getLogger(__name__)
+
+
+def _to_plain_container(obj: Any) -> Any:
+    """
+    Convert OmegaConf containers to resolved plain Python dict/list objects.
+
+    ANM stage specs often come from YAML as ``DictConfig`` / ``ListConfig``.
+    Those are mapping-like but do not satisfy ``isinstance(x, dict)``, which
+    previously caused nested keys such as ``evaluation.functions`` to be
+    silently ignored.  Resolving here also materialises interpolations such as
+    ``batch_key_dropout_p: ${experiment.batch_key_dropout}``.
+    """
+    if isinstance(obj, (DictConfig, ListConfig)):
+        return OmegaConf.to_container(obj, resolve=True)
+    return obj
+
+
+def _get_stage_eval_functions(stage_spec: dict) -> List[str]:
+    """Return the post-stage evaluation function list from a stage spec."""
+    evaluation = _to_plain_container(stage_spec.get("evaluation", {}) or {})
+    if not isinstance(evaluation, dict):
+        return []
+    functions = _to_plain_container(evaluation.get("functions", []) or [])
+    if isinstance(functions, str):
+        return [functions]
+    if isinstance(functions, (list, tuple)):
+        return [str(fn) for fn in functions if fn]
+    return []
+
+
+def _save_stage_config(stage_config: dict, stage_dir: Path) -> str:
+    """
+    Save the fully-resolved per-stage config inside the stage directory.
+
+    Evaluation functions load checkpoints from the stage directory.  They must
+    also load the *same* config that produced that checkpoint, including stage
+    overrides (loss weights, freezing flags, BKD p, epochs) and populated
+    dataset-derived fields (sequence lengths, feature indices).  Therefore each
+    stage persists its resolved config as ``<stage_dir>/config.yaml``.
+    """
+    stage_config_path = stage_dir / "config.yaml"
+    cfg = OmegaConf.create(_to_plain_container(stage_config))
+    OmegaConf.save(config=cfg, f=str(stage_config_path), resolve=True)
+    return str(stage_config_path)
+
+
+# =============================================================================
+# STAGE EVALUATION CALLBACK
+# =============================================================================
+
+class StageEvalCallback(Callback):
+    """
+    Per-stage evaluation callback for ANM staged training.
+
+    Fires at the end of each stage (``on_train_end``) and optionally every N
+    epochs within a stage (``on_train_epoch_end``).  Captures:
+
+    - DAG metrics via ``evaluate_dag_from_model``:
+        phi decisiveness (how far edge probabilities are from 0.5),
+        soft Hamming distance to the true DAG.
+    - Score margin: ``score(true edges) - score(false edges)`` for both
+      cross and self attention — the primary H2/H3 diagnostic.
+
+    Args:
+        stage_name:          Identifier for the current stage (in log tags).
+        stage_idx:           Index of the current stage (0-based).
+        config:              Full configuration dict.
+        data_dir:            Root data directory (for loading true DAG masks).
+        eval_every_n_epochs: Mid-stage snapshot frequency (0 = only at end).
+    """
+
+    def __init__(
+        self,
+        stage_name: str,
+        stage_idx: int,
+        config: dict,
+        data_dir: str,
+        eval_every_n_epochs: int = 0,
+    ):
+        super().__init__()
+        self.stage_name = stage_name
+        self.stage_idx = stage_idx
+        self.config = config
+        self.data_dir = data_dir
+        self.eval_every_n_epochs = eval_every_n_epochs
+
+        # Accumulated snapshots (mid-stage) and final result
+        self.epoch_snapshots: List[Dict[str, Any]] = []
+        self.final_metrics: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    def _capture(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        label: str,
+    ) -> Dict[str, Any]:
+        """Capture DAG + score-margin diagnostics from the current model."""
+        from causaliT.training.causal_initialization import evaluate_dag_from_model
+
+        dag_metrics: Dict[str, Any] = {}
+        try:
+            dag_metrics = evaluate_dag_from_model(
+                pl_module, self.config, self.data_dir
+            )
+        except Exception as exc:
+            logger.debug(
+                f"StageEvalCallback ({self.stage_name}): "
+                f"evaluate_dag_from_model failed: {exc}"
+            )
+
+        score_margin = _compute_score_margin(pl_module, self.config, self.data_dir)
+
+        result: Dict[str, Any] = {
+            "stage": self.stage_name,
+            "stage_idx": self.stage_idx,
+            "epoch": trainer.current_epoch,
+            "label": label,
+            "score_margin_cross": score_margin.get("cross"),
+            "score_margin_self": score_margin.get("self"),
+        }
+        # Attach scalar DAG metrics (skip numpy arrays — too large for JSON)
+        for k, v in dag_metrics.items():
+            if not isinstance(v, np.ndarray):
+                result[k] = v
+
+        return result
+
+    # ------------------------------------------------------------------
+    def on_train_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        if self.eval_every_n_epochs <= 0:
+            return
+        epoch = trainer.current_epoch
+        if (epoch + 1) % self.eval_every_n_epochs == 0:
+            snap = self._capture(trainer, pl_module, label=f"epoch_{epoch}")
+            self.epoch_snapshots.append(snap)
+
+    def on_train_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        self.final_metrics = self._capture(
+            trainer, pl_module, label="stage_end"
+        )
+
+
+# =============================================================================
+# SCORE MARGIN HELPER
+# =============================================================================
+
+def _compute_score_margin(
+    pl_module: pl.LightningModule,
+    config: dict,
+    data_dir: str,
+) -> Dict[str, Optional[float]]:
+    """
+    Compute ``score(true edges) - score(false edges)`` for cross and self.
+
+    Uses the batch-averaged score tensor stored on the inner attention module
+    after the last forward pass.  Returns ``None`` for each attention type
+    when the true DAG mask or the score tensor is unavailable.
+
+    This is the primary diagnostic for H2 (does alternating improve edge
+    separation?) and H3 (does the curriculum improve margin over stages?).
+
+    Returns:
+        Dict with keys ``"cross"`` and ``"self"``, each a float or None.
+    """
+    result: Dict[str, Optional[float]] = {"cross": None, "self": None}
+    try:
+        inner_model = getattr(pl_module, "model", pl_module)
+        if not hasattr(inner_model, "decoder"):
+            return result
+
+        layer = inner_model.decoder.layers[0]
+        dataset_name = config.get("data", {}).get("dataset", "")
+        if not dataset_name or not data_dir:
+            return result
+
+        from causaliT.evaluation.eval_funs.eval_utils import _load_true_dag_mask
+
+        # --- Cross-attention score margin ---
+        true_cross = _load_true_dag_mask(data_dir, dataset_name, "dec_cross")
+        cross_inner = layer.global_cross_attention.inner_attention
+        cross_score_t = getattr(cross_inner, "_score_tensor_for_sparsity", None)
+        if cross_score_t is not None and true_cross is not None:
+            scores_np = cross_score_t.detach().cpu().numpy()
+            if scores_np.shape == true_cross.shape:
+                true_mask = true_cross.astype(bool)
+                false_mask = ~true_mask
+                if true_mask.any() and false_mask.any():
+                    result["cross"] = float(
+                        scores_np[true_mask].mean() - scores_np[false_mask].mean()
+                    )
+
+        # --- Self-attention score margin ---
+        true_self = _load_true_dag_mask(data_dir, dataset_name, "dec_self")
+        self_inner = layer.global_self_attention.inner_attention
+        # ToeplitzAttention exposes P_edge_for_reg; others use _score_tensor_for_sparsity
+        self_score_t = getattr(self_inner, "P_edge_for_reg", None)
+        if self_score_t is None:
+            self_score_t = getattr(self_inner, "_score_tensor_for_sparsity", None)
+        if self_score_t is not None and true_self is not None:
+            scores_np = self_score_t.detach().cpu().numpy()
+            if scores_np.ndim == 2 and scores_np.shape == true_self.shape:
+                true_mask = true_self.astype(bool)
+                false_mask = ~true_mask
+                np.fill_diagonal(false_mask, False)   # exclude diagonal (no self-loops)
+                if true_mask.any() and false_mask.any():
+                    result["self"] = float(
+                        scores_np[true_mask].mean() - scores_np[false_mask].mean()
+                    )
+
+    except Exception as exc:
+        logger.debug(f"_compute_score_margin failed (non-critical): {exc}")
+
+    return result
+
+
+# =============================================================================
+# STAGE CONFIG BUILDER
+# =============================================================================
+
+# Training-level keys that a stage spec may override directly
+_TRAINING_OVERRIDE_KEYS = frozenset({
+    "max_epochs",
+    "lambda_hsic_cross",
+    "lambda_hsic_self",
+    "lambda_recon",
+    "lambda_self_score_sparse",
+    "lambda_cross_score_sparse",
+    "use_gradient_routing",
+    # Freeze flags — processed with fallback logic below
+    "freeze_structural_params",
+    "freeze_reconstruction_params",
+    # Gate bias annealing (H5)
+    "use_gate_bias_annealing",
+    "gate_bias_start",
+    "gate_bias_end",
+    "gate_bias_anneal_epochs",
+    # Optimizer overrides
+    "lr",
+    "structural_lr",
+    # Checkpoint frequency
+    "save_ckpt_every_n_epochs",
+})
+
+# Keys consumed by the orchestrator only — not forwarded to training config
+_ORCHESTRATOR_ONLY_KEYS = frozenset({
+    "name",
+    "eval_every_n_epochs",
+    "eval_dag",
+    "batch_key_dropout_p",
+    # Per-stage post-training evaluation — dispatched by the orchestrator after
+    # train_single_fold returns; not a training-config key.
+    "evaluation",
+})
+
+
+def _build_stage_config(
+    base_config: dict,
+    stage_spec: dict,
+    stage_idx: int,
+) -> dict:
+    """
+    Build a per-stage training config by overlaying ``stage_spec`` onto
+    a deep copy of ``base_config``.
+
+    Always forces ``k_fold=1`` (stages run on a single fold) and ensures
+    ``save_ckpt_every_n_epochs`` is set so a checkpoint is always written.
+
+    Freeze flag logic:
+        ``freeze_structural_params=True`` with ``use_gradient_routing=True``:
+            Passed through to ``training`` config — ``SingleCausalForecaster.
+            on_fit_start`` will call ``requires_grad_(False)`` on structural
+            params (Q/K, structure embeddings, attention internals).
+
+        ``freeze_structural_params=True`` with ``use_gradient_routing=False``:
+            Falls back to loss-level gating: sets ``lambda_hsic_cross=0`` and
+            ``lambda_hsic_self=0``.  The flag is cleared so the forecaster
+            does not attempt to use ``classify_parameters`` on a non-routed model.
+            TODO: Extend with per-module freezing for specific non-routed
+                  architectures (e.g. locking ``query_projection`` only).
+
+        ``freeze_reconstruction_params=True`` with ``use_gradient_routing=True``:
+            Sets ``training.freeze_reconstruction_params=True`` so the forecaster
+            calls ``requires_grad_(False)`` on value/FF/MLP parameters.
+
+        ``freeze_reconstruction_params=True`` with ``use_gradient_routing=False``:
+            Falls back to loss-level gating: sets ``lambda_recon=0.0``.
+
+    BKD curriculum (batch_key_dropout_p):
+        Overrides ``model.kwargs.batch_key_dropout`` (p_init) and
+        ``batch_key_dropout_p_final`` (set to the same value so there is no
+        within-stage annealing).  ``batch_key_dropout_annealing_batches`` is
+        cleared (None) so the BKD step-counter annealing is disabled for this
+        stage.  The stage's fixed p directly controls parent-set coverage.
+
+    Args:
+        base_config: Full base configuration dict (deep-copied, not modified).
+        stage_spec:  Flat dict of stage-specific overrides.
+        stage_idx:   0-based stage index (for log messages only).
+
+    Returns:
+        A deep copy of base_config with all stage overrides applied.
+    """
+    cfg = copy.deepcopy(base_config)
+    tc = cfg["training"]
+
+    # --- Direct training-level overrides ---
+    for key in _TRAINING_OVERRIDE_KEYS:
+        if key in stage_spec:
+            tc[key] = stage_spec[key]
+
+    # --- Freeze flag fallback when gradient routing is off ---
+    use_gr = tc.get("use_gradient_routing", False)
+
+    if stage_spec.get("freeze_structural_params", False) and not use_gr:
+        # TODO: per-architecture hard freezing could go here for specific models
+        logger.info(
+            "Stage %d: freeze_structural_params=True but use_gradient_routing=False "
+            "— falling back to HSIC loss-gating (lambda_hsic_cross/self = 0.0).",
+            stage_idx,
+        )
+        tc["lambda_hsic_cross"] = 0.0
+        tc["lambda_hsic_self"] = 0.0
+        tc["freeze_structural_params"] = False   # don't try requires_grad route
+
+    if stage_spec.get("freeze_reconstruction_params", False) and not use_gr:
+        # TODO: per-architecture hard freezing could go here
+        logger.info(
+            "Stage %d: freeze_reconstruction_params=True but use_gradient_routing=False "
+            "— falling back to recon loss-gating (lambda_recon = 0.0).",
+            stage_idx,
+        )
+        tc["lambda_recon"] = 0.0
+        tc["freeze_reconstruction_params"] = False
+
+    # --- BKD dropout curriculum: fixed p per stage, no within-stage annealing ---
+    bkd_p = stage_spec.get("batch_key_dropout_p", None)
+    if bkd_p is not None:
+        bkd_p = float(bkd_p)
+        model_kwargs = cfg.get("model", {}).get("kwargs", {})
+        if model_kwargs is not None:
+            model_kwargs["batch_key_dropout"] = bkd_p
+            # p_init == p_final → no annealing within the stage
+            model_kwargs["batch_key_dropout_p_final"] = bkd_p
+            # Disable step-counter annealing
+            model_kwargs["batch_key_dropout_annealing_batches"] = None
+
+    # --- Always single fold ---
+    tc["k_fold"] = 1
+
+    # --- Ensure a checkpoint is always saved ---
+    if tc.get("save_ckpt_every_n_epochs") is None:
+        tc["save_ckpt_every_n_epochs"] = tc.get("max_epochs", 100)
+
+    return cfg
+
+
+# =============================================================================
+# CHECKPOINT FINDER
+# =============================================================================
+
+def _find_stage_checkpoint(stage_dir: Path) -> Optional[str]:
+    """
+    Find the last checkpoint written by ``train_single_fold`` in a stage dir.
+
+    Standard path: ``<stage_dir>/k_0/checkpoints/last.ckpt``.
+    Fallback: any ``.ckpt`` file in the checkpoints directory (alphabetical last).
+    """
+    last_ckpt = stage_dir / "k_0" / "checkpoints" / "last.ckpt"
+    if last_ckpt.exists():
+        return str(last_ckpt)
+
+    ckpt_dir = stage_dir / "k_0" / "checkpoints"
+    if ckpt_dir.exists():
+        ckpts = sorted(ckpt_dir.glob("*.ckpt"))
+        if ckpts:
+            return str(ckpts[-1])
+
+    return None
+
+
+# =============================================================================
+# MAIN ORCHESTRATOR
+# =============================================================================
+
+def anm_alternating_trainer(
+    config: dict,
+    data_dir: str,
+    save_dir: str,
+    cluster: bool,
+    experiment_tag: str = "NA",
+    debug: bool = False,
+    best: bool = False,
+) -> pd.DataFrame:
+    """
+    ANM alternating trainer: runs the Subsequent Structure-Reconstruct schedule.
+
+    Reads stage specifications from ``config['anm_training']['stages']``.
+    Each stage spec is a flat dict; see module docstring and ``_build_stage_config``
+    for the full list of supported keys.
+
+    Data splits are computed once and shared across all stages, ensuring
+    consistent train/val partitioning throughout the alternating schedule.
+
+    Stage checkpoints are chained: stage k warm-starts from the last.ckpt of
+    stage k-1.  If a stage produces no checkpoint (e.g. 0 training epochs), the
+    previous checkpoint is reused and a warning is logged.
+
+    Args:
+        config:          Full configuration dict (``anm_training.stages`` required).
+        data_dir:        Root data directory.
+        save_dir:        Parent save directory.  Each stage writes to
+                         ``<save_dir>/anm_stages/{idx:02d}_{name}/``.
+        cluster:         Suppress progress bar / use 1-GPU mode.
+        experiment_tag:  Passed to ``train_single_fold`` for the per-run manifest.
+        debug:           Enable anomaly detection, memory logger, etc.
+        best:            If True, collect best-checkpoint metrics per stage.
+
+    Returns:
+        pd.DataFrame: One row per stage with training metrics and DAG diagnostics.
+    """
+    from causaliT.training.trainer import (
+        get_dataloader,
+        _make_fold_splits,
+        create_model_instance,
+        train_single_fold,
+    )
+    from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+
+    # -------------------------------------------------------------------------
+    anm_cfg = config.get("anm_training", {})
+    # Convert OmegaConf containers to resolved plain Python containers so
+    # nested blocks such as ``evaluation.functions`` behave like normal dicts.
+    stages = _to_plain_container(anm_cfg.get("stages", []))
+    if not stages:
+        raise ValueError(
+            "config['anm_training']['stages'] is empty or missing. "
+            "Define at least one stage spec dict."
+        )
+
+    seed = config["training"].get("seed", 42)
+    seed_everything(seed)
+    torch.set_float32_matmul_precision("high")
+
+    # Populate sequence lengths from dataset metadata (needed by model builder)
+    config = populate_seq_lengths_from_dataset(config, data_dir)
+
+    # -------------------------------------------------------------------------
+    # Build shared data module and fold splits (used by all stages)
+    # -------------------------------------------------------------------------
+    dm = get_dataloader(config, data_dir, cluster, seed)
+    dm.prepare_data()
+    fold_splits, test_idx, train_val_idx = _make_fold_splits(
+        config, dm, seed, data_dir=data_dir
+    )
+    # All stages use fold 0
+    train_local_idx, val_local_idx = fold_splits[0]
+
+    stages_parent_dir = Path(save_dir) / "anm_stages"
+    stages_parent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional warm-start before stage 0
+    starting_ckpt: Optional[str] = _to_plain_container(
+        anm_cfg.get("starting_checkpoint", None)
+    )
+
+    # -------------------------------------------------------------------------
+    # Stage loop
+    # -------------------------------------------------------------------------
+    all_stage_rows: List[Dict[str, Any]] = []
+    all_stage_summaries: List[Dict[str, Any]] = []
+
+    for stage_idx, stage_spec in enumerate(stages):
+        stage_spec = _to_plain_container(stage_spec)
+        if not isinstance(stage_spec, dict):
+            raise TypeError(
+                f"ANM stage {stage_idx} must be a mapping/dict, "
+                f"got {type(stage_spec).__name__}: {stage_spec!r}"
+            )
+        stage_name = stage_spec.get("name", f"stage_{stage_idx:02d}")
+        stage_dir = stages_parent_dir / f"{stage_idx:02d}_{stage_name}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        if not cluster:
+            print("\n" + "=" * 70)
+            print(f"ANM STAGE {stage_idx}: {stage_name}")
+            print("=" * 70)
+            _print_stage_header(stage_spec, starting_ckpt)
+
+        # Build stage config
+        stage_config = _build_stage_config(config, stage_spec, stage_idx)
+        stage_config_path = _save_stage_config(stage_config, stage_dir)
+
+        # Fresh model (weights from warm_start_ckpt, not optimizer state)
+        seed_everything(seed)
+        model = create_model_instance(stage_config, data_dir)
+
+        # Stage evaluation callback
+        do_eval = stage_spec.get("eval_dag", True)
+        eval_every = int(stage_spec.get("eval_every_n_epochs", 0)) if do_eval else 0
+        stage_eval_cb: Optional[StageEvalCallback] = (
+            StageEvalCallback(
+                stage_name=stage_name,
+                stage_idx=stage_idx,
+                config=config,
+                data_dir=data_dir,
+                eval_every_n_epochs=eval_every,
+            )
+            if do_eval else None
+        )
+        extra_cbs = [stage_eval_cb] if stage_eval_cb is not None else []
+
+        # Train the stage
+        fold_metrics = train_single_fold(
+            config=stage_config,
+            model=model,
+            dm=dm,
+            fold=0,
+            train_local_idx=train_local_idx,
+            val_local_idx=val_local_idx,
+            test_idx=test_idx,
+            train_val_idx=train_val_idx,
+            save_dir=str(stage_dir),
+            trainable_params=0,
+            cluster=cluster,
+            resume_ckpt=None,
+            warm_start_ckpt=starting_ckpt,
+            experiment_tag=f"{experiment_tag}_{stage_name}",
+            debug=debug,
+            best=best,
+            extra_callbacks=extra_cbs,
+        )
+
+        # Chain checkpoints
+        new_ckpt = _find_stage_checkpoint(stage_dir)
+        if new_ckpt is None:
+            logger.warning(
+                "Stage %d (%s): no checkpoint found in %s. "
+                "Next stage will reuse the previous checkpoint.",
+                stage_idx, stage_name, stage_dir,
+            )
+        else:
+            starting_ckpt = new_ckpt
+
+        # ---------------------------------------------------------------
+        # Per-stage post-training evaluation (H1/H2/H3/H4/H5 diagnostics)
+        #
+        # If the stage spec contains an ``evaluation: {functions: [...]}``
+        # block, run those functions now against the stage's output directory.
+        # The last stage can therefore list the classical eval functions
+        # (eval_attention_scores, eval_interventions, …) just like the
+        # standard trainer does after a full training run.
+        #
+        # Errors in evaluation never abort the pipeline — they are logged
+        # and the stage loop continues normally.
+        # ---------------------------------------------------------------
+        stage_eval_fns: List[str] = _get_stage_eval_functions(stage_spec)
+        if stage_eval_fns:
+            if not cluster:
+                print(
+                    f"\n  [{stage_name}] Running {len(stage_eval_fns)} "
+                    f"post-stage evaluation(s): {stage_eval_fns}"
+                )
+            try:
+                from causaliT.evaluation.eval_funs.eval_funs_wraps import (
+                    run_evaluations_from_config,
+                )
+                run_evaluations_from_config(
+                    experiment=str(stage_dir),
+                    datadir_path=data_dir,
+                    show_plots=False,
+                    functions=stage_eval_fns,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Stage %d (%s): post-stage evaluation failed (non-critical): %s",
+                    stage_idx, stage_name, exc,
+                )
+
+        # Collect stage row
+        row: Dict[str, Any] = {
+            "stage_idx": stage_idx,
+            "stage_name": stage_name,
+            "checkpoint": starting_ckpt or "",
+            "stage_config": stage_config_path,
+        }
+        for k, v in fold_metrics.items():
+            row[k] = v.item() if isinstance(v, torch.Tensor) else v
+
+        # Attach final DAG diagnostics
+        if stage_eval_cb is not None and stage_eval_cb.final_metrics:
+            fm = stage_eval_cb.final_metrics
+            for diag_key in (
+                "phi_cross_decisiveness",
+                "phi_self_decisiveness",
+                "soft_hamming_cross",
+                "soft_hamming_self",
+                "score_margin_cross",
+                "score_margin_self",
+            ):
+                row[f"dag_{diag_key}"] = fm.get(diag_key)
+
+        all_stage_rows.append(row)
+
+        # Build JSON-serializable stage summary
+        stage_summary: Dict[str, Any] = {
+            "stage_idx": stage_idx,
+            "stage_name": stage_name,
+            "stage_spec": _to_plain_container(stage_spec),
+            "stage_config": stage_config_path,
+            "checkpoint": starting_ckpt or "",
+            "final_dag_metrics": (
+                {
+                    k: v
+                    for k, v in stage_eval_cb.final_metrics.items()
+                    if not isinstance(v, np.ndarray)
+                }
+                if stage_eval_cb is not None and stage_eval_cb.final_metrics
+                else {}
+            ),
+            "epoch_snapshots": (
+                stage_eval_cb.epoch_snapshots if stage_eval_cb is not None else []
+            ),
+        }
+        all_stage_summaries.append(stage_summary)
+
+        if not cluster and stage_eval_cb is not None and stage_eval_cb.final_metrics:
+            _print_dag_metrics(stage_eval_cb.final_metrics, stage_name)
+
+    # -------------------------------------------------------------------------
+    # Save full summary JSON
+    # -------------------------------------------------------------------------
+    summary = {
+        "experiment_tag": experiment_tag,
+        "n_stages": len(stages),
+        "final_checkpoint": starting_ckpt or "",
+        "stages": all_stage_summaries,
+    }
+    summary_path = Path(save_dir) / "anm_training_summary.json"
+    with open(summary_path, "w") as fh:
+        json.dump(summary, fh, indent=2, default=_json_default)
+
+    if not cluster:
+        print("\n" + "=" * 70)
+        print("ANM ALTERNATING TRAINING COMPLETE")
+        print(f"  {len(stages)} stage(s) completed")
+        print(f"  Final checkpoint: {starting_ckpt}")
+        print(f"  Summary: {summary_path}")
+        print("=" * 70)
+
+    df = pd.DataFrame(all_stage_rows)
+    return df
+
+
+# =============================================================================
+# CONVENIENCE WRAPPER
+# =============================================================================
+
+def run_anm_trainer_from_config(
+    config_path: str,
+    data_dir: str,
+    save_dir: str,
+    cluster: bool = False,
+    experiment_tag: str = "NA",
+) -> pd.DataFrame:
+    """Run ANM alternating training directly from a YAML config path."""
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.load(config_path)
+    return anm_alternating_trainer(
+        config=config,
+        data_dir=data_dir,
+        save_dir=save_dir,
+        cluster=cluster,
+        experiment_tag=experiment_tag,
+    )
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _print_stage_header(stage_spec: dict, starting_ckpt: Optional[str]) -> None:
+    """Print a concise stage configuration summary."""
+    def _fmt(key, default="(inherited)"):
+        return stage_spec.get(key, default)
+
+    print(f"  epochs:        {_fmt('max_epochs')}")
+    print(
+        f"  lambda_hsic:   cross={_fmt('lambda_hsic_cross')}  "
+        f"self={_fmt('lambda_hsic_self')}"
+    )
+    print(f"  lambda_recon:  {_fmt('lambda_recon')}")
+    print(f"  BKD p:         {_fmt('batch_key_dropout_p')}")
+    print(f"  freeze_struct: {stage_spec.get('freeze_structural_params', False)}")
+    print(f"  freeze_recon:  {stage_spec.get('freeze_reconstruction_params', False)}")
+    if stage_spec.get("use_gate_bias_annealing"):
+        print(
+            f"  gate_bias:     {_fmt('gate_bias_start', 0.0)} → "
+            f"{_fmt('gate_bias_end', -20.0)} "
+            f"over {_fmt('gate_bias_anneal_epochs', '?')} epochs"
+        )
+    if starting_ckpt:
+        print(f"  warm start:    {starting_ckpt}")
+    else:
+        print("  warm start:    (fresh initialization)")
+
+
+def _print_dag_metrics(metrics: dict, stage_name: str) -> None:
+    """Print scalar DAG diagnostics after a stage completes."""
+    print(f"\n  [{stage_name}] DAG diagnostics:")
+    for key in (
+        "phi_cross_decisiveness",
+        "phi_self_decisiveness",
+        "soft_hamming_cross",
+        "soft_hamming_self",
+        "score_margin_cross",
+        "score_margin_self",
+    ):
+        val = metrics.get(key)
+        if val is not None:
+            print(f"    {key}: {val:.4f}")
+
+
+def _json_default(obj: Any) -> Any:
+    """Fallback JSON serializer for numpy/torch types."""
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.item() if obj.numel() == 1 else obj.tolist()
+    return str(obj)

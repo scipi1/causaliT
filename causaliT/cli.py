@@ -176,5 +176,51 @@ def calitrain(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, 
 cli.add_command(calitrain)
 
 
+# ANM ALTERNATING TRAINING
+@click.command()
+@click.option("--exp_id",       help="Experiment folder containing the config file")
+@click.option("--debug",        default=False, help="Debug mode")
+@click.option("--cluster",      default=False, help="On the cluster?")
+@click.option("--exp_tag",      default="NA",  help="Tag for model manifest")
+@click.option("--scratch_path", default=None,  help="SCRATCH path for cluster")
+@click.option("--best",         default=False, help="Collect best-checkpoint metrics per stage")
+def anmtrain(exp_id, debug, cluster, exp_tag, scratch_path, best):
+    """
+    Run ANM alternating training (Subsequent Structure-Reconstruct schedule).
+
+    Stages are defined in config['anm_training']['stages'].
+    Each stage warm-starts from the last checkpoint of the previous stage.
+
+    Example:
+        python -m causaliT.cli anmtrain --exp_id 5_EXPLORATORY/PARTIAL_ANM/H1_ANM_STAGE_TRAINING
+    """
+    from causaliT.training.anm_staged_trainer import anm_alternating_trainer
+
+    ROOT_DIR = dirname(dirname(abspath(__file__)))
+
+    if not cluster:
+        print(f"ANM Alternating Training: {exp_id}")
+
+    exp_dir  = join(scratch_path) if scratch_path else join(ROOT_DIR, "experiments/", exp_id)
+    data_dir = join(ROOT_DIR, "data")
+
+    makedirs(join(ROOT_DIR, "logs"), exist_ok=True)
+
+    config, _ = find_yml_files(dir=exp_dir)
+
+    anm_alternating_trainer(
+        config=config,
+        data_dir=data_dir,
+        save_dir=exp_dir,
+        cluster=cluster,
+        experiment_tag=exp_tag,
+        debug=debug,
+        best=best,
+    )
+
+
+cli.add_command(anmtrain)
+
+
 if __name__ == "__main__":
     cli()

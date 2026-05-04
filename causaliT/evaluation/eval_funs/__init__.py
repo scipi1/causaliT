@@ -98,6 +98,9 @@ from .eval_interventions import eval_interventions
 # ANS evaluation (sweep experiments only)
 from .eval_ans import eval_ans
 
+# ANM residual-HSIC evaluation (partial ANM regression experiments)
+from .eval_anm import eval_anm_residual_hsic
+
 # d_model sweep evaluation
 from .eval_d_model_sweep import eval_d_model_sweep, analyze_hsic_ate_correlation
 
@@ -187,6 +190,8 @@ __all__ = [
     "eval_interventions",
     # ANS (sweep experiments only)
     "eval_ans",
+    # ANM residual-HSIC (partial ANM regression experiments)
+    "eval_anm_residual_hsic",
     # d_model sweep evaluation
     "eval_d_model_sweep",
     "analyze_hsic_ate_correlation",

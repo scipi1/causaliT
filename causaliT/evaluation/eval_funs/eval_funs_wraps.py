@@ -14,6 +14,7 @@ from .eval_training import eval_train_metrics
 from .eval_attention import eval_attention_scores, eval_attention_evolution
 from .eval_embeddings import eval_embed, eval_embedding_dag_correlation
 from .eval_interventions import eval_interventions
+from .eval_anm import eval_anm_residual_hsic
 from .update_manifest import fix_kfold_summary, enrich_kfold_summary
 
 
@@ -84,6 +85,8 @@ def run_evaluations_from_config(
         # "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
         "enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
+        # ANM residual-HSIC: per-edge HSIC diagnostic for partial ANM experiments
+        "eval_anm_residual_hsic": lambda exp: eval_anm_residual_hsic(exp, show_plots=show_plots),
     }
     
     # Dyconex-specific functions (lazy import)

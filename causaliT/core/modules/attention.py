@@ -218,6 +218,14 @@ class SigmoidCrossAttention(nn.Module):
 
         self.tau = float(init_tau)
 
+        # Additive gate bias for dense→sparse annealing (H5 experiment).
+        # Plain float (not a Parameter) so it is not part of the checkpoint
+        # state and always resets to 0.0 on model creation.  Set externally
+        # by the gate-bias annealer in ``on_train_epoch_start``.
+        # Mirrors the ``gate_bias`` nn.Parameter on ToeplitzAttention; the
+        # annealer handles both types via an isinstance check.
+        self.gate_bias: float = 0.0
+
         # Batch-consistent key dropout (None = disabled).
         # blanking_value=0.0: applied post-activation (Sigmoid output).
         if batch_key_dropout is not None:
@@ -292,8 +300,9 @@ class SigmoidCrossAttention(nn.Module):
             M_causal = build_causal_mask(pos, n_heads=H_score)
             scores = scores + M_causal
 
-        # Sigmoid activation with constant temperature
-        att = torch.sigmoid(scores / self.tau)
+        # Sigmoid activation with constant temperature and additive gate_bias
+        # (plain float, default 0.0; set by H5 annealer to impose sparsity).
+        att = torch.sigmoid(scores / self.tau + self.gate_bias)
         att = torch.nan_to_num(att, nan=0.0)
 
         if hard_mask is not None:

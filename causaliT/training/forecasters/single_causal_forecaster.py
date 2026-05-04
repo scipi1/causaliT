@@ -230,7 +230,36 @@ class SingleCausalForecaster(pl.LightningModule):
             )
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
-        
+
+        # =====================================================================
+        # PARAMETER FREEZING FOR ALTERNATING STAGES (ANM experiments)
+        # =====================================================================
+        # Set by anm_staged_trainer._build_stage_config per stage.
+        # Requires use_gradient_routing=True; otherwise _build_stage_config
+        # falls back to loss-level gating and leaves these False.
+        # requires_grad is not saved in checkpoints, so each new stage starts
+        # with all params unfrozen.
+        self.freeze_structural_params = bool(
+            config["training"].get("freeze_structural_params", False)
+        )
+        self.freeze_reconstruction_params = bool(
+            config["training"].get("freeze_reconstruction_params", False)
+        )
+
+        # =====================================================================
+        # GATE BIAS ANNEALING (H5: Dense-to-Sparse Attention Bias)
+        # =====================================================================
+        # Drifts the gate bias from gate_bias_start to gate_bias_end over
+        # gate_bias_anneal_epochs. Applied to ToeplitzAttention.gate_bias
+        # (nn.Parameter, via .fill_()) and SigmoidCrossAttention.gate_bias
+        # (plain float, via direct assignment).
+        self.use_gate_bias_annealing = bool(
+            config["training"].get("use_gate_bias_annealing", False)
+        )
+        self.gate_bias_start = float(config["training"].get("gate_bias_start", 0.0))
+        self.gate_bias_end = float(config["training"].get("gate_bias_end", -20.0))
+        self.gate_bias_anneal_epochs = config["training"].get("gate_bias_anneal_epochs", None)
+
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
@@ -947,14 +976,21 @@ class SingleCausalForecaster(pl.LightningModule):
     # Used-mask dump (fires once per fit)
     # ------------------------------------------------------------------
     def on_fit_start(self):
-        """Persist the *actual* hard masks used in training to disk.
+        """Stage-level parameter freezing + hard-mask dump."""
+        # ANM alternating experiments: freeze structural or reconstruction params.
+        # Only applies when use_gradient_routing=True (param groups exist).
+        # When gradient_routing=False, _build_stage_config already fell back to
+        # loss-level gating and left these flags False.
+        if self.freeze_structural_params and self.use_gradient_routing:
+            for p in self._structural_params:
+                p.requires_grad_(False)
+            print("  [ANM stage] Structural parameters frozen (requires_grad=False).")
+        if self.freeze_reconstruction_params and self.use_gradient_routing:
+            for p in self._reconstruction_params:
+                p.requires_grad_(False)
+            print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
 
-        Always runs when ``use_hard_masks=True``, regardless of corruption.
-        Output goes to ``<run_dir_k>/used_masks/`` so that GT, corrupted, and
-        any future programmatic mask is always reproducible from the run dir.
-
-        Also writes a ``mask_summary.json`` with corruption metadata (if any).
-        """
+        # Hard mask dump.
         if not self.use_hard_masks or not self._hard_masks_loaded:
             return
 
@@ -1137,7 +1173,30 @@ class SingleCausalForecaster(pl.LightningModule):
             else:
                 self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
 
-    
+        # 5. Gate bias annealing (H5: Dense-to-Sparse Attention Bias)
+        #    Drifts gate_bias from gate_bias_start to gate_bias_end across all layers.
+        #    ToeplitzAttention.gate_bias is an nn.Parameter → use .fill_().
+        #    SigmoidCrossAttention.gate_bias is a plain float → direct assignment.
+        if self.use_gate_bias_annealing:
+            anneal_epochs = self.gate_bias_anneal_epochs or max_epochs
+            new_bias = self._linear_anneal(
+                self.gate_bias_start, self.gate_bias_end, epoch, anneal_epochs
+            )
+            for layer in self.model.decoder.layers:
+                for inner in (
+                    layer.global_self_attention.inner_attention,
+                    layer.global_cross_attention.inner_attention,
+                ):
+                    gb = getattr(inner, "gate_bias", None)
+                    if gb is None:
+                        continue
+                    if isinstance(gb, torch.Tensor):
+                        with torch.no_grad():
+                            gb.fill_(float(new_bias))
+                    else:
+                        inner.gate_bias = float(new_bias)
+            self.log("annealed_gate_bias", new_bias, on_step=False, on_epoch=True)
+
     def training_step(self, batch, batch_idx):
         """Training step with optional gradient routing.
         
