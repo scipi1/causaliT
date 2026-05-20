@@ -21,6 +21,9 @@ References:
 - docs/NOISE_LEARNING.md
 """
 
+import json
+import numpy as np
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from os.path import join
 
@@ -31,7 +34,7 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.noise_aware import NoiseAwareSingleCausalLayer
 from causaliT.core.modules.noise_layers import GaussianNLLLoss
-from causaliT.core.utils import load_dag_masks
+from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_per_token, hsic_per_x_pair, hsic_attention_weighted, hsic_cross_per_pair
 from causaliT.training.gradient_routing import classify_parameters
 
@@ -203,7 +206,31 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
         self._hard_masks = None
-        
+
+        # =====================================================================
+        # ORACLE / MASK CORRUPTION CONFIGURATION
+        # Mirrors SingleCausalForecaster — same config keys, same semantics.
+        # hard_masks_corruption_seed in {None, 0}  OR  both SHDs == 0
+        # disables corruption and the ground-truth masks are used unchanged.
+        # See causaliT.core.utils.corrupt_dag_masks for full semantics.
+        # =====================================================================
+        self.use_oracle_attention = config["training"].get("use_oracle_attention", False)
+        if self.use_oracle_attention and not self.use_hard_masks:
+            raise ValueError(
+                "training.use_oracle_attention=True requires training.use_hard_masks=True. "
+                "The oracle uses the hard mask itself as the attention score matrix."
+            )
+        self.hard_masks_corruption_seed = config["training"].get("hard_masks_corruption_seed", None)
+        self.cross_control_shd = int(config["training"].get("cross_control_shd", 0) or 0)
+        self.self_control_shd  = int(config["training"].get("self_control_shd",  0) or 0)
+        # When True, corruption is restricted to one-for-one edge swaps so the
+        # corrupted mask retains the SAME number of edges as the ground truth.
+        self.hard_masks_preserve_sparsity = bool(
+            config["training"].get("hard_masks_preserve_sparsity", False)
+        )
+        # Filled in by _load_hard_masks when corruption is applied.
+        self.hard_mask_corruption_info: Optional[Dict[str, dict]] = None
+
         if self.use_hard_masks:
             self._register_hard_mask_placeholders()
         
@@ -226,28 +253,72 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         self.register_buffer('hard_mask_dec_self', torch.zeros(X_len, X_len))
     
     def _load_hard_masks(self, config: dict, data_dir: str):
-        """Load hard masks from data directory based on config."""
+        """Load hard masks from data directory based on config.
+
+        Mirrors SingleCausalForecaster._load_hard_masks:
+        - Loads base masks from disk.
+        - Applies corrupt_dag_masks() when hard_masks_corruption_seed is set
+          and cross/self_control_shd > 0.
+        - Stores corruption metadata in self.hard_mask_corruption_info for
+          on_fit_start logging.
+        """
         mask_files = config["training"].get("hard_mask_files", None)
-        
+
         if mask_files is None:
             print("Warning: use_hard_masks=True but no hard_mask_files specified in config.")
             return
-        
+
         dataset_name = config["data"]["dataset"]
         dataset_dir = join(data_dir, dataset_name)
-        
+
         masks = load_dag_masks(dataset_dir, mask_files, device='cpu')
-        
-        if masks is not None:
-            self._hard_masks = masks
-            self._hard_masks_loaded = True
-            
-            for name, mask in masks.items():
-                self.register_buffer(f'hard_mask_{name}', mask)
-            
-            print(f"✓ Hard masks loaded and registered for training.")
-        else:
+
+        if masks is None:
             print("Warning: No hard masks were loaded.")
+            return
+
+        # ------------------------------------------------------------------
+        # Optional mask corruption (anti-oracle / SHD sweep)
+        # Corruption is skipped when seed is None/0 or both SHDs are 0.
+        # ------------------------------------------------------------------
+        corruption_info = None
+        if (
+            self.hard_masks_corruption_seed not in (None, 0)
+            and (self.cross_control_shd > 0 or self.self_control_shd > 0)
+        ):
+            X_len = int(self.config["data"]["X_seq_len"])
+            masks, corruption_info = corrupt_dag_masks(
+                masks,
+                seed=self.hard_masks_corruption_seed,
+                cross_shd=self.cross_control_shd,
+                self_shd=self.self_control_shd,
+                X_len=X_len,
+                preserve_sparsity=self.hard_masks_preserve_sparsity,
+            )
+            print(
+                f"✓ Hard masks CORRUPTED "
+                f"(seed={int(self.hard_masks_corruption_seed)}, "
+                f"cross_shd={self.cross_control_shd}, "
+                f"self_shd={self.self_control_shd}, "
+                f"preserve_sparsity={self.hard_masks_preserve_sparsity})"
+            )
+            for _name, _info in corruption_info.items():
+                cyc = _info.get("has_cycles")
+                print(f"  [{_name}] actual_shd={_info.get('actual_shd')}  has_cycles={cyc}")
+        else:
+            print(
+                f"✓ Hard masks loaded (no corruption: seed={self.hard_masks_corruption_seed}, "
+                f"cross_shd={self.cross_control_shd}, self_shd={self.self_control_shd})"
+            )
+
+        self.hard_mask_corruption_info = corruption_info
+        self._hard_masks = masks
+        self._hard_masks_loaded = True
+
+        for name, mask in masks.items():
+            self.register_buffer(f'hard_mask_{name}', mask)
+
+        print("✓ Hard masks registered for training.")
     
     def get_hard_masks(self) -> Optional[Dict[str, torch.Tensor]]:
         """Get hard masks dictionary, retrieving from buffers."""
@@ -683,7 +754,70 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         """Linear annealing from start to end over total_epochs."""
         progress = min(1.0, epoch / max(1, total_epochs))
         return start + progress * (end - start)
-    
+
+    def on_fit_start(self):
+        """Dump the actually-used masks (possibly corrupted) to disk at fit start.
+
+        Writes to <run_dir>/used_masks/:
+        - dec_cross_used.csv, dec_self_used.csv  — binary mask arrays
+        - mask_summary.json — corruption metadata (mirrors SingleCausalForecaster)
+
+        Path resolution mirrors SingleCausalForecaster.on_fit_start:
+        CSVLogger.log_dir is "<save_dir_k>/logs/csv/version_X"
+        so parents[2] = "<save_dir_k>".
+        """
+        if not self.use_hard_masks or not self._hard_masks_loaded:
+            return
+
+        try:
+            log_dir = getattr(self.trainer, "log_dir", None)
+            if log_dir is None:
+                return
+            out_dir = Path(log_dir).resolve().parents[2] / "used_masks"
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[on_fit_start] could not resolve run dir for mask dump: {e}")
+            return
+
+        masks = self.get_hard_masks() or {}
+        for name, mask in masks.items():
+            arr = mask.detach().cpu().numpy()
+            np.savetxt(out_dir / f"{name}_used.csv", arr, fmt="%.6g", delimiter=",")
+
+        # Build a small JSON summary (same schema as SingleCausalForecaster)
+        summary: Dict[str, Any] = {
+            "use_oracle_attention": bool(self.use_oracle_attention),
+            "hard_masks_corruption_seed": self.hard_masks_corruption_seed,
+            "cross_control_shd_requested": int(self.cross_control_shd),
+            "self_control_shd_requested": int(self.self_control_shd),
+            "hard_masks_preserve_sparsity": bool(self.hard_masks_preserve_sparsity),
+            "corruption_applied": self.hard_mask_corruption_info is not None,
+            "per_mask": {},
+        }
+        for name, mask in masks.items():
+            arr = mask.detach().cpu().numpy()
+            entry = {
+                "shape": list(arr.shape),
+                "num_active_edges": int((arr != 0).sum()),
+                "density": float((arr != 0).mean()),
+            }
+            if (
+                self.hard_mask_corruption_info is not None
+                and name in self.hard_mask_corruption_info
+            ):
+                # Surface corrupt_dag_masks metadata verbatim
+                entry["corruption"] = {
+                    k: (v if not isinstance(v, (np.bool_, np.integer))
+                        else (bool(v) if isinstance(v, np.bool_) else int(v)))
+                    for k, v in self.hard_mask_corruption_info[name].items()
+                }
+            summary["per_mask"][name] = entry
+
+        with open(out_dir / "mask_summary.json", "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+
+        print(f"[on_fit_start] wrote used masks to {out_dir}")
+
     def on_train_epoch_start(self):
         """Apply annealing schedules at the start of each training epoch."""
         epoch = self.current_epoch

@@ -646,7 +646,7 @@ class ScaledDotAttention(nn.Module):
             entropy = None
 
         A = self.dropout(att)
-
+        
         if is_multihead:
             V = torch.einsum("bhls,bshd->blhd", A, value)
         else:

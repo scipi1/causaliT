@@ -1,4 +1,13 @@
-# NoiseAwareSingleCausalLayer Template — SVFA for S and X with learned noise parameters.
+# NoiseAwareSingleCausalLayerRes Template — noise-aware SVFA dual-residual.
+#
+# Identical to config_noise_aware.yaml except model_object is
+# "NoiseAwareSingleCausalLayerRes".  The dual-residual decoder updates
+# X_struct after BOTH cross- and self-attention (in addition to the usual
+# value-stream update), while ambient noise injection on the value path is
+# preserved unchanged.
+#
+# All training config keys (NLL loss, σ_A / σ_R priors, gradient routing,
+# HSIC, score sparsity, …) are identical to config_noise_aware.yaml.
 
 experiment:
   d_model_set: 24
@@ -19,7 +28,7 @@ experiment:
 
 
 model:
-  model_object: "NoiseAwareSingleCausalLayer"
+  model_object: "NoiseAwareSingleCausalLayerRes"
 
   embed_dim:
     d_model_set: ${experiment.d_model_set}

@@ -8,9 +8,10 @@ This module provides:
         Post-stage H1 diagnostic: loads the final stage checkpoint, runs a
         batched forward pass over the validation split in *eval mode* (so
         BatchConsistentKeyDropout is disabled — dense attention), computes
-        per-(X_j, S_i) cross-HSIC values from the residuals, classifies each
-        edge pair against the true DAG mask, and saves a structured CSV and
-        JSON summary under ``<experiment>/eval/eval_anm_residual_hsic/``.
+        residual-HSIC ``HSIC(ε_j, Z_k)`` against all candidate parents
+        ``Z ∈ {S, X}``, classifies each edge pair against the true DAG masks,
+        and saves structured CSV/JSON/plot artifacts under
+        ``<experiment>/eval/eval_anm_residual_hsic/``.
 
 Hypothesis covered:
     H1 — Does reconstruction warmup make HSIC meaningful?
@@ -18,18 +19,19 @@ Hypothesis covered:
         true parent edges.  Running this eval at the end of each stage lets
         you track whether HSIC becomes progressively more informative.
 
-Edge classification (cross-attention only):
+Edge classification:
     true_parent   : (X_j, S_i) with  true_dag[j, i] == 1
     false_parent  : (X_j, S_i) with  true_dag[j, i] == 0  AND S_i not independent of X_j
     independent   : (X_j, S_i) pairs where S_i has no true child in X  (column sum == 0)
+    self_loop     : diagonal self-attention pair (X_j, X_j), excluded from margins
 
     NOTE: proxy/omitted-parent classification requires oracle knowledge and is
     not available at eval time.  The ``edge_class`` column will contain one of
     the three labels above.
 
-Self-attention HSIC (X_j ← X_k) is computed when the inner self-attention
-module stores a ``score_tensor_for_sparsity`` (Toeplitz), using the true
-self-attention DAG mask if available.  Otherwise only cross-HSIC is reported.
+``edge_hsic_all.csv`` is the notebook-friendly long-format artifact containing
+both cross pairs ``HSIC(ε_Xj, S_i)`` and self pairs ``HSIC(ε_Xj, X_k)``.
+``edge_hsic.csv`` remains the backward-compatible cross-only artifact.
 """
 
 import json
@@ -41,6 +43,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+
+from causaliT.utils.hsic_utils import hsic_pair_matrix
 
 from .eval_lib import (
     find_config_file,
@@ -163,7 +167,7 @@ def _collect_residuals_and_sources(
     val_idx: int,
     device: str = "cpu",
     max_batches: Optional[int] = None,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Run batched forward pass in eval mode and return concatenated arrays.
 
@@ -181,12 +185,14 @@ def _collect_residuals_and_sources(
     Returns:
         residuals  : ``(N, L_X)`` float32 array
         s_values   : ``(N, L_S)`` float32 array
+        x_values   : ``(N, L_X)`` float32 array
     """
     model = model.to(device)
     loader = dm.val_dataloader()
 
     all_residuals: List[np.ndarray] = []
     all_s_values: List[np.ndarray] = []
+    all_x_values: List[np.ndarray] = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
@@ -206,94 +212,106 @@ def _collect_residuals_and_sources(
 
             residuals = (x_target - pred_x.squeeze()).detach().cpu().float().numpy()
             s_vals = S[:, :, val_idx].detach().cpu().float().numpy()
+            x_vals = x_target.detach().cpu().float().numpy()
 
             all_residuals.append(residuals)
             all_s_values.append(s_vals)
+            all_x_values.append(x_vals)
 
     if not all_residuals:
-        return None, None
+        return None, None, None
 
-    return np.concatenate(all_residuals, axis=0), np.concatenate(all_s_values, axis=0)
+    return (
+        np.concatenate(all_residuals, axis=0),
+        np.concatenate(all_s_values, axis=0),
+        np.concatenate(all_x_values, axis=0),
+    )
 
 
-def _compute_hsic_matrix_np(
-    residuals: np.ndarray,
-    sources: np.ndarray,
-    sigma_res: float = 1.0,
-    sigma_src: float = 1.0,
-) -> np.ndarray:
+def _classify_edge_pair(
+    true_dag: Optional[np.ndarray],
+    target_idx: int,
+    parent_idx: int,
+    parent_space: str,
+) -> Tuple[str, Optional[int]]:
     """
-    Compute ``HSIC(ε_j, S_i)`` for all (j, i) pairs with RBF kernels.
+    Classify one residual-vs-parent pair for either S or X parent variables.
 
-    Uses the biased estimator ``(1/n²) * tr(K_X H K_Y H)`` where ``H`` is
-    the centring matrix.  Computation is vectorised over the source dimension
-    (one kernel matrix ``K_S`` per source variable, then batched dot products).
-
-    Args:
-        residuals : ``(N, L_X)``  — residuals per target variable.
-        sources   : ``(N, L_S)``  — source variable values.
-        sigma_res : RBF bandwidth for residuals (same for all ``X_j``).
-        sigma_src : RBF bandwidth for sources   (same for all ``S_i``).
-
-    Returns:
-        hsic_matrix : ``(L_X, L_S)``  — HSIC value for each (j, i) pair.
-    """
-    N, L_X = residuals.shape
-    N2, L_S = sources.shape
-    assert N == N2, "residuals and sources must have the same number of samples"
-
-    # Centring matrix
-    H = np.eye(N) - np.ones((N, N)) / N  # (N, N)
-
-    hsic_mat = np.zeros((L_X, L_S), dtype=np.float32)
-
-    # Pre-compute centred source kernels K_S_i (H @ K @ H)
-    src_kernels_centred: List[np.ndarray] = []
-    for i in range(L_S):
-        si = sources[:, i : i + 1]           # (N, 1)
-        diff2_s = ((si - si.T) ** 2)          # (N, N)
-        K_s = np.exp(-diff2_s / (2 * sigma_src**2))
-        src_kernels_centred.append(H @ K_s @ H)
-
-    for j in range(L_X):
-        rj = residuals[:, j : j + 1]          # (N, 1)
-        diff2_r = ((rj - rj.T) ** 2)          # (N, N)
-        K_r = np.exp(-diff2_r / (2 * sigma_res**2))
-        K_r_centred = H @ K_r @ H             # (N, N)
-
-        for i, K_s_centred in enumerate(src_kernels_centred):
-            hsic_val = float(np.trace(K_r_centred @ K_s_centred)) / (N**2)
-            hsic_mat[j, i] = max(hsic_val, 0.0)  # HSIC ≥ 0 by construction
-
-    return hsic_mat
-
-
-def _classify_edges(true_dag: np.ndarray) -> np.ndarray:
-    """
-    Classify each (X_j, S_i) pair into an edge class string.
-
-    Classification rules (cross-attention):
+    Classification rules:
     - ``"true_parent"``  : true_dag[j, i] == 1
-    - ``"independent"``  : column i of true_dag is all-zero (S_i has no
-                           children in X — genuinely independent).
-    - ``"false_parent"`` : true_dag[j, i] == 0 and S_i is not independent.
+    - ``"self_loop"``    : parent_space == "X" and target_idx == parent_idx
+    - ``"independent"``  : column i of true_dag is all-zero
+    - ``"false_parent"`` : true_dag[j, i] == 0 and parent variable is not independent
+    - ``"unknown"``      : no compatible true mask is available
 
     Returns:
-        ``(L_X, L_S)`` object array of strings.
+        ``(edge_class, true_edge)`` where true_edge is 0/1 or None.
     """
-    L_X, L_S = true_dag.shape
-    classes = np.empty((L_X, L_S), dtype=object)
+    if parent_space == "X" and target_idx == parent_idx:
+        return "self_loop", 0
 
-    col_sums = true_dag.sum(axis=0)  # (L_S,) — number of true children per Si
-    for j in range(L_X):
-        for i in range(L_S):
-            if true_dag[j, i] == 1:
-                classes[j, i] = "true_parent"
-            elif col_sums[i] == 0:
-                classes[j, i] = "independent"
-            else:
-                classes[j, i] = "false_parent"
-    return classes
+    if true_dag is None or target_idx >= true_dag.shape[0] or parent_idx >= true_dag.shape[1]:
+        return "unknown", None
+
+    true_edge = int(true_dag[target_idx, parent_idx])
+    if true_edge == 1:
+        return "true_parent", true_edge
+    if true_dag[:, parent_idx].sum() == 0:
+        return "independent", true_edge
+    return "false_parent", true_edge
+
+
+def _class_stats_from_df(df: pd.DataFrame) -> Dict[str, Optional[float]]:
+    """Mean HSIC by edge class for valid non-diagonal candidate pairs."""
+    class_stats: Dict[str, Optional[float]] = {}
+    valid_df = df[df["edge_class"] != "self_loop"]
+    for cls in ("true_parent", "false_parent", "independent", "unknown"):
+        sub = valid_df[valid_df["edge_class"] == cls]["hsic"].dropna()
+        class_stats[cls] = float(sub.mean()) if len(sub) > 0 else None
+    return class_stats
+
+
+def _margin_from_class_stats(class_stats: Dict[str, Optional[float]]) -> Optional[float]:
+    """Return mean(true_parent) - mean(false_parent), or None if unavailable."""
+    tp = class_stats.get("true_parent")
+    fp = class_stats.get("false_parent")
+    return (tp - fp) if tp is not None and fp is not None else None
+
+
+def _plot_hsic_heatmap(
+    hsic_mat: np.ndarray,
+    row_labels: List[str],
+    col_labels: List[str],
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    fig_path: str,
+    show_plots: bool,
+) -> bool:
+    """Save a residual-HSIC heatmap. Returns True on success."""
+    try:
+        import matplotlib.pyplot as plt
+
+        n_rows, n_cols = hsic_mat.shape
+        fig, ax = plt.subplots(figsize=(max(4, n_cols * 0.6), max(3, n_rows * 0.5)))
+        im = ax.imshow(hsic_mat, aspect="auto", cmap="hot_r")
+        plt.colorbar(im, ax=ax, label="HSIC")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels(col_labels[:n_cols], rotation=45, ha="right", fontsize=7)
+        ax.set_yticks(range(n_rows))
+        ax.set_yticklabels(row_labels[:n_rows], fontsize=7)
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=120, bbox_inches="tight")
+        if show_plots:
+            plt.show()
+        plt.close(fig)
+        return True
+    except Exception as exc:
+        print(f"  [warn] Could not save HSIC heatmap {fig_path}: {exc}")
+        return False
 
 
 def _compute_adaptive_sigma(values: np.ndarray) -> float:
@@ -441,7 +459,7 @@ def eval_anm_residual_hsic(
     # Forward pass — collect residuals & sources
     # ------------------------------------------------------------------
     print("  Running forward pass (eval mode, BKD disabled)…")
-    residuals, s_values = _collect_residuals_and_sources(
+    residuals, s_values, x_values = _collect_residuals_and_sources(
         model=model,
         dm=dm,
         val_idx=val_idx,
@@ -449,7 +467,7 @@ def eval_anm_residual_hsic(
         max_batches=max_batches,
     )
 
-    if residuals is None or s_values is None or residuals.shape[0] == 0:
+    if residuals is None or s_values is None or x_values is None or residuals.shape[0] == 0:
         print("  [skip] No validation samples available.")
         return result
 
@@ -459,39 +477,68 @@ def eval_anm_residual_hsic(
     print(f"  Collected {N} samples  (L_X={L_X}, L_S={L_S})")
 
     # ------------------------------------------------------------------
-    # Adaptive bandwidth
+    # HSIC configuration: reuse the same torch utilities/kernels as training.
     # ------------------------------------------------------------------
+    train_cfg = config.get("training", {})
+    hsic_sigma = float(train_cfg.get("hsic_sigma", sigma_src))
+    hsic_mode = str(train_cfg.get("hsic_mode", "biased"))
+    nhsic_epsilon = float(train_cfg.get("nhsic_epsilon", 0.01))
+    source_kernel = str(train_cfg.get("hsic_kernel_source", "rbf"))
+
     if adaptive_bandwidth:
         sigma_res = _compute_adaptive_sigma(residuals)
         sigma_src = _compute_adaptive_sigma(s_values)
-        print(f"  Adaptive σ — residuals: {sigma_res:.4f}  sources: {sigma_src:.4f}")
+        sigma_x = _compute_adaptive_sigma(x_values)
+        print(
+            f"  Adaptive σ diagnostics — residuals: {sigma_res:.4f}  "
+            f"S: {sigma_src:.4f}  X: {sigma_x:.4f}"
+        )
+    else:
+        sigma_x = float(hsic_sigma)
 
     # ------------------------------------------------------------------
-    # Compute HSIC matrix  (L_X, L_S)
+    # Compute residual-HSIC matrices using the training HSIC implementation.
     # ------------------------------------------------------------------
-    print(f"  Computing HSIC for {L_X}x{L_S} = {L_X * L_S} pairs...")
-    hsic_mat = _compute_hsic_matrix_np(
-        residuals=residuals,
-        sources=s_values,
-        sigma_res=sigma_res,
-        sigma_src=sigma_src,
+    print(
+        f"  Computing residual-HSIC for S and X parents: "
+        f"cross={L_X}x{L_S}, self={L_X}x{L_X}..."
     )
+    residuals_t = torch.as_tensor(residuals, dtype=torch.float32)
+    s_values_t = torch.as_tensor(s_values, dtype=torch.float32)
+    x_values_t = torch.as_tensor(x_values, dtype=torch.float32)
+
+    with torch.no_grad():
+        hsic_cross = hsic_pair_matrix(
+            source_values=s_values_t,
+            residuals=residuals_t,
+            sigma=hsic_sigma,
+            adaptive_bandwidth=adaptive_bandwidth,
+            mode=hsic_mode,
+            nhsic_epsilon=nhsic_epsilon,
+            source_kernel=source_kernel,
+            exclude_diagonal=False,
+        ).cpu().numpy()
+        hsic_self = hsic_pair_matrix(
+            source_values=x_values_t,
+            residuals=residuals_t,
+            sigma=hsic_sigma,
+            adaptive_bandwidth=adaptive_bandwidth,
+            mode=hsic_mode,
+            nhsic_epsilon=nhsic_epsilon,
+            source_kernel="rbf",
+            exclude_diagonal=True,
+        ).cpu().numpy()
 
     # ------------------------------------------------------------------
-    # Load true DAG mask for classification
+    # Load true DAG masks for classification
     # ------------------------------------------------------------------
     dataset_name = config.get("data", {}).get("dataset", "")
     true_cross = _load_true_dag_mask(data_dir, dataset_name, "dec_cross")
+    true_self = _load_true_dag_mask(data_dir, dataset_name, "dec_self")
 
     # ------------------------------------------------------------------
-    # Build per-edge DataFrame
-    # ------------------------------------------------------------------
-    rows = []
-    edge_classes = None
-    if true_cross is not None and true_cross.shape == (L_X, L_S):
-        edge_classes = _classify_edges(true_cross)
-
     # Variable labels (fallback to index strings)
+    # ------------------------------------------------------------------
     from .eval_utils import load_dataset_metadata
     meta = {}
     try:
@@ -502,56 +549,95 @@ def eval_anm_residual_hsic(
     src_labels = list(var_info.get("source_labels", [f"S{i}" for i in range(L_S)]))
     inp_labels = list(var_info.get("input_labels", [f"X{j}" for j in range(L_X)]))
 
+    # ------------------------------------------------------------------
+    # Build one long-format residual-vs-parent table for S and X parents.
+    # ------------------------------------------------------------------
+    rows = []
+
     for j in range(L_X):
-        x_label = inp_labels[j] if j < len(inp_labels) else f"X{j}"
+        target_label = inp_labels[j] if j < len(inp_labels) else f"X{j}"
         for i in range(L_S):
-            s_label = src_labels[i] if i < len(src_labels) else f"S{i}"
-            edge_class = (
-                edge_classes[j, i]
-                if edge_classes is not None
-                else "unknown"
-            )
-            true_val = (
-                int(true_cross[j, i])
-                if true_cross is not None and true_cross.shape == (L_X, L_S)
-                else None
+            parent_label = src_labels[i] if i < len(src_labels) else f"S{i}"
+            edge_class, true_val = _classify_edge_pair(
+                true_dag=true_cross,
+                target_idx=j,
+                parent_idx=i,
+                parent_space="S",
             )
             rows.append({
+                "attention_type": "cross",
+                "parent_space": "S",
                 "target_idx": j,
-                "source_idx": i,
-                "target_label": x_label,
-                "source_label": s_label,
-                "hsic": float(hsic_mat[j, i]),
+                "parent_idx": i,
+                "source_idx": i,  # backward-compatible alias for cross rows
+                "target_label": target_label,
+                "parent_label": parent_label,
+                "source_label": parent_label,  # backward-compatible alias for cross rows
+                "hsic": float(hsic_cross[j, i]),
                 "edge_class": edge_class,
                 "true_edge": true_val,
+                "is_self_loop": False,
             })
 
-    df = pd.DataFrame(rows)
+        for k in range(L_X):
+            parent_label = inp_labels[k] if k < len(inp_labels) else f"X{k}"
+            edge_class, true_val = _classify_edge_pair(
+                true_dag=true_self,
+                target_idx=j,
+                parent_idx=k,
+                parent_space="X",
+            )
+            hsic_val = hsic_self[j, k]
+            rows.append({
+                "attention_type": "self",
+                "parent_space": "X",
+                "target_idx": j,
+                "parent_idx": k,
+                "source_idx": k,
+                "target_label": target_label,
+                "parent_label": parent_label,
+                "source_label": parent_label,
+                "hsic": float(hsic_val) if not np.isnan(hsic_val) else np.nan,
+                "edge_class": edge_class,
+                "true_edge": true_val,
+                "is_self_loop": bool(j == k),
+            })
+
+    df_all = pd.DataFrame(rows)
+    df = df_all[df_all["attention_type"] == "cross"].copy()
+    df_self = df_all[df_all["attention_type"] == "self"].copy()
 
     # ------------------------------------------------------------------
     # Summary statistics per edge class
     # ------------------------------------------------------------------
-    class_stats: Dict[str, Optional[float]] = {}
-    for cls in ("true_parent", "false_parent", "independent", "unknown"):
-        sub = df[df["edge_class"] == cls]["hsic"]
-        class_stats[cls] = float(sub.mean()) if len(sub) > 0 else None
+    class_stats = _class_stats_from_df(df)
+    self_class_stats = _class_stats_from_df(df_self)
+    all_class_stats = _class_stats_from_df(df_all)
 
     result["mean_hsic_true_parent"] = class_stats.get("true_parent")
     result["mean_hsic_false_parent"] = class_stats.get("false_parent")
     result["mean_hsic_independent"] = class_stats.get("independent")
-
-    tp = class_stats.get("true_parent")
-    fp = class_stats.get("false_parent")
-    if tp is not None and fp is not None:
-        result["true_minus_false_margin"] = tp - fp
+    result["true_minus_false_margin"] = _margin_from_class_stats(class_stats)
+    result["self_true_minus_false_margin"] = _margin_from_class_stats(self_class_stats)
+    result["all_true_minus_false_margin"] = _margin_from_class_stats(all_class_stats)
 
     # ------------------------------------------------------------------
-    # Save CSV
+    # Save CSVs. `edge_hsic.csv` is kept as the historical cross-only artifact.
     # ------------------------------------------------------------------
     csv_path = join(eval_path_files, "edge_hsic.csv")
     df.to_csv(csv_path, index=False)
     result["edge_hsic_path"] = csv_path
     print(f"  Saved: edge_hsic.csv  ({len(df)} rows)")
+
+    self_csv_path = join(eval_path_files, "edge_hsic_self.csv")
+    df_self.to_csv(self_csv_path, index=False)
+    result["self_edge_hsic_path"] = self_csv_path
+    print(f"  Saved: edge_hsic_self.csv  ({len(df_self)} rows)")
+
+    all_csv_path = join(eval_path_files, "edge_hsic_all.csv")
+    df_all.to_csv(all_csv_path, index=False)
+    result["all_edge_hsic_path"] = all_csv_path
+    print(f"  Saved: edge_hsic_all.csv  ({len(df_all)} rows)")
 
     # ------------------------------------------------------------------
     # Save JSON summary
@@ -560,58 +646,89 @@ def eval_anm_residual_hsic(
         "n_samples": N,
         "L_X": L_X,
         "L_S": L_S,
+        "hsic_sigma": float(hsic_sigma),
         "sigma_res": float(sigma_res),
         "sigma_src": float(sigma_src),
+        "sigma_x": float(sigma_x),
         "adaptive_bandwidth": adaptive_bandwidth,
-        "mean_hsic_per_class": {
+        "hsic_mode": hsic_mode,
+        "nhsic_epsilon": nhsic_epsilon,
+        "source_kernel_cross": source_kernel,
+        "source_kernel_self": "rbf",
+        "mean_hsic_per_class_cross": {
             k: (float(v) if v is not None else None)
             for k, v in class_stats.items()
         },
-        "true_minus_false_margin": result["true_minus_false_margin"],
-        "true_dag_available": true_cross is not None,
+        "mean_hsic_per_class_self": {
+            k: (float(v) if v is not None else None)
+            for k, v in self_class_stats.items()
+        },
+        "mean_hsic_per_class_all": {
+            k: (float(v) if v is not None else None)
+            for k, v in all_class_stats.items()
+        },
+        "true_minus_false_margin_cross": result["true_minus_false_margin"],
+        "true_minus_false_margin_self": result["self_true_minus_false_margin"],
+        "true_minus_false_margin_all": result["all_true_minus_false_margin"],
+        "true_cross_dag_available": true_cross is not None,
+        "true_self_dag_available": true_self is not None,
+        "output_files": {
+            "edge_hsic_cross": csv_path,
+            "edge_hsic_self": self_csv_path,
+            "edge_hsic_all": all_csv_path,
+        },
     }
     json_path = join(eval_path_files, "summary.json")
     with open(json_path, "w") as f:
         json.dump(summary, f, indent=2)
+    result["summary_path"] = json_path
     print(f"  Saved: summary.json")
 
     # ------------------------------------------------------------------
     # Console summary
     # ------------------------------------------------------------------
-    print("\n  Edge-class HSIC summary (cross-attention):")
-    for cls, val in class_stats.items():
-        if val is not None:
-            print(f"    {cls:20s}: {val:.6f}")
-    if result["true_minus_false_margin"] is not None:
-        margin = result["true_minus_false_margin"]
-        sign = "↓ good (true < false)" if margin < 0 else "↑ warning (true > false)"
-        print(f"    margin (true−false)  : {margin:+.6f}  {sign}")
+    def _print_stats(title: str, stats: Dict[str, Optional[float]], margin: Optional[float]) -> None:
+        print(f"\n  Edge-class HSIC summary ({title}):")
+        for cls, val in stats.items():
+            if val is not None:
+                print(f"    {cls:20s}: {val:.6f}")
+        if margin is not None:
+            sign = "↓ good (true < false)" if margin < 0 else "↑ warning (true > false)"
+            print(f"    margin (true−false)  : {margin:+.6f}  {sign}")
+
+    _print_stats("cross / S parents", class_stats, result["true_minus_false_margin"])
+    _print_stats("self / X parents", self_class_stats, result["self_true_minus_false_margin"])
+    _print_stats("all parents", all_class_stats, result["all_true_minus_false_margin"])
 
     # ------------------------------------------------------------------
-    # Optional heatmap plot
+    # Heatmap plots. Always save; display only when requested.
     # ------------------------------------------------------------------
-    if show_plots or True:  # always save to file; show only when requested
-        try:
-            import matplotlib.pyplot as plt
+    cross_fig_path = join(eval_path_figs, f"residual_hsic_heatmap.{DEFAULT_PLOT_FORMAT}")
+    if _plot_hsic_heatmap(
+        hsic_mat=hsic_cross,
+        row_labels=inp_labels,
+        col_labels=src_labels,
+        title="Residual HSIC — cross-attention / S parents",
+        xlabel="Parent source variable (S_i)",
+        ylabel="Target residual (ε_Xj)",
+        fig_path=cross_fig_path,
+        show_plots=show_plots,
+    ):
+        result["cross_heatmap_path"] = cross_fig_path
+        print(f"  Saved: residual_hsic_heatmap.{DEFAULT_PLOT_FORMAT}")
 
-            fig, ax = plt.subplots(figsize=(max(4, L_S * 0.6), max(3, L_X * 0.5)))
-            im = ax.imshow(hsic_mat, aspect="auto", cmap="hot_r")
-            plt.colorbar(im, ax=ax, label="HSIC")
-            ax.set_xlabel("Source variable (S_i)")
-            ax.set_ylabel("Target variable (X_j)")
-            ax.set_title("Residual HSIC — cross-attention")
-            ax.set_xticks(range(L_S))
-            ax.set_xticklabels(src_labels[:L_S], rotation=45, ha="right", fontsize=7)
-            ax.set_yticks(range(L_X))
-            ax.set_yticklabels(inp_labels[:L_X], fontsize=7)
-            plt.tight_layout()
-            fig_path = join(eval_path_figs, f"residual_hsic_heatmap.{DEFAULT_PLOT_FORMAT}")
-            plt.savefig(fig_path, dpi=120, bbox_inches="tight")
-            print(f"  Saved: residual_hsic_heatmap.{DEFAULT_PLOT_FORMAT}")
-            if show_plots:
-                plt.show()
-            plt.close(fig)
-        except Exception as exc:
-            print(f"  [warn] Could not save HSIC heatmap: {exc}")
+    self_fig_path = join(eval_path_figs, f"residual_hsic_self_heatmap.{DEFAULT_PLOT_FORMAT}")
+    if _plot_hsic_heatmap(
+        hsic_mat=hsic_self,
+        row_labels=inp_labels,
+        col_labels=inp_labels,
+        title="Residual HSIC — self-attention / X parents",
+        xlabel="Parent intermediate variable (X_k)",
+        ylabel="Target residual (ε_Xj)",
+        fig_path=self_fig_path,
+        show_plots=show_plots,
+    ):
+        result["self_heatmap_path"] = self_fig_path
+        print(f"  Saved: residual_hsic_self_heatmap.{DEFAULT_PLOT_FORMAT}")
 
     return result

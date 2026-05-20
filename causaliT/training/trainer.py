@@ -32,6 +32,7 @@ from causaliT.training.forecasters import (
     SingleCausalForecaster,
     SingleCausalResForecaster,
     NoiseAwareCausalForecaster,
+    NoiseAwareCausalResForecaster,
 )
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
@@ -529,7 +530,8 @@ def get_model_class(config: dict):
     available_models = [
         "proT", "StageCausaliT", "SingleCausalLayer",
         "SingleCausalLayerRes",
-        "NoiseAwareSingleCausalLayer", "LSTM", "GRU", "TCN", "MLP",
+        "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes",
+        "LSTM", "GRU", "TCN", "MLP",
     ]
     assert model_obj in available_models, (
         f"{model_obj} unavailable! Choose between {available_models}"
@@ -540,6 +542,7 @@ def get_model_class(config: dict):
         "SingleCausalLayer": SingleCausalForecaster,
         "SingleCausalLayerRes": SingleCausalResForecaster,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
+        "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
@@ -565,6 +568,8 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return SingleCausalResForecaster(config, data_dir=data_dir)
     elif model_obj == "NoiseAwareSingleCausalLayer":
         return NoiseAwareCausalForecaster(config, data_dir=data_dir)
+    elif model_obj == "NoiseAwareSingleCausalLayerRes":
+        return NoiseAwareCausalResForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
         return TransformerForecaster(config)
     else:
@@ -592,6 +597,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "SingleCausalLayer": StageCausalDataModule,
         "SingleCausalLayerRes": StageCausalDataModule,
         "NoiseAwareSingleCausalLayer": StageCausalDataModule,
+        "NoiseAwareSingleCausalLayerRes": StageCausalDataModule,
         "LSTM": ProcessDataModule,
         "GRU": ProcessDataModule,
         "TCN": ProcessDataModule,
@@ -599,7 +605,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     }
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
 
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer"]:
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes"]:
         return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],
