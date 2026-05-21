@@ -1,0 +1,22 @@
+# To run:
+#   # Step 1 — create the study (writes optuna_protocol.json)
+#   python -m causaliT.euler_optuna.euler_optuna.cli paramsopt --exp_id path_to_experiment  --mode create
+#
+#   # Step 2 — run 3 trials sequentially
+#   python -m causaliT.euler_optuna.euler_optuna.cli paramsopt --exp_id path_to_experiment --mode resume
+#
+#   # Step 3 — inspect best result
+#   python -m causaliT.euler_optuna.euler_optuna.cli paramsopt --exp_id path_to_experiment --mode summary
+
+# Total number of trials
+n_trials: 20
+
+# Optimisation direction
+direction: "minimize"
+
+# Sampler: "sobol" (quasi-random, good for exploration) or "tpe" (Bayesian)
+sampler:
+  name: "sobol"
+
+# Pruner: "none", "median", or "hyperband"
+pruner: "none"

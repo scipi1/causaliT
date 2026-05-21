@@ -646,9 +646,16 @@ class ScaledDotAttention(nn.Module):
             entropy = None
 
         A = self.dropout(att)
-        
+
         if is_multihead:
+            # Q/K are 4D (B, L, H, E) and V is 4D (B, S, H, d_head):
+            # standard multi-head path.
             V = torch.einsum("bhls,bshd->blhd", A, value)
+        elif value.dim() == 4:
+            # Mixed SVFA case: Q/K have 1 structure head (3D, shape B×L×E / B×S×E)
+            # but V has multiple value heads (4D, shape B×S×H×d_head).
+            # A is 3D (B×L×S); broadcast the shared attention map across all V heads.
+            V = torch.einsum("bls,bshd->blhd", A, value)
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
 
@@ -1161,7 +1168,13 @@ class AttentionLayer(nn.Module):
             # The two value paths intentionally share the same masked attention
             # matrix — that is the SVFA dual-residual design contract.
             if H > 1:
-                out_struct = torch.einsum("bhls,bshd->blhd", attn, v_struct)
+                if attn.dim() == 4:
+                    # Both struct and value heads are multi-head (normal case)
+                    out_struct = torch.einsum("bhls,bshd->blhd", attn, v_struct)
+                else:
+                    # n_heads_struct=1 (attn is 3-D), n_heads_value>1 (v_struct is 4-D):
+                    # broadcast the single structure attention map across all value heads.
+                    out_struct = torch.einsum("bls,bshd->blhd", attn, v_struct)
                 out_struct = out_struct.contiguous().view(B, L, -1)
                 if self.out_projection_struct is not None:
                     out_struct = self.out_projection_struct(out_struct)
