@@ -78,6 +78,20 @@ ARCHITECTURE_REGISTRY = {
             "self": ("dec_self", "decoder"),
         },
     },
+    "NoiseAwareCausalResForecaster": {
+        # Dual-residual noise-aware variant — identical attention/phi structure
+        # to NoiseAwareCausalForecaster; only the value/output projection paths differ.
+        "attention_keys": ["dec_self", "dec_cross"],
+        "phi_keys": ["decoder", "decoder_cross"],
+        "blocks_to_eval": [
+            ("dec_cross", "decoder_cross", "dec_cross"),
+            ("dec_self", "decoder", "dec_self"),
+        ],
+        "mec_keys": {
+            "cross": ("dec_cross", "decoder_cross"),
+            "self": ("dec_self", "decoder"),
+        },
+    },
     "SingleCausalResForecaster": {
         # SVFA dual-residual variant of SingleCausalForecaster.
         # Attention/phi shape is identical: the dual-residual decoder only
@@ -697,17 +711,7 @@ def _get_learned_dag(
             - learned_dag: np.ndarray with shape (n_targets, n_sources), values in [0,1]
             - source: "phi" or "attention" indicating which was used
     """
-    # Try phi first (preferred - it's the learned DAG structure)
-    phi_list = attention_data.phi_tensors.get(phi_key, [])
-    phi_available = any(p is not None for p in phi_list)
-    
-    if phi_available:
-        # Average phi across k-folds
-        phi_arrays = [p for p in phi_list if p is not None]
-        learned_dag = np.mean(phi_arrays, axis=0)
-        return learned_dag, "phi"
-    
-    # Fall back to mean attention scores
+    # Use mean attention scores (phi-learning deprecated — attention weights are the learned DAG)
     att_list = attention_data.attention_weights.get(attention_key, [])
     att_available = any(a is not None for a in att_list)
     
@@ -1261,26 +1265,13 @@ def _get_learned_dag_per_fold(
             else:
                 fold_names.append(f"fold_{len(fold_names)}")
     else:
-        # Determine number of folds from phi_tensors or attention_weights
-        phi_list = attention_data.phi_tensors.get(phi_key, [])
+        # Determine number of folds from attention_weights
+        # (phi_key retained for signature backward-compat but is ignored)
         att_list = attention_data.attention_weights.get(attention_key, [])
-        num_folds = max(len(phi_list), len(att_list))
+        num_folds = len(att_list)
         fold_names = [f"k_{i}" for i in range(num_folds)]
     
-    # Try phi first (preferred - it's the learned DAG structure)
-    phi_list = attention_data.phi_tensors.get(phi_key, [])
-    phi_available = any(p is not None for p in phi_list)
-    
-    if phi_available:
-        fold_dags = []
-        for i, fold_name in enumerate(fold_names):
-            if i < len(phi_list) and phi_list[i] is not None:
-                fold_dags.append((fold_name, phi_list[i]))
-            else:
-                fold_dags.append((fold_name, None))
-        return fold_dags, "phi"
-    
-    # Fall back to mean attention scores
+    # Use mean attention scores (phi-learning deprecated)
     att_list = attention_data.attention_weights.get(attention_key, [])
     att_available = any(a is not None for a in att_list)
     
@@ -1742,6 +1733,73 @@ def _check_mec_membership(
     }
     
     return in_mec, details
+
+
+def _compute_mec_threshold(
+    learned_adj: np.ndarray,
+    true_dag_adj: np.ndarray,
+) -> Tuple[Optional[float], bool]:
+    """
+    Compute the MEC threshold: the maximum binarisation threshold θ at which
+    the learned DAG is in the same Markov Equivalence Class as the true DAG.
+
+    Analogous to a p-value: a higher value means the scores are more
+    discriminative — even aggressive pruning (high threshold) still recovers
+    the correct skeleton and v-structures.
+
+    Algorithm:
+        The binarised graph ``(learned_adj >= θ)`` only changes at the unique
+        score values present in ``learned_adj``.  We evaluate
+        ``_check_mec_membership`` at each such value (plus 0.0) and return
+        the **maximum** θ for which membership holds.
+
+    Args:
+        learned_adj:   Continuous adjacency matrix with values in [0, 1].
+        true_dag_adj:  Binary true DAG adjacency matrix.
+
+    Returns:
+        Tuple of (mec_threshold, exists):
+            mec_threshold : float or None
+                Maximum threshold achieving MEC membership.
+                ``None`` (→ stored as NaN downstream) when no threshold works.
+            exists : bool
+                ``True`` when at least one threshold achieves MEC membership.
+
+    Example:
+        >>> true_dag = np.array([[0, 0, 0],
+        ...                      [0, 0, 0],
+        ...                      [1, 1, 0]])   # V-structure 0→2←1
+        >>> learned = np.array([[0,    0,    0],
+        ...                     [0,    0,    0],
+        ...                     [0.85, 0.75, 0]])
+        >>> mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+        >>> exists
+        True
+        >>> 0.0 < mec_thresh <= 0.75  # Must be ≤ min(true-edge scores)
+        True
+    """
+    # Candidate thresholds: all unique score values (these are the only points
+    # at which the binarised graph changes), plus:
+    #   0.0          → "include all edges" baseline
+    #   max + epsilon → "include no edges" endpoint (needed for empty true DAG)
+    max_val = float(np.max(learned_adj)) if learned_adj.size else 0.0
+    epsilon = max(max_val * 1e-9, 1e-12)
+    candidates = np.unique(np.concatenate(
+        [[0.0], learned_adj.ravel(), [max_val + epsilon]]
+    ))
+
+    # Evaluate from highest threshold downward so we can short-circuit.
+    # We want the *maximum* θ where in_mec is True.
+    best_threshold: Optional[float] = None
+    for theta in candidates[::-1]:   # descending order
+        in_mec, _ = _check_mec_membership(learned_adj, true_dag_adj, threshold=float(theta))
+        if in_mec:
+            best_threshold = float(theta)
+            break   # First hit in descending order is the maximum
+
+    if best_threshold is None:
+        return None, False
+    return best_threshold, True
 
 
 def _load_full_true_dag(

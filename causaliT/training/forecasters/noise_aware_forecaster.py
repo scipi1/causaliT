@@ -201,7 +201,22 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             )
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
-        
+
+        # =====================================================================
+        # PARAMETER FREEZING FOR ALTERNATING STAGES (ANM experiments)
+        # =====================================================================
+        # Set by anm_staged_trainer._build_stage_config per stage.
+        # Requires use_gradient_routing=True; otherwise _build_stage_config
+        # falls back to loss-level gating and leaves these False.
+        # requires_grad is not saved in checkpoints, so each new stage starts
+        # with all params unfrozen.
+        self.freeze_structural_params = bool(
+            config["training"].get("freeze_structural_params", False)
+        )
+        self.freeze_reconstruction_params = bool(
+            config["training"].get("freeze_reconstruction_params", False)
+        )
+
         # Hard mask configuration
         self.use_hard_masks = config["training"].get("use_hard_masks", False)
         self._hard_masks_loaded = False
@@ -756,16 +771,35 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         return start + progress * (end - start)
 
     def on_fit_start(self):
-        """Dump the actually-used masks (possibly corrupted) to disk at fit start.
+        """Stage-level parameter freezing + hard-mask dump.
 
-        Writes to <run_dir>/used_masks/:
-        - dec_cross_used.csv, dec_self_used.csv  — binary mask arrays
-        - mask_summary.json — corruption metadata (mirrors SingleCausalForecaster)
+        Parameter freezing:
+            ANM alternating experiments: freeze structural or reconstruction
+            params.  Only applies when use_gradient_routing=True (param groups
+            exist).  When gradient_routing=False, _build_stage_config already
+            fell back to loss-level gating and left these flags False.
+            requires_grad is not saved in checkpoints, so each new stage starts
+            with all params unfrozen.
 
-        Path resolution mirrors SingleCausalForecaster.on_fit_start:
-        CSVLogger.log_dir is "<save_dir_k>/logs/csv/version_X"
-        so parents[2] = "<save_dir_k>".
+        Hard-mask dump:
+            Writes to <run_dir>/used_masks/:
+            - dec_cross_used.csv, dec_self_used.csv  — binary mask arrays
+            - mask_summary.json — corruption metadata
+
+            Path resolution: CSVLogger.log_dir is "<save_dir_k>/logs/csv/version_X"
+            so parents[2] = "<save_dir_k>".
         """
+        # ANM alternating experiments: freeze structural or reconstruction params.
+        # Only applies when use_gradient_routing=True (param groups exist).
+        if self.freeze_structural_params and self.use_gradient_routing:
+            for p in self._structural_params:
+                p.requires_grad_(False)
+            print("  [ANM stage] Structural parameters frozen (requires_grad=False).")
+        if self.freeze_reconstruction_params and self.use_gradient_routing:
+            for p in self._reconstruction_params:
+                p.requires_grad_(False)
+            print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
+
         if not self.use_hard_masks or not self._hard_masks_loaded:
             return
 

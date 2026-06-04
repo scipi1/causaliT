@@ -141,7 +141,7 @@ class CausalCrossAttention(nn.Module):
             scores = torch.einsum("blhe,bshe->bhls", query, key)
         else:
             scores = torch.einsum("ble,bse->bls", query, key)
-
+        
         scores = scale * scores
 
         # Apply causal mask (additive, before activation)

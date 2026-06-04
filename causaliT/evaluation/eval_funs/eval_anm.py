@@ -434,6 +434,7 @@ def eval_anm_residual_hsic(
         "SingleCausalForecaster",
         "SingleCausalResForecaster",
         "NoiseAwareCausalForecaster",
+        "NoiseAwareCausalResForecaster",
     ):
         print(
             f"  [skip] eval_anm_residual_hsic only supports SingleCausalForecaster "

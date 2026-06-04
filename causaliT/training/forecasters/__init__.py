@@ -9,6 +9,8 @@ Currently supports:
 - SingleCausalResForecaster: SingleCausalLayerRes (SVFA dual-residual variant)
 - NoiseAwareCausalForecaster: Noise-aware model with Gaussian NLL training
 - NoiseAwareCausalResForecaster: Noise-aware SVFA dual-residual variant
+- VarianceCausalForecaster: Variance-centric model with analytical noise propagation
+- AttentionSelectorForecaster: Single cross-attention block for observational causal discovery
 """
 
 from .transformer_forecaster import TransformerForecaster
@@ -17,6 +19,8 @@ from .single_causal_forecaster import SingleCausalForecaster
 from .single_causal_res_forecaster import SingleCausalResForecaster
 from .noise_aware_forecaster import NoiseAwareCausalForecaster
 from .noise_aware_res_forecaster import NoiseAwareCausalResForecaster
+from .variance_causal_forecaster import VarianceCausalForecaster
+from .attention_selector_forecaster import AttentionSelectorForecaster
 
 __all__ = [
     'TransformerForecaster',
@@ -25,4 +29,6 @@ __all__ = [
     'SingleCausalResForecaster',
     'NoiseAwareCausalForecaster',
     'NoiseAwareCausalResForecaster',
+    'VarianceCausalForecaster',
+    'AttentionSelectorForecaster',
 ]

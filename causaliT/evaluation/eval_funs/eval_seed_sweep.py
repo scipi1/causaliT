@@ -63,12 +63,16 @@ def _extract_fit_diagnostics(run_path: str) -> Optional[Dict[str, float]]:
     
     Reads the training CSV log from k_0/logs/csv/version_0/metrics.csv,
     finds the epoch with best val_loss, and computes:
-    - best_train_loss: train_loss at the best val_loss epoch
+    - best_train_loss: first column matching ``train_loss*`` at the best val_loss epoch
     - best_val_loss: best validation loss achieved
     - generalization_gap: val_loss - train_loss at best epoch
     - gap_ratio: (val_loss - train_loss) / train_loss
     
-    Returns None if training CSV is not found or metrics are missing.
+    The train-loss column is resolved via a ``train_loss*`` regex so that
+    experiments logged as ``train_loss_x`` (component loss) or ``train_loss``
+    (total loss) are both handled transparently.
+    
+    Returns None if training CSV is not found or required metrics are missing.
     """
     # Find the k-fold directory (typically k_0 for single-fold)
     kfold_dirs = sorted([
@@ -89,8 +93,12 @@ def _extract_fit_diagnostics(run_path: str) -> Optional[Dict[str, float]]:
     except Exception:
         return None
     
-    if "train_loss" not in df.columns or "val_loss" not in df.columns:
+    # Resolve train-loss column: prefer exact "train_loss", fall back to first
+    # column matching the train_loss* pattern (e.g. "train_loss_x").
+    train_loss_cols = [c for c in df.columns if re.match(r'train_loss', c)]
+    if not train_loss_cols or "val_loss" not in df.columns:
         return None
+    train_loss_col = train_loss_cols[0]
     
     # Group by epoch, take first non-NaN for each metric
     if "epoch" in df.columns:
@@ -99,7 +107,7 @@ def _extract_fit_diagnostics(run_path: str) -> Optional[Dict[str, float]]:
         df_epoch = df
     
     # Drop rows where either is NaN
-    valid = df_epoch.dropna(subset=["train_loss", "val_loss"])
+    valid = df_epoch.dropna(subset=[train_loss_col, "val_loss"])
     if len(valid) == 0:
         return None
     
@@ -107,7 +115,7 @@ def _extract_fit_diagnostics(run_path: str) -> Optional[Dict[str, float]]:
     best_idx = valid["val_loss"].idxmin()
     best_row = valid.loc[best_idx]
     
-    best_train = float(best_row["train_loss"])
+    best_train = float(best_row[train_loss_col])
     best_val = float(best_row["val_loss"])
     gen_gap = best_val - best_train
     gap_ratio = gen_gap / best_train if best_train > 1e-12 else float('inf')
@@ -137,6 +145,9 @@ _DAG_METRIC_COLUMNS = [
     # MEC (Markov Equivalence Class) metrics on the combined full DAG
     "mec_distance",
     "mec_membership_rate",
+    # MEC threshold: max binarisation threshold θ at which the DAG is still in the MEC.
+    # Analogous to a p-value: higher = scores are more discriminative (NaN = never in MEC).
+    "mec_threshold",
     # Skeleton / v-structure quality (averaged across folds within each seed)
     "skeleton_recall",
     "skeleton_precision",
@@ -210,13 +221,18 @@ def _extract_dag_metrics_per_seed(dag_data: Dict[str, Any]) -> Dict[str, float]:
     if zs is not None:
         out["zeroness_self_contrast"] = float(zs)
 
-    # --- MEC distance & membership ------------------------------------------
+    # --- MEC distance, membership, and threshold ----------------------------
     mec_mean = _safe_get(dag_data, "mec_distance", "mean")
     mec_member = _safe_get(dag_data, "mec_membership_rate")
+    mec_thresh = _safe_get(dag_data, "mec_threshold", "mean")
     if mec_mean is not None:
         out["mec_distance"] = float(mec_mean)
     if mec_member is not None:
         out["mec_membership_rate"] = float(mec_member)
+    # mec_threshold may be None when no fold achieved MEC membership (→ omit
+    # from out so downstream dropna() naturally treats it as NaN).
+    if mec_thresh is not None:
+        out["mec_threshold"] = float(mec_thresh)
 
     # --- Skeleton / v-structure metrics (avg across folds) -----------------
     mec_per_fold = _safe_get(dag_data, "mec_distance", "per_fold")
@@ -389,7 +405,7 @@ def _aggregate_learned_dag_across_seeds(
     print(f"Saved: {csv_path}")
 
 
-def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[Optional[pd.DataFrame], pd.DataFrame]:
     """
     Evaluate a seed sweep experiment and compute mean ± std over seeds.
     
@@ -398,14 +414,16 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
         
     Returns:
         Tuple of:
-        - df_ate: ATE metrics per (intervention, variable) with mean/std over seeds
+        - df_ate: ATE metrics per (intervention, variable) with mean/std over seeds.
+          ``None`` when no seed run produced ``eval_ate_mc`` results (e.g. pure
+          DAG-learning experiments without ATE evaluation).
         - df_experiment: Experiment-wide metrics (test_mae, shd, mec) with mean/std over seeds
         
     Output Files:
-        eval/eval_seed_sweep/files/ate_summary.csv
+        eval/eval_seed_sweep/files/ate_summary.csv       (only when ATE data available)
         eval/eval_seed_sweep/files/experiment_summary.csv
-        eval/eval_seed_sweep/files/dag_summary.csv   (only when DAG metrics are available)
-        eval/eval_seed_sweep/files/dag_summary.json  (only when DAG metrics are available)
+        eval/eval_seed_sweep/files/dag_summary.csv        (only when DAG metrics are available)
+        eval/eval_seed_sweep/files/dag_summary.json       (only when DAG metrics are available)
     """
     combinations_dir = join(sweep_experiment, "sweeper", "runs", "combinations")
     
@@ -516,41 +534,44 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
                     "scaled_error": scaled_error,
                 })
     
-    if not ate_records:
+    if not experiment_records:
         raise ValueError("No valid seed runs found")
     
     # Create DataFrames
-    df_ate = pd.DataFrame(ate_records)
     df_exp = pd.DataFrame(experiment_records)
     
     # =========================================================================
-    # Aggregate ATE metrics by (intervention, variable)
+    # Aggregate ATE metrics by (intervention, variable) — optional
+    # Skipped when no seed produced eval_ate_mc results (e.g. pure causal-
+    # discovery experiments that never ran eval_ate_mc).
     # =========================================================================
-    agg_ate = df_ate.groupby(["intervention", "variable"]).agg({
-        "true_ate": "first",
-        "model_ate": ["mean", "std"],
-        "abs_error": ["mean", "std"],
-        "scaled_error": ["mean", "std"],
-        "seed": "count",
-    })
-    
-    # Flatten column names
-    agg_ate.columns = [
-        f"{col[0]}_{col[1]}" if col[1] else col[0] 
-        for col in agg_ate.columns
-    ]
-    agg_ate = agg_ate.rename(columns={"seed_count": "n_seeds", "true_ate_first": "true_ate"})
-    agg_ate = agg_ate.reset_index()
-    
-    # Reorder columns
-    col_order_ate = [
-        "intervention", "variable", "true_ate",
-        "model_ate_mean", "model_ate_std",
-        "abs_error_mean", "abs_error_std",
-        "scaled_error_mean", "scaled_error_std",
-        "n_seeds",
-    ]
-    agg_ate = agg_ate[[c for c in col_order_ate if c in agg_ate.columns]]
+    agg_ate: Optional[pd.DataFrame] = None
+    if ate_records:
+        df_ate = pd.DataFrame(ate_records)
+        _agg = df_ate.groupby(["intervention", "variable"]).agg({
+            "true_ate": "first",
+            "model_ate": ["mean", "std"],
+            "abs_error": ["mean", "std"],
+            "scaled_error": ["mean", "std"],
+            "seed": "count",
+        })
+        # Flatten column names
+        _agg.columns = [
+            f"{col[0]}_{col[1]}" if col[1] else col[0]
+            for col in _agg.columns
+        ]
+        _agg = _agg.rename(columns={"seed_count": "n_seeds", "true_ate_first": "true_ate"})
+        _agg = _agg.reset_index()
+        col_order_ate = [
+            "intervention", "variable", "true_ate",
+            "model_ate_mean", "model_ate_std",
+            "abs_error_mean", "abs_error_std",
+            "scaled_error_mean", "scaled_error_std",
+            "n_seeds",
+        ]
+        agg_ate = _agg[[c for c in col_order_ate if c in _agg.columns]]
+    else:
+        print("No ATE data found across seeds (skipping ate_summary.csv).")
     
     # =========================================================================
     # Aggregate experiment-wide metrics
@@ -574,14 +595,14 @@ def eval_seed_sweep(sweep_experiment: str, show_plots: bool=False) -> Tuple[pd.D
     # =========================================================================
     # Save outputs
     # =========================================================================
-    ate_path = join(eval_path_files, "ate_summary.csv")
     exp_path = join(eval_path_files, "experiment_summary.csv")
-    
-    agg_ate.to_csv(ate_path, index=False)
     df_exp_summary.to_csv(exp_path, index=False)
-    
-    print(f"Saved: {ate_path}")
     print(f"Saved: {exp_path}")
+
+    if agg_ate is not None:
+        ate_path = join(eval_path_files, "ate_summary.csv")
+        agg_ate.to_csv(ate_path, index=False)
+        print(f"Saved: {ate_path}")
     
     # =========================================================================
     # Aggregate DAG metrics across seeds (only when at least one seed produced
@@ -682,6 +703,9 @@ if __name__ == "__main__":
     
     df_ate, df_exp = eval_seed_sweep(args.sweep_experiment)
     print("\n--- ATE Summary ---")
-    print(df_ate.to_string())
+    if df_ate is not None:
+        print(df_ate.to_string())
+    else:
+        print("(not available — no eval_ate_mc results found)")
     print("\n--- Experiment Summary ---")
     print(df_exp.to_string())

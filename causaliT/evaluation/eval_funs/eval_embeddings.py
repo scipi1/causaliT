@@ -600,7 +600,7 @@ def eval_embedding_dag_correlation(experiment: str, show_plots: bool = True) -> 
         # cross-attention pattern keys are unchanged.
         phi_key = "decoder_cross"
         att_key = "dec_cross"
-    elif architecture == "NoiseAwareCausalForecaster":
+    elif architecture in ("NoiseAwareCausalForecaster", "NoiseAwareCausalResForecaster"):
         phi_key = "decoder_cross"
         att_key = "dec_cross"
     elif architecture == "StageCausalForecaster":

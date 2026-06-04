@@ -31,6 +31,9 @@ from causaliT.training.forecasters.stage_causal_forecaster import StageCausalFor
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
 from causaliT.training.forecasters.single_causal_res_forecaster import SingleCausalResForecaster
 from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
+from causaliT.training.forecasters.noise_aware_res_forecaster import (
+    NoiseAwareCausalResForecaster,
+)
 
 # Import root_path from eval_utils (relative import)
 from .eval_utils import root_path
@@ -267,6 +270,10 @@ def get_architecture_type(config: dict) -> str:
         return "SingleCausalResForecaster"
     elif model_obj == "NoiseAwareSingleCausalLayer":
         return "NoiseAwareCausalForecaster"
+    elif model_obj == "NoiseAwareSingleCausalLayerRes":
+        return "NoiseAwareCausalResForecaster"
+    elif model_obj == "AttentionSelectorLayer":
+        return "AttentionSelectorForecaster"
     else:
         raise ValueError(f"Unknown model type: {model_obj}")
 
@@ -277,100 +284,17 @@ def get_architecture_type(config: dict) -> str:
 
 def extract_phi_from_model(model, architecture_type: str) -> Dict[str, Optional[np.ndarray]]:
     """
-    Extract learned DAG probabilities (sigmoid(phi)) from a loaded model.
-    
-    This function extracts the posterior DAG structure learned by attention modules
-    with learnable phi (e.g. CausalCrossAttention). It uses `get_dag_probabilities()`
-    which returns sigmoid(phi), the actual edge probabilities, rather than raw phi logits.
-    
-    Args:
-        model: Loaded model (TransformerForecaster, StageCausalForecaster, or SingleCausalForecaster)
-        architecture_type: "TransformerForecaster", "StageCausalForecaster", or "SingleCausalForecaster"
-        
-    Returns:
-        Dict mapping component name to DAG probability array (or None if not available)
-        Keys:
-        - TransformerForecaster: "encoder", "decoder", "cross"
-        - StageCausalForecaster: "decoder1", "decoder1_cross", "decoder2", "decoder2_cross"
-        - SingleCausalForecaster: "decoder", "decoder_cross"
+    [DEPRECATED] Phi-learning has been removed from CausaliT.
+
+    The learned DAG structure is now read directly from attention weights
+    (mean attention over the test set) rather than from a separate learnable
+    phi parameter.  This stub is kept so that old call-sites do not crash;
+    it simply returns an empty dict, leaving phi_tensors unpopulated.
+
+    All DAG metrics now use the attention-weight path in
+    ``_get_learned_dag`` / ``_get_learned_dag_per_fold`` (eval_utils.py).
     """
-    phi_dict = {}
-    
-    def _get_dag_probs(inner_attention):
-        """Helper to safely extract DAG probabilities from an attention module."""
-        if hasattr(inner_attention, 'get_dag_probabilities'):
-            dag_probs = inner_attention.get_dag_probabilities()
-            if dag_probs is not None:
-                return dag_probs.detach().cpu().numpy()
-        return None
-    
-    if architecture_type == "TransformerForecaster":
-        # Encoder self-attention DAG
-        enc_inner = model.model.encoder.layers[0].global_attention.inner_attention
-        phi_dict["encoder"] = _get_dag_probs(enc_inner)
-        
-        # Decoder self-attention DAG
-        dec_self_inner = model.model.decoder.layers[0].global_self_attention.inner_attention
-        phi_dict["decoder"] = _get_dag_probs(dec_self_inner)
-        
-        # Decoder cross-attention DAG (for CausalCrossAttention)
-        dec_cross_inner = model.model.decoder.layers[0].global_cross_attention.inner_attention
-        phi_dict["cross"] = _get_dag_probs(dec_cross_inner)
-        
-    elif architecture_type == "StageCausalForecaster":
-        # Decoder1 self-attention DAG (X -> X structure)
-        dec1_self_inner = model.model.decoder1.layers[0].global_self_attention.inner_attention
-        phi_dict["decoder1"] = _get_dag_probs(dec1_self_inner)
-        
-        # Decoder1 cross-attention DAG (S -> X structure)
-        dec1_cross_inner = model.model.decoder1.layers[0].global_cross_attention.inner_attention
-        phi_dict["decoder1_cross"] = _get_dag_probs(dec1_cross_inner)
-        
-        # Decoder2 self-attention DAG (Y -> Y structure)
-        dec2_self_inner = model.model.decoder2.layers[0].global_self_attention.inner_attention
-        phi_dict["decoder2"] = _get_dag_probs(dec2_self_inner)
-        
-        # Decoder2 cross-attention DAG (X -> Y structure)
-        dec2_cross_inner = model.model.decoder2.layers[0].global_cross_attention.inner_attention
-        phi_dict["decoder2_cross"] = _get_dag_probs(dec2_cross_inner)
-        
-        # Compatibility keys
-        phi_dict["encoder"] = None  # No encoder in StageCausal
-        phi_dict["decoder"] = None  # For compatibility
-        
-    elif architecture_type in (
-        "SingleCausalForecaster",
-        "SingleCausalResForecaster",
-        "NoiseAwareCausalForecaster",
-    ):
-        # Iterate all decoder layers for multi-layer support
-        n_layers = len(model.model.decoder.layers)
-        
-        for layer_idx, layer in enumerate(model.model.decoder.layers):
-            # Self-attention DAG (X -> X structure)
-            dec_self_inner = layer.global_self_attention.inner_attention
-            phi_dict[f"decoder_L{layer_idx}"] = _get_dag_probs(dec_self_inner)
-            
-            # Cross-attention DAG (S -> X structure)
-            dec_cross_inner = layer.global_cross_attention.inner_attention
-            phi_dict[f"decoder_cross_L{layer_idx}"] = _get_dag_probs(dec_cross_inner)
-        
-        # Backward-compat keys: layer 0 for single-layer, average for multi-layer
-        if n_layers == 1:
-            phi_dict["decoder"] = phi_dict.get("decoder_L0")
-            phi_dict["decoder_cross"] = phi_dict.get("decoder_cross_L0")
-        else:
-            # Average across layers (only for non-None entries)
-            self_phis = [phi_dict[f"decoder_L{i}"] for i in range(n_layers) if phi_dict.get(f"decoder_L{i}") is not None]
-            cross_phis = [phi_dict[f"decoder_cross_L{i}"] for i in range(n_layers) if phi_dict.get(f"decoder_cross_L{i}") is not None]
-            phi_dict["decoder"] = np.mean(self_phis, axis=0) if self_phis else None
-            phi_dict["decoder_cross"] = np.mean(cross_phis, axis=0) if cross_phis else None
-        
-        # Compatibility keys
-        phi_dict["encoder"] = None
-        phi_dict["cross"] = phi_dict["decoder_cross"]  # Alias for compatibility
-    
-    return phi_dict
+    return {}
 
 
 def extract_embeddings_from_model(model, architecture_type: str) -> Dict[str, Dict[str, Any]]:
@@ -709,7 +633,7 @@ def load_attention_data(
             "decoder_cross": [],  # Cross-attention DAG (S -> X)
             "cross": [],  # Alias for decoder_cross
         }
-    elif architecture_type == "NoiseAwareCausalForecaster":
+    elif architecture_type in ("NoiseAwareCausalForecaster", "NoiseAwareCausalResForecaster"):
         # Same structure as SingleCausalForecaster
         result.attention_weights = {
             "encoder": [],  # Empty for compatibility
@@ -779,6 +703,7 @@ def load_attention_data(
                 "SingleCausalForecaster",
                 "SingleCausalResForecaster",
                 "NoiseAwareCausalForecaster",
+                "NoiseAwareCausalResForecaster",
             ):
                 # Predictors return backward-compat keys + per-layer keys (dec_cross_L0, etc.)
                 result.attention_weights["dec_self"].append(att_weights.get("dec_self"))
@@ -795,24 +720,8 @@ def load_attention_data(
                             result.attention_weights[key] = [None] * (len(result.attention_weights["dec_self"]) - 1)
                         result.attention_weights[key].append(att_weights[key])
             
-            # Load model and extract phi tensors
-            if architecture_type == "TransformerForecaster":
-                model = TransformerForecaster.load_from_checkpoint(checkpoint_path)
-            elif architecture_type == "StageCausalForecaster":
-                model = StageCausalForecaster.load_from_checkpoint(checkpoint_path)
-            elif architecture_type == "SingleCausalForecaster":
-                model = SingleCausalForecaster.load_from_checkpoint(checkpoint_path)
-            elif architecture_type == "SingleCausalResForecaster":
-                model = SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
-            elif architecture_type == "NoiseAwareCausalForecaster":
-                model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
-            
-            phi_dict = extract_phi_from_model(model, architecture_type)
-            
-            for key, value in phi_dict.items():
-                if key in result.phi_tensors:
-                    result.phi_tensors[key].append(value)
-            
+            # NOTE: phi-learning deprecated — phi_tensors stay empty.
+            # Attention weights above are the learned DAG representation.
             print(f"  ✓ Successfully processed {kfold_dir}")
             
         except Exception as e:
@@ -1244,6 +1153,8 @@ def load_embeddings_evolution(
                         model = SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
                     elif architecture_type == "NoiseAwareCausalForecaster":
                         model = NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
+                    elif architecture_type == "NoiseAwareCausalResForecaster":
+                        model = NoiseAwareCausalResForecaster.load_from_checkpoint(checkpoint_path)
                     
                     # Extract embeddings
                     embeddings = extract_embeddings_from_model(model, architecture_type)

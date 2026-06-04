@@ -9,6 +9,7 @@ SUPPORTED MODELS
 - proT
 - SingleCausalLayer / SingleCausalLayerRes
 - NoiseAwareSingleCausalLayer / NoiseAwareSingleCausalLayerRes
+- AttentionSelectorLayer
 
 Note: StageCausaliT is intentionally excluded from the current Optuna scope
 because it uses a different metric naming convention (``val_mae_X`` instead
@@ -169,6 +170,11 @@ OPTUNA_RECONSTRUCTION_PROTOCOL = {
         "training.lambda_noise_prior": 0.0,
         "training.lambda_sparse": 0.0,
         "training.lambda_sparse_cross": 0.0,
+        # AttentionSelectorLayer uses unified lambda keys (not _cross/_self variants).
+        # These are silently skipped for models that don't have them (try/except in
+        # apply_optuna_reconstruction_protocol), so adding them here is backward-safe.
+        "training.lambda_hsic": 0.0,
+        "training.lambda_score_sparse": 0.0,
         "training.early_stopping.enabled": True,
         "training.early_stopping.monitor": "val_x_mae",
         "training.early_stopping.patience": 30,
@@ -328,6 +334,34 @@ def SingleCausal_sample_params(trial):
     }
 
 
+def AttentionSelector_sample_params(trial):
+    """
+    Capacity sampling for ``AttentionSelectorLayer``.
+
+    This architecture uses a *single* combined cross-attention block (no
+    stacked decoder layers), so ``dec_layers`` is intentionally absent from
+    the search space.
+
+    Config keys sampled:
+      - d_model_set  : embedding / model dimension
+      - n_heads      : attention heads (categorical from {1, 2, 4})
+      - dropout      : dropout rate
+      - training.lr  : learning rate
+
+    Note on n_heads:
+      When comps_embed is "svfa" and n_heads=1, the SVFA path degrades
+      gracefully to summation-equivalent behaviour (one value head = full
+      d_model vector).  n_heads ∈ {1, 2, 4} is safe for any d_model_set
+      that is a multiple of 16 (guaranteed by the d_model_set bounds).
+    """
+    return {
+        "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
+        "experiment.n_heads":     trial.suggest_categorical("n_heads", N_HEADS_CHOICES),
+        "experiment.dropout":     trial.suggest_float("dropout",     **SAMPLING_BOUNDS["dropout"]),
+        "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
+    }
+
+
 # =============================================================================
 # DISPATCHER
 # =============================================================================
@@ -340,6 +374,7 @@ _SAMPLING_DISPATCH = {
     "SingleCausalLayerRes":           SingleCausal_sample_params,
     "NoiseAwareSingleCausalLayer":    SingleCausal_sample_params,
     "NoiseAwareSingleCausalLayerRes": SingleCausal_sample_params,
+    "AttentionSelectorLayer":         AttentionSelector_sample_params,
 }
 
 

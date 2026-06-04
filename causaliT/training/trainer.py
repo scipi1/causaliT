@@ -33,6 +33,8 @@ from causaliT.training.forecasters import (
     SingleCausalResForecaster,
     NoiseAwareCausalForecaster,
     NoiseAwareCausalResForecaster,
+    VarianceCausalForecaster,
+    AttentionSelectorForecaster,
 )
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
@@ -184,6 +186,8 @@ def train_single_fold(
         enable_progress_bar=not cluster,
         enable_model_summary=not cluster,
         detect_anomaly=debug,
+        gradient_clip_val=config["training"].get("gradient_clip_val", None),
+        gradient_clip_algorithm=config["training"].get("gradient_clip_algorithm", "norm"),
     )
 
     # ---- Warm-start: load model weights only (no optimizer / epoch restore) -----
@@ -531,6 +535,8 @@ def get_model_class(config: dict):
         "proT", "StageCausaliT", "SingleCausalLayer",
         "SingleCausalLayerRes",
         "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes",
+        "VarianceCausalLayer",
+        "AttentionSelectorLayer",
         "LSTM", "GRU", "TCN", "MLP",
     ]
     assert model_obj in available_models, (
@@ -543,6 +549,8 @@ def get_model_class(config: dict):
         "SingleCausalLayerRes": SingleCausalResForecaster,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
         "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResForecaster,
+        "VarianceCausalLayer": VarianceCausalForecaster,
+        "AttentionSelectorLayer": AttentionSelectorForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
@@ -570,6 +578,10 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return NoiseAwareCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "NoiseAwareSingleCausalLayerRes":
         return NoiseAwareCausalResForecaster(config, data_dir=data_dir)
+    elif model_obj == "VarianceCausalLayer":
+        return VarianceCausalForecaster(config, data_dir=data_dir)
+    elif model_obj == "AttentionSelectorLayer":
+        return AttentionSelectorForecaster(config)
     elif model_obj == "proT":
         return TransformerForecaster(config)
     else:
@@ -598,6 +610,8 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "SingleCausalLayerRes": StageCausalDataModule,
         "NoiseAwareSingleCausalLayer": StageCausalDataModule,
         "NoiseAwareSingleCausalLayerRes": StageCausalDataModule,
+        "VarianceCausalLayer": StageCausalDataModule,
+        "AttentionSelectorLayer": StageCausalDataModule,
         "LSTM": ProcessDataModule,
         "GRU": ProcessDataModule,
         "TCN": ProcessDataModule,
@@ -605,7 +619,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     }
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
 
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes"]:
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer"]:
         return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],

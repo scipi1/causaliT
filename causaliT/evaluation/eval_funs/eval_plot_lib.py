@@ -92,6 +92,7 @@ def plot_attention_scores(
         "SingleCausalForecaster",
         "SingleCausalResForecaster",
         "NoiseAwareCausalForecaster",
+        "NoiseAwareCausalResForecaster",
     ]:
         # Detect per-layer keys (dec_self_L0, dec_cross_L0, etc.)
         import re

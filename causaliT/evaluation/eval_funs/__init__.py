@@ -59,7 +59,6 @@ from .eval_lib import (
     find_config_file,
     find_best_or_last_checkpoint,
     get_architecture_type,
-    extract_phi_from_model,
     load_attention_data,
     load_attention_data_from_file,
     save_attention_data,
@@ -91,6 +90,9 @@ from .eval_attention import (
     eval_attention_scores,     # FAST: final checkpoint DAG metrics
     eval_attention_evolution,  # SLOW: evolution tracking across epochs
 )
+
+# AttentionSelector evaluation (self-contained, writes to eval_attention_scores/ path)
+from .eval_attention_selector import eval_attention_selector_scores
 
 # Intervention evaluation
 from .eval_interventions import eval_interventions
@@ -155,7 +157,6 @@ __all__ = [
     "find_config_file",
     "find_best_or_last_checkpoint",
     "get_architecture_type",
-    "extract_phi_from_model",
     "load_attention_data",
     "load_attention_data_from_file",
     "save_attention_data",
@@ -183,6 +184,7 @@ __all__ = [
     "load_attention_evolution",  # Deprecated
     "eval_attention_scores",
     "eval_attention_evolution",
+    "eval_attention_selector_scores",
     # Architecture registry
     "ARCHITECTURE_REGISTRY",
     "get_architecture_config",

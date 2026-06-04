@@ -17,6 +17,7 @@ from .orthogonal_linear import OrthogonalLinear
 from .embedding_layers import *
 from .extra_layers import Normalization, UniformAttentionMask
 from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
+from .variance_layers import IntrinsicNoiseLayer, AnalyticalVarianceHead, ResidualCovarianceLoss
 from .mlp_head import MLPHead
 
 __all__ = [
@@ -39,6 +40,10 @@ __all__ = [
     'ReadingNoiseHead',
     'GaussianNLLLoss',
     'VariancePropagationTracker',
+    # Variance-centric modules
+    'IntrinsicNoiseLayer',
+    'AnalyticalVarianceHead',
+    'ResidualCovarianceLoss',
     # Output head
     'MLPHead',
 ]

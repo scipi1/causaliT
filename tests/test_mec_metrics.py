@@ -20,6 +20,7 @@ from causaliT.evaluation.eval_funs.eval_utils import (
     _soft_v_structure_distance,
     _compute_mec_distance,
     _check_mec_membership,
+    _compute_mec_threshold,
 )
 
 
@@ -310,6 +311,168 @@ class TestMecWithRealStructure:
         # Perfect learned DAG should be in MEC
         in_mec, details = _check_mec_membership(true_dag.astype(float), true_dag)
         assert in_mec is True
+
+
+class TestComputeMecThreshold:
+    """Tests for _compute_mec_threshold function."""
+
+    def test_perfect_scores_return_high_threshold(self):
+        """
+        When true edges have score 1.0 and non-edges have score 0.0, the MEC
+        threshold should equal the minimum true-edge score (1.0 here).
+        """
+        # V-structure: 0 → 2 ← 1
+        true_dag = np.array([
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 1, 0],
+        ])
+        # Perfect scores: true edges = 1.0, non-edges = 0.0
+        learned = true_dag.astype(float)
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        assert exists is True
+        assert mec_thresh is not None
+        assert mec_thresh == pytest.approx(1.0)
+
+    def test_good_scores_threshold_below_min_edge(self):
+        """
+        When true edges have clear scores (0.85, 0.75) and non-edges are 0,
+        the MEC threshold should be ≤ min(true-edge scores) = 0.75 and > 0.
+        """
+        true_dag = np.array([
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 1, 0],
+        ])
+        learned = np.array([
+            [0,    0,    0],
+            [0,    0,    0],
+            [0.85, 0.75, 0],
+        ])
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        assert exists is True
+        assert mec_thresh is not None
+        assert 0.0 < mec_thresh <= 0.75
+
+    def test_never_in_mec_returns_none(self):
+        """
+        When the learned scores are all equal (uniform), the binarised graph
+        is either the full graph (all scores ≥ θ) or the empty graph
+        (all scores < θ).  Neither matches the 2-edge fork skeleton, so
+        no threshold achieves MEC membership.
+
+        True DAG: fork  0 → 1,  0 → 2  (skeleton has exactly 2 edges;
+        v-structures: none — each of 1 and 2 has only one parent).
+
+        At every candidate threshold θ:
+          θ ≤ 0.3       → full graph (3 edges: 0-1, 0-2, 1-2) ≠ 2-edge skeleton
+          θ > 0.3+ε     → empty graph (0 edges) ≠ 2-edge skeleton
+        Hence never in MEC.
+        """
+        # Fork: 0 → 1, 0 → 2
+        true_dag = np.array([
+            [0, 0, 0],
+            [1, 0, 0],   # 0 → 1
+            [1, 0, 0],   # 0 → 2
+        ])
+        # All scores uniform at 0.3 → no threshold recovers exactly 2 specific edges
+        learned = np.full((3, 3), 0.3)
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        assert exists is False
+        assert mec_thresh is None
+
+    def test_threshold_respects_wrong_v_structure(self):
+        """
+        If the model perfectly recovers the skeleton but orients one edge
+        incorrectly (creating a wrong v-structure), membership should fail.
+        Conversely, at a higher threshold that drops the spurious edge, it
+        might succeed.
+        """
+        # True DAG: 0 → 2 ← 1 (v-structure at 2; parents 0 and 1 NOT adjacent)
+        true_dag = np.array([
+            [0, 0, 0],
+            [0, 0, 0],
+            [1, 1, 0],
+        ])
+        # Model: correct edges (0→2, 1→2) but also adds spurious 0→1 edge
+        # At threshold = 0.5: three edges, wrong v-structure (parents adjacent)
+        # At threshold = 0.9: only 0→2 and 1→2 survive (spurious 0→1 dropped)
+        learned = np.array([
+            [0,   0.6, 0],   # spurious 0→1 edge at 0.6
+            [0,   0,   0],
+            [0.9, 0.9, 0],   # true edges at 0.9
+        ])
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        # At threshold >= 0.9, only 0→2 and 1→2 survive → correct MEC
+        # At threshold 0.6, spurious 0→1 is included → skeleton changes
+        # Best threshold should be 0.9
+        assert exists is True
+        assert mec_thresh is not None
+        assert mec_thresh == pytest.approx(0.9)
+
+    def test_chain_graph_perfect_scores(self):
+        """Chain graph: 0 → 1 → 2. True edges have high scores."""
+        true_dag = np.array([
+            [0, 0, 0],
+            [1, 0, 0],  # 0 → 1
+            [0, 1, 0],  # 1 → 2
+        ])
+        # True edges at 0.8, non-edges at 0.0
+        learned = np.array([
+            [0,   0,   0],
+            [0.8, 0,   0],
+            [0,   0.8, 0],
+        ])
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        assert exists is True
+        assert mec_thresh is not None
+        assert 0.0 < mec_thresh <= 0.8
+
+    def test_empty_true_dag(self):
+        """
+        True DAG with no edges: the empty binarised graph (any threshold ≥ max
+        score) is trivially in the MEC (empty skeleton, no v-structures).
+        """
+        true_dag = np.zeros((3, 3))
+        # Scores all near zero; binarised at any threshold > 0 gives empty graph
+        learned = np.array([
+            [0,    0,    0],
+            [0.1,  0,    0],
+            [0.05, 0.02, 0],
+        ])
+
+        mec_thresh, exists = _compute_mec_threshold(learned, true_dag)
+
+        # At the highest threshold (0.1), all edges are dropped → in MEC
+        assert exists is True
+        assert mec_thresh is not None
+        assert mec_thresh == pytest.approx(0.1)
+
+    def test_return_type(self):
+        """Verify return types are (float | None, bool)."""
+        true_dag = np.array([[0, 0], [1, 0]])
+        learned = np.array([[0.0, 0.0], [0.9, 0.0]])
+
+        result = _compute_mec_threshold(learned, true_dag)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        mec_thresh, exists = result
+        assert isinstance(exists, bool)
+        if exists:
+            assert isinstance(mec_thresh, float)
+        else:
+            assert mec_thresh is None
 
 
 if __name__ == "__main__":

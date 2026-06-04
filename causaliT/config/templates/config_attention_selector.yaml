@@ -1,0 +1,239 @@
+# AttentionSelectorLayer Template
+#
+# Research question:
+#   Can a single cross-attention block recover causal parent sets from
+#   observational data when given the actual values of all candidate
+#   parents (S and X) as keys?
+#
+# Architecture:
+#   Q: X_blanked  (variable identity only)
+#   K/V: [S_actual, X_actual]  (actual values of all variables)
+#   Hard mask: diagonal of X-X sub-block zeroed (no self-loops)
+#   No self-attention block.
+#
+# Attention type recommendation:
+#   CausalCrossAttention (ReLU-Tanh):  non-normalized, can be zero → sparse
+#   SigmoidCrossAttention:             bounded [0,1], can be near-zero → sparse
+#   ScaledDotProduct:                  softmax, always dense → use only as baseline
+#
+# Suggested workflow:
+#   1. Run with lambda_hsic=0, lambda_score_sparse=0 to verify reconstruction works.
+#   2. Add score sparsity (lambda_score_sparse=0.01) to drive attention sparse.
+#   3. Add HSIC (lambda_hsic=0.1) to drive independence between sources and residuals.
+#   4. Enable gradient routing for cleaner structure optimization.
+
+experiment:
+  d_model_set: 24
+  n_heads: 1
+  d_ff_mult: 2.0
+  d_qk_mult: 0.5
+  d_ff: null
+  d_qk: null
+  dropout: 0.0
+
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 2
+
+  attention_type: "CausalCrossAttention"
+  init_tau: 3.0
+  # SVFA: when True a single (L_X, L_S+L_X) DAG score is shared across all
+  # value heads (Sparse Value-Function Attention).  Set False to give each
+  # head its own independent score (no sharing).
+  shared_dag_across_heads: true
+  # Embedding composition mode.
+  # "summation"  — standard: all sub-modules summed into one d_model vector.
+  # "svfa"       — SVFA multi-head values: sub-modules split into value/structure
+  #                roles and projected into H separate value heads.
+  #                Requires n_heads > 1 and shared_dag_across_heads: true.
+  comps_embed: "svfa"
+  use_gradient_routing: true
+
+
+model:
+  model_object: "AttentionSelectorLayer"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+
+  kwargs:
+    model: ${model.model_object}
+
+    # S embedding (actual values used as keys)
+    ds_embed_S:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_S}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_S: ${experiment.comps_embed}
+
+    # X embedding — SAME module used for both:
+    #   queries (blanked: value=0, only variable identity)
+    #   keys    (actual: value + variable identity)
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_X}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_X: ${experiment.comps_embed}
+
+    # Attention
+    attention_type: ${experiment.attention_type}
+    n_heads: ${experiment.n_heads}
+    init_tau: ${experiment.init_tau}
+    shared_dag_across_heads: ${experiment.shared_dag_across_heads}
+
+    # Dropout
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dropout_qkv: ${experiment.dropout}
+    attention_dropout: ${experiment.dropout}
+
+    # Architecture
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+
+    # Dimensions
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+
+    # Sequence lengths
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+
+    # Output MLP head
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+
+  loss_fn: "mse"
+  lambda_recon: 1.0
+
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 1
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+
+  # --- Score sparsity (L1 on attention weights) ---
+  # Set >0 to encourage sparse attention (structure recovery).
+  # Recommended range: 0.001 to 0.1.
+  lambda_score_sparse: 0.0
+
+  # --- HSIC regularization (unified over [S, X] source) ---
+  # Minimizes HSIC(source_j, residual_i) for all (i,j) pairs.
+  # Drives residuals towards independence from all candidate parents.
+  # Correct parents: residuals ≈ noise → HSIC → 0.
+  # Wrong parents (descendants/spurious): HSIC > 0 → penalized.
+  # Recommended range: 0.01 to 1.0.
+  lambda_hsic: 1.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: true
+  hsic_kernel_source: "rbf"
+  hsic_mode: "biased"
+  nhsic_epsilon: 0.01
+
+  # --- Group-L1 (embedding column sparsity) ---
+  lambda_group_l1: 0.0
+
+  # --- Gradient routing ---
+  # When True: structural params (Q, K) updated by HSIC + sparsity;
+  #            reconstruction params (V, output, FFN) updated by MSE.
+  # Requires lambda_hsic > 0 or lambda_score_sparse > 0 to be meaningful.
+  use_gradient_routing: ${experiment.use_gradient_routing}
+
+  # Oracle mode: bypass QK^T, use hard mask directly as attention weights.
+  # Useful as an upper-bound reconstruction baseline.
+  use_oracle_attention: false
+
+
+data:
+  dataset: "scm1_continuous"
+  filename_input: "ds.npz"
+
+  train_file: "ds_train.npz"
+  test_file: "ds_test.npz"
+
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+
+  feature_indices:
+    value: null
+    variable: null
+
+
+evaluation:
+  functions:
+    - "eval_train_metrics"
+    - "eval_attention_selector_scores"
+
+special:
+  mode: []

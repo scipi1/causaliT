@@ -48,6 +48,7 @@ from .eval_utils import (
     _load_full_true_dag,
     _compute_mec_distance,
     _check_mec_membership,
+    _compute_mec_threshold,
     _find_v_structures,
     _dag_to_skeleton,
 )
@@ -59,6 +60,9 @@ from causaliT.training.forecasters.stage_causal_forecaster import StageCausalFor
 from causaliT.training.forecasters.single_causal_forecaster import SingleCausalForecaster
 from causaliT.training.forecasters.single_causal_res_forecaster import SingleCausalResForecaster
 from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausalForecaster
+from causaliT.training.forecasters.noise_aware_res_forecaster import (
+    NoiseAwareCausalResForecaster,
+)
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import (
@@ -204,6 +208,8 @@ def _load_model_from_checkpoint(checkpoint_path: str, architecture_type: str):
         return SingleCausalResForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "NoiseAwareCausalForecaster":
         return NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
+    elif architecture_type == "NoiseAwareCausalResForecaster":
+        return NoiseAwareCausalResForecaster.load_from_checkpoint(checkpoint_path)
     else:
         raise ValueError(f"Unknown architecture type: {architecture_type}")
 
@@ -390,6 +396,7 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
         "SingleCausalForecaster",
         "SingleCausalResForecaster",
         "NoiseAwareCausalForecaster",
+        "NoiseAwareCausalResForecaster",
     ):
         import re as _re
         layer_phi_self = sorted(
@@ -579,13 +586,15 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             
             mec_dist, mec_details = _compute_mec_distance(learned_full_dag, true_full_dag)
             in_mec, membership_details = _check_mec_membership(learned_full_dag, true_full_dag)
-            
+            mec_thresh, _ = _compute_mec_threshold(learned_full_dag, true_full_dag)
+
             mec_distances.append(mec_dist)
             mec_memberships.append(in_mec)
-            
+
             mec_per_fold[fold_name] = {
                 "mec_distance": mec_dist,
                 "in_mec": in_mec,
+                "mec_threshold": mec_thresh,
                 "skeleton_recall": mec_details["skeleton_recall"],
                 "skeleton_precision": mec_details["skeleton_precision"],
                 "v_structure_recall": mec_details["v_structure_recall"],
@@ -605,6 +614,34 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
             }
             dag_metrics["mec_membership_rate"] = float(np.mean(mec_memberships))
             dag_metrics["n_true_v_structures"] = len(true_v_structures)
+
+            # mec_threshold: aggregate across folds (NaN where no threshold works)
+            thresh_vals = [
+                d["mec_threshold"]
+                for d in mec_per_fold.values()
+                if isinstance(d, dict) and d.get("mec_threshold") is not None
+            ]
+            if thresh_vals:
+                thresh_arr = np.array(thresh_vals)
+                dag_metrics["mec_threshold"] = {
+                    "mean":  float(np.mean(thresh_arr)),
+                    "std":   float(np.std(thresh_arr)) if len(thresh_arr) > 1 else 0.0,
+                    "best":  float(np.max(thresh_arr)),   # higher = better
+                    "worst": float(np.min(thresh_arr)),
+                    "per_fold": {
+                        k: d["mec_threshold"]
+                        for k, d in mec_per_fold.items()
+                        if isinstance(d, dict)
+                    },
+                }
+                print(
+                    f"    MEC threshold: mean={dag_metrics['mec_threshold']['mean']:.4f}  "
+                    f"std={dag_metrics['mec_threshold']['std']:.4f}  "
+                    f"best={dag_metrics['mec_threshold']['best']:.4f}"
+                )
+            else:
+                dag_metrics["mec_threshold"] = None
+                print("    MEC threshold: no fold reached MEC membership at any threshold.")
     else:
         print("  Could not load full true DAG for MEC computation")
     
@@ -1001,6 +1038,7 @@ def _load_attention_evolution_data(
                             "SingleCausalForecaster",
                             "SingleCausalResForecaster",
                             "NoiseAwareCausalForecaster",
+                            "NoiseAwareCausalResForecaster",
                         ):
                             _pl_phi_self = sorted(
                                 [k for k in phi_dict.keys() if _re.match(r'^decoder_L\d+$', k)],

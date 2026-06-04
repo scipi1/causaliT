@@ -1,0 +1,279 @@
+# VarianceCausalLayer Template — SVFA dual-residual with analytical variance propagation.
+#
+# Key differences from config_noise_aware.yaml:
+#   - model_object: "VarianceCausalLayer"  (no sigma_R, no noise injection)
+#   - init_sigma_A raised to 0.1 (sigma_A is now the primary variance parameter)
+#   - lambda_cov: optional covariance matching loss (Wright's path formula)
+#   - prior_sigma_A updated to match init_sigma_A
+#   - No prior_sigma_R
+
+experiment:
+  d_model_set: 24
+  dec_layers: 1
+  n_heads: 1
+  d_ff_mult: 2.0
+  d_qk_mult: 0.5
+  d_ff: null
+  d_qk: null
+  dropout: 0.0
+
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 100
+
+  dec_self_attention_type: "ToeplitzAttention"
+  dec_cross_attention_type: "CausalCrossAttention"
+
+
+model:
+  model_object: "VarianceCausalLayer"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+
+  kwargs:
+    model: ${model.model_object}
+
+    ds_embed_S:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_S}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_S: "svfa"
+
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_X}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_X: "svfa"
+
+    dec_cross_attention_type: ${experiment.dec_cross_attention_type}
+    dec_cross_mask_type: "Uniform"
+    dec_self_attention_type: ${experiment.dec_self_attention_type}
+    dec_self_mask_type: "Uniform"
+
+    n_heads: ${experiment.n_heads}
+    dec_causal_mask: false
+    dec_layers: ${experiment.dec_layers}
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dec_cross_dropout_qkv: ${experiment.dropout}
+    dec_cross_attention_dropout: ${experiment.dropout}
+    dec_self_dropout_qkv: ${experiment.dropout}
+    dec_self_attention_dropout: ${experiment.dropout}
+
+    share_structure_across_layers: false
+
+    key_projection_type_cross: "linear"
+    key_projection_type_self: "linear"
+    orthogonal_scale: true
+    orthogonal_init_scale: 1.0
+
+    toeplitz_init_gate_bias: -15.0
+    toeplitz_gate_bias_trainable: true
+    init_tau: 3.0
+    shared_dag_across_heads: true
+    batch_key_dropout: null
+    batch_key_dropout_p_final: null
+    batch_key_dropout_annealing_batches: null
+
+    # Variance-centric noise parameter (single σ per node):
+    #   Var(X_i) = σ[i]² + Σ_j α_ij² · σ[j]²  =  (α_sq + I) @ σ²
+    # The same σ[j] that gives node j its own variance propagates to its children.
+    init_sigma: 0.1
+    variance_head_eps: 1.0e-6
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: true
+
+  loss_fn: "gaussian_nll"
+  nll_eps: 1.0e-6
+  nll_full: false
+
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 5
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+
+  kappa: 0.0
+
+  lambda_self_score_sparse: 0.0
+  lambda_cross_score_sparse: 0.0
+
+  lambda_hsic_cross: 0.0
+  lambda_hsic_self: 0.0
+  use_attention_weighted_hsic: false
+  normalize_hsic_by_loss: true
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false
+  hsic_kernel_source: "rbf"
+  hsic_mode: "biased"
+  nhsic_epsilon: 0.01
+
+  use_hsic_annealing: false
+  hsic_anneal_epochs: null
+  hsic_lambda_cross_start: null
+  hsic_lambda_cross_end: 0.0
+  hsic_lambda_self_start: null
+  hsic_lambda_self_end: 0.0
+
+  use_gradient_routing: false
+
+  # Covariance matching loss (Wright's path formula)
+  # Set lambda_cov > 0 to match empirical residual covariance to:
+  #   Sigma_model = alpha @ diag(sigma_A^2) @ alpha.T
+  lambda_cov: 0.0
+  normalize_cov_loss: false
+
+  # Noise prior for σ (single parameter)
+  lambda_noise_prior: 0.0
+  prior_sigma_A: 0.1
+
+  lambda_group_l1: 0.0
+  lambda_group_l1_anneal_start_value: null
+  lambda_group_l1_anneal_idle_epochs: 0
+  lambda_group_l1_anneal_transient_epochs: 0
+
+  log_gradient_norms: false
+
+  # Gradient clipping — applied by Trainer (automatic_optimization=True) and
+  # manually inside training_step (automatic_optimization=False / gradient routing).
+  # Set to null to disable.
+  gradient_clip_val: null
+  gradient_clip_algorithm: "norm"
+
+  use_hard_masks: false
+  hard_mask_files:
+    dec_cross: "dec1_cross_att_mask.csv"
+    dec_self: "dec1_self_att_mask.csv"
+
+
+staged_training:
+  use_calibration: false
+  use_causal_init: false
+  use_score_sparsity_cv: false
+
+  calibration_epochs: 10
+  calibration_balance_threshold: 2.0
+  calibration_lambda_group_range: [1.0e-3, 10]
+  calibration_max_iterations: 10
+
+  causal_init_epochs: 20
+  causal_init_hsic_multiplier: 10.0
+  causal_init_n_seeds: 1
+  causal_init_freeze_output_mlp: true
+
+  score_sparsity_lambda_candidates: [0.0, 0.001, 0.005, 0.01, 0.05, 0.1]
+  score_sparsity_cv_folds: 5
+  score_sparsity_cv_epochs: 20
+  score_sparsity_selection_rule: "min_hsic"
+
+  lambda_group_l1: null
+
+  lambda_hsic_cross_suggested: null
+  lambda_hsic_self_suggested: null
+  calibration_checkpoint: null
+  lambda_score_suggested: null
+
+
+data:
+  dataset: "scm1"
+  filename_input: "ds.npz"
+
+  train_file: "ds_train.npz"
+  test_file: "ds_test.npz"
+
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+
+  feature_indices:
+    value: null
+    variable: null
+
+
+evaluation:
+  functions: []
+
+
+special:
+  mode: []
