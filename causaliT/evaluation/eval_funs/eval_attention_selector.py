@@ -158,8 +158,18 @@ def _extract_combined_attention_from_data(
             _, att, _ = forecaster.forward(S_b, X_b)   # att: (B, L_X, L_S+L_X)
             att_list.append(att.cpu().numpy())
 
-    all_att = np.concatenate(att_list, axis=0)  # (N, L_X, L_S+L_X)
-    return all_att.mean(axis=0)                 # (L_X, L_S+L_X)
+    all_att = np.concatenate(att_list, axis=0)  # (N, L_X, L_S+L_X)  or  (N, H, L_X, L_S+L_X)
+
+    att_mean = all_att.mean(axis=0)             # (L_X, L_S+L_X)  or  (H, L_X, L_S+L_X)
+
+    # When shared_dag_across_heads=False, each head gets its own Q/K projection
+    # and the inner_attention enters the is_multihead=True path, producing a 4-D
+    # attention tensor (B, H, L_X, L_S+L_X).  Collapse the head dimension by
+    # averaging so the returned matrix is always 2-D (L_X, L_S+L_X).
+    if att_mean.ndim == 3:
+        att_mean = att_mean.mean(axis=0)        # (H, L_X, L_S+L_X) → (L_X, L_S+L_X)
+
+    return att_mean
 
 
 def _plot_heatmaps(

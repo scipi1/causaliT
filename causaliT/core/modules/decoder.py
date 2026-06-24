@@ -121,7 +121,7 @@ class DecoderLayer(nn.Module):
             dec_val_norm = self.norm1(dec_val, not_self_mask_miss_q)
             
             # Self-attention: Q, K from dec_struct; V from dec_val
-            self_attn_out, self_att, self_ent = self.global_self_attention(
+            self_attn_out, self_att, _self_aux = self.global_self_attention(
                 query=dec_struct_norm,      # Q: decoder structure
                 key=dec_struct_norm,        # K: decoder structure
                 value=dec_val_norm,         # V: decoder value
@@ -130,6 +130,7 @@ class DecoderLayer(nn.Module):
                 pos=dec_input_pos,
                 causal_mask=causal_mask
             )
+            self_ent = _self_aux["entropy"] if isinstance(_self_aux, dict) else _self_aux
             
             # Residual on decoder VALUE only
             dec_val = dec_val + self.dropout_attn_out(self_attn_out)
@@ -140,7 +141,7 @@ class DecoderLayer(nn.Module):
             dec_val_norm = self.norm2(dec_val, not_self_mask_miss_q)
             
             # Cross-attention: Q from dec_struct; K from enc_struct; V from enc_val
-            cross_attn_out, cross_att, cross_ent = self.global_cross_attention(
+            cross_attn_out, cross_att, _cross_aux = self.global_cross_attention(
                 query=dec_struct_norm,      # Q: decoder structure
                 key=enc_struct,             # K: encoder structure
                 value=enc_val,              # V: encoder value
@@ -149,6 +150,7 @@ class DecoderLayer(nn.Module):
                 pos=None,
                 causal_mask=False
             )
+            cross_ent = _cross_aux["entropy"] if isinstance(_cross_aux, dict) else _cross_aux
             
             # Residual on decoder VALUE only
             dec_val = dec_val + self.dropout_attn_out(cross_attn_out)
@@ -168,7 +170,7 @@ class DecoderLayer(nn.Module):
             # Standard mode
             X1 = self.norm1(X, not_self_mask_miss_q)
             
-            X1, self_att, self_ent = self.global_self_attention(
+            X1, self_att, _self_aux = self.global_self_attention(
                 query=X1,
                 key=X1,
                 value=X1,
@@ -177,12 +179,13 @@ class DecoderLayer(nn.Module):
                 pos=dec_input_pos,
                 causal_mask=causal_mask
             )
+            self_ent = _self_aux["entropy"] if isinstance(_self_aux, dict) else _self_aux
             
             X2 = X + self.dropout_attn_out(X1)
             
             X3 = self.norm2(X2, not_self_mask_miss_q)
             
-            X3, cross_att, cross_ent = self.global_cross_attention(
+            X3, cross_att, _cross_aux = self.global_cross_attention(
                 query=X3,
                 key=enc_out,
                 value=enc_out,
@@ -191,6 +194,7 @@ class DecoderLayer(nn.Module):
                 pos=None,
                 causal_mask=False
             )
+            cross_ent = _cross_aux["entropy"] if isinstance(_cross_aux, dict) else _cross_aux
             
             X4 = X2 + self.dropout_attn_out(X3)
 

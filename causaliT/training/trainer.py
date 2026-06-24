@@ -581,7 +581,7 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
     elif model_obj == "VarianceCausalLayer":
         return VarianceCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "AttentionSelectorLayer":
-        return AttentionSelectorForecaster(config)
+        return AttentionSelectorForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
         return TransformerForecaster(config)
     else:

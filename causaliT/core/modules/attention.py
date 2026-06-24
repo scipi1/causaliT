@@ -32,6 +32,27 @@ def _drop_legacy_attention_keys(
         state_dict.pop(full, None)
 
 
+# ---------------------------------------------------------------------------
+# aux_dict helpers
+# ---------------------------------------------------------------------------
+
+def _make_aux(entropy, l0_penalty=None):
+    """Build the standard attention auxiliary dictionary.
+
+    All attention modules return ``(V, A, aux_dict)`` where ``aux_dict``
+    contains at least the keys ``"entropy"`` and ``"l0_penalty"``.  This
+    factory ensures a consistent structure across all attention classes.
+
+    Args:
+        entropy: Attention entropy tensor (or None if disabled).
+        l0_penalty: Scalar L0 regularization penalty (None for non-HC modules).
+
+    Returns:
+        dict with keys "entropy" and "l0_penalty".
+    """
+    return {"entropy": entropy, "l0_penalty": l0_penalty}
+
+
 class CausalCrossAttention(nn.Module):
     """
     Causal Cross-Attention with ReLU(Tanh) activation.
@@ -43,6 +64,8 @@ class CausalCrossAttention(nn.Module):
     Activation parameterization (iter_10+):
         ``att = ReLU(Tanh(scores / tau))`` where ``tau`` is a *constant* scalar
         (default 3.0). Pass ``init_tau`` to override.
+
+    Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
 
     Args:
         attention_dropout: Dropout rate for attention weights
@@ -121,7 +144,7 @@ class CausalCrossAttention(nn.Module):
                 entropy_enabled=self.entropy_enabled,
             )
             self._score_tensor_for_sparsity = A_out.detach().mean(dim=0)
-            return V_out, A_out, ent
+            return V_out, A_out, _make_aux(ent)
 
         is_multihead = query.dim() == 4
         # Shared-DAG / multi-head-V: Q,K are 3-D, V is 4-D.
@@ -176,7 +199,7 @@ class CausalCrossAttention(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
 
-        return V.contiguous(), A, entropy
+        return V.contiguous(), A, _make_aux(entropy)
 
     @property
     def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
@@ -189,6 +212,8 @@ class SigmoidCrossAttention(nn.Module):
 
     Identical to ``CausalCrossAttention`` but uses ``sigmoid(scores / tau)``
     instead of ``ReLU(Tanh(scores / tau))``. Constant (non-learnable) temperature.
+
+    Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
 
     Args:
         attention_dropout: Dropout rate for attention weights
@@ -273,7 +298,7 @@ class SigmoidCrossAttention(nn.Module):
                 entropy_enabled=self.entropy_enabled,
             )
             self._score_tensor_for_sparsity = A_out.detach().mean(dim=0)
-            return V_out, A_out, ent
+            return V_out, A_out, _make_aux(ent)
 
         is_multihead = query.dim() == 4
         is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
@@ -327,7 +352,265 @@ class SigmoidCrossAttention(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
 
-        return V.contiguous(), A, entropy
+        return V.contiguous(), A, _make_aux(entropy)
+
+    @property
+    def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        return getattr(self, '_score_tensor_for_sparsity', None)
+
+
+class HardConcreteCrossAttention(nn.Module):
+    """
+    Causal Cross-Attention with Hard Concrete stochastic gates (L0 regularization).
+
+    Inspired by Louizos, Welling, Kingma "Learning Sparse Neural Networks through
+    L0 Regularization" (ICLR 2018, https://arxiv.org/abs/1712.01312).
+
+    The scaled QK dot-product score is used directly as the log-alpha location
+    parameter of the Binary Concrete distribution.  The attention weight IS the
+    Hard Concrete gate z_ij ∈ [0,1] — no separate multiplicative gate.
+
+    Forward (training, stochastic):
+        log_alpha_ij = s_ij = (q_i · k_j) / sqrt(E)
+        u_ij ~ Uniform(0, 1)
+        s_tilde = sigmoid((log(u) - log(1-u) + log_alpha) / beta)
+        s_bar   = s_tilde * (zeta - gamma) + gamma
+        z_ij    = clip(s_bar, 0, 1)                    [Hard Concrete gate]
+
+    Forward (eval / MAP, deterministic):
+        z_ij = clip(sigmoid(log_alpha / beta) * (zeta - gamma) + gamma, 0, 1)
+
+    L0 penalty (expected number of active edges, differentiable surrogate):
+        P(z_ij > 0) = sigmoid(log_alpha_ij - beta * log(-gamma / zeta))
+        l0_penalty  = sum_{(i,j) unmasked} P(z_ij > 0)
+
+    The L0 penalty is included in aux_dict["l0_penalty"] and should be added to
+    the training loss weighted by a small lambda_l0 coefficient.
+
+    Full edge-existence posterior:
+        self.last_p_edge_on  (L, S) or (H, L, S) — P(edge is ON) per (i,j).
+        MAP causal graph: ``(module.last_p_edge_on > 0.5).float()``
+
+    Returns ``(V, A, aux_dict)`` where
+        ``aux_dict = {"entropy": ..., "l0_penalty": <scalar tensor>}``.
+
+    Hard mask is supported to zero out structurally forbidden edges (e.g. the
+    diagonal self-loop constraint in AttentionSelectorLayer). Masked positions
+    are excluded from the L0 penalty.
+
+    Oracle mode and causal mask are NOT supported (raise NotImplementedError).
+
+    Args:
+        attention_dropout: Dropout rate applied to z after sampling.
+        register_entropy: Whether to compute and return attention entropy.
+        layer_name: Name for logging purposes.
+        init_tau: Binary Concrete temperature β (default 2/3 as in paper).
+            Passed as ``init_tau`` for compatibility with AttentionLayer which
+            uses that kwarg for all temperature-bearing attention classes.
+        gamma: Stretch lower bound, must be < 0 (default −0.1 as in paper).
+        zeta: Stretch upper bound, must be > 1 (default 1.1 as in paper).
+        batch_key_dropout: Optional batch-consistent key dropout probability.
+        batch_key_dropout_p_final: Final dropout probability after annealing.
+        batch_key_dropout_annealing_batches: Batches over which to anneal dropout.
+    """
+
+    def __init__(
+        self,
+        attention_dropout: float,
+        register_entropy: bool,
+        layer_name: str,
+        init_tau: float = 2.0 / 3.0,
+        gamma: float = -0.1,
+        zeta: float = 1.1,
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
+    ):
+        super(HardConcreteCrossAttention, self).__init__()
+
+        if gamma >= 0.0:
+            raise ValueError(
+                f"gamma must be strictly negative (stretch lower bound), got {gamma}"
+            )
+        if zeta <= 1.0:
+            raise ValueError(
+                f"zeta must be strictly greater than 1 (stretch upper bound), got {zeta}"
+            )
+
+        self.dropout = nn.Dropout(attention_dropout)
+        self.register_entropy = register_entropy
+        self.layer_name = layer_name
+        self.entropy_enabled = True
+
+        if register_entropy and layer_name is None:
+            raise ValueError("If register_entropy is True, layer_name must be provided.")
+
+        # Hard Concrete parameters (all fixed, non-learnable).
+        # init_tau mirrors the kwarg name used by other tau-bearing attention
+        # classes so that AttentionLayer can instantiate this class uniformly.
+        self.beta = float(init_tau)    # Binary Concrete temperature
+        self.gamma = float(gamma)      # Stretch lower bound  (< 0)
+        self.zeta = float(zeta)        # Stretch upper bound  (> 1)
+
+        # Pre-compute the constant offset for the L0 penalty:
+        #   P(z > 0) = sigmoid(log_alpha - beta * log(-gamma / zeta))
+        self._l0_offset: float = float(self.beta * log(-self.gamma / self.zeta))
+
+        # Batch-consistent key dropout (None = disabled).
+        # blanking_value=0.0: applied post-sampling so dropped keys get z=0.
+        if batch_key_dropout is not None:
+            self.batch_key_dropout = BatchConsistentKeyDropout(
+                p_init=batch_key_dropout,
+                p_final=batch_key_dropout_p_final,
+                annealing_batches=batch_key_dropout_annealing_batches,
+                blanking_value=0.0,
+            )
+        else:
+            self.batch_key_dropout = None
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask_miss_k: torch.Tensor,
+        mask_miss_q: torch.Tensor,
+        pos: torch.Tensor,
+        causal_mask: bool,
+        hard_mask: torch.Tensor = None,
+        oracle: bool = False,
+    ):
+        """
+        Hard Concrete cross-attention forward pass.
+
+        Args:
+            query: (B, L, E) or (B, L, H, E) query tensor.
+            key:   (B, S, E) or (B, S, H, E) key tensor.
+            value: (B, S, E), (B, S, H, d) or (B, S, d) value tensor.
+            mask_miss_k: Unused (kept for interface compatibility).
+            mask_miss_q: Unused (kept for interface compatibility).
+            pos:       Unused (causal_mask not supported; raises if True).
+            causal_mask: Must be False; raises NotImplementedError otherwise.
+            hard_mask: Optional binary mask (L, S) or (B, L, S) zeroing out
+                forbidden edges. Masked positions are excluded from the L0
+                penalty. Supported for diagonal / structural constraints.
+            oracle: Must be False; raises NotImplementedError.
+
+        Returns:
+            V_out:    (B, L, E) or (B, L, H, d) value-aggregated output.
+            A:        (B, L, S) or (B, H, L, S) Hard Concrete gates after dropout.
+            aux_dict: {"entropy": <Tensor|None>, "l0_penalty": <scalar Tensor>}
+        """
+        if oracle:
+            raise NotImplementedError(
+                "Oracle mode is not supported by HardConcreteCrossAttention. "
+                "Use CausalCrossAttention or ToeplitzAttention instead."
+            )
+        if causal_mask:
+            raise NotImplementedError(
+                "Causal masking (causal_mask=True) is not supported by "
+                "HardConcreteCrossAttention. The Hard Concrete gate already "
+                "encodes edge direction via the QK scores."
+            )
+
+        is_multihead = query.dim() == 4
+        is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
+
+        if is_multihead:
+            B, L, H, E = query.shape
+            _, S, _, _ = key.shape
+        else:
+            B, L, E = query.shape
+            _, S, _ = key.shape
+            H = value.shape[2] if is_shared_mh_v else 1
+
+        scale = 1.0 / sqrt(E)
+
+        # ---- Scaled QK scores = log_alpha of the Binary Concrete ----
+        if is_multihead:
+            log_alpha = scale * torch.einsum("blhe,bshe->bhls", query, key)
+        else:
+            log_alpha = scale * torch.einsum("ble,bse->bls", query, key)
+
+        # Guard against NaN inputs propagating from missing/masked tokens.
+        # NaN log_alpha would corrupt both the sampled gate z and the L0
+        # penalty.  Replace with 0.0 (→ P(z>0) = sigmoid(-offset) ≈ 0.09
+        # with paper defaults), which is the maximally uncertain / sparse
+        # default for positions whose score is undefined.
+        log_alpha = torch.nan_to_num(log_alpha, nan=0.0)
+
+        # ---- Hard Concrete sampling ----
+        if self.training:
+            # Stochastic path: u ~ Uniform(0, 1), clamped for numerical stability
+            u = torch.zeros_like(log_alpha).uniform_().clamp_(1e-8, 1.0 - 1e-8)
+            # Binary Concrete relaxation
+            s_tilde = torch.sigmoid(
+                (torch.log(u) - torch.log1p(-u) + log_alpha) / self.beta
+            )
+            # Stretch to (gamma, zeta)
+            s_bar = s_tilde * (self.zeta - self.gamma) + self.gamma
+            # Hard-sigmoid clip → z ∈ {0} ∪ (0,1) ∪ {1}
+            z = s_bar.clamp(0.0, 1.0)
+        else:
+            # Deterministic MAP path: mode of the Hard Concrete distribution
+            z = (
+                torch.sigmoid(log_alpha / self.beta) * (self.zeta - self.gamma)
+                + self.gamma
+            ).clamp(0.0, 1.0)
+
+        # ---- L0 penalty: expected number of active (non-zero) gates ----
+        # P(z_ij > 0) = sigmoid(log_alpha_ij - beta * log(-gamma / zeta))
+        p_edge_on = torch.sigmoid(log_alpha - self._l0_offset)
+
+        # Store batch-averaged posterior for external access (evaluation,
+        # graph extraction, MAP thresholding at p_edge_on > 0.5).
+        self.last_p_edge_on = p_edge_on.detach().mean(dim=0)
+
+        # ---- Hard mask (structural / self-loop constraint) ----
+        if hard_mask is not None:
+            hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
+            z = z * hard_mask_expanded
+            # Exclude masked positions from the L0 penalty
+            p_edge_on_for_penalty = p_edge_on * hard_mask_expanded
+        else:
+            p_edge_on_for_penalty = p_edge_on
+
+        # Scalar L0 penalty: sum of P(z_ij > 0) over all unmasked (i,j) positions.
+        # Summed (not averaged) so the penalty scales with graph size, consistent
+        # with the original L0 formulation.
+        l0_penalty = p_edge_on_for_penalty.sum()
+
+        # ---- Entropy (for logging / compatibility with existing pipeline) ----
+        z_clean = torch.nan_to_num(z, nan=0.0)
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(z_clean)
+        else:
+            entropy = None
+
+        # ---- Dropout ----
+        A = self.dropout(z_clean)
+        if self.batch_key_dropout is not None:
+            A = self.batch_key_dropout(A)
+
+        # Expose p_edge_on (batch-averaged) as the sparsity tensor.
+        # Using the edge-existence probability rather than the gate z ensures
+        # the sparsity metric is differentiable and interpretable even at eval
+        # time (where z may be clipped to 0 or 1).
+        self._score_tensor_for_sparsity = p_edge_on.detach().mean(dim=0)
+
+        # ---- Value aggregation ----
+        if is_multihead:
+            V = torch.einsum("bhls,bshd->blhd", A, value)
+        elif is_shared_mh_v:
+            V = torch.einsum("bls,bshd->blhd", A, value)
+        else:
+            V = torch.einsum("bls,bsd->bld", A, value)
+
+        return V.contiguous(), A, _make_aux(entropy, l0_penalty)
 
     @property
     def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
@@ -353,6 +636,8 @@ class ToeplitzAttention(nn.Module):
     pre-activation. Initialized strongly negative (default -15.0) so the gate is
     effectively closed at init. Whether the bias is learnable or fixed is
     controlled by ``gate_bias_trainable``.
+
+    Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
 
     Args:
         attention_dropout: Dropout rate for attention weights
@@ -456,7 +741,7 @@ class ToeplitzAttention(nn.Module):
             self.last_S = torch.zeros_like(mask_avg)
             self.last_A = torch.zeros_like(mask_avg)
             self.P_edge_for_reg = A_out.mean(dim=0)
-            return V_out, A_out, ent
+            return V_out, A_out, _make_aux(ent)
 
         is_multihead = query.dim() == 4
         is_shared_mh_v = (query.dim() == 3 and value.dim() == 4)
@@ -524,7 +809,7 @@ class ToeplitzAttention(nn.Module):
         else:
             V_out = torch.einsum("bls,bsd->bld", A_out, value)
 
-        return V_out.contiguous(), A_out, entropy
+        return V_out.contiguous(), A_out, _make_aux(entropy)
 
     @property
     def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
@@ -537,6 +822,8 @@ class ScaledDotAttention(nn.Module):
 
     Hard mask is applied BEFORE softmax to ensure masked positions don't
     influence the softmax normalization (preventing information leakage).
+
+    Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
     """
     def __init__(
         self,
@@ -659,7 +946,7 @@ class ScaledDotAttention(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
 
-        return V.contiguous(), A, entropy
+        return V.contiguous(), A, _make_aux(entropy)
 
     @property
     def score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
@@ -676,6 +963,8 @@ class ScaledDotAttentionNAIM(nn.Module):
 
     NOTE: The hard_mask in this version is applied AFTER softmax, which can cause
     information leakage. Use ScaledDotAttention for proper causal masking.
+
+    Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
     """
     def __init__(
         self,
@@ -807,7 +1096,7 @@ class ScaledDotAttentionNAIM(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
 
-        return V.contiguous(), A, entropy
+        return V.contiguous(), A, _make_aux(entropy)
 
 
 def _oracle_attention_forward(
@@ -823,6 +1112,10 @@ def _oracle_attention_forward(
     """
     Oracle attention forward: bypass QK^T entirely and use the hard mask directly
     as the attention score matrix for the values.
+
+    Returns ``(V_out, att, entropy_tensor)`` — note: raw entropy tensor, NOT aux_dict.
+    Callers that wrap this (the attention module forward methods) are responsible
+    for wrapping the entropy into ``_make_aux(entropy)``.
     """
     if hard_mask is None:
         raise ValueError(
@@ -841,7 +1134,11 @@ def _oracle_attention_forward(
     else:
         if att.shape[0] == 1:
             att = att.expand(batch_size, *att.shape[1:])
-        V_out = torch.einsum("bls,bsd->bld", att, value)
+        if value.dim() == 4:
+            # shared_dag_across_heads: Q/K are 3-D (H_struct=1), V is 4-D (B, S, H, d)
+            V_out = torch.einsum("bls,bshd->blhd", att, value)
+        else:
+            V_out = torch.einsum("bls,bsd->bld", att, value)
 
     if entropy_enabled:
         entropy = calculate_attention_entropy(att)
@@ -924,9 +1221,15 @@ class AttentionLayer(nn.Module):
     Supports the following attention mechanisms:
         - ScaledDotAttention
         - ScaledDotAttentionNAIM
-        - CausalCrossAttention  (ReLU(Tanh) activation, constant tau)
-        - SigmoidCrossAttention (Sigmoid activation, constant tau)
-        - ToeplitzAttention     (Toeplitz decomposition, constant tau + learnable gate bias)
+        - CausalCrossAttention    (ReLU(Tanh) activation, constant tau)
+        - SigmoidCrossAttention   (Sigmoid activation, constant tau)
+        - ToeplitzAttention       (Toeplitz decomposition, constant tau + learnable gate bias)
+        - HardConcreteCrossAttention  (Hard Concrete L0 gates, constant beta/gamma/zeta)
+
+    All inner attention modules return ``(V, A, aux_dict)`` where
+    ``aux_dict = {"entropy": <Tensor|None>, "l0_penalty": <Tensor|None>}``.
+    ``AttentionLayer.forward()`` passes ``aux_dict`` through as the 3rd return
+    value, so callers receive the full dictionary.
 
     Shared Structure Mode:
         When ``shared_qk_inner`` is provided, the layer reuses the Q/K projections
@@ -950,11 +1253,16 @@ class AttentionLayer(nn.Module):
         orthogonal_scale: Whether to include learnable scale in orthogonal projection
         orthogonal_init_scale: Initial scale value for orthogonal projection
         init_tau: Constant temperature for CausalCrossAttention / SigmoidCrossAttention
-                  / ToeplitzAttention (non-learnable, not annealed). Default 3.0.
+                  / ToeplitzAttention / HardConcreteCrossAttention (non-learnable).
+                  Default 3.0; for HardConcreteCrossAttention the paper default is 2/3.
         init_gate_bias: Initial value of the gate bias in ToeplitzAttention (default: -15.0).
             Ignored for other attention types.
         gate_bias_trainable: If True (default), the gate bias is updated during training.
             If False, it is frozen at init_gate_bias. Only applies to ToeplitzAttention.
+        init_gamma: Stretch lower bound for HardConcreteCrossAttention (default: -0.1).
+            Ignored for other attention types.
+        init_zeta: Stretch upper bound for HardConcreteCrossAttention (default: 1.1).
+            Ignored for other attention types.
         shared_qk_inner: Optional dict with shared Q/K/inner_attention components.
         shared_dag_across_heads: When True (default), a single score (B,L,S) is
             shared across n_heads value channels. When False, legacy per-head scores.
@@ -981,6 +1289,8 @@ class AttentionLayer(nn.Module):
         init_tau: float = 3.0,
         init_gate_bias: float = -15.0,
         gate_bias_trainable: bool = True,
+        init_gamma: float = -0.1,
+        init_zeta: float = 1.1,
         shared_qk_inner: dict = None,
         shared_dag_across_heads: bool = True,
         dual_value: bool = False,
@@ -1007,8 +1317,15 @@ class AttentionLayer(nn.Module):
         else:
             # ===== STANDARD MODE =====
 
+            # Attention classes that accept init_tau
+            ATTENTION_WITH_TAU = (
+                CausalCrossAttention,
+                SigmoidCrossAttention,
+                ToeplitzAttention,
+                HardConcreteCrossAttention,
+            )
+
             # Create inner attention module
-            ATTENTION_WITH_TAU = (CausalCrossAttention, SigmoidCrossAttention, ToeplitzAttention)
             if attention is ToeplitzAttention:
                 # ToeplitzAttention also accepts gate bias settings
                 self.inner_attention = attention(
@@ -1018,6 +1335,19 @@ class AttentionLayer(nn.Module):
                     init_tau=init_tau,
                     init_gate_bias=init_gate_bias,
                     gate_bias_trainable=gate_bias_trainable,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                )
+            elif attention is HardConcreteCrossAttention:
+                # HardConcreteCrossAttention also needs gamma / zeta stretch params
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    gamma=init_gamma,
+                    zeta=init_zeta,
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
@@ -1129,7 +1459,7 @@ class AttentionLayer(nn.Module):
         else:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
 
-        out, attn, ent = self.inner_attention(
+        out, attn, aux = self.inner_attention(
             query=q,
             key=k,
             value=v,
@@ -1182,9 +1512,9 @@ class AttentionLayer(nn.Module):
                 out_struct = torch.einsum("bls,bsd->bld", attn, v_struct)
                 out_struct = out_struct.view(B, L, -1)
 
-            return out, out_struct, attn, ent
+            return out, out_struct, attn, aux
 
-        return out, attn, ent
+        return out, attn, aux
 
 
 def main():
@@ -1209,7 +1539,7 @@ def main():
         attention_dropout=0,
         dropout_qkv=0)
 
-    out_single, score_single, ent = attention_single.forward(
+    out_single, score_single, aux = attention_single.forward(
         query=x,
         key=x,
         value=x,
@@ -1220,6 +1550,7 @@ def main():
     )
 
     print(f"Single-head - Output shape: {out_single.shape}, Score shape: {score_single.shape}")
+    print(f"Single-head - aux keys: {list(aux.keys())}")
 
     print("\nTesting multi-head attention (n_heads=4):")
     attention_multi = AttentionLayer(
@@ -1233,7 +1564,7 @@ def main():
         attention_dropout=0,
         dropout_qkv=0)
 
-    out_multi, score_multi, ent = attention_multi.forward(
+    out_multi, score_multi, aux = attention_multi.forward(
         query=x,
         key=x,
         value=x,
@@ -1248,7 +1579,7 @@ def main():
     print("\nTesting with causal mask:")
     pos = torch.arange(seq_len).unsqueeze(0).unsqueeze(-1).float()
 
-    out_causal, score_causal, ent = attention_multi.forward(
+    out_causal, score_causal, aux = attention_multi.forward(
         query=x,
         key=x,
         value=x,
@@ -1258,6 +1589,48 @@ def main():
         causal_mask=True
     )
     print(f"Causal multi-head - Output shape: {out_causal.shape}, Score shape: {score_causal.shape}")
+
+    print("\nTesting HardConcreteCrossAttention (n_heads=1):")
+    hc_attention = AttentionLayer(
+        attention=HardConcreteCrossAttention,
+        d_model_queries=d_model,
+        d_model_keys=d_model,
+        d_model_values=d_model,
+        d_queries_keys=d_queries_keys,
+        n_heads=1,
+        mask_layer=None,
+        attention_dropout=0,
+        dropout_qkv=0,
+        init_tau=2.0/3.0,
+        init_gamma=-0.1,
+        init_zeta=1.1,
+    )
+    hc_attention.train()
+    out_hc, score_hc, aux_hc = hc_attention.forward(
+        query=x,
+        key=x,
+        value=x,
+        mask_miss_k=None,
+        mask_miss_q=None,
+        pos=None,
+        causal_mask=False,
+    )
+    print(f"HardConcrete (train) - Output: {out_hc.shape}, Attn: {score_hc.shape}, "
+          f"l0_penalty={aux_hc['l0_penalty']:.3f}")
+    hc_attention.eval()
+    out_hc_e, score_hc_e, aux_hc_e = hc_attention.forward(
+        query=x,
+        key=x,
+        value=x,
+        mask_miss_k=None,
+        mask_miss_q=None,
+        pos=None,
+        causal_mask=False,
+    )
+    print(f"HardConcrete (eval)  - Output: {out_hc_e.shape}, Attn: {score_hc_e.shape}, "
+          f"l0_penalty={aux_hc_e['l0_penalty']:.3f}")
+    print(f"p_edge_on posterior: min={hc_attention.inner_attention.last_p_edge_on.min():.3f}, "
+          f"max={hc_attention.inner_attention.last_p_edge_on.max():.3f}")
 
     print("\n" + "="*60)
     print("All tests completed successfully!")

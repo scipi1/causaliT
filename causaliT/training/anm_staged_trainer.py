@@ -265,15 +265,77 @@ def _compute_score_margin(
     result: Dict[str, Optional[float]] = {"cross": None, "self": None}
     try:
         inner_model = getattr(pl_module, "model", pl_module)
-        if not hasattr(inner_model, "decoder"):
-            return result
-
-        layer = inner_model.decoder.layers[0]
         dataset_name = config.get("data", {}).get("dataset", "")
         if not dataset_name or not data_dir:
             return result
 
         from causaliT.evaluation.eval_funs.eval_utils import _load_true_dag_mask
+
+        # ------------------------------------------------------------------
+        # AttentionSelectorLayer branch
+        # Single combined cross-attention block; no ``decoder`` attribute.
+        # The attention module lives at ``inner_model.attention`` and its
+        # inner_attention exposes a combined (L_X, L_S+L_X) score tensor.
+        # We split it into the S→X (cross) and X→X (self) sub-matrices and
+        # compute separate margins against the respective GT DAG masks.
+        # ------------------------------------------------------------------
+        if hasattr(inner_model, "attention") and not hasattr(inner_model, "decoder"):
+            combined_inner = inner_model.attention.inner_attention
+            # Accept both public and private attribute names for robustness.
+            combined_score_t = getattr(combined_inner, "score_tensor_for_sparsity", None)
+            if combined_score_t is None:
+                combined_score_t = getattr(
+                    combined_inner, "_score_tensor_for_sparsity", None
+                )
+            if combined_score_t is not None:
+                scores_np = combined_score_t.detach().cpu().numpy()
+                S_seq_len = getattr(inner_model, "S_seq_len", None)
+                if S_seq_len is not None and scores_np.ndim == 2:
+                    cross_scores_np = scores_np[:, :S_seq_len]    # (L_X, L_S)
+                    self_scores_np  = scores_np[:, S_seq_len:]    # (L_X, L_X)
+
+                    # --- S→X (cross) margin ---
+                    true_cross = _load_true_dag_mask(
+                        data_dir, dataset_name, "dec_cross"
+                    )
+                    if (
+                        true_cross is not None
+                        and cross_scores_np.shape == true_cross.shape
+                    ):
+                        true_mask  = true_cross.astype(bool)
+                        false_mask = ~true_mask
+                        if true_mask.any() and false_mask.any():
+                            result["cross"] = float(
+                                cross_scores_np[true_mask].mean()
+                                - cross_scores_np[false_mask].mean()
+                            )
+
+                    # --- X→X (self) margin ---
+                    true_self = _load_true_dag_mask(
+                        data_dir, dataset_name, "dec_self"
+                    )
+                    if (
+                        true_self is not None
+                        and self_scores_np.shape == true_self.shape
+                    ):
+                        true_mask  = true_self.astype(bool)
+                        false_mask = ~true_mask
+                        np.fill_diagonal(false_mask, False)  # no self-loops
+                        if true_mask.any() and false_mask.any():
+                            result["self"] = float(
+                                self_scores_np[true_mask].mean()
+                                - self_scores_np[false_mask].mean()
+                            )
+            return result
+
+        # ------------------------------------------------------------------
+        # SingleCausalLayer (and related) branch
+        # Separate cross- and self-attention blocks inside ``decoder.layers``.
+        # ------------------------------------------------------------------
+        if not hasattr(inner_model, "decoder"):
+            return result
+
+        layer = inner_model.decoder.layers[0]
 
         # --- Cross-attention score margin ---
         true_cross = _load_true_dag_mask(data_dir, dataset_name, "dec_cross")
@@ -317,14 +379,22 @@ def _compute_score_margin(
 # STAGE CONFIG BUILDER
 # =============================================================================
 
-# Training-level keys that a stage spec may override directly
+# Training-level keys that a stage spec may override directly.
+# Keys are intentionally additive — adding a key here makes it eligible for
+# direct forwarding into the ``training`` config for ALL architectures.
+# Architecture-specific keys (e.g. ``lambda_hsic`` for AttentionSelectorLayer)
+# are translated by ``_build_stage_config`` after this loop.
 _TRAINING_OVERRIDE_KEYS = frozenset({
     "max_epochs",
+    # SingleCausalLayer / related: separate cross and self HSIC weights
     "lambda_hsic_cross",
     "lambda_hsic_self",
     "lambda_recon",
     "lambda_self_score_sparse",
     "lambda_cross_score_sparse",
+    # AttentionSelectorLayer: unified HSIC weight and score sparsity weight
+    "lambda_hsic",
+    "lambda_score_sparse",
     "use_gradient_routing",
     # Freeze flags — processed with fallback logic below
     "freeze_structural_params",
@@ -402,11 +472,36 @@ def _build_stage_config(
     """
     cfg = copy.deepcopy(base_config)
     tc = cfg["training"]
+    model_obj = cfg.get("model", {}).get("model_object", "")
 
     # --- Direct training-level overrides ---
     for key in _TRAINING_OVERRIDE_KEYS:
         if key in stage_spec:
             tc[key] = stage_spec[key]
+
+    # --- AttentionSelectorLayer key translation ---
+    # AttentionSelectorForecaster uses unified ``lambda_hsic`` and
+    # ``lambda_score_sparse`` (no separate cross/self split).  When a stage
+    # spec was written with SingleCausalLayer key names and no explicit unified
+    # key, translate automatically so the override takes effect.
+    if model_obj == "AttentionSelectorLayer":
+        if "lambda_hsic_cross" in stage_spec and "lambda_hsic" not in stage_spec:
+            tc["lambda_hsic"] = stage_spec["lambda_hsic_cross"]
+            logger.debug(
+                "Stage %d: translated lambda_hsic_cross → lambda_hsic for "
+                "AttentionSelectorLayer.",
+                stage_idx,
+            )
+        if (
+            "lambda_cross_score_sparse" in stage_spec
+            and "lambda_score_sparse" not in stage_spec
+        ):
+            tc["lambda_score_sparse"] = stage_spec["lambda_cross_score_sparse"]
+            logger.debug(
+                "Stage %d: translated lambda_cross_score_sparse → lambda_score_sparse "
+                "for AttentionSelectorLayer.",
+                stage_idx,
+            )
 
     # --- Freeze flag fallback when gradient routing is off ---
     use_gr = tc.get("use_gradient_routing", False)
@@ -420,6 +515,9 @@ def _build_stage_config(
         )
         tc["lambda_hsic_cross"] = 0.0
         tc["lambda_hsic_self"] = 0.0
+        # AttentionSelectorLayer reads the unified key — zero it too.
+        if model_obj == "AttentionSelectorLayer":
+            tc["lambda_hsic"] = 0.0
         tc["freeze_structural_params"] = False   # don't try requires_grad route
 
     if stage_spec.get("freeze_reconstruction_params", False) and not use_gr:
@@ -433,8 +531,9 @@ def _build_stage_config(
         tc["freeze_reconstruction_params"] = False
 
     # --- BKD dropout curriculum: fixed p per stage, no within-stage annealing ---
+    # AttentionSelectorLayer does not accept batch_key_dropout kwargs — skip it.
     bkd_p = stage_spec.get("batch_key_dropout_p", None)
-    if bkd_p is not None:
+    if bkd_p is not None and model_obj != "AttentionSelectorLayer":
         bkd_p = float(bkd_p)
         model_kwargs = cfg.get("model", {}).get("kwargs", {})
         if model_kwargs is not None:
@@ -443,6 +542,13 @@ def _build_stage_config(
             model_kwargs["batch_key_dropout_p_final"] = bkd_p
             # Disable step-counter annealing
             model_kwargs["batch_key_dropout_annealing_batches"] = None
+    elif bkd_p is not None and model_obj == "AttentionSelectorLayer":
+        logger.debug(
+            "Stage %d: batch_key_dropout_p=%s ignored for AttentionSelectorLayer "
+            "(no BKD support in this architecture).",
+            stage_idx,
+            bkd_p,
+        )
 
     # --- Always single fold ---
     tc["k_fold"] = 1
@@ -569,6 +675,12 @@ def anm_alternating_trainer(
     all_stage_rows: List[Dict[str, Any]] = []
     all_stage_summaries: List[Dict[str, Any]] = []
 
+    # Cumulative epoch offset: PL's epoch counter is NOT reset between stages
+    # (resume_ckpt restores it).  We must therefore set max_epochs to the
+    # running total so that PL runs exactly stage_local_epochs new epochs per
+    # stage.  E.g. for four 200-epoch stages: 200 / 400 / 600 / 800.
+    cumulative_epoch_offset: int = 0
+
     for stage_idx, stage_spec in enumerate(stages):
         stage_spec = _to_plain_container(stage_spec)
         if not isinstance(stage_spec, dict):
@@ -580,17 +692,38 @@ def anm_alternating_trainer(
         stage_dir = stages_parent_dir / f"{stage_idx:02d}_{stage_name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
+        # Local epoch count from stage spec (or fall back to base config)
+        stage_local_epochs: int = int(
+            stage_spec.get("max_epochs", config["training"].get("max_epochs", 100))
+        )
+        # Cumulative max_epochs passed to PL so the epoch counter continues
+        # from where the previous stage left off
+        cumulative_max_epochs: int = cumulative_epoch_offset + stage_local_epochs
+
+        # Determine checkpoint mode:
+        #   stage 0  → warm_start (weights only) from the optional pre-existing ckpt
+        #   stage 1+ → resume (weights + optimizer state + epoch counter)
+        # Note: resume_ckpt=None for stage 0 when no starting_checkpoint is set
+        # in anm_training config; that is already the correct "fresh start" behaviour.
+        is_first_stage: bool = (stage_idx == 0)
+        stage_ckpt_mode: str = "warm_start" if is_first_stage else "resume"
+
         if not cluster:
             print("\n" + "=" * 70)
-            print(f"ANM STAGE {stage_idx}: {stage_name}")
+            print(f"ANM STAGE {stage_idx}: {stage_name}  "
+                  f"(global epochs {cumulative_epoch_offset}–{cumulative_max_epochs - 1})")
             print("=" * 70)
-            _print_stage_header(stage_spec, starting_ckpt)
+            _print_stage_header(stage_spec, starting_ckpt, ckpt_mode=stage_ckpt_mode)
 
-        # Build stage config
+        # Build stage config and override max_epochs with the cumulative total
         stage_config = _build_stage_config(config, stage_spec, stage_idx)
+        stage_config["training"]["max_epochs"] = cumulative_max_epochs
         stage_config_path = _save_stage_config(stage_config, stage_dir)
 
-        # Fresh model (weights from warm_start_ckpt, not optimizer state)
+        # Model: always created fresh with the current stage config so that
+        # freeze flags and lambda overrides are in effect.  When resume_ckpt is
+        # used, PL will overwrite the random weights with the checkpoint weights
+        # before training begins; the model object is just the architecture holder.
         seed_everything(seed)
         model = create_model_instance(stage_config, data_dir)
 
@@ -622,13 +755,21 @@ def anm_alternating_trainer(
             save_dir=str(stage_dir),
             trainable_params=0,
             cluster=cluster,
-            resume_ckpt=None,
-            warm_start_ckpt=starting_ckpt,
+            # Stages 1+: resume restores weights + optimizer state + epoch counter.
+            # Stage 0:   warm_start loads weights only (optimizer starts fresh),
+            #            which is the correct behaviour when kicking off from an
+            #            optional pre-existing checkpoint that may differ in
+            #            training configuration.
+            resume_ckpt=starting_ckpt if not is_first_stage else None,
+            warm_start_ckpt=starting_ckpt if is_first_stage else None,
             experiment_tag=f"{experiment_tag}_{stage_name}",
             debug=debug,
             best=best,
             extra_callbacks=extra_cbs,
         )
+
+        # Advance cumulative epoch offset for the next stage
+        cumulative_epoch_offset = cumulative_max_epochs
 
         # Chain checkpoints
         new_ckpt = _find_stage_checkpoint(stage_dir)
@@ -640,6 +781,12 @@ def anm_alternating_trainer(
             )
         else:
             starting_ckpt = new_ckpt
+            logger.info(
+                "Stage %d (%s): checkpoint for next stage → %s",
+                stage_idx, stage_name, starting_ckpt,
+            )
+            if not cluster:
+                print(f"  ✓ Next-stage checkpoint: {starting_ckpt}")
 
         # ---------------------------------------------------------------
         # Per-stage post-training evaluation (H1/H2/H3/H4/H5 diagnostics)
@@ -705,6 +852,9 @@ def anm_alternating_trainer(
         stage_summary: Dict[str, Any] = {
             "stage_idx": stage_idx,
             "stage_name": stage_name,
+            "global_epoch_start": cumulative_epoch_offset - stage_local_epochs,
+            "global_epoch_end": cumulative_epoch_offset - 1,
+            "checkpoint_mode": stage_ckpt_mode,
             "stage_spec": _to_plain_container(stage_spec),
             "stage_config": stage_config_path,
             "checkpoint": starting_ckpt or "",
@@ -779,7 +929,11 @@ def run_anm_trainer_from_config(
 # HELPERS
 # =============================================================================
 
-def _print_stage_header(stage_spec: dict, starting_ckpt: Optional[str]) -> None:
+def _print_stage_header(
+    stage_spec: dict,
+    starting_ckpt: Optional[str],
+    ckpt_mode: str = "warm_start",
+) -> None:
     """Print a concise stage configuration summary."""
     def _fmt(key, default="(inherited)"):
         return stage_spec.get(key, default)
@@ -795,12 +949,15 @@ def _print_stage_header(stage_spec: dict, starting_ckpt: Optional[str]) -> None:
     print(f"  freeze_recon:  {stage_spec.get('freeze_reconstruction_params', False)}")
     if stage_spec.get("use_gate_bias_annealing"):
         print(
-            f"  gate_bias:     {_fmt('gate_bias_start', 0.0)} → "
-            f"{_fmt('gate_bias_end', -20.0)} "
+            f"  gate_bias:     {stage_spec.get('gate_bias_start', 0.0)} → "
+            f"{stage_spec.get('gate_bias_end', -20.0)} "
             f"over {_fmt('gate_bias_anneal_epochs', '?')} epochs"
         )
     if starting_ckpt:
-        print(f"  warm start:    {starting_ckpt}")
+        if ckpt_mode == "resume":
+            print(f"  resume from:   {starting_ckpt}  (weights + optimizer state)")
+        else:
+            print(f"  warm start:    {starting_ckpt}  (weights only)")
     else:
         print("  warm start:    (fresh initialization)")
 

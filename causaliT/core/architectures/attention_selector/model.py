@@ -59,6 +59,7 @@ from causaliT.core.modules import (
     CausalCrossAttention,
     SigmoidCrossAttention,
     ScaledDotAttention,
+    HardConcreteCrossAttention,
     AttentionLayer,
     ModularEmbedding,
     Normalization,
@@ -152,6 +153,9 @@ class AttentionSelectorLayer(nn.Module):
         self.d_model = d_model
         self.S_seq_len = S_seq_len
         self.X_seq_len = X_seq_len
+        # Store embedding composition mode so callers (and diagnostics) can
+        # inspect whether the model is operating in SVFA or standard mode.
+        self.comps_embed_X = comps_embed_X
 
         # ------------------------------------------------------------------
         # Embeddings
@@ -181,6 +185,13 @@ class AttentionSelectorLayer(nn.Module):
             "CausalCrossAttention": CausalCrossAttention,
             "SigmoidCrossAttention": SigmoidCrossAttention,
             "ScaledDotProduct": ScaledDotAttention,
+            # Backward-compat alias: configs and checkpoint hparams saved before the
+            # "ScaledDotProduct" rename still store attention_type="ScaledDotAttention".
+            # load_from_checkpoint reconstructs the model from stored hparams, so
+            # without this alias those checkpoints raise a ValueError at eval time.
+            "ScaledDotAttention": ScaledDotAttention,
+            # Hard Concrete L0 gates (Louizos et al., ICLR 2018).
+            "HardConcreteCrossAttention": HardConcreteCrossAttention,
         }
         if attention_type not in att_cls_map:
             raise ValueError(
@@ -310,6 +321,7 @@ class AttentionSelectorLayer(nn.Module):
         x_blanked: torch.Tensor,
         x_actual: torch.Tensor,
         oracle: bool = False,
+        oracle_combined_mask: Optional[torch.Tensor] = None,
     ):
         """
         Full forward pass with separate blanked (query) and actual (key) X.
@@ -322,11 +334,35 @@ class AttentionSelectorLayer(nn.Module):
                 Used as the key/value input — full embedding (identity + value).
             oracle: If True, bypass QK^T and use the hard mask directly as
                 attention weights (inherited from CausalCrossAttention oracle mode).
+            oracle_combined_mask: Optional (L_X, L_S+L_X) GT DAG combined mask.
+                When oracle=True and this is provided, it is used as the hard_mask
+                (i.e. the GT adjacency is the oracle attention).  When oracle=True
+                but this is None, falls back to self.combined_mask (structural
+                constraint — all-ones S block + off-diagonal X block), which gives
+                uniform oracle attention and is useful only as a sanity baseline.
+                When oracle=False this argument is ignored entirely.
 
         Returns:
             pred_x:           (B, L_X, out_dim)
             attention_weights: (B, L_X, L_S + L_X)  combined attention matrix
             entropy:           Attention entropy
+
+        SVFA residual streams
+        ---------------------
+        When ``comps_embed_X="svfa"`` the embedding returns ``(struct, val)``
+        tuples.  In that regime the architecture preserves **two separate
+        residual streams**, exactly as in ``ReversedDecoderLayer``:
+
+        * **Structure stream** (``x_struct = xq_struct``): carries the
+          variable-identity signal used as the attention Query.  It passes
+          through the block **unchanged** — no residual is added to it.
+        * **Value stream** (``x_val``): starts from ``xq_val`` (the value
+          embedding of the zero-blanked X) and accumulates the attention
+          output, the FFN, and optional final norm via residual connections.
+          The forecaster reads from this stream only.
+
+        When ``comps_embed_X="summation"`` a single fused stream is used,
+        preserving the original (pre-SVFA) behaviour.
         """
         # ---- Embed (SVFA-aware) ------------------------------------------
         # ModularEmbedding returns either:
@@ -342,7 +378,10 @@ class AttentionSelectorLayer(nn.Module):
 
         s_struct,  s_val  = _emb_drop(self.embedding_S(X=source_tensor))
         xk_struct, xk_val = _emb_drop(self.embedding_X(X=x_actual))
-        xq_struct, _      = _emb_drop(self.embedding_X(X=x_blanked))
+        # xq_val is the initial *value* stream for x_blanked (embedding of the
+        # zeroed value column).  In SVFA mode this is the residual target — it
+        # must NOT be discarded.
+        xq_struct, xq_val = _emb_drop(self.embedding_X(X=x_blanked))
 
         # Q/K always use the structural embedding; V uses value embedding if SVFA.
         sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d)
@@ -356,7 +395,17 @@ class AttentionSelectorLayer(nn.Module):
         # Q: X_blanked struct  (B, L_X,       d)
         # K: [S, X_actual] struct (B, L_S+L_X, d)
         # V: [S, X_actual] val    (B, L_S+L_X, d)   (same as K in summation mode)
-        attn_out, attention_weights, entropy = self.attention(
+        #
+        # hard_mask selection:
+        #   oracle=True  + oracle_combined_mask provided → GT DAG combined mask
+        #   oracle=True  + no oracle_combined_mask       → structural mask (fallback)
+        #   oracle=False                                 → structural mask (learned att)
+        if oracle and oracle_combined_mask is not None:
+            hard_mask = oracle_combined_mask
+        else:
+            hard_mask = self.combined_mask
+
+        attn_out, attention_weights, _aux = self.attention(
             query=x_q_emb,
             key=sx_keys,
             value=sx_vals,
@@ -364,14 +413,25 @@ class AttentionSelectorLayer(nn.Module):
             mask_miss_q=None,
             pos=None,
             causal_mask=False,
-            hard_mask=self.combined_mask,
+            hard_mask=hard_mask,
             oracle=oracle,
         )
-
         # ---- Residual + Norm 1 -------------------------------------------
-        x = self.norm1(x_q_emb + self.dropout_attn_out(attn_out))
+        # SVFA mode: the attention output (derived from the value V stream)
+        # must go to the VALUE stream only.  The structure stream (x_struct =
+        # xq_struct) passes through UNCHANGED — no residual is applied to it.
+        # Standard (summation) mode: single fused stream (original behaviour).
+        is_svfa = xq_val is not None
+        if is_svfa:
+            # Value stream: accumulate the attention output.
+            # Structure stream: unchanged (xq_struct is held implicitly; it is
+            # not modified here and is not passed to the FFN or forecaster,
+            # preserving the separation of the two signals).
+            x = self.norm1(xq_val + self.dropout_attn_out(attn_out))
+        else:
+            x = self.norm1(x_q_emb + self.dropout_attn_out(attn_out))
 
-        # ---- FFN ---------------------------------------------------------
+        # ---- FFN (value stream in SVFA, single stream in standard) -------
         x_ff = self.dropout_ff(self._act_fn(self.linear1(x)))
         x_ff = self.dropout_ff(self.linear2(x_ff))
         x = x + x_ff
@@ -381,9 +441,12 @@ class AttentionSelectorLayer(nn.Module):
             x = self.norm2(x)
 
         # ---- MLP head ---------------------------------------------------
+        # In SVFA mode `x` is the value stream (set above); in standard mode
+        # it is the single fused stream.  Either way, the forecaster reads from
+        # the correct (reconstruction-targeted) stream.
         pred_x = self.forecaster(x)
 
-        return pred_x, attention_weights, entropy
+        return pred_x, attention_weights, _aux
 
     # ------------------------------------------------------------------
     # Utility: split the combined attention matrix into S→X and X→X parts

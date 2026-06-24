@@ -63,6 +63,9 @@ from causaliT.training.forecasters.noise_aware_forecaster import NoiseAwareCausa
 from causaliT.training.forecasters.noise_aware_res_forecaster import (
     NoiseAwareCausalResForecaster,
 )
+from causaliT.training.forecasters.attention_selector_forecaster import (
+    AttentionSelectorForecaster,
+)
 
 # Import from local eval_funs modules (self-contained)
 from .eval_lib import (
@@ -210,6 +213,8 @@ def _load_model_from_checkpoint(checkpoint_path: str, architecture_type: str):
         return NoiseAwareCausalForecaster.load_from_checkpoint(checkpoint_path)
     elif architecture_type == "NoiseAwareCausalResForecaster":
         return NoiseAwareCausalResForecaster.load_from_checkpoint(checkpoint_path)
+    elif architecture_type == "AttentionSelectorForecaster":
+        return AttentionSelectorForecaster.load_from_checkpoint(checkpoint_path)
     else:
         raise ValueError(f"Unknown architecture type: {architecture_type}")
 
