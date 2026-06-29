@@ -9,11 +9,25 @@ Key idea:
 Use case:
 - Embed source variables (S) with orthogonal representations
 - Ensures attention scores between X and different S variables carry independent information
+
+When used inside AttentionSelectorLayer (SVFA mode), both S and X nodes are embedded
+as structural keys that are concatenated before the shared W_K projection:
+
+    sx_keys = cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d_model)
+
+For the L_S+L_X keys to be mutually orthogonal, S and X must occupy **disjoint**
+partitions of the d_model dimension space. This is achieved via ``mask_start_dim``:
+
+    embedding_S = OrthogonalMaskEmbedding(L_S, d_model, mask_start_dim=0)
+    embedding_X = OrthogonalMaskEmbedding(L_X, d_model, mask_start_dim=L_S * dims_per_var)
+
+with d_model = (L_S + L_X) * dims_per_var.
 """
 
 import torch
 import torch.nn as nn
 import math
+from typing import Optional
 
 
 class OrthogonalMaskEmbedding(nn.Module):
@@ -32,13 +46,32 @@ class OrthogonalMaskEmbedding(nn.Module):
     
     Args:
         num_variables: Number of source variables (e.g., 3 for S₁, S₂, S₃)
-        d_model: Embedding dimension (should be divisible by num_variables for even split)
+        d_model: Embedding dimension (must be large enough to hold all variables'
+            partitions starting from mask_start_dim)
         value_input_dim: Dimension of value input (default 1)
         value_idx: Index of value in input tensor
         var_idx: Index of variable ID in input tensor
         var_id_offset: Offset to subtract from var_ids before indexing masks.
                        Default 1 since SCM datasets use 1-indexed var IDs (S1=1, S2=2, S3=3)
                        and 0 is reserved for padding/missing.
+        mask_start_dim: First dimension index assigned to variable 0.  Default 0.
+                        Set this to a non-zero value when multiple
+                        OrthogonalMaskEmbedding instances must occupy disjoint
+                        partitions of the same d_model space (e.g. S and X nodes
+                        concatenated as keys in AttentionSelectorLayer).
+                        Must be used together with ``dims_per_var`` to fix the
+                        partition width:
+                            k = d_model // (L_S + L_X)
+                            embedding_S = OrthogonalMaskEmbedding(L_S, d_model, mask_start_dim=0,      dims_per_var=k)
+                            embedding_X = OrthogonalMaskEmbedding(L_X, d_model, mask_start_dim=L_S*k, dims_per_var=k)
+                        with d_model = (L_S + L_X) * k.
+        dims_per_var:   Exact number of dimensions allocated to each variable.
+                        When None (default), auto-computed as
+                        ``(d_model - mask_start_dim) // num_variables`` — this is
+                        correct when all variables belong to the same group (the
+                        default single-group case).  Must be provided explicitly
+                        when two groups share the same d_model with ``mask_start_dim``
+                        to avoid one group inadvertently consuming the other's space.
         freeze: Whether to freeze the entire embedding (default True for source variables)
         device: Device to place tensors on
     """
@@ -51,6 +84,8 @@ class OrthogonalMaskEmbedding(nn.Module):
         value_idx: int = 0,
         var_idx: int = 1,
         var_id_offset: int = 1,
+        mask_start_dim: int = 0,
+        dims_per_var: Optional[int] = None,
         freeze: bool = True,
         device: str = "cpu"
     ):
@@ -61,13 +96,35 @@ class OrthogonalMaskEmbedding(nn.Module):
         self.value_idx = value_idx
         self.var_idx = var_idx
         self.var_id_offset = var_id_offset
+        self.mask_start_dim = mask_start_dim
         self.freeze = freeze
         self.device = device
         
-        # Calculate dimensions per variable
-        # If d_model not divisible, distribute extra dims to first variables
-        self.dims_per_var = d_model // num_variables
-        self.extra_dims = d_model % num_variables
+        if dims_per_var is not None:
+            # Explicit partition width: all variables get exactly dims_per_var dims.
+            # Used when two OrthogonalMaskEmbedding groups share the same d_model
+            # via mask_start_dim and must have equal-sized partitions.
+            if dims_per_var <= 0:
+                raise ValueError(f"dims_per_var must be positive, got {dims_per_var}.")
+            end_dim = mask_start_dim + num_variables * dims_per_var
+            if end_dim > d_model:
+                raise ValueError(
+                    f"mask_start_dim={mask_start_dim} + num_variables={num_variables} * "
+                    f"dims_per_var={dims_per_var} = {end_dim} exceeds d_model={d_model}."
+                )
+            self.dims_per_var = dims_per_var
+            self.extra_dims = 0  # uniform allocation, no remainder
+        else:
+            # Auto-compute: partition [mask_start_dim, d_model) evenly.
+            # When mask_start_dim=0 this is the original single-group behaviour.
+            available_dims = d_model - mask_start_dim
+            if available_dims <= 0:
+                raise ValueError(
+                    f"mask_start_dim={mask_start_dim} leaves no space in d_model={d_model} "
+                    f"for {num_variables} variables."
+                )
+            self.dims_per_var = available_dims // num_variables
+            self.extra_dims = available_dims % num_variables
         
         # Scale factor to maintain variance after masking
         # Since only dims_per_var out of d_model dimensions are active,
@@ -81,6 +138,7 @@ class OrthogonalMaskEmbedding(nn.Module):
         # Create binary orthogonal masks (registered as buffer - not trainable)
         # Shape: (num_variables, d_model)
         masks = self._create_orthogonal_masks()
+        self.binary_masks: torch.Tensor
         self.register_buffer('binary_masks', masks)
         
         # Apply freezing if requested
@@ -90,15 +148,21 @@ class OrthogonalMaskEmbedding(nn.Module):
     def _create_orthogonal_masks(self) -> torch.Tensor:
         """
         Create binary orthogonal masks that partition the d_model dimensions.
+
+        Each variable gets a non-overlapping block of ``dims_per_var`` dimensions
+        (±1 for the first ``extra_dims`` variables) starting at ``mask_start_dim``.
+        Dimensions below ``mask_start_dim`` are left as zero, allowing multiple
+        OrthogonalMaskEmbedding instances to share the same d_model space without
+        overlap.
         
         Returns:
             Tensor of shape (num_variables, d_model) with binary values
         """
         masks = torch.zeros(self.num_variables, self.d_model)
         
-        start_idx = 0
+        start_idx = self.mask_start_dim   # honour the partition offset
         for var_id in range(self.num_variables):
-            # Distribute extra dimensions to first variables
+            # Distribute any remainder dimensions to the first variables
             dims_for_this_var = self.dims_per_var + (1 if var_id < self.extra_dims else 0)
             end_idx = start_idx + dims_for_this_var
             

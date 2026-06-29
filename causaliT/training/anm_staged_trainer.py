@@ -420,6 +420,9 @@ _ORCHESTRATOR_ONLY_KEYS = frozenset({
     # Per-stage post-training evaluation — dispatched by the orchestrator after
     # train_single_fold returns; not a training-config key.
     "evaluation",
+    # Per-stage model-constructor kwargs (e.g. init_tau, batch_key_dropout).
+    # Applied to config['model']['kwargs'] in _build_stage_config.
+    "model_kwargs_overrides",
 })
 
 
@@ -531,9 +534,8 @@ def _build_stage_config(
         tc["freeze_reconstruction_params"] = False
 
     # --- BKD dropout curriculum: fixed p per stage, no within-stage annealing ---
-    # AttentionSelectorLayer does not accept batch_key_dropout kwargs — skip it.
     bkd_p = stage_spec.get("batch_key_dropout_p", None)
-    if bkd_p is not None and model_obj != "AttentionSelectorLayer":
+    if bkd_p is not None:
         bkd_p = float(bkd_p)
         model_kwargs = cfg.get("model", {}).get("kwargs", {})
         if model_kwargs is not None:
@@ -542,13 +544,40 @@ def _build_stage_config(
             model_kwargs["batch_key_dropout_p_final"] = bkd_p
             # Disable step-counter annealing
             model_kwargs["batch_key_dropout_annealing_batches"] = None
-    elif bkd_p is not None and model_obj == "AttentionSelectorLayer":
-        logger.debug(
-            "Stage %d: batch_key_dropout_p=%s ignored for AttentionSelectorLayer "
-            "(no BKD support in this architecture).",
-            stage_idx,
-            bkd_p,
-        )
+
+    # --- Arbitrary model-constructor kwargs overrides ---
+    # Overrides ``config['model']['kwargs']`` directly so that any model
+    # constructor kwarg can be varied per stage without adding a dedicated
+    # handling block here.
+    #
+    # Typical use-cases:
+    #   init_tau          — attention temperature (plain Python float; NOT saved
+    #                       in checkpoint state_dict, so the value from the freshly
+    #                       constructed stage model always survives checkpoint loading)
+    #   batch_key_dropout — BKD initial drop probability (plain float; also safe)
+    #   init_gate_bias    — initial Toeplitz gate bias (initial value only; the
+    #                       learnable ``gate_bias`` Parameter IS in state_dict and
+    #                       WILL be restored from checkpoint — use with care)
+    #
+    # Note: keys in ``model_kwargs_overrides`` take precedence over the
+    # ``batch_key_dropout_p`` shorthand applied in the block above, since this
+    # block runs last.
+    #
+    # Note on AttentionSelectorLayer: ``batch_key_dropout`` is now supported
+    # and can be passed freely via ``model_kwargs_overrides`` (or via the
+    # ``batch_key_dropout_p`` shorthand above).
+    mkw_overrides = stage_spec.get("model_kwargs_overrides", None)
+    if mkw_overrides:
+        mkw_overrides = _to_plain_container(mkw_overrides)
+        if isinstance(mkw_overrides, dict) and mkw_overrides:
+            model_kwargs = cfg.get("model", {}).get("kwargs")
+            if model_kwargs is not None:
+                for key, val in mkw_overrides.items():
+                    model_kwargs[key] = val
+                    logger.debug(
+                        "Stage %d: model_kwargs_overrides[%s] = %s",
+                        stage_idx, key, val,
+                    )
 
     # --- Always single fold ---
     tc["k_fold"] = 1
@@ -953,6 +982,10 @@ def _print_stage_header(
             f"{stage_spec.get('gate_bias_end', -20.0)} "
             f"over {_fmt('gate_bias_anneal_epochs', '?')} epochs"
         )
+    mkw = stage_spec.get("model_kwargs_overrides")
+    if mkw:
+        for k, v in (_to_plain_container(mkw) or {}).items():
+            print(f"  model_kwarg:   {k} = {v}")
     if starting_ckpt:
         if ckpt_mode == "resume":
             print(f"  resume from:   {starting_ckpt}  (weights + optimizer state)")

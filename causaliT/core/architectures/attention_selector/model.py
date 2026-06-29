@@ -64,6 +64,7 @@ from causaliT.core.modules import (
     ModularEmbedding,
     Normalization,
     MLPHead,
+    OrthogonalMaskEmbedding,
 )
 
 
@@ -105,6 +106,27 @@ class AttentionSelectorLayer(nn.Module):
         shared_dag_across_heads: When True (default), a single (B,L,S) score is
             shared across all value heads (SVFA-style). When False, each head
             has its own independent DAG score.
+        orthogonal_struct_embedding: When True, replace the structural stream
+            (Q/K) embeddings for both S and X with ``OrthogonalMaskEmbedding``
+            instances whose partitions tile the full d_model space without overlap:
+
+                S occupies dims [0,           S_seq_len * k)
+                X occupies dims [S_seq_len*k, (S_seq_len+X_seq_len)*k)
+
+            where k = d_model // (S_seq_len + X_seq_len).  The value stream
+            (V, residual, MLP head) continues to use the standard ModularEmbedding.
+            Default False (original behaviour).
+        batch_key_dropout: Initial probability for ``BatchConsistentKeyDropout``
+            applied to the combined attention weights after the inner attention
+            activation.  When set, entire key-position columns are zeroed
+            consistently across the batch, preventing the model from relying on
+            any single parent variable.  ``None`` (default) disables BKD.
+        batch_key_dropout_p_final: Final dropout probability after annealing.
+            When ``None`` (default), equals ``batch_key_dropout`` (no annealing).
+        batch_key_dropout_annealing_batches: Number of optimiser steps over
+            which to linearly anneal the dropout probability from
+            ``batch_key_dropout`` to ``batch_key_dropout_p_final``.
+            ``None`` (default) disables step-counter annealing.
     """
 
     def __init__(
@@ -146,6 +168,12 @@ class AttentionSelectorLayer(nn.Module):
         output_mlp_dropout: float = 0.0,
         # Multi-head semantics
         shared_dag_across_heads: bool = True,
+        # Orthogonal structural embeddings
+        orthogonal_struct_embedding: bool = False,
+        # Batch-consistent key dropout
+        batch_key_dropout: Optional[float] = None,
+        batch_key_dropout_p_final: Optional[float] = None,
+        batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super().__init__()
 
@@ -156,6 +184,7 @@ class AttentionSelectorLayer(nn.Module):
         # Store embedding composition mode so callers (and diagnostics) can
         # inspect whether the model is operating in SVFA or standard mode.
         self.comps_embed_X = comps_embed_X
+        self.orthogonal_struct_embedding = orthogonal_struct_embedding
 
         # ------------------------------------------------------------------
         # Embeddings
@@ -216,6 +245,10 @@ class AttentionSelectorLayer(nn.Module):
             key_seq_len=S_seq_len + X_seq_len,
             init_tau=init_tau,
             shared_dag_across_heads=shared_dag_across_heads,
+            # Batch-consistent key dropout.
+            batch_key_dropout=batch_key_dropout,
+            batch_key_dropout_p_final=batch_key_dropout_p_final,
+            batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
         )
 
         # ------------------------------------------------------------------
@@ -243,6 +276,47 @@ class AttentionSelectorLayer(nn.Module):
         self.linear1 = nn.Linear(d_model, d_ff)
         self.linear2 = nn.Linear(d_ff, d_model)
         self._act_fn = F.gelu if activation == "gelu" else F.relu
+
+        # ------------------------------------------------------------------
+        # Orthogonal structural embeddings (optional override for Q/K stream)
+        # ------------------------------------------------------------------
+        # When orthogonal_struct_embedding=True the standard nn_embedding
+        # structural role is replaced with two OrthogonalMaskEmbedding modules
+        # whose dimension partitions tile d_model without overlap:
+        #   S → dims [0,       S_seq_len * k)
+        #   X → dims [S_seq_len*k, (S_seq_len+X_seq_len)*k)
+        # where k = d_model // (S_seq_len + X_seq_len).
+        # The value stream (V, residual, FFN, MLP head) is UNCHANGED.
+        self.orth_embed_S: Optional[OrthogonalMaskEmbedding]
+        self.orth_embed_X: Optional[OrthogonalMaskEmbedding]
+        if orthogonal_struct_embedding:
+            total_vars = S_seq_len + X_seq_len
+            k = d_model // total_vars
+            if k <= 0:
+                raise ValueError(
+                    f"d_model={d_model} is too small for orthogonal structural embeddings "
+                    f"with S_seq_len={S_seq_len} + X_seq_len={X_seq_len} = {total_vars} variables "
+                    f"(need d_model >= {total_vars})."
+                )
+            self.orth_embed_S = OrthogonalMaskEmbedding(
+                num_variables=S_seq_len,
+                d_model=d_model,
+                mask_start_dim=0,
+                dims_per_var=k,
+                freeze=False,
+                device=device,
+            )
+            self.orth_embed_X = OrthogonalMaskEmbedding(
+                num_variables=X_seq_len,
+                d_model=d_model,
+                mask_start_dim=S_seq_len * k,
+                dims_per_var=k,
+                freeze=False,
+                device=device,
+            )
+        else:
+            self.orth_embed_S = None
+            self.orth_embed_X = None
 
         # ------------------------------------------------------------------
         # Output MLP head
@@ -382,6 +456,17 @@ class AttentionSelectorLayer(nn.Module):
         # zeroed value column).  In SVFA mode this is the residual target — it
         # must NOT be discarded.
         xq_struct, xq_val = _emb_drop(self.embedding_X(X=x_blanked))
+
+        # ---- Orthogonal structural stream override -----------------------
+        # When orthogonal_struct_embedding=True, replace the structural (Q/K)
+        # embeddings with OrthogonalMaskEmbedding outputs.  The value stream
+        # (s_val, xk_val, xq_val) is UNCHANGED — it still comes from the
+        # standard ModularEmbedding above.
+        if self.orthogonal_struct_embedding:
+            assert self.orth_embed_S is not None and self.orth_embed_X is not None
+            s_struct  = self.dropout_emb(self.orth_embed_S(source_tensor))
+            xk_struct = self.dropout_emb(self.orth_embed_X(x_actual))
+            xq_struct = self.dropout_emb(self.orth_embed_X(x_blanked))
 
         # Q/K always use the structural embedding; V uses value embedding if SVFA.
         sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d)
