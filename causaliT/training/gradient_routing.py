@@ -16,6 +16,7 @@ reconstruction signal and vice versa.
 Parameter Classification:
     Structural (theta_S):
         - Structure embeddings (nn_embedding for variable IDs)
+        - Free query embedding (decoupled X query, feeds Q only)
         - Q, K projections in all attention layers
         - Attention internal params (log_gain, log_tau, etc.)
         - Structure-path layer norms (norm1_struct, norm2_struct)
@@ -73,6 +74,11 @@ STRUCTURAL_PATTERNS = [
     # In the standard DataSetEmbedding with role="structure", the module
     # label is "variable" and uses nn.Embedding.
     "structure_modules",
+    # Free query embedding (AttentionSelectorLayer, free_query_embedding=True).
+    # This is the decoupled X *query* identity lookup table; it feeds only the
+    # attention Query, so it is a structural parameter driven by HSIC /
+    # score-sparsity — NOT the reconstruction loss.
+    "query_embed_X",
     # Attention internal parameters (gain, temperature, Gumbel tau, etc.)
     "inner_attention.log_gain",
     "inner_attention.log_tau",

@@ -17,6 +17,8 @@ This document aims to collect the project status main findings, open problems an
 
 - F5: The oracle condition scores the minimum structural signal (from HSIC) for the noise-aware architecture. The single architecture shows better structural signal when it can cheat with spurious edges.
 
+- F6: *"Query/key decoupling helps contrast, not recovery."* In the ORTH_EMBED attention-selector study (`experiments/2_ARCH_STUDY/ORTH_EMBED_STUDY`), the combo `key_projection=orthogonal` + `free_query` (K_orth + Q+) raises the **edge/non-edge contrast** of the attention scores — the score-matrix rows stop being near-duplicates, so different edges are learned more independently ("disentangled edges"). On the sparse-init `CausalCrossAttention` run it is the clear winner on contrast (`E+ Korth Q+`: S→X **+0.09**, X→X **+0.14** at the structural stage), and there the fixed orthonormal frame additionally helps the endogenous X→X block. **BUT the gain is local to contrast: it does not improve SHD/recall** — on `CausalCross` the joint stage even adds spurious X→X edges, and on the dense-init `HardConcreteCrossAttention` run the same HSIC-favoured combo is among the *worst* on SHD/zeroness. That last point is a concrete instance of OQ1 (structural/HSIC signal ≠ recovery). Support is qualitative + zeroness-contrast so far, pending a dedicated `row_disentanglement` metric (see next steps).
+
 ## Problems
 - P1: Optimizing the structure is challenging (see F3)
 - P2: The model structure doesn't converge to the true DAG
@@ -38,3 +40,8 @@ With the noise-aware model, we saw that the oracle is heuristically at the minim
 5. Continue the study on the `experiments\5_EXPLORATORY\PARTIAL_ANM` to tackle P1
 6. Better understand why F4
 7. Optimize reconstruction-optimized models on the structure learning with Optuna.
+8. Implement a `row_disentanglement_{cross,self}` metric (mean off-diagonal |cosine| between score rows, or effective rank of the score matrix) to quantify F6, and add it to `eval_attention_selector_scores`.
+9. BKD (batch key-dropout) two-phase warmup study: sweep key-dropout strength in the reconstruction warmup so the residual becomes insensitive to variable selection; judge each BKD value by the **residual increase during the structural stage AND the structural payoff** (contrast/HSIC/SHD), not residual stability alone.
+10. Introduce L0 on the HardConcrete attention (dense-init run) to convert the current "retained-but-dense" scores into selective pruning, and test whether K_orth + Q+ enables turning off individual non-causal edges while leaving true edges retained.
+
+

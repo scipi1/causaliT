@@ -10,6 +10,13 @@ Verifies:
    correct output shape.
 5. _build_stage_config in anm_staged_trainer now applies batch_key_dropout_p
    to AttentionSelectorLayer kwargs (regression test for the previous skip).
+6. BKD stage-transition state_dict compatibility:
+   - BatchConsistentKeyDropout._step_count is only in state_dict when annealing
+     is active (Fix 1).
+   - AttentionSelectorForecaster.on_load_checkpoint strips unexpected BKD keys
+     from legacy checkpoints (Fix 2, recon→struct direction).
+   - on_load_checkpoint fills missing BKD keys from the current model
+     (Fix 2, struct→recon direction).
 """
 
 import pytest
@@ -256,3 +263,233 @@ class TestBuildStageConfigBKDForAtsel:
         assert mk["batch_key_dropout"] is None
         assert mk["batch_key_dropout_p_final"] is None
         assert mk["batch_key_dropout_annealing_batches"] is None
+
+
+# ---------------------------------------------------------------------------
+# Helper: build a minimal AttentionSelectorForecaster config dict
+# ---------------------------------------------------------------------------
+
+def _make_forecaster_config(
+    S_seq_len: int = 3,
+    X_seq_len: int = 3,
+    d_model: int = D_MODEL,
+    batch_key_dropout=None,
+    batch_key_dropout_p_final=None,
+    batch_key_dropout_annealing_batches=None,
+) -> dict:
+    """Return a minimal config dict accepted by AttentionSelectorForecaster.__init__."""
+    return {
+        "data": {
+            "val_idx": 1,           # feature index 1 = value column
+            "S_seq_len": S_seq_len,
+            "X_seq_len": X_seq_len,
+            "dataset": "dummy",
+        },
+        "model": {
+            "model_object": "AttentionSelectorLayer",
+            "kwargs": {
+                "model": "AttentionSelectorLayer",
+                "ds_embed_S": _embed_cfg(VOCAB_S, d_model),
+                "ds_embed_X": _embed_cfg(VOCAB_X, d_model),
+                "comps_embed_S": "summation",
+                "comps_embed_X": "summation",
+                "attention_type": "CausalCrossAttention",
+                "n_heads": 1,
+                "dropout_emb": 0.0,
+                "dropout_attn_out": 0.0,
+                "dropout_ff": 0.0,
+                "dropout_qkv": 0.0,
+                "attention_dropout": 0.0,
+                "activation": "relu",
+                "norm": "layer",
+                "use_final_norm": False,
+                "device": "cpu",
+                "out_dim": 1,
+                "d_ff": 32,
+                "d_model": d_model,
+                "d_qk": d_model,
+                "S_seq_len": S_seq_len,
+                "X_seq_len": X_seq_len,
+                "batch_key_dropout": batch_key_dropout,
+                "batch_key_dropout_p_final": batch_key_dropout_p_final,
+                "batch_key_dropout_annealing_batches": batch_key_dropout_annealing_batches,
+            },
+        },
+        "training": {
+            "loss_fn": "mse",
+            "lr": 1e-3,
+            "weight_decay": 0.0,
+            "optimizer": "adamw",
+            "use_gradient_routing": False,
+            "lambda_recon": 1.0,
+            "lambda_hsic": 0.0,
+            "lambda_score_sparse": 0.0,
+            "lambda_group_l1": 0.0,
+            "lambda_l0": 0.0,
+            "kappa": 0.0,
+            "hsic_sigma": 1.0,
+            "hsic_adaptive_bandwidth": False,
+            "hsic_mode": "biased",
+            "nhsic_epsilon": 0.01,
+            "hsic_kernel_source": "rbf",
+            "use_oracle_attention": False,
+            "use_hard_masks": False,
+            "freeze_structural_params": False,
+            "freeze_reconstruction_params": False,
+        },
+    }
+
+
+class TestBKDStageTransitionStateDict:
+    """
+    Regression tests for the BKD stage-transition state_dict mismatch fix.
+
+    The original bug: loading a checkpoint saved by a stage with
+    ``batch_key_dropout=0.8`` into a stage model with ``batch_key_dropout=null``
+    raised::
+
+        RuntimeError: unexpected key(s) in state_dict:
+            "model.attention.inner_attention.batch_key_dropout._step_count"
+
+    Fix 1 (BatchConsistentKeyDropout): ``_step_count`` is no longer registered
+    as a buffer when step-counter annealing is disabled — new checkpoints won't
+    contain the key at all.
+
+    Fix 2 (AttentionSelectorForecaster.on_load_checkpoint): legacy checkpoints
+    that still contain the key are handled gracefully by stripping (or filling)
+    any ``batch_key_dropout.*`` key that doesn't match the current model.
+    """
+
+    # ------------------------------------------------------------------
+    # Fix 1: BatchConsistentKeyDropout state_dict behaviour
+    # ------------------------------------------------------------------
+
+    def test_bkd_no_annealing_step_count_not_in_state_dict(self):
+        """
+        When annealing is disabled (annealing_batches=None), _step_count must
+        NOT appear in state_dict.  This is the root-cause fix: checkpoints
+        saved after this change will never contain the offending key.
+        """
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=0.8)
+        sd_keys = list(bkd.state_dict().keys())
+        assert "_step_count" not in sd_keys, (
+            f"_step_count should NOT be in state_dict when annealing is off, "
+            f"but found keys: {sd_keys}"
+        )
+
+    def test_bkd_with_annealing_step_count_in_state_dict(self):
+        """
+        When annealing IS active (p_final + annealing_batches both set),
+        _step_count MUST appear in state_dict so that annealing progress
+        is preserved across checkpoint save/load.
+        """
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(
+            p_init=0.8, p_final=0.0, annealing_batches=1000
+        )
+        sd_keys = list(bkd.state_dict().keys())
+        assert "_step_count" in sd_keys, (
+            f"_step_count MUST be in state_dict when annealing is active, "
+            f"but found keys: {sd_keys}"
+        )
+
+    # ------------------------------------------------------------------
+    # Fix 2: on_load_checkpoint — recon→struct direction (unexpected key)
+    # ------------------------------------------------------------------
+
+    def test_on_load_checkpoint_strips_unexpected_bkd_keys(self):
+        """
+        Core regression for the H9 crash.
+
+        Simulates loading a legacy checkpoint (saved by a stage with BKD enabled,
+        before Fix 1) into a stage model with batch_key_dropout=None.  The
+        checkpoint contains 'model.attention.inner_attention.batch_key_dropout._step_count'.
+
+        After on_load_checkpoint the key must be stripped so that
+        load_state_dict(strict=True) no longer raises RuntimeError.
+        """
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+
+        # Stage 2 model: BKD disabled (no batch_key_dropout module)
+        model_no_bkd = AttentionSelectorForecaster(
+            _make_forecaster_config(batch_key_dropout=None)
+        )
+
+        # Simulate a legacy checkpoint from Stage 1 (BKD enabled, pre-Fix 1).
+        # The key that caused the crash is injected manually.
+        legacy_ckpt_state = dict(model_no_bkd.state_dict())  # base keys are correct
+        offending_key = (
+            "model.attention.inner_attention.batch_key_dropout._step_count"
+        )
+        legacy_ckpt_state[offending_key] = torch.tensor(42, dtype=torch.long)
+
+        fake_checkpoint = {"state_dict": legacy_ckpt_state}
+
+        # This must NOT raise.
+        model_no_bkd.on_load_checkpoint(fake_checkpoint)
+
+        # The offending key must have been removed.
+        assert offending_key not in fake_checkpoint["state_dict"], (
+            "on_load_checkpoint did not strip the unexpected BKD key."
+        )
+
+        # After stripping, strict load must succeed.
+        model_no_bkd.load_state_dict(fake_checkpoint["state_dict"], strict=True)
+
+    # ------------------------------------------------------------------
+    # Fix 2: on_load_checkpoint — struct→recon direction (missing key)
+    # ------------------------------------------------------------------
+
+    def test_on_load_checkpoint_fills_missing_bkd_keys(self):
+        """
+        Symmetric direction: loading a checkpoint saved by a no-BKD stage into
+        a model with BKD + annealing enabled.
+
+        The checkpoint is missing 'model.attention.inner_attention.batch_key_dropout._step_count'.
+        on_load_checkpoint must fill it from the current model's state_dict so that
+        load_state_dict(strict=True) succeeds (step counter resets to 0).
+        """
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+
+        # Stage 3 model: BKD enabled WITH annealing (so _step_count IS a buffer).
+        model_with_bkd = AttentionSelectorForecaster(
+            _make_forecaster_config(
+                batch_key_dropout=0.6,
+                batch_key_dropout_p_final=0.0,
+                batch_key_dropout_annealing_batches=1000,
+            )
+        )
+
+        bkd_key = (
+            "model.attention.inner_attention.batch_key_dropout._step_count"
+        )
+        # Verify the model actually has the buffer (sanity check for test validity).
+        assert bkd_key in model_with_bkd.state_dict(), (
+            f"Test setup error: expected {bkd_key!r} in state_dict of "
+            "BKD+annealing model, but it is missing."
+        )
+
+        # Checkpoint from Stage 2 (no BKD) — does NOT contain the buffer.
+        ckpt_state = {
+            k: v
+            for k, v in model_with_bkd.state_dict().items()
+            if "batch_key_dropout" not in k
+        }
+        fake_checkpoint = {"state_dict": ckpt_state}
+
+        # on_load_checkpoint must fill the missing BKD key.
+        model_with_bkd.on_load_checkpoint(fake_checkpoint)
+
+        assert bkd_key in fake_checkpoint["state_dict"], (
+            "on_load_checkpoint did not fill the missing BKD key."
+        )
+
+        # Strict load must succeed (step counter is reset to 0 from current model).
+        model_with_bkd.load_state_dict(fake_checkpoint["state_dict"], strict=True)

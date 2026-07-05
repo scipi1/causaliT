@@ -49,6 +49,24 @@ experiment:
   comps_embed: "svfa"
   use_gradient_routing: true
 
+  # Orthogonal structural embeddings (Q/K stream).
+  # When True, replace the standard nn_embedding structural role with
+  # OrthogonalMaskEmbedding modules whose disjoint d_model partitions make the
+  # S and X keys mutually orthogonal.  The value stream is unchanged.
+  orthogonal_struct_embedding: false
+
+  # Decoupled key/query embedding for the predicted (X) nodes.
+  # In the combined attention each X_i is used BOTH as a key (offered as a
+  # parent to other X_j) and as a query (selecting its own parents).  With a
+  # single shared embedding, updating "X_i-as-child" also perturbs
+  # "X_i-as-parent", so X_i ← S and X_i ← X_j cannot be learned independently.
+  # When True, the X QUERY gets its own free (unconstrained) identity embedding
+  # (FreeQueryEmbedding), removing this coupling.  The X KEY stream keeps its
+  # configured embedding (orthogonal or standard); the value stream is
+  # unchanged.  The query embedding is classified as a STRUCTURAL parameter by
+  # gradient routing (feeds Q only).
+  free_query_embedding: false
+
 
 model:
   model_object: "AttentionSelectorLayer"
@@ -129,6 +147,11 @@ model:
     init_tau: ${experiment.init_tau}
     shared_dag_across_heads: ${experiment.shared_dag_across_heads}
 
+    # Structural embedding variants (Q/K stream)
+    orthogonal_struct_embedding: ${experiment.orthogonal_struct_embedding}
+    # Decoupled X query embedding (Q only); see experiment.free_query_embedding.
+    free_query_embedding: ${experiment.free_query_embedding}
+
     # Dropout
     dropout_emb: ${experiment.dropout}
     dropout_attn_out: ${experiment.dropout}
@@ -194,6 +217,25 @@ training:
 
   # --- Group-L1 (embedding column sparsity) ---
   lambda_group_l1: 0.0
+
+  # --- L0 regularization (HardConcreteCrossAttention only) ---
+  # Expected number of active edges = sum P(z_ij > 0).  Set >0 to encourage
+  # sparse hard-concrete gates.  Ignored for non-HardConcrete attention types.
+  lambda_l0: 0.0
+
+  # --- L0 <-> HSIC gradient-interference diagnostic ---
+  # When True AND attention_type == "HardConcreteCrossAttention" AND
+  # lambda_l0 > 0 AND lambda_hsic > 0, log the per-structural-block cosine
+  # similarity between the L0 gradient and the HSIC gradient.  Metrics are
+  # emitted to the CSV logger as ``train_interf_cos_<block>`` for blocks:
+  #   query_projection, key_projection, embedding_S, embedding_X,
+  #   query_embedding_X, attention_internals   (plus ``train_interf_cos_overall``).
+  #   cos ~ +1 -> aligned;  cos ~ 0 -> orthogonal;  cos ~ -1 -> conflict.
+  # The probe uses autograd.grad(retain_graph=True) and never writes .grad,
+  # so it does NOT perturb training.  It runs on the first batch of every
+  # ``interference_log_every_n_epochs`` epochs to keep the overhead low.
+  log_l0_hsic_interference: false
+  interference_log_every_n_epochs: 1
 
   # --- Gradient routing ---
   # When True: structural params (Q, K) updated by HSIC + sparsity;

@@ -395,6 +395,9 @@ _TRAINING_OVERRIDE_KEYS = frozenset({
     # AttentionSelectorLayer: unified HSIC weight and score sparsity weight
     "lambda_hsic",
     "lambda_score_sparse",
+    # L0 regularization (HardConcreteCrossAttention) — per-stage override,
+    # e.g. lambda_l0=0 in warmup stage, swept value in structural/joint stages.
+    "lambda_l0",
     "use_gradient_routing",
     # Freeze flags — processed with fallback logic below
     "freeze_structural_params",

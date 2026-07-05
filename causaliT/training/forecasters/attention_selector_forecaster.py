@@ -43,6 +43,11 @@ Logged metrics
 - train/val_hsic_reg       : Weighted HSIC regularization term
 - train/val_group_l1       : Group-L1 embedding regularization
 - train/val_notears        : NOTEARS acyclicity penalty on X→X sub-block
+- train_interf_cos_<block> : (diagnostic) per-structural-block cosine
+                             similarity between the L0 and HSIC gradients.
+                             Only logged when HardConcreteCrossAttention is
+                             active, lambda_l0>0, lambda_hsic>0, and
+                             ``training.log_l0_hsic_interference=True``.
 
 Attention splitting for evaluation
 ====================================
@@ -53,6 +58,7 @@ Then threshold and compute SHD.
 """
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -68,6 +74,10 @@ from causaliT.core.architectures.attention_selector import AttentionSelectorLaye
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
 from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.interference_utils import (
+    build_interference_blocks,
+    compute_l0_hsic_interference,
+)
 
 
 class AttentionSelectorForecaster(pl.LightningModule):
@@ -133,6 +143,34 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # L0 regularization (HardConcreteCrossAttention only)
         # ----------------------------------------------------------------
         self.lambda_l0 = float(config["training"].get("lambda_l0", 0.0))
+
+        # ----------------------------------------------------------------
+        # L0 ↔ HSIC gradient-interference logging (diagnostic).
+        # When enabled AND the attention is HardConcreteCrossAttention AND
+        # both lambda_l0 > 0 and lambda_hsic > 0, we log the per-block cosine
+        # similarity between the L0 gradient and the HSIC gradient.  Negative
+        # cosine ⇒ the two objectives push the structural parameters in
+        # opposing directions (interference); positive ⇒ aligned.
+        #
+        # The two objectives share the structural pathway (Q/K projections and
+        # structural embeddings), because the L0 penalty is a function of
+        # log_alpha = QK^T/sqrt(E) and HSIC back-props through the attention
+        # output, so this cosine localises where they conflict.
+        # ----------------------------------------------------------------
+        self.log_l0_hsic_interference = bool(
+            config["training"].get("log_l0_hsic_interference", False)
+        )
+        self.interference_log_every_n_epochs = int(
+            config["training"].get("interference_log_every_n_epochs", 1)
+        )
+        self._attention_type = config["model"]["kwargs"].get("attention_type", "")
+        # Cached block → parameter-list mapping (built lazily on first use so
+        # it reflects any requires_grad freezing applied in on_fit_start).
+        self._interference_blocks: Optional[Dict[str, list]] = None
+        # Stash for the two reg tensors so training_step can probe them while
+        # the autograd graph is still alive.
+        self._last_hsic_reg: Optional[torch.Tensor] = None
+        self._last_l0_reg: Optional[torch.Tensor] = None
 
         # ----------------------------------------------------------------
         # Acyclicity regularization (NOTEARS) — X→X sub-block only
@@ -381,7 +419,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         pred_x, attention_weights, aux = self.forward(S, X)
         entropy    = aux.get("entropy")    if isinstance(aux, dict) else aux
         l0_penalty = aux.get("l0_penalty") if isinstance(aux, dict) else None
-        
+
         # Reconstruction loss
         x_target = torch.nan_to_num(x_val)
         mse_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
@@ -479,6 +517,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             "loss_recon": loss_x,
             "loss_structural": hsic_reg + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg,
         }
+        # Keep references to the individual reg terms (graph still attached) so
+        # training_step can probe L0 ↔ HSIC gradient interference before the
+        # real backward runs.
+        self._last_hsic_reg = hsic_reg
+        self._last_l0_reg = l0_reg
 
         # ----------------------------------------------------------------
         # Logging
@@ -510,6 +553,81 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
 
         return total_loss, pred_x, X
+
+    # ------------------------------------------------------------------
+    # L0 ↔ HSIC gradient-interference diagnostic
+    # ------------------------------------------------------------------
+
+    def _interference_enabled(self) -> bool:
+        """Whether the L0 ↔ HSIC interference diagnostic should run."""
+        return (
+            self.log_l0_hsic_interference
+            and self._attention_type == "HardConcreteCrossAttention"
+            and float(self.lambda_l0) > 0.0
+            and float(self.lambda_hsic) > 0.0
+        )
+
+    def _maybe_log_interference(self, batch_idx: int):
+        """Log per-block cosine similarity between the L0 and HSIC gradients.
+
+        Guarded so it runs only for the first batch of an epoch, on the
+        configured epoch cadence, and only when the diagnostic is enabled.
+
+        Uses ``torch.autograd.grad(..., retain_graph=True)`` (inside
+        :func:`compute_l0_hsic_interference`), which returns the gradients as
+        tensors WITHOUT writing to ``.grad``.  Consequently the subsequent
+        real backward (automatic optimisation) or the gradient-routing dual
+        backward is left completely unaffected.
+        """
+        if not self._interference_enabled():
+            return
+        if batch_idx != 0:
+            return
+        every = max(1, int(self.interference_log_every_n_epochs))
+        if (self.current_epoch % every) != 0:
+            return
+        if self._last_hsic_reg is None or self._last_l0_reg is None:
+            return
+
+        # Build the block → parameter mapping lazily.  Rebuilt if it came back
+        # empty last time (e.g. structural params were frozen for this stage).
+        if not self._interference_blocks:
+            self._interference_blocks = build_interference_blocks(self.model)
+        blocks = self._interference_blocks
+        if not blocks:
+            return
+
+        try:
+            cos_by_block = compute_l0_hsic_interference(
+                model=self.model,
+                hsic_reg=self._last_hsic_reg,
+                l0_reg=self._last_l0_reg,
+                blocks=blocks,
+            )
+        except RuntimeError as exc:
+            # Autograd may fail if the graph was already freed (e.g. a prior
+            # backward without retain_graph).  Never let the diagnostic break
+            # training — just skip this step.
+            import logging
+            logging.getLogger(__name__).warning(
+                "L0↔HSIC interference probe skipped (autograd error): %s", exc
+            )
+            return
+
+        # Skip NaN blocks: a NaN cosine means one objective's gradient is
+        # entirely zero in that block (pure reconstruction blocks receive no
+        # L0 gradient).  Logging only the non-NaN blocks auto-focuses the
+        # metric set on the structural pathway (Q/K + embeddings) where the
+        # L0 ↔ HSIC interference actually happens.
+        for block_name, cos in cos_by_block.items():
+            if math.isnan(cos):
+                continue
+            self.log(
+                f"train_interf_cos_{block_name}",
+                float(cos),
+                on_step=False,
+                on_epoch=True,
+            )
 
     # ------------------------------------------------------------------
     # Acyclicity helper (mirrors SingleCausalForecaster)
@@ -568,6 +686,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             loss_recon = self._last_loss_components["loss_recon"]
             loss_structural = self._last_loss_components["loss_structural"]
 
+            # Diagnostic: probe L0 ↔ HSIC gradient interference on the live
+            # graph BEFORE any zero_grad / backward.  Uses autograd.grad with
+            # retain_graph=True and never touches .grad, so the dual backward
+            # below is unaffected.
+            self._maybe_log_interference(batch_idx)
+
             # Zero all gradients
             opt_recon.zero_grad()
             opt_struct.zero_grad()
@@ -599,6 +723,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
             return total_loss
         else:
             total_loss, _, _ = self._step(batch, stage="train")
+            # Diagnostic: probe interference on the live graph before Lightning
+            # runs its automatic backward on total_loss (retain_graph=True in
+            # the probe keeps the graph intact for that backward).
+            self._maybe_log_interference(batch_idx)
             return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -629,6 +757,83 @@ class AttentionSelectorForecaster(pl.LightningModule):
         else:
             return _make_optimizer(self.model.parameters())
 
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Strip BKD state-dict keys that don't exist in the current model.
+
+        When warm-starting across ANM stages whose ``batch_key_dropout``
+        configuration differs (e.g. stage 1 has BKD enabled, stage 2 has
+        ``batch_key_dropout=null``), the saved checkpoint may contain keys
+        such as::
+
+            model.attention.inner_attention.batch_key_dropout._step_count
+
+        that are absent from the freshly-constructed stage model.  Leaving
+        them in the checkpoint causes PyTorch Lightning to raise a
+        ``RuntimeError: unexpected key(s) in state_dict`` when it calls
+        ``load_state_dict(strict=True)``.
+
+        This hook removes any key whose prefix matches
+        ``*.batch_key_dropout.*`` and that is absent from the current
+        model's ``state_dict``.  All other unexpected keys are left
+        untouched so that genuine architecture mismatches still surface
+        as hard errors.
+
+        Note: the symmetric case (stage without BKD warm-starting a stage
+        with BKD) produces *missing* keys for ``batch_key_dropout.*``
+        entries.  Those are benign — PyTorch initialises missing buffers
+        from the module constructor, which is exactly what we want (the
+        step counter resets to 0 at each new stage).  However PL strict
+        loading would still reject them, so we also drop keys present in
+        the *current* model but absent from the checkpoint when they
+        belong to ``batch_key_dropout.*``.
+        """
+        if "state_dict" not in checkpoint:
+            return
+
+        current_keys = set(self.state_dict().keys())
+        ckpt_keys = set(checkpoint["state_dict"].keys())
+
+        # Keys in checkpoint that the current model doesn't have
+        unexpected = {
+            k for k in (ckpt_keys - current_keys)
+            if "batch_key_dropout" in k
+        }
+        # Keys the current model has but the checkpoint doesn't
+        # (only for batch_key_dropout — handled by popping from state_dict
+        # here so we can fill them from the constructor default below)
+        missing_bkd = {
+            k for k in (current_keys - ckpt_keys)
+            if "batch_key_dropout" in k
+        }
+
+        if unexpected:
+            for key in unexpected:
+                del checkpoint["state_dict"][key]
+            import logging
+            logging.getLogger(__name__).warning(
+                "on_load_checkpoint: removed %d unexpected batch_key_dropout "
+                "key(s) from checkpoint state_dict (BKD presence changed "
+                "between stages): %s",
+                len(unexpected),
+                sorted(unexpected),
+            )
+
+        if missing_bkd:
+            # Fill missing BKD keys from the current model so that
+            # strict loading doesn't complain about missing keys either.
+            current_sd = self.state_dict()
+            for key in missing_bkd:
+                checkpoint["state_dict"][key] = current_sd[key]
+            import logging
+            logging.getLogger(__name__).warning(
+                "on_load_checkpoint: filled %d missing batch_key_dropout "
+                "key(s) from current model (BKD absent in checkpoint, "
+                "present in current stage): %s",
+                len(missing_bkd),
+                sorted(missing_bkd),
+            )
+
     def on_fit_start(self):
         """
         ANM stage-level parameter freezing.
@@ -653,6 +858,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
             for p in self._reconstruction_params:
                 p.requires_grad_(False)
             print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
+
+        # Rebuild the interference block mapping so it reflects the current
+        # requires_grad state for this stage.
+        self._interference_blocks = None
 
     # ------------------------------------------------------------------
     # Convenience: expose split attention for post-hoc evaluation

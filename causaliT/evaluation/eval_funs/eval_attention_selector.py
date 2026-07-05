@@ -20,6 +20,7 @@ eval_attention_selector_scores(experiment, show_plots=False) -> dict
 """
 
 import json
+import traceback
 from os.path import join, exists, isdir
 from os import listdir
 
@@ -459,7 +460,16 @@ def eval_attention_selector_scores(
             continue
 
         # Extract combined attention (L_X, L_S+L_X) via batched forward pass
-        att_combined = _extract_combined_attention_from_data(forecaster, data_path)
+        # Wrapped in try/except: any forward-pass or data-loading error is caught
+        # so that dag_metrics.json is always written even if a fold fails.
+        try:
+            att_combined = _extract_combined_attention_from_data(forecaster, data_path)
+        except Exception as e:
+            print(f"    ✗ Failed to extract attention weights: {e}")
+            traceback.print_exc()
+            phi_sx_per_fold.append(None)
+            phi_xx_per_fold.append(None)
+            continue
         if att_combined is None:
             print("    ✗ Could not extract attention weights (data file missing).")
             phi_sx_per_fold.append(None)

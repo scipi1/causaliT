@@ -65,7 +65,11 @@ from causaliT.core.modules import (
     Normalization,
     MLPHead,
     OrthogonalMaskEmbedding,
+    FixedOrthonormalEmbedding,
 )
+# Imported directly from the submodule so the layer does not depend on the
+# package ``__init__`` re-export being present.
+from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
 
 
 class AttentionSelectorLayer(nn.Module):
@@ -115,7 +119,51 @@ class AttentionSelectorLayer(nn.Module):
 
             where k = d_model // (S_seq_len + X_seq_len).  The value stream
             (V, residual, MLP head) continues to use the standard ModularEmbedding.
+            Default False (original behaviour).  Mutually exclusive with
+            ``orthogonal_fixed``.
+        orthogonal_fixed: When True, replace the structural stream (Q/K)
+            embeddings for both S and X with ``FixedOrthonormalEmbedding``
+            instances.  Unlike ``orthogonal_struct_embedding`` (disjoint binary
+            blocks, so each variable lives on ``d_model // n_vars`` axis-aligned
+            dimensions with the remainder idle), this uses **dense frozen rows
+            spanning the FULL d_model space** that are still mutually orthonormal
+            (S and X share ONE frame via disjoint row slices, so all L_S + L_X
+            rows are pairwise orthogonal).  It is value-independent (identity
+            only), so the actual value must reach the output through the SVFA
+            value (V) stream.  Requires ``d_model >= S_seq_len + X_seq_len``.
+            The value stream is UNCHANGED.  Default False.  Mutually exclusive
+            with ``orthogonal_struct_embedding``.
+        orthogonal_fixed_frame_type: Frame construction for ``orthogonal_fixed``:
+            ``"random"`` (default) — QR of a Gaussian matrix, seeded from the
+            global training seed so it varies per run; ``"dct"`` — deterministic
+            DCT-II basis rows (seed-independent).
+        orthogonal_fixed_scale: Scalar norm applied to every fixed orthonormal
+            row (default 1.0).  Rescales the rows without breaking orthogonality.
+        free_query_embedding: When True, decouple the X **query** from the X
+            **key** by giving the query its own free (unconstrained) learnable
+            identity embedding (``FreeQueryEmbedding``).  Rationale: in the
+            combined attention each X_i is used BOTH as a key (offered as a
+            parent to other X_j) and as a query (selecting its own parents).
+            With a single shared embedding, updating "X_i-as-child" also
+            perturbs "X_i-as-parent", so ``X_i ← S`` and ``X_i ← X_j`` cannot be
+            learned independently.  A separate query embedding removes this
+            coupling.  Works with or without ``orthogonal_struct_embedding``:
+            the X KEY stream keeps whatever embedding is configured (orthogonal
+            or standard), only the X QUERY structural stream is overridden.
+            The value stream (V, residual, FFN, MLP head) is UNCHANGED.
             Default False (original behaviour).
+        key_projection_type: Type of the shared W_K key projection inside the
+            attention.  ``"linear"`` (default) is an unconstrained ``nn.Linear``.
+            ``"orthogonal"`` constrains W_K to an isometry (``W_K^T W_K = I``)
+            via ``OrthogonalLinear`` (Cayley parametrisation).  Because an
+            isometry preserves inner products, orthogonal raw keys (e.g. from
+            ``OrthogonalMaskEmbedding``) stay orthogonal AFTER projection:
+            ``<k_i W_K, k_j W_K> = <k_i, k_j>``.  Requires ``d_qk >= d_model``.
+            Most meaningful with ``orthogonal_struct_embedding=True`` and
+            ``n_heads=1``.
+        orthogonal_key_scale: When ``key_projection_type="orthogonal"``, whether
+            the ``OrthogonalLinear`` includes a learnable scalar scale factor
+            (default True).  Ignored for ``"linear"``.
         batch_key_dropout: Initial probability for ``BatchConsistentKeyDropout``
             applied to the combined attention weights after the inner attention
             activation.  When set, entire key-position columns are zeroed
@@ -168,8 +216,19 @@ class AttentionSelectorLayer(nn.Module):
         output_mlp_dropout: float = 0.0,
         # Multi-head semantics
         shared_dag_across_heads: bool = True,
-        # Orthogonal structural embeddings
+        # Orthogonal structural embeddings (binary-mask, disjoint blocks)
         orthogonal_struct_embedding: bool = False,
+        # Fixed dense orthonormal structural embeddings (spans full d_model,
+        # no idle dimensions; value-independent). Mutually exclusive with
+        # orthogonal_struct_embedding.
+        orthogonal_fixed: bool = False,
+        orthogonal_fixed_frame_type: str = "random",
+        orthogonal_fixed_scale: float = 1.0,
+        # Decoupled key/query embedding for X
+        free_query_embedding: bool = False,
+        # Orthogonal (isometric) key projection: W_K^T W_K = I
+        key_projection_type: str = "linear",
+        orthogonal_key_scale: bool = True,
         # Batch-consistent key dropout
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
@@ -185,6 +244,35 @@ class AttentionSelectorLayer(nn.Module):
         # inspect whether the model is operating in SVFA or standard mode.
         self.comps_embed_X = comps_embed_X
         self.orthogonal_struct_embedding = orthogonal_struct_embedding
+        self.orthogonal_fixed = orthogonal_fixed
+        self.free_query_embedding = free_query_embedding
+
+        # The two structural-orthogonality schemes both override the Q/K stream
+        # via ``orth_embed_S`` / ``orth_embed_X`` and cannot be combined.
+        if orthogonal_struct_embedding and orthogonal_fixed:
+            raise ValueError(
+                "orthogonal_struct_embedding and orthogonal_fixed are mutually "
+                "exclusive; enable at most one structural-orthogonality scheme."
+            )
+
+        # Orthogonal (isometric) key projection.  When "orthogonal", the shared
+        # W_K is constrained so that W_K^T W_K = I (Cayley parametrisation inside
+        # OrthogonalLinear).  An isometry preserves inner products, so
+        #   <k_i W_K, k_j W_K> = k_i (W_K^T W_K) k_j^T = <k_i, k_j> = 0
+        # whenever the raw keys are orthogonal (e.g. OrthogonalMaskEmbedding).
+        # This carries the embedding-level orthogonality through to the projected
+        # keys.  NOTE: an isometry from R^d requires d_qk >= d_model.
+        self.key_projection_type = key_projection_type
+        if key_projection_type not in ("linear", "orthogonal"):
+            raise ValueError(
+                f"key_projection_type='{key_projection_type}' is invalid. "
+                f"Must be one of: 'linear', 'orthogonal'."
+            )
+        if key_projection_type == "orthogonal" and d_qk < d_model:
+            raise ValueError(
+                f"key_projection_type='orthogonal' requires d_qk >= d_model to be "
+                f"an isometry (W_K^T W_K = I), got d_qk={d_qk} < d_model={d_model}."
+            )
 
         # ------------------------------------------------------------------
         # Embeddings
@@ -245,6 +333,9 @@ class AttentionSelectorLayer(nn.Module):
             key_seq_len=S_seq_len + X_seq_len,
             init_tau=init_tau,
             shared_dag_across_heads=shared_dag_across_heads,
+            # Isometric key projection (W_K^T W_K = I) when "orthogonal".
+            key_projection_type=key_projection_type,
+            orthogonal_scale=orthogonal_key_scale,
             # Batch-consistent key dropout.
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
@@ -280,15 +371,20 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
         # Orthogonal structural embeddings (optional override for Q/K stream)
         # ------------------------------------------------------------------
-        # When orthogonal_struct_embedding=True the standard nn_embedding
-        # structural role is replaced with two OrthogonalMaskEmbedding modules
-        # whose dimension partitions tile d_model without overlap:
-        #   S → dims [0,       S_seq_len * k)
-        #   X → dims [S_seq_len*k, (S_seq_len+X_seq_len)*k)
-        # where k = d_model // (S_seq_len + X_seq_len).
-        # The value stream (V, residual, FFN, MLP head) is UNCHANGED.
-        self.orth_embed_S: Optional[OrthogonalMaskEmbedding]
-        self.orth_embed_X: Optional[OrthogonalMaskEmbedding]
+        # Two mutually-exclusive schemes populate orth_embed_S / orth_embed_X:
+        #
+        #  (a) orthogonal_struct_embedding → OrthogonalMaskEmbedding: disjoint
+        #      binary blocks tiling d_model (k = d_model // n_vars dims/var; the
+        #      remainder d_model % n_vars is idle). Value-modulated.
+        #
+        #  (b) orthogonal_fixed → FixedOrthonormalEmbedding: dense frozen rows
+        #      spanning ALL d_model dims, mutually orthonormal across S and X via
+        #      a shared frame + disjoint row slices. Value-independent (identity
+        #      only); the value reaches the output through the SVFA V stream.
+        #
+        # In both cases the value stream (V, residual, FFN, MLP head) is UNCHANGED.
+        self.orth_embed_S: Optional[nn.Module]
+        self.orth_embed_X: Optional[nn.Module]
         if orthogonal_struct_embedding:
             total_vars = S_seq_len + X_seq_len
             k = d_model // total_vars
@@ -314,9 +410,58 @@ class AttentionSelectorLayer(nn.Module):
                 freeze=False,
                 device=device,
             )
+        elif orthogonal_fixed:
+            total_vars = S_seq_len + X_seq_len
+            if total_vars > d_model:
+                raise ValueError(
+                    f"orthogonal_fixed requires d_model >= S_seq_len + X_seq_len for "
+                    f"mutually orthonormal rows, got d_model={d_model} < {total_vars}."
+                )
+            # Derive the frame seed from the global RNG (set by the training
+            # seed_everything) so the frame varies across runs/seeds while both
+            # S and X instances receive the SAME seed → identical shared frame →
+            # S-rows are guaranteed orthogonal to X-rows.
+            frame_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+            self.orth_embed_S = FixedOrthonormalEmbedding(
+                num_variables=S_seq_len,
+                d_model=d_model,
+                total_variables=total_vars,
+                row_offset=0,
+                frame_type=orthogonal_fixed_frame_type,
+                seed=frame_seed,
+                scale=orthogonal_fixed_scale,
+                device=device,
+            )
+            self.orth_embed_X = FixedOrthonormalEmbedding(
+                num_variables=X_seq_len,
+                d_model=d_model,
+                total_variables=total_vars,
+                row_offset=S_seq_len,
+                frame_type=orthogonal_fixed_frame_type,
+                seed=frame_seed,
+                scale=orthogonal_fixed_scale,
+                device=device,
+            )
         else:
             self.orth_embed_S = None
             self.orth_embed_X = None
+
+        # ------------------------------------------------------------------
+        # Free query embedding (optional override for the X QUERY stream only)
+        # ------------------------------------------------------------------
+        # When free_query_embedding=True the X query gets its OWN learnable
+        # identity embedding, decoupling "X_i as child" (query) from "X_i as
+        # parent" (key).  The X KEY stream is untouched (it keeps the orthogonal
+        # or standard embedding).  The value stream is also UNCHANGED.
+        self.query_embed_X: Optional[FreeQueryEmbedding]
+        if free_query_embedding:
+            self.query_embed_X = FreeQueryEmbedding(
+                num_variables=X_seq_len,
+                d_model=d_model,
+                device=device,
+            )
+        else:
+            self.query_embed_X = None
 
         # ------------------------------------------------------------------
         # Output MLP head
@@ -458,15 +603,25 @@ class AttentionSelectorLayer(nn.Module):
         xq_struct, xq_val = _emb_drop(self.embedding_X(X=x_blanked))
 
         # ---- Orthogonal structural stream override -----------------------
-        # When orthogonal_struct_embedding=True, replace the structural (Q/K)
-        # embeddings with OrthogonalMaskEmbedding outputs.  The value stream
-        # (s_val, xk_val, xq_val) is UNCHANGED — it still comes from the
-        # standard ModularEmbedding above.
-        if self.orthogonal_struct_embedding:
+        # When orthogonal_struct_embedding OR orthogonal_fixed is enabled,
+        # replace the structural (Q/K) embeddings with the orthogonal outputs
+        # (OrthogonalMaskEmbedding or FixedOrthonormalEmbedding respectively).
+        # The value stream (s_val, xk_val, xq_val) is UNCHANGED — it still comes
+        # from the standard ModularEmbedding above.
+        if self.orthogonal_struct_embedding or self.orthogonal_fixed:
             assert self.orth_embed_S is not None and self.orth_embed_X is not None
             s_struct  = self.dropout_emb(self.orth_embed_S(source_tensor))
             xk_struct = self.dropout_emb(self.orth_embed_X(x_actual))
             xq_struct = self.dropout_emb(self.orth_embed_X(x_blanked))
+
+        # ---- Free query embedding override (X QUERY stream only) ---------
+        # When free_query_embedding=True, the X query uses its OWN learnable
+        # identity embedding, decoupling it from the X key embedding (xk_struct
+        # is left as set above — orthogonal or standard).  Only the STRUCTURAL
+        # query is replaced; the value stream (xq_val) is untouched.
+        if self.free_query_embedding:
+            assert self.query_embed_X is not None
+            xq_struct = self.dropout_emb(self.query_embed_X(x_blanked))
 
         # Q/K always use the structural embedding; V uses value embedding if SVFA.
         sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d)

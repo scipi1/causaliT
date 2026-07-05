@@ -381,8 +381,17 @@ class BatchConsistentKeyDropout(nn.Module):
         # Current effective drop probability — updated each training step.
         self.p = self.p_init
 
-        # Persistent step counter so checkpointing preserves annealing state.
-        self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
+        # Persistent step counter — only registered as a buffer (and therefore
+        # persisted in state_dict / checkpoints) when annealing is actually
+        # active.  When annealing is off, ``_step_count`` is a plain attribute
+        # so that checkpoints produced by BKD-enabled stages do not inject a
+        # ``batch_key_dropout._step_count`` key that would cause a
+        # strict state_dict mismatch when loading into a stage that has
+        # ``batch_key_dropout=None`` (i.e. no BKD module at all).
+        if self._use_annealing:
+            self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
+        else:
+            self._step_count = torch.tensor(0, dtype=torch.long)
 
         # Outputs of the most recent training forward (None in eval mode / p=0).
         self._last_key_mask: Optional[torch.Tensor] = None
