@@ -190,21 +190,40 @@ class StageEvalCallback(Callback):
         pl_module: pl.LightningModule,
         label: str,
     ) -> Dict[str, Any]:
-        """Capture DAG + score-margin diagnostics from the current model."""
+        """Capture DAG + score-margin diagnostics from the current model.
+
+        Runs *inside* the training loop (``on_train_epoch_end``).  Any eval
+        helper that flips the module into ``eval()`` and forgets to restore it
+        would corrupt the NEXT training epoch — the root cause of the one-time
+        HSIC "jump" at ``stage_start + eval_every_n_epochs`` observed for
+        HardConcreteCrossAttention (its train forward is stochastic while its
+        eval forward is a deterministic MAP gate).  We therefore snapshot the
+        training mode here and restore it in a ``finally`` block as a
+        defense-in-depth guard, in addition to the fix inside
+        ``evaluate_dag_from_model``.
+        """
         from causaliT.training.causal_initialization import evaluate_dag_from_model
 
-        dag_metrics: Dict[str, Any] = {}
+        was_training = pl_module.training
         try:
-            dag_metrics = evaluate_dag_from_model(
+            dag_metrics: Dict[str, Any] = {}
+            try:
+                dag_metrics = evaluate_dag_from_model(
+                    pl_module, self.config, self.data_dir
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"StageEvalCallback ({self.stage_name}): "
+                    f"evaluate_dag_from_model failed: {exc}"
+                )
+
+            score_margin = _compute_score_margin(
                 pl_module, self.config, self.data_dir
             )
-        except Exception as exc:
-            logger.debug(
-                f"StageEvalCallback ({self.stage_name}): "
-                f"evaluate_dag_from_model failed: {exc}"
-            )
+        finally:
+            if was_training:
+                pl_module.train()
 
-        score_margin = _compute_score_margin(pl_module, self.config, self.data_dir)
 
         result: Dict[str, Any] = {
             "stage": self.stage_name,
@@ -420,6 +439,10 @@ _ORCHESTRATOR_ONLY_KEYS = frozenset({
     "eval_every_n_epochs",
     "eval_dag",
     "batch_key_dropout_p",
+    # Cross-fit / bilevel data-split selector: which training subset this stage
+    # trains on ("recon" | "struct" | "full").  Consumed by the orchestrator to
+    # pick the per-stage train indices; not forwarded to the training config.
+    "data_split",
     # Per-stage post-training evaluation — dispatched by the orchestrator after
     # train_single_fold returns; not a training-config key.
     "evaluation",
@@ -617,6 +640,47 @@ def _find_stage_checkpoint(stage_dir: Path) -> Optional[str]:
 
 
 # =============================================================================
+# CROSS-FIT DATA SPLIT HELPER
+# =============================================================================
+
+def _partition_train_indices(
+    train_local_idx: np.ndarray,
+    ratio: float,
+    seed: int,
+) -> tuple:
+    """
+    Split ``train_local_idx`` into two disjoint subsets (recon, struct).
+
+    Deterministic given ``seed`` so reruns are reproducible.  ``ratio`` is the
+    fraction of samples assigned to the reconstruction subset; the remainder go
+    to the structure subset.  Both subsets are guaranteed non-empty.
+
+    This implements the DML / DARTS-style honest cross-fit: the reconstruction
+    regressor is fit on one subset and residual-based structural signals (HSIC)
+    are computed on the other, so residuals used for structure learning are
+    out-of-sample w.r.t. the reconstruction fit.
+
+    Args:
+        train_local_idx: 1-D array of local training indices to partition.
+        ratio:           Fraction assigned to the recon subset (0 < ratio < 1).
+        seed:            RNG seed for the deterministic permutation.
+
+    Returns:
+        (recon_idx, struct_idx): two disjoint sub-arrays of ``train_local_idx``.
+    """
+    train_local_idx = np.asarray(train_local_idx)
+    n = len(train_local_idx)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    cut = int(round(ratio * n))
+    # Keep both subsets non-empty
+    cut = max(1, min(n - 1, cut))
+    recon_idx = train_local_idx[perm[:cut]]
+    struct_idx = train_local_idx[perm[cut:]]
+    return recon_idx, struct_idx
+
+
+# =============================================================================
 # MAIN ORCHESTRATOR
 # =============================================================================
 
@@ -693,6 +757,32 @@ def anm_alternating_trainer(
     # All stages use fold 0
     train_local_idx, val_local_idx = fold_splits[0]
 
+    # -------------------------------------------------------------------------
+    # Cross-fit / bilevel data splits (computed once, shared across all stages)
+    # -------------------------------------------------------------------------
+    # Partition the training indices into two disjoint subsets so that
+    # reconstruction-dominant and structure-dominant stages can train on
+    # DIFFERENT data (DML/DARTS-style honesty: residual-HSIC is evaluated on
+    # samples the reconstruction fit never saw).  Validation stays SHARED so
+    # stage-to-stage DAG metrics remain comparable.  Each stage picks its subset
+    # via the ``data_split`` spec key ("recon" | "struct" | "full"); "full"
+    # (default) uses the entire training set = fully backward compatible.
+    data_split_ratio = float(anm_cfg.get("data_split_ratio", 0.5))
+    split_recon, split_struct = _partition_train_indices(
+        train_local_idx, data_split_ratio, seed
+    )
+    stage_splits: Dict[str, np.ndarray] = {
+        "recon": split_recon,
+        "struct": split_struct,
+        "full": train_local_idx,
+    }
+    if not cluster:
+        print(
+            f"  Cross-fit data splits (ratio={data_split_ratio}): "
+            f"recon={len(split_recon)}, struct={len(split_struct)}, "
+            f"full={len(train_local_idx)}; val shared={len(val_local_idx)}"
+        )
+
     stages_parent_dir = Path(save_dir) / "anm_stages"
     stages_parent_dir.mkdir(parents=True, exist_ok=True)
 
@@ -723,6 +813,15 @@ def anm_alternating_trainer(
         stage_name = stage_spec.get("name", f"stage_{stage_idx:02d}")
         stage_dir = stages_parent_dir / f"{stage_idx:02d}_{stage_name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
+
+        # Select this stage's training subset (cross-fit data split).
+        stage_data_split = str(stage_spec.get("data_split", "full")).lower()
+        if stage_data_split not in stage_splits:
+            raise ValueError(
+                f"ANM stage {stage_idx} ({stage_name}): invalid data_split "
+                f"{stage_data_split!r}. Expected one of {sorted(stage_splits)}."
+            )
+        stage_train_idx = stage_splits[stage_data_split]
 
         # Local epoch count from stage spec (or fall back to base config)
         stage_local_epochs: int = int(
@@ -780,7 +879,7 @@ def anm_alternating_trainer(
             model=model,
             dm=dm,
             fold=0,
-            train_local_idx=train_local_idx,
+            train_local_idx=stage_train_idx,
             val_local_idx=val_local_idx,
             test_idx=test_idx,
             train_val_idx=train_val_idx,
@@ -859,6 +958,8 @@ def anm_alternating_trainer(
         row: Dict[str, Any] = {
             "stage_idx": stage_idx,
             "stage_name": stage_name,
+            "data_split": stage_data_split,
+            "n_train_samples": int(len(stage_train_idx)),
             "checkpoint": starting_ckpt or "",
             "stage_config": stage_config_path,
         }
@@ -884,6 +985,8 @@ def anm_alternating_trainer(
         stage_summary: Dict[str, Any] = {
             "stage_idx": stage_idx,
             "stage_name": stage_name,
+            "data_split": stage_data_split,
+            "n_train_samples": int(len(stage_train_idx)),
             "global_epoch_start": cumulative_epoch_offset - stage_local_epochs,
             "global_epoch_end": cumulative_epoch_offset - 1,
             "checkpoint_mode": stage_ckpt_mode,
@@ -979,6 +1082,7 @@ def _print_stage_header(
     print(f"  BKD p:         {_fmt('batch_key_dropout_p')}")
     print(f"  freeze_struct: {stage_spec.get('freeze_structural_params', False)}")
     print(f"  freeze_recon:  {stage_spec.get('freeze_reconstruction_params', False)}")
+    print(f"  data_split:    {stage_spec.get('data_split', 'full')}")
     if stage_spec.get("use_gate_bias_annealing"):
         print(
             f"  gate_bias:     {stage_spec.get('gate_bias_start', 0.0)} → "

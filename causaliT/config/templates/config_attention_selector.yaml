@@ -248,6 +248,62 @@ training:
   use_oracle_attention: false
 
 
+# ---------------------------------------------------------------------------
+# ANM staged training (cross-fit / bilevel data splits)
+# ---------------------------------------------------------------------------
+# Consumed by ``anm_alternating_trainer`` (causaliT.training.anm_staged_trainer)
+# when this config is run via the ANM entry point.  A standard single-run
+# trainer ignores this block, so it is safe to keep in the template.
+#
+# Cross-fit rationale (Double ML / DARTS style "honesty"):
+#   The reconstruction map f and the causal structure are trained on DISJOINT
+#   subsets of the training data.  The residual-independence signal (HSIC) that
+#   drives structure learning is only a valid independence test if residuals are
+#   OUT-OF-SAMPLE w.r.t. the reconstruction fit — otherwise f can memorise the
+#   very samples used to judge independence and bias edge scores toward false
+#   independence.  ``data_split_ratio`` sets the fraction assigned to the
+#   ``recon`` subset (the rest go to ``struct``); validation stays shared.
+#
+# Per-stage key ``data_split``:  "recon" | "struct" | "full"
+#   recon  — reconstruction-warmup stage trains on the recon subset.
+#   struct — structure stage trains (and measures HSIC) on the held-out subset.
+#   full   — (default) use the entire training set = classic joint behaviour.
+anm_training:
+  starting_checkpoint: null      # optional warm-start before stage 0
+  data_split_ratio: 0.5          # fraction of train samples in the "recon" subset
+
+  stages:
+    # Stage 1 — RECON WARMUP: freeze structure (Q/K + gates), fit only V/FFN/MLP
+    #           on the recon subset.
+    - name: recon_warmup
+      max_epochs: ${experiment.max_epochs}
+      lambda_hsic: 0.0
+      lambda_recon: 1.0
+      freeze_structural_params: true
+      freeze_reconstruction_params: false
+      data_split: recon
+      eval_every_n_epochs: 0
+      eval_dag: true
+      evaluation:
+        functions: []
+
+    # Stage 2 — STRUCTURAL LEARNING: freeze reconstruction, let HSIC drive the
+    #           structure on the held-out "struct" subset (out-of-sample residuals).
+    - name: struct_phase
+      max_epochs: ${experiment.max_epochs}
+      lambda_hsic: 1.0
+      lambda_recon: 0.0
+      freeze_structural_params: false
+      freeze_reconstruction_params: true
+      data_split: struct
+      eval_every_n_epochs: 0
+      eval_dag: true
+      evaluation:
+        functions:
+          - eval_train_metrics
+          - eval_attention_selector_scores
+
+
 data:
   dataset: "scm1_continuous"
   filename_input: "ds.npz"

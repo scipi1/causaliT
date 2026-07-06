@@ -189,9 +189,44 @@ def evaluate_dag_from_model(
 
     metrics = {}
 
+    # Snapshot the current training mode so we can restore it on exit.  This
+    # function is frequently called *inside* the training loop (e.g. by
+    # StageEvalCallback every eval_every_n_epochs).  Leaving the model in
+    # eval() would corrupt the NEXT training epoch — catastrophically so for
+    # stochastic-at-train / deterministic-at-eval modules such as
+    # HardConcreteCrossAttention, whose forward pass differs between modes.
+    # (This was the cause of the one-time HSIC "jump" at stage_start + cadence.)
+    was_training = model.training
     model.eval()
 
+    try:
+        return _evaluate_dag_from_model_impl(
+            model, config, data_dir, metrics
+        )
+    finally:
+        if was_training:
+            model.train()
+
+
+def _evaluate_dag_from_model_impl(
+    model: "pl.LightningModule",
+    config: dict,
+    data_dir: str,
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Body of :func:`evaluate_dag_from_model` (assumes model already in eval).
+
+    Split out so the public entry point can guarantee the model's training
+    mode is restored via try/finally regardless of how this body returns or
+    raises.
+    """
+    from causaliT.evaluation.eval_funs.eval_lib import (
+        extract_phi_from_model,
+        get_architecture_type,
+    )
+
     # Reuse the proven extraction from eval_lib (handles all architectures).
+
     # extract_phi_from_model uses get_dag_probabilities() internally,
     # returning numpy arrays already in [0, 1].
     # NOTE: This requires that internal attention state has been populated

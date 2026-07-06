@@ -3,3 +3,8 @@
 /experiments
 /notebooks/eval
 /logs
+
+# Python / pytest auto-generated artifacts
+.pytest_cache/
+__pycache__/
+*.egg-info/
