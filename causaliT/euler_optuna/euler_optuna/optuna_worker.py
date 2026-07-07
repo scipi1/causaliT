@@ -32,11 +32,14 @@ from omegaconf import OmegaConf
 
 # ── causaliT imports ──────────────────────────────────────────────────────────
 from causaliT.euler_optuna.euler_optuna.optuna_opt import objective_extended
+from causaliT.euler_optuna.euler_optuna import cli as causalit_cli
 from causaliT.euler_optuna.euler_optuna.cli import (
     sample_params_for_optuna,
     train_function_for_optuna,
     get_metrics_for_optuna,
+    load_protocol_extension,
 )
+
 
 
 # =============================================================================
@@ -109,7 +112,17 @@ def main(
     base_config = OmegaConf.load(join(home_exp_dir, config_files[0]))
     print(f"[Worker {task_id}] Loaded config: {config_files[0]}")
 
+    # ── Resolve capacity-search protocol (config-driven) ──────────────────────
+    # Read the `protocol:` key from optuna*.yaml and set the module-level
+    # ACTIVE_PROTOCOL_EXTENSION in THIS worker process, so train_function_for_optuna
+    # applies the same constant-score override the sequential driver would.
+    causalit_cli.ACTIVE_PROTOCOL_EXTENSION, protocol_name = load_protocol_extension(
+        home_exp_dir
+    )
+    print(f"[Worker {task_id}] Protocol ext.: {protocol_name}")
+
     # ── Load study ────────────────────────────────────────────────────────────
+
     storage = f"sqlite:///{join(exp_dir, 'optuna', 'study.db')}?timeout=60"
     study = optuna.load_study(study_name=study_name, storage=storage)
     print(f"[Worker {task_id}] Loaded study ({len(study.trials)} trials completed)")

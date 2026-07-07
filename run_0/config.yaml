@@ -1,0 +1,180 @@
+experiment:
+  d_model_set: 96
+  n_heads: 2
+  d_ff_mult: 2.0
+  d_qk_mult: 1.0
+  d_ff: 192
+  d_qk: 96
+  dropout: 0.0
+  lr: 0.001
+  batch_size: 2048
+  max_epochs: 200
+  attention_type: CausalCrossAttention
+  init_tau: 3.0
+  shared_dag_across_heads: true
+  comps_embed: svfa
+  use_gradient_routing: false
+  orthogonal_struct_embedding: true
+  orthogonal_fixed: false
+  orthogonal_fixed_frame_type: random
+  orthogonal_fixed_scale: 1.0
+  key_projection_type: orthogonal
+  orthogonal_key_scale: false
+  free_query_embedding: true
+model:
+  model_object: AttentionSelectorLayer
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+  kwargs:
+    model: ${model.model_object}
+    ds_embed_S:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+      - idx: ${data.feature_indices.value}
+        embed: linear
+        label: value
+        role: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: ${model.embed_dim.val_emb_hidden}
+      - idx: ${data.feature_indices.variable}
+        embed: nn_embedding
+        label: variable
+        role: structure
+        kwargs:
+          num_embeddings: ${data.num_embeddings_S}
+          embedding_dim: ${model.embed_dim.var_emb_hidden}
+          padding_idx: 0
+          sparse: false
+          max_norm: 1
+      - idx: ${data.feature_indices.value}
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    comps_embed_S: ${experiment.comps_embed}
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+      - idx: ${data.feature_indices.value}
+        embed: linear
+        label: value
+        role: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: ${model.embed_dim.val_emb_hidden}
+      - idx: ${data.feature_indices.variable}
+        embed: nn_embedding
+        label: variable
+        role: structure
+        kwargs:
+          num_embeddings: ${data.num_embeddings_X}
+          embedding_dim: ${model.embed_dim.var_emb_hidden}
+          padding_idx: 0
+          sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+          max_norm: 1
+      - idx: ${data.feature_indices.value}
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    comps_embed_X: ${experiment.comps_embed}
+    attention_type: ${experiment.attention_type}
+    n_heads: ${experiment.n_heads}
+    init_tau: ${experiment.init_tau}
+    shared_dag_across_heads: ${experiment.shared_dag_across_heads}
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dropout_qkv: ${experiment.dropout}
+    attention_dropout: ${experiment.dropout}
+    activation: gelu
+    norm: layer
+    use_final_norm: true
+    device: cuda
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: relu
+    output_mlp_dropout: 0.0
+    orthogonal_fixed: ${experiment.orthogonal_fixed}
+    orthogonal_fixed_frame_type: ${experiment.orthogonal_fixed_frame_type}
+    orthogonal_fixed_scale: ${experiment.orthogonal_fixed_scale}
+    key_projection_type: ${experiment.key_projection_type}
+    orthogonal_key_scale: ${experiment.orthogonal_key_scale}
+    free_query_embedding: ${experiment.free_query_embedding}
+    optuna_protocol: 1.0
+    batch_key_dropout: 0.5
+    batch_key_dropout_p_final: 0.5
+    batch_key_dropout_annealing_batches: null
+training:
+  optimizer: adamw
+  lr: 0.0009840083080050548
+  weight_decay: 0.01
+  use_scheduler: false
+  loss_fn: mse
+  lambda_recon: 1.0
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 1
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+  lambda_score_sparse: 0.0
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false
+  hsic_kernel_source: rbf
+  hsic_mode: biased
+  nhsic_epsilon: 0.01
+  lambda_group_l1: 0.0
+  lambda_l0: 0.0
+  use_gradient_routing: false
+  use_oracle_attention: false
+  lambda_hsic_cross: 0.0
+  lambda_hsic_self: 0.0
+  lambda_self_score_sparse: 0.0
+  lambda_cross_score_sparse: 0.0
+  lambda_noise_prior: 0.0
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  early_stopping:
+    enabled: true
+    monitor: val_x_mae
+    patience: 30
+    min_delta: 1.0e-05
+    mode: min
+data:
+  dataset: scm3_continuous
+  filename_input: ds.npz
+  train_file: ds_train.npz
+  test_file: ds_test.npz
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+  feature_indices:
+    value: null
+    variable: null
+evaluation:
+  functions: []
+special:
+  mode: []
+staged_training:
+  use_calibration: false
+  use_causal_init: false
+  use_score_sparsity_cv: false

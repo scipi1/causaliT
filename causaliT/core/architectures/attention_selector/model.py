@@ -60,6 +60,7 @@ from causaliT.core.modules import (
     SigmoidCrossAttention,
     ScaledDotAttention,
     HardConcreteCrossAttention,
+    GatedCrossAttention,
     AttentionLayer,
     ModularEmbedding,
     Normalization,
@@ -233,7 +234,18 @@ class AttentionSelectorLayer(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        # Optuna capacity-search protocol (constant-score override). See
+        # CausalCrossAttention: None disables; 0 = residual-only floor;
+        # 1 = uniform mixing (pair with heavy batch_key_dropout).
+        optuna_protocol: Optional[float] = None,
+        # GatedCrossAttention (attention_type="GatedCrossAttention"):
+        # disentangled structure-gate x reconstruction-gain. See gain_stream_source.
+        gain_stream_source: str = "separate",
+        gain_tau: float = 1.0,
+        init_gamma: float = -0.1,
+        init_zeta: float = 1.1,
     ):
+
         super().__init__()
 
         self.model_name = model
@@ -246,6 +258,24 @@ class AttentionSelectorLayer(nn.Module):
         self.orthogonal_struct_embedding = orthogonal_struct_embedding
         self.orthogonal_fixed = orthogonal_fixed
         self.free_query_embedding = free_query_embedding
+        self.is_gated = (attention_type == "GatedCrossAttention")
+        self.gain_stream_source = gain_stream_source
+        if gain_stream_source not in ("separate", "shared"):
+            raise ValueError(
+                f"gain_stream_source='{gain_stream_source}' is invalid. "
+                f"Must be one of: 'separate', 'shared'."
+            )
+        # 'shared' mode reuses the structural Q/K inputs for the gain stream.
+        # That is only safe when those inputs carry NO structural gradient
+        # (frozen fixed orthonormal frame); otherwise the reconstruction loss
+        # would leak into the structure via the shared embedding.
+        if self.is_gated and gain_stream_source == "shared" and not orthogonal_fixed:
+            raise ValueError(
+                "gain_stream_source='shared' requires orthogonal_fixed=True so "
+                "the shared struct embeddings carry no structural gradient. "
+                "Use gain_stream_source='separate' otherwise."
+            )
+
 
         # The two structural-orthogonality schemes both override the Q/K stream
         # via ``orth_embed_S`` / ``orth_embed_X`` and cannot be combined.
@@ -309,7 +339,10 @@ class AttentionSelectorLayer(nn.Module):
             "ScaledDotAttention": ScaledDotAttention,
             # Hard Concrete L0 gates (Louizos et al., ICLR 2018).
             "HardConcreteCrossAttention": HardConcreteCrossAttention,
+            # Disentangled structure-gate x reconstruction-gain (anti-run_0).
+            "GatedCrossAttention": GatedCrossAttention,
         }
+
         if attention_type not in att_cls_map:
             raise ValueError(
                 f"attention_type='{attention_type}' is not supported for "
@@ -340,7 +373,16 @@ class AttentionSelectorLayer(nn.Module):
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
             batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+            # Optuna capacity-search protocol (constant-score override; only
+            # honoured by CausalCrossAttention, ignored by other attention types).
+            optuna_protocol=optuna_protocol,
+            # HardConcrete / GatedCrossAttention stretch params + gain temperature.
+            init_gamma=init_gamma,
+            init_zeta=init_zeta,
+            gain_tau=gain_tau,
         )
+
+
 
         # ------------------------------------------------------------------
         # Static combined hard mask: (L_X, L_S + L_X)
@@ -464,8 +506,38 @@ class AttentionSelectorLayer(nn.Module):
             self.query_embed_X = None
 
         # ------------------------------------------------------------------
+        # Gain-stream embeddings (GatedCrossAttention, gain_stream_source="separate")
+        # ------------------------------------------------------------------
+        # The reconstruction-gain g_ij needs its OWN query/key identity signal,
+        # fully decoupled from the structural gate's query/key.  We give each of
+        # the three roles (X-as-child query, S-as-parent key, X-as-parent key) a
+        # dedicated free learnable identity table.  The names start with "gain_"
+        # and do NOT contain "query_projection"/"key_projection"/"query_embed_X",
+        # so the gradient router classifies them as RECONSTRUCTION parameters.
+        # In "shared" mode the gain stream reuses the (frozen) structural inputs
+        # and no separate tables are created.
+        self.gain_q_embed_X: Optional[FreeQueryEmbedding]
+        self.gain_k_embed_S: Optional[FreeQueryEmbedding]
+        self.gain_k_embed_X: Optional[FreeQueryEmbedding]
+        if self.is_gated and self.gain_stream_source == "separate":
+            self.gain_q_embed_X = FreeQueryEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
+            self.gain_k_embed_S = FreeQueryEmbedding(
+                num_variables=S_seq_len, d_model=d_model, device=device,
+            )
+            self.gain_k_embed_X = FreeQueryEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
+        else:
+            self.gain_q_embed_X = None
+            self.gain_k_embed_S = None
+            self.gain_k_embed_X = None
+
+        # ------------------------------------------------------------------
         # Output MLP head
         # ------------------------------------------------------------------
+
         mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
         self.forecaster = MLPHead(
             d_model=d_model,
@@ -645,6 +717,21 @@ class AttentionSelectorLayer(nn.Module):
         else:
             hard_mask = self.combined_mask
 
+        # ---- Reconstruction-gain stream (GatedCrossAttention only) -------
+        # Build the gain query/key identity signals.  In "separate" mode they
+        # come from their OWN free identity tables (reconstruction-routed);
+        # in "shared" mode they reuse the (frozen) structural embeddings, so
+        # gain_query/gain_key are left as None and the AttentionLayer falls
+        # back to the structural q/k inputs internally.
+        gain_query = None
+        gain_key = None
+        if self.is_gated and self.gain_stream_source == "separate":
+            assert self.gain_q_embed_X is not None
+            gain_query = self.dropout_emb(self.gain_q_embed_X(x_blanked))
+            gk_S = self.dropout_emb(self.gain_k_embed_S(source_tensor))
+            gk_X = self.dropout_emb(self.gain_k_embed_X(x_actual))
+            gain_key = torch.cat([gk_S, gk_X], dim=1)       # (B, L_S+L_X, d)
+
         attn_out, attention_weights, _aux = self.attention(
             query=x_q_emb,
             key=sx_keys,
@@ -655,6 +742,8 @@ class AttentionSelectorLayer(nn.Module):
             causal_mask=False,
             hard_mask=hard_mask,
             oracle=oracle,
+            gain_query=gain_query,
+            gain_key=gain_key,
         )
         # ---- Residual + Norm 1 -------------------------------------------
         # SVFA mode: the attention output (derived from the value V stream)

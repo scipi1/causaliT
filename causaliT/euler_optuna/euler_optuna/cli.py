@@ -187,9 +187,129 @@ OPTUNA_RECONSTRUCTION_PROTOCOL = {
 }
 
 
-def apply_optuna_reconstruction_protocol(config, save_dir=None):
+#: -----------------------------------------------------------------------------
+#: PROTOCOL EXTENSIONS (constant-score capacity search)
+#: -----------------------------------------------------------------------------
+#: The base ``OPTUNA_RECONSTRUCTION_PROTOCOL`` completely severs the structural
+#: (query/key) stream by zeroing every structural lambda AND disabling gradient
+#: routing.  With the newer architectures (free query embedding, orthogonal
+#: embeddings, orthogonal key projection, HardConcrete attention) the learned
+#: QK^T attention weights still fluctuate freely during a search trial, so the
+#: measured reconstruction floor is polluted by an *untrained, noisy* selection
+#: matrix.  The result is the very poor first-phase fit observed in the ARCH
+#: studies.
+#:
+#: These extensions REPLACE the learned attention weights with a CONSTANT on
+#: every allowed edge (via ``model.kwargs.optuna_protocol``; see
+#: ``CausalCrossAttention``).  This makes the value/reconstruction capacity
+#: measurable independently of an untrained structure — mimicking the
+#: frozen-structure warmup phase — so ``d_model_set`` can be tuned honestly.
+#:
+#:   floor_residual_v1  → optuna_protocol=0.0
+#:       All allowed edges receive weight 0 → the value stream contributes
+#:       nothing; only the query residual / FFN / MLP-head reconstruct X.
+#:       Measures the *residual-only* floor (a strict lower bound on capacity).
+#:
+#:   regime_uniform_v1  → optuna_protocol=1.0 + heavy batch_key_dropout=0.5
+#:       All allowed edges receive weight 1 (uniform mixing of every candidate
+#:       parent).  Because uniform mixing is selection-INSENSITIVE, a heavy
+#:       batch-consistent key dropout (p=0.5, non-annealed) forces the value
+#:       stream to reconstruct from random *subsets* of parents, which is the
+#:       regime the downstream sparse structure will operate in.  This is the
+#:       recommended profile for choosing the embedding dimension.
+#:
+#: NOTE: ``optuna_protocol`` is honoured by ``CausalCrossAttention`` (the
+#: AttentionSelectorLayer default) and by ``GatedCrossAttention``.  For
+#: ``GatedCrossAttention`` the override is GATE-ONLY: it freezes the
+#: Hard-Concrete STRUCTURE gate ``z`` at the constant (0/1) while the
+#: bounded-sigmoid RECONSTRUCTION gain ``g`` stays learnable — so the capacity
+#: search measures the true gain+value reconstruction pathway.  For all other
+#: attention types the flag is silently ignored, so these extensions have no
+#: effect there and the base protocol behaviour is retained.
+
+OPTUNA_PROTOCOL_EXTENSIONS = {
+    "none": None,
+    "floor_residual_v1": {
+        "protocol_name": "optuna_floor_residual_v1",
+        "description": (
+            "Constant-score capacity search: the learned QK^T attention is "
+            "replaced by 0 on every allowed edge, severing the value stream so "
+            "only the query residual/FFN/MLP-head reconstruct X. Measures the "
+            "residual-only reconstruction floor (strict lower bound)."
+        ),
+        "overrides": {
+            "model.kwargs.optuna_protocol": 0.0,
+        },
+    },
+    "regime_uniform_v1": {
+        "protocol_name": "optuna_regime_uniform_v1",
+        "description": (
+            "Constant-score capacity search: the learned QK^T attention is "
+            "replaced by 1 on every allowed edge (uniform mixing of all "
+            "candidate parents), paired with heavy non-annealed batch-consistent "
+            "key dropout (p=0.5) so the value stream must reconstruct X from "
+            "random subsets of parents. This is the recommended profile for "
+            "tuning the embedding dimension because it measures value-stream "
+            "capacity under the sparse-selection regime the model will face "
+            "downstream, without relying on an untrained structure."
+        ),
+        "overrides": {
+            "model.kwargs.optuna_protocol": 1.0,
+            "model.kwargs.batch_key_dropout": 0.5,
+            "model.kwargs.batch_key_dropout_p_final": 0.5,
+            "model.kwargs.batch_key_dropout_annealing_batches": None,
+        },
+    },
+}
+
+#: Module-level variable — set from the ``protocol:`` key of the experiment's
+#: ``optuna*.yaml`` (via ``load_protocol_extension``) before optimisation
+#: starts.  Holds the selected extension dict (or None).  Both the sequential
+#: driver (``paramsopt``) and each parallel SLURM worker set this in their own
+#: process, so the constant-score override applies identically in every mode.
+ACTIVE_PROTOCOL_EXTENSION = None
+
+
+def load_protocol_extension(home_exp_dir):
+    """
+    Resolve the capacity-search protocol extension for an experiment.
+
+    Reads the ``protocol:`` key from the single ``optuna*.yaml`` settings file
+    in ``home_exp_dir``.  This is the single source of truth so that BOTH the
+    sequential driver and every parallel SLURM worker (which each load the
+    settings fresh from disk) apply the same extension automatically — no CLI
+    flag required.
+
+    Args:
+        home_exp_dir: Directory containing ``optuna*.yaml`` (and ``config*.yaml``).
+
+    Returns:
+        Tuple ``(extension_dict_or_None, protocol_name)``.
+
+    Raises:
+        ValueError: If ``protocol`` names an unknown extension.
+    """
+    name = "none"
+    optuna_files = [
+        f for f in os.listdir(home_exp_dir) if re.match(r"optuna.*\.yaml", f)
+    ]
+    if len(optuna_files) == 1:
+        settings = OmegaConf.load(join(home_exp_dir, optuna_files[0]))
+        name = settings.get("protocol", "none") or "none"
+
+    if name not in OPTUNA_PROTOCOL_EXTENSIONS:
+        raise ValueError(
+            f"Unknown protocol '{name}' in optuna settings. "
+            f"Valid options: {list(OPTUNA_PROTOCOL_EXTENSIONS.keys())}"
+        )
+    return OPTUNA_PROTOCOL_EXTENSIONS[name], name
+
+
+
+def apply_optuna_reconstruction_protocol(config, save_dir=None, protocol_extension=None):
     """
     Apply the standard reconstruction protocol overrides to a trial config.
+
 
     Ensures every trial runs under identical fair conditions:
       - k_fold=1 (single 80/20 split, ~5x faster)
@@ -201,9 +321,16 @@ def apply_optuna_reconstruction_protocol(config, save_dir=None):
     If ``save_dir`` is provided the protocol dict is written to
     ``save_dir/optuna_protocol.json`` for per-trial auditability.
 
+    When ``protocol_extension`` is provided (one of the
+    ``OPTUNA_PROTOCOL_EXTENSIONS`` dicts, or None), its overrides are applied
+    AFTER the base protocol so they take precedence (e.g. the constant-score
+    ``model.kwargs.optuna_protocol`` flag and heavy batch_key_dropout).
+
     Args:
-        config:   OmegaConf config (already has sampled params applied).
-        save_dir: Optional path to write ``optuna_protocol.json``.
+        config:             OmegaConf config (already has sampled params applied).
+        save_dir:           Optional path to write ``optuna_protocol.json``.
+        protocol_extension: Optional extension dict from
+                            ``OPTUNA_PROTOCOL_EXTENSIONS`` (or None).
 
     Returns:
         Modified OmegaConf config (struct mode disabled, overrides applied).
@@ -219,14 +346,27 @@ def apply_optuna_reconstruction_protocol(config, save_dir=None):
             # simply not relevant for that model.
             pass
 
+    # Apply the constant-score extension overrides (if any) on top of the base
+    # protocol so they win where keys overlap.
+    if protocol_extension is not None:
+        for dotted_key, value in protocol_extension["overrides"].items():
+            try:
+                OmegaConf.update(config, dotted_key, value, merge=True)
+            except Exception:
+                pass
+
     if save_dir is not None:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         protocol_path = save_dir / "optuna_protocol.json"
+        payload = dict(OPTUNA_RECONSTRUCTION_PROTOCOL)
+        if protocol_extension is not None:
+            payload = {**payload, "protocol_extension": protocol_extension}
         with open(protocol_path, "w") as f:
-            json.dump(OPTUNA_RECONSTRUCTION_PROTOCOL, f, indent=2)
+            json.dump(payload, f, indent=2)
 
     return config
+
 
 
 # =============================================================================
@@ -345,8 +485,12 @@ def AttentionSelector_sample_params(trial):
     Config keys sampled:
       - d_model_set  : embedding / model dimension
       - n_heads      : attention heads (categorical from {1, 2, 4})
-      - dropout      : dropout rate
       - training.lr  : learning rate
+
+    Note: ``dropout`` is intentionally NOT sampled for this architecture — it is
+    fixed at 0.0 in the config.  The constant-score capacity protocol already
+    regularises the value stream via heavy batch_key_dropout, and pure
+    reconstruction capacity is best measured without additional dropout noise.
 
     Note on n_heads:
       When comps_embed is "svfa" and n_heads=1, the SVFA path degrades
@@ -357,9 +501,9 @@ def AttentionSelector_sample_params(trial):
     return {
         "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
         "experiment.n_heads":     trial.suggest_categorical("n_heads", N_HEADS_CHOICES),
-        "experiment.dropout":     trial.suggest_float("dropout",     **SAMPLING_BOUNDS["dropout"]),
         "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
     }
+
 
 
 # =============================================================================
@@ -444,8 +588,10 @@ def train_function_for_optuna(
     #    inject early stopping, disable staged training.
     #    Also writes optuna_protocol.json to save_dir.
     config_updated = apply_optuna_reconstruction_protocol(
-        config_updated, save_dir=save_dir
+        config_updated, save_dir=save_dir,
+        protocol_extension=ACTIVE_PROTOCOL_EXTENSION,
     )
+
 
     # 3. Re-save the trial config so the on-disk config.yaml matches what
     #    trainer() actually received (sampled params + protocol overrides).
@@ -535,7 +681,9 @@ def cli():
 @click.option("--sampling_profile", default="baseline",
               type=click.Choice(["baseline"]),
               help="Sampling bounds profile (default: baseline)")
+
 # ── Parallel execution (only with --mode resume --parallel) ──────────────────
+
 @click.option("--parallel",          default=False, is_flag=True,
               help="Use SLURM job arrays for parallel execution (requires --cluster)")
 @click.option("--n_trials",          type=int, default=50,
@@ -553,6 +701,8 @@ def paramsopt(
     optimization_metric, optimization_direction, sampling_profile,
     parallel, n_trials, max_concurrent_jobs, walltime, gpu_type, mem_per_cpu,
 ):
+
+
     """
     Hyperparameter optimisation for causaliT causal transformer models.
 
@@ -596,6 +746,7 @@ def paramsopt(
     print(f"Sampling profile : {sampling_profile}")
     print(f"Metric           : {optimization_metric} ({optimization_direction})")
 
+
     # ── Directories ───────────────────────────────────────────────────────────
     if scratch_path is None:
         exp_dir      = str(ROOT_DIR / "experiments" / exp_id)
@@ -611,6 +762,16 @@ def paramsopt(
 
     print(f"Experiment dir   : {exp_dir}")
     print(f"Data dir         : {data_dir}")
+
+    # ── Constant-score protocol extension (config-driven) ─────────────────────
+    # Read from the `protocol:` key of the experiment's optuna*.yaml so the
+    # SAME extension is applied in sequential AND parallel modes.  In parallel
+    # mode the SLURM worker independently re-reads this file, so no CLI flag is
+    # needed and there is no risk of the driver/worker desyncing.
+    global ACTIVE_PROTOCOL_EXTENSION
+    ACTIVE_PROTOCOL_EXTENSION, protocol_name = load_protocol_extension(home_exp_dir)
+    print(f"Protocol ext.    : {protocol_name}")
+
 
     # ── Load base config ──────────────────────────────────────────────────────
     pattern = re.compile(r"config.*\.yaml")

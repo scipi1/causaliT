@@ -1,0 +1,180 @@
+experiment:
+  d_model_set: 96
+  n_heads: 2
+  d_ff_mult: 2.0
+  d_qk_mult: 1.0
+  d_ff: 192
+  d_qk: 96
+  dropout: 0.0
+  lr: 0.001
+  batch_size: 2048
+  max_epochs: 200
+  attention_type: CausalCrossAttention
+  init_tau: 3.0
+  shared_dag_across_heads: true
+  comps_embed: svfa
+  use_gradient_routing: false
+  orthogonal_struct_embedding: true
+  orthogonal_fixed: false
+  orthogonal_fixed_frame_type: random
+  orthogonal_fixed_scale: 1.0
+  key_projection_type: orthogonal
+  orthogonal_key_scale: false
+  free_query_embedding: true
+model:
+  model_object: AttentionSelectorLayer
+  embed_dim:
+    d_model_set: 96
+    val_emb_hidden: 96
+    var_emb_hidden: 96
+  kwargs:
+    model: AttentionSelectorLayer
+    ds_embed_S:
+      setting:
+        d_model: 96
+        sparse_grad: false
+      modules:
+      - idx: 0
+        embed: linear
+        label: value
+        role: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: 96
+      - idx: 1
+        embed: nn_embedding
+        label: variable
+        role: structure
+        kwargs:
+          num_embeddings: 6
+          embedding_dim: 96
+          padding_idx: 0
+          sparse: false
+          max_norm: 1
+      - idx: 0
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    comps_embed_S: svfa
+    ds_embed_X:
+      setting:
+        d_model: 96
+        sparse_grad: false
+      modules:
+      - idx: 0
+        embed: linear
+        label: value
+        role: value
+        kwargs:
+          input_dim: 1
+          embedding_dim: 96
+      - idx: 1
+        embed: nn_embedding
+        label: variable
+        role: structure
+        kwargs:
+          num_embeddings: 6
+          embedding_dim: 96
+          padding_idx: 0
+          sparse: false
+          max_norm: 1
+      - idx: 0
+        embed: mask
+        label: value_missing
+        kwargs: {}
+    comps_embed_X: svfa
+    attention_type: CausalCrossAttention
+    n_heads: 2
+    init_tau: 3.0
+    shared_dag_across_heads: true
+    dropout_emb: 0.0
+    dropout_attn_out: 0.0
+    dropout_ff: 0.0
+    dropout_qkv: 0.0
+    attention_dropout: 0.0
+    activation: gelu
+    norm: layer
+    use_final_norm: true
+    device: cuda
+    out_dim: 1
+    d_ff: 192
+    d_model: 96
+    d_qk: 96
+    S_seq_len: 5
+    X_seq_len: 5
+    output_mlp_layers: 1
+    output_mlp_hidden: 192
+    output_mlp_activation: relu
+    output_mlp_dropout: 0.0
+    orthogonal_fixed: false
+    orthogonal_fixed_frame_type: random
+    orthogonal_fixed_scale: 1.0
+    key_projection_type: orthogonal
+    orthogonal_key_scale: false
+    free_query_embedding: true
+    optuna_protocol: 1.0
+    batch_key_dropout: 0.5
+    batch_key_dropout_p_final: 0.5
+    batch_key_dropout_annealing_batches: null
+training:
+  optimizer: adamw
+  lr: 0.0009840083080050548
+  weight_decay: 0.01
+  use_scheduler: false
+  loss_fn: mse
+  lambda_recon: 1.0
+  batch_size: 2048
+  max_epochs: 200
+  k_fold: 1
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+  lambda_score_sparse: 0.0
+  lambda_hsic: 0.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: false
+  hsic_kernel_source: rbf
+  hsic_mode: biased
+  nhsic_epsilon: 0.01
+  lambda_group_l1: 0.0
+  lambda_l0: 0.0
+  use_gradient_routing: false
+  use_oracle_attention: false
+  lambda_hsic_cross: 0.0
+  lambda_hsic_self: 0.0
+  lambda_self_score_sparse: 0.0
+  lambda_cross_score_sparse: 0.0
+  lambda_noise_prior: 0.0
+  lambda_sparse: 0.0
+  lambda_sparse_cross: 0.0
+  early_stopping:
+    enabled: true
+    monitor: val_x_mae
+    patience: 30
+    min_delta: 1.0e-05
+    mode: min
+data:
+  dataset: scm3_continuous
+  filename_input: ds.npz
+  train_file: ds_train.npz
+  test_file: ds_test.npz
+  val_idx: 0
+  test_ds_ixd: null
+  max_data_size: null
+  S_seq_len: 5
+  X_seq_len: 5
+  Y_seq_len: 0
+  num_embeddings_S: 6
+  num_embeddings_X: 6
+  num_embeddings_Y: 0
+  num_embeddings_shared: 11
+  feature_indices:
+    value: 0
+    variable: 1
+evaluation:
+  functions: []
+special:
+  mode: []
+staged_training:
+  use_calibration: false
+  use_causal_init: false
+  use_score_sparsity_cv: false

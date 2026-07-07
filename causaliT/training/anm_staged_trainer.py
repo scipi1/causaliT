@@ -662,13 +662,25 @@ def _partition_train_indices(
 
     Args:
         train_local_idx: 1-D array of local training indices to partition.
-        ratio:           Fraction assigned to the recon subset (0 < ratio < 1).
+        ratio:           Fraction assigned to the recon subset.  Values in the
+                         open interval (0, 1) produce a genuine disjoint split;
+                         values <= 0 or >= 1 deactivate cross-fitting (both
+                         subsets = the full training set).
         seed:            RNG seed for the deterministic permutation.
 
     Returns:
         (recon_idx, struct_idx): two disjoint sub-arrays of ``train_local_idx``.
     """
     train_local_idx = np.asarray(train_local_idx)
+
+    # --- Cross-fit deactivation: ratio outside (0, 1) -> use full set for both ---
+    # A ratio of exactly 0 or 1 (or out-of-range) is not a valid disjoint split;
+    # treat it as an explicit "turn cross-fitting off" signal and return the full
+    # training set for both subsets (identical to every stage using
+    # ``data_split: full``).
+    if not (0.0 < ratio < 1.0):
+        return train_local_idx, train_local_idx
+
     n = len(train_local_idx)
     rng = np.random.default_rng(seed)
     perm = rng.permutation(n)

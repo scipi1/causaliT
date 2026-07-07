@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import numpy as np
 from causaliT.core.modules.extra_layers import UniformAttentionMask, BatchConsistentKeyDropout
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
+from causaliT.core.modules.gated_cross_attention import GatedCrossAttention
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List, Optional
 
@@ -82,6 +83,7 @@ class CausalCrossAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        optuna_protocol: Optional[float] = None,
     ):
         super(CausalCrossAttention, self).__init__()
 
@@ -95,6 +97,24 @@ class CausalCrossAttention(nn.Module):
 
         # Constant activation temperature (non-learnable, not annealed).
         self.tau = float(init_tau)
+
+        # --- Optuna capacity-search protocol (constant-score override) --------
+        # When set (``0`` or ``1``), the learned QK^T attention weights are
+        # REPLACED by this constant on every allowed edge, in BOTH train and
+        # eval.  This severs the query/key (structural) stream from the loss so
+        # the reconstruction capacity of the value stream can be measured
+        # independently of structure learning — mimicking the frozen-structure
+        # warmup phase:
+        #   optuna_protocol=0 → residual-only floor  (no variable mixing)
+        #   optuna_protocol=1 → uniform mixing        (selection-insensitive;
+        #                        pair with heavy batch_key_dropout for robustness)
+        # ``None`` (default) disables the override entirely (normal behaviour).
+        # The override is applied BEFORE the hard mask so the diagonal
+        # self-loop constraint still prevents X_i from reading its own value.
+        self.optuna_protocol: Optional[float] = (
+            float(optuna_protocol) if optuna_protocol is not None else None
+        )
+
 
         # Batch-consistent key dropout (None = disabled, use standard nn.Dropout).
         # blanking_value=0.0: applied post-activation (ReLU-Tanh output).
@@ -177,10 +197,21 @@ class CausalCrossAttention(nn.Module):
         att = F.relu(F.tanh(scores / self.tau))
         att = torch.nan_to_num(att, nan=0.0)
 
+        # --- Optuna capacity-search override (constant-score protocol) --------
+        # Replace the learned QK^T attention weights with a constant so the
+        # structural (query/key) stream is detached from the loss.  Applied in
+        # BOTH train and eval, and BEFORE the hard mask so the diagonal
+        # self-loop constraint still removes X_i -> X_i value leakage.
+        # ``torch.full_like`` produces a leaf-free constant → no gradient flows
+        # back into Q/K (structure is effectively frozen for free).
+        if self.optuna_protocol is not None:
+            att = torch.full_like(att, self.optuna_protocol)
+
         # Apply hard mask if provided
         if hard_mask is not None:
             hard_mask_expanded = expand_hard_mask(hard_mask, is_multihead, B)
             att = att * hard_mask_expanded
+
 
         if self.entropy_enabled:
             entropy = calculate_attention_entropy(att)
@@ -1291,14 +1322,17 @@ class AttentionLayer(nn.Module):
         gate_bias_trainable: bool = True,
         init_gamma: float = -0.1,
         init_zeta: float = 1.1,
+        gain_tau: float = 1.0,
         shared_qk_inner: dict = None,
         shared_dag_across_heads: bool = True,
         dual_value: bool = False,
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        optuna_protocol: Optional[float] = None,
     ):
         super(AttentionLayer, self).__init__()
+
 
         self._uses_shared_structure = shared_qk_inner is not None
         self.shared_dag_across_heads = bool(shared_dag_across_heads)
@@ -1352,6 +1386,38 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
+            elif attention is GatedCrossAttention:
+                # GatedCrossAttention: HardConcrete structure gate x sigmoid
+                # reconstruction gain.  Needs gamma/zeta (gate) + gain_tau.
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    gamma=init_gamma,
+                    zeta=init_zeta,
+                    gain_tau=gain_tau,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    # Optuna capacity-search protocol: freeze the STRUCTURE gate
+                    # at a constant (0/1) while the reconstruction gain learns.
+                    optuna_protocol=optuna_protocol,
+                )
+            elif attention is CausalCrossAttention:
+
+                # CausalCrossAttention also accepts the Optuna capacity-search
+                # protocol flag (constant-score override).
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    optuna_protocol=optuna_protocol,
+                )
             elif attention in ATTENTION_WITH_TAU:
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
@@ -1363,6 +1429,7 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
             else:
+
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
@@ -1417,6 +1484,24 @@ class AttentionLayer(nn.Module):
             self.value_projection_struct = None
             self.out_projection_struct = None
 
+        # Reconstruction-gain projections (GatedCrossAttention only).
+        # Named ``gain_q_proj`` / ``gain_k_proj`` — deliberately WITHOUT the
+        # substrings "query_projection" / "key_projection" — so the name-based
+        # gradient router classifies them as RECONSTRUCTION parameters (driven
+        # by the MSE loss), keeping them disentangled from the structural gate.
+        self._gated_gain = (attention is GatedCrossAttention) and (shared_qk_inner is None)
+        if self._gated_gain:
+            if not self.shared_dag_across_heads:
+                raise ValueError(
+                    "GatedCrossAttention requires shared_dag_across_heads=True "
+                    "(single structural head)."
+                )
+            self.gain_q_proj = nn.Linear(d_model_queries, d_queries_keys)
+            self.gain_k_proj = nn.Linear(d_model_keys, d_queries_keys)
+        else:
+            self.gain_q_proj = None
+            self.gain_k_proj = None
+
     def get_shared_qk_inner(self) -> dict:
         if self._uses_shared_structure:
             raise ValueError(
@@ -1441,6 +1526,8 @@ class AttentionLayer(nn.Module):
         hard_mask: torch.Tensor = None,
         oracle: bool = False,
         key_value: torch.Tensor = None,
+        gain_query: torch.Tensor = None,
+        gain_key: torch.Tensor = None,
     ):
         B, L, _ = query.shape
         _, S, _ = key.shape
@@ -1459,17 +1546,39 @@ class AttentionLayer(nn.Module):
         else:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
 
-        out, attn, aux = self.inner_attention(
-            query=q,
-            key=k,
-            value=v,
-            mask_miss_k=mask_miss_k,
-            mask_miss_q=mask_miss_q,
-            pos=pos,
-            causal_mask=causal_mask,
-            hard_mask=hard_mask,
-            oracle=oracle,
-        )
+        if self._gated_gain:
+            # Reconstruction-gain stream (GatedCrossAttention).  gain_query /
+            # gain_key default to the structural query/key inputs when the
+            # caller does not supply dedicated gain embeddings (shared mode).
+            gq_in = gain_query if gain_query is not None else query
+            gk_in = gain_key if gain_key is not None else key
+            gq = self.dropout_qkv(self.gain_q_proj(gq_in)).view(B, L, -1)
+            gk = self.dropout_qkv(self.gain_k_proj(gk_in)).view(B, S, -1)
+            out, attn, aux = self.inner_attention(
+                query=q,
+                key=k,
+                value=v,
+                mask_miss_k=mask_miss_k,
+                mask_miss_q=mask_miss_q,
+                pos=pos,
+                causal_mask=causal_mask,
+                hard_mask=hard_mask,
+                oracle=oracle,
+                gain_query=gq,
+                gain_key=gk,
+            )
+        else:
+            out, attn, aux = self.inner_attention(
+                query=q,
+                key=k,
+                value=v,
+                mask_miss_k=mask_miss_k,
+                mask_miss_q=mask_miss_q,
+                pos=pos,
+                causal_mask=causal_mask,
+                hard_mask=hard_mask,
+                oracle=oracle,
+            )
 
         if H > 1:
             out = out.contiguous().view(B, L, -1)
