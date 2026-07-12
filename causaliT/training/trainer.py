@@ -35,7 +35,9 @@ from causaliT.training.forecasters import (
     NoiseAwareCausalResForecaster,
     VarianceCausalForecaster,
     AttentionSelectorForecaster,
+    SelfSelectorForecaster,
 )
+
 from causaliT.training.dataloader import ProcessDataModule
 from causaliT.training.stage_causal_dataloader import StageCausalDataModule
 from causaliT.training.experiment_control import update_config
@@ -66,6 +68,7 @@ def train_single_fold(
     debug: bool = False,
     best: bool = False,
     extra_callbacks: Optional[List] = None,
+    reload_dataloaders_every_n_epochs: int = 0,
 ) -> dict:
     """
     Execute training for a single fold and return metrics.
@@ -108,6 +111,13 @@ def train_single_fold(
         extra_callbacks:   Additional Lightning callbacks injected by the caller.
                            These are appended **after** the standard callbacks so
                            they have access to all trainer state.
+        reload_dataloaders_every_n_epochs:
+                           Forwarded to ``pl.Trainer``.  Default 0 keeps the train
+                           dataloader cached for the whole run (standard behaviour).
+                           Set to 1 when a callback mutates the data module's train
+                           split mid-fit (e.g. the adaptive cross-fit phase switch)
+                           so Lightning re-queries ``dm.train_dataloader()`` at each
+                           epoch boundary and picks up the new subset.
 
     Returns:
         dict: Metrics for this fold (val + test + timing).
@@ -175,8 +185,23 @@ def train_single_fold(
     )
 
     # ---- Lightning Trainer ------------------------------------------------------
+    # Defense-in-depth: reloading the dataloader every epoch respawns the worker
+    # pool each epoch.  On Windows (spawn) each worker re-imports the package and
+    # re-copies the in-memory dataset tensors, crashing the session at the first
+    # epoch boundary; on Linux (fork) it is cheaper but leaks memory over long
+    # runs.  Datasets here are in-memory TensorDatasets (no I/O to overlap), so
+    # workers add pure overhead — force single-process loading whenever the train
+    # dataloader is reloaded, so any caller of train_single_fold is safe.
+    if reload_dataloaders_every_n_epochs:
+        if getattr(dm, "num_workers", 0):
+            dm.num_workers = 0
+        if getattr(dm, "persistent_workers", False):
+            dm.persistent_workers = False
+
+
     pl_trainer = pl.Trainer(
         callbacks=callbacks_list,
+
         logger=logger_csv,
         accelerator="gpu" if torch.cuda.is_available() else "auto",
         devices=1 if cluster else "auto",
@@ -188,6 +213,7 @@ def train_single_fold(
         detect_anomaly=debug,
         gradient_clip_val=config["training"].get("gradient_clip_val", None),
         gradient_clip_algorithm=config["training"].get("gradient_clip_algorithm", "norm"),
+        reload_dataloaders_every_n_epochs=reload_dataloaders_every_n_epochs,
     )
 
     # ---- Warm-start: load model weights only (no optimizer / epoch restore) -----
@@ -537,8 +563,10 @@ def get_model_class(config: dict):
         "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes",
         "VarianceCausalLayer",
         "AttentionSelectorLayer",
+        "SelfSelectorLayer",
         "LSTM", "GRU", "TCN", "MLP",
     ]
+
     assert model_obj in available_models, (
         f"{model_obj} unavailable! Choose between {available_models}"
     )
@@ -551,8 +579,10 @@ def get_model_class(config: dict):
         "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResForecaster,
         "VarianceCausalLayer": VarianceCausalForecaster,
         "AttentionSelectorLayer": AttentionSelectorForecaster,
+        "SelfSelectorLayer": SelfSelectorForecaster,
     }
     return MODEL_REGISTRY[model_obj]
+
 
 
 def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningModule:
@@ -582,7 +612,10 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return VarianceCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "AttentionSelectorLayer":
         return AttentionSelectorForecaster(config, data_dir=data_dir)
+    elif model_obj == "SelfSelectorLayer":
+        return SelfSelectorForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
+
         return TransformerForecaster(config)
     else:
         return get_model_class(config)(config)
@@ -612,14 +645,17 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "NoiseAwareSingleCausalLayerRes": StageCausalDataModule,
         "VarianceCausalLayer": StageCausalDataModule,
         "AttentionSelectorLayer": StageCausalDataModule,
+        "SelfSelectorLayer": StageCausalDataModule,
         "LSTM": ProcessDataModule,
+
         "GRU": ProcessDataModule,
         "TCN": ProcessDataModule,
         "MLP": ProcessDataModule,
     }
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
 
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer"]:
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer", "SelfSelectorLayer"]:
+
         return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],

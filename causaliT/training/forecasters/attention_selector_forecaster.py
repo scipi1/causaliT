@@ -41,13 +41,19 @@ Logged metrics
 - train/val_score_sparse   : L1 sparsity on attention weights
 - train/val_hsic           : HSIC regularization value
 - train/val_hsic_reg       : Weighted HSIC regularization term
+- train/val_struct_recon_reg: Reconstruction injected into the structural loss
+                             (lambda_struct_recon * loss_x); 0 unless > 0.
 - train/val_group_l1       : Group-L1 embedding regularization
+
 - train/val_notears        : NOTEARS acyclicity penalty on X→X sub-block
 - train_interf_cos_<block> : (diagnostic) per-structural-block cosine
                              similarity between the L0 and HSIC gradients.
-                             Only logged when HardConcreteCrossAttention is
-                             active, lambda_l0>0, lambda_hsic>0, and
+                             Only logged when the attention exposes a
+                             differentiable L0 gate — i.e.
+                             HardConcreteCrossAttention or GatedCrossAttention
+                             — and lambda_l0>0, lambda_hsic>0, and
                              ``training.log_l0_hsic_interference=True``.
+
 
 Attention splitting for evaluation
 ====================================
@@ -58,11 +64,13 @@ Then threshold and compute SHD.
 """
 
 import json
+import logging
 import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from os.path import join
+
 
 import numpy as np
 import pytorch_lightning as pl
@@ -79,8 +87,11 @@ from causaliT.training.interference_utils import (
     compute_l0_hsic_interference,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class AttentionSelectorForecaster(pl.LightningModule):
+
     """
     Lightning wrapper for AttentionSelectorLayer.
 
@@ -118,6 +129,36 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Reconstruction loss weight
         # ----------------------------------------------------------------
         self.lambda_recon = float(config["training"].get("lambda_recon", 1.0))
+
+        # ----------------------------------------------------------------
+        # Structural reconstruction mixing (convex mix on the structural
+        # pathway).  Mirrors SingleCausalForecaster.lambda_struct_recon.
+        #
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
+        #
+        # alpha = lambda_struct_recon in [0, 1]:
+        #   * 0.0 → pure HSIC structural stream (original behaviour).
+        #   * >0  → re-inject a controlled dose of reconstruction signal into
+        #           the STRUCTURAL parameters (Q/K, structural embeddings) that
+        #           gradient routing otherwise severs.  Motivated by the
+        #           observation that causal parents must also be predictive,
+        #           aligning the method with fit/likelihood-driven differentiable
+        #           causal discovery (NOTEARS/DAG-GNN/GraN-DAG/DCDI).
+        #
+        # Only meaningful with use_gradient_routing=True: without routing the
+        # reconstruction loss already updates every parameter via total_loss,
+        # so the mix (which lives only in _last_loss_components["loss_structural"])
+        # has no effect on the automatic-optimisation path.
+        # ----------------------------------------------------------------
+        self.lambda_struct_recon = float(
+            config["training"].get("lambda_struct_recon", 0.0)
+        )
+        if not (0.0 <= self.lambda_struct_recon <= 1.0):
+            raise ValueError(
+                f"lambda_struct_recon must be in [0, 1], got {self.lambda_struct_recon}"
+            )
+
 
         # ----------------------------------------------------------------
         # Score sparsity (L1 on attention weights)
@@ -489,11 +530,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # L0 regularization (non-zero only for HardConcreteCrossAttention)
         # l0_penalty is the expected number of active edges = sum P(z_ij > 0)
         # ----------------------------------------------------------------
-        if self.lambda_l0 > 0.0 and l0_penalty is not None:
+        # NOTE: the weighted term ``l0_reg`` (which enters the loss) is gated by
+        # ``lambda_l0`` so a zero strength contributes nothing to the gradient.
+        # However ``l0_penalty`` (the *measured* expected active-gate count) must
+        # be logged UNCONDITIONALLY: at ``lambda_l0 == 0`` the gate is fully dense,
+        # so the true penalty is at its MAXIMUM (~n_edges), not zero. Overwriting
+        # it with 0.0 (as the old code did) produced a misleading sparsity
+        # dose-response where the no-L0 baseline appeared perfectly sparse.
+        if l0_penalty is None:
+            # Non-HardConcrete attentions do not expose an L0 penalty at all.
+            l0_penalty = torch.tensor(0.0, device=X.device)
+        if self.lambda_l0 > 0.0:
             l0_reg = self.lambda_l0 * l0_penalty
         else:
             l0_reg = torch.tensor(0.0, device=X.device)
-            l0_penalty = torch.tensor(0.0, device=X.device)
 
         # ----------------------------------------------------------------
         # Total loss
@@ -513,10 +563,29 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # structural embeddings, leaving V/FFN/MLP untouched.
         # L0 also rides on the structural pathway: P(z>0) = sigmoid(log_alpha - offset)
         # and log_alpha = QK^T/sqrt(E), so gradients flow through Q/K.
+        #
+        # Convex mix on the HSIC/reconstruction split of the structural pathway
+        # (mirrors SingleCausalForecaster):
+        #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+        #              + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
+        # alpha = lambda_struct_recon.  At alpha=0 this is identical to the
+        # original pure-HSIC structural stream.  The alpha * loss_x term reuses
+        # the already-computed reconstruction loss and the retained autograd
+        # graph, so its gradient flows to the STRUCTURAL params through the
+        # attention weights with no extra forward/backward pass.  The
+        # reconstruction params keep their pure-recon gradients via the
+        # save/restore logic in training_step, so theta_R is unaffected.
+        alpha = self.lambda_struct_recon
+        struct_recon_reg = alpha * loss_x
         self._last_loss_components = {
             "loss_recon": loss_x,
-            "loss_structural": hsic_reg + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg,
+            "loss_structural": (
+                (1.0 - alpha) * hsic_reg
+                + struct_recon_reg
+                + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
+            ),
         }
+
         # Keep references to the individual reg terms (graph still attached) so
         # training_step can probe L0 ↔ HSIC gradient interference before the
         # real backward runs.
@@ -531,7 +600,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_score_sparse", score_sparse_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
+        # Structural-pathway reconstruction term (alpha * loss_x).  Non-zero
+        # only when lambda_struct_recon > 0; lets eval/monitoring see how much
+        # reconstruction signal is shaping the structural parameters.
+        self.log(f"{stage}_struct_recon_reg", struct_recon_reg, on_step=False, on_epoch=True)
         self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+
 
         for name, metric in [("mae", self.mae_x), ("rmse", self.rmse_x), ("r2", self.r2_x)]:
             metric_eval = metric(pred_x.reshape(-1), x_target.reshape(-1))
@@ -558,14 +632,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # L0 ↔ HSIC gradient-interference diagnostic
     # ------------------------------------------------------------------
 
+    # Attention types that expose a differentiable L0 penalty on the structure
+    # gate (aux["l0_penalty"]), for which the L0 ↔ HSIC interference probe is
+    # meaningful.  Both drive the Hard-Concrete gate logit off the structural
+    # query/key pair, so their gradients flow to the same structural params.
+    _INTERFERENCE_ATTENTION_TYPES = (
+        "HardConcreteCrossAttention",
+        "GatedCrossAttention",
+    )
+
     def _interference_enabled(self) -> bool:
         """Whether the L0 ↔ HSIC interference diagnostic should run."""
         return (
             self.log_l0_hsic_interference
-            and self._attention_type == "HardConcreteCrossAttention"
+            and self._attention_type in self._INTERFERENCE_ATTENTION_TYPES
             and float(self.lambda_l0) > 0.0
             and float(self.lambda_hsic) > 0.0
         )
+
 
     def _maybe_log_interference(self, batch_idx: int):
         """Log per-block cosine similarity between the L0 and HSIC gradients.
@@ -608,8 +692,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # Autograd may fail if the graph was already freed (e.g. a prior
             # backward without retain_graph).  Never let the diagnostic break
             # training — just skip this step.
-            import logging
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "L0↔HSIC interference probe skipped (autograd error): %s", exc
             )
             return
@@ -618,7 +701,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # entirely zero in that block (pure reconstruction blocks receive no
         # L0 gradient).  Logging only the non-NaN blocks auto-focuses the
         # metric set on the structural pathway (Q/K + embeddings) where the
-        # L0 ↔ HSIC interference actually happens.
+        # L0 ↔ HSIC interference actually happens.  We simultaneously collect
+        # per-block cosines into a summary so the conflict is human-readable in
+        # the console / log file (not just as scattered CSV columns).
+        overall_cos = float("nan")
+        block_cos: Dict[str, float] = {}
         for block_name, cos in cos_by_block.items():
             if math.isnan(cos):
                 continue
@@ -628,6 +715,35 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 on_step=False,
                 on_epoch=True,
             )
+            if block_name == "overall":
+                overall_cos = float(cos)
+            else:
+                block_cos[block_name] = float(cos)
+
+        # --- Human-readable summary of the L0 ↔ HSIC gradient conflict ---
+        # cos < 0 ⇒ the L0 (sparsity) and HSIC (independence) gradients push
+        # the shared structural parameters in opposing directions in that
+        # block, i.e. the two objectives are in direct conflict there.
+        if block_cos:
+            conflicting = {b: c for b, c in block_cos.items() if c < 0.0}
+            n_blocks = len(block_cos)
+            n_conflict = len(conflicting)
+            # Sort blocks from most-conflicting (most negative) to most-aligned
+            worst = sorted(block_cos.items(), key=lambda kv: kv[1])
+            detail = ", ".join(f"{b}={c:+.3f}" for b, c in worst)
+            overall_str = (
+                f"{overall_cos:+.3f}" if not math.isnan(overall_cos) else "n/a"
+            )
+            logger.info(
+                "[L0↔HSIC interference] epoch=%d | overall_cos=%s | "
+                "conflicting_blocks=%d/%d | per-block: %s",
+                int(self.current_epoch),
+                overall_str,
+                n_conflict,
+                n_blocks,
+                detail,
+            )
+
 
     # ------------------------------------------------------------------
     # Acyclicity helper (mirrors SingleCausalForecaster)

@@ -21,6 +21,8 @@ from .noise_aware_forecaster import NoiseAwareCausalForecaster
 from .noise_aware_res_forecaster import NoiseAwareCausalResForecaster
 from .variance_causal_forecaster import VarianceCausalForecaster
 from .attention_selector_forecaster import AttentionSelectorForecaster
+from .self_selector_forecaster import SelfSelectorForecaster
+
 
 __all__ = [
     'TransformerForecaster',
@@ -31,4 +33,7 @@ __all__ = [
     'NoiseAwareCausalResForecaster',
     'VarianceCausalForecaster',
     'AttentionSelectorForecaster',
+    'SelfSelectorForecaster',
 ]
+
+

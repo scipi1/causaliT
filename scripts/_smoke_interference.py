@@ -113,7 +113,7 @@ def _build_config() -> dict:
         "output_mlp_hidden": D_FF,
         "output_mlp_activation": "relu",
         "output_mlp_dropout": 0.0,
-        "orthogonal_struct_embedding": False,
+        "struct_embedding_type": "standard_learnable",
     }
     return {
         "model": {"model_object": "AttentionSelectorLayer", "kwargs": model_kwargs},

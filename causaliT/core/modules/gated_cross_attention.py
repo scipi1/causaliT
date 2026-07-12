@@ -59,7 +59,35 @@ functions of the **gate** only — never the gain — so they act purely on
 structure.  Evaluation should threshold ``last_p_edge_on`` (the gate posterior
 edge probability) to obtain the recovered adjacency.
 
+Mirrors the other inner-attention modules:
+``forward(query, key, value, mask_miss_k, mask_miss_q, pos, causal_mask,
+          hard_mask=None, oracle=False, gain_query=None, gain_key=None)``
+returns ``(out, attn, aux)`` with
+``aux = {"entropy": Tensor|None, "l0_penalty": Tensor}``.
 Contract
+Mirrors the other inner-attention modules:
+``forward(query, key, value, mask_miss_k, mask_miss_q, pos, causal_mask,
+          hard_mask=None, oracle=False, gain_query=None, gain_key=None)``
+returns ``(out, attn, aux)`` with
+``aux = {"entropy": Tensor|None, "l0_penalty": Tensor}``.
+
+GCA-SPECIFIC use of the second return slot
+------------------------------------------
+For every *other* attention module the second element ``attn`` is the weight
+matrix actually applied to the values.  For GCA that applied weight is the
+conflated product ``A = z*g`` (structure gate x reconstruction gain), which is
+**not** a clean structural signal.  Because ``out`` (first element) is already
+computed from ``A`` internally and **no downstream calculation consumes the
+returned ``attn`` for reconstruction** — the training loss reads ``out``,
+the residuals, the ``score_tensor_for_sparsity`` attribute and ``aux``; only
+the evaluation/DAG-extraction path reads the returned ``attn`` — GCA reuses this
+slot to emit the **structure gate posterior** ``p_edge_on * hard_mask`` (the
+masked ``P(z>0)`` edge-existence probability, shape ``(B, L, S)``, values in
+``(0, 1)``, forbidden/diagonal edges = 0).  Evaluation can therefore threshold
+the returned matrix at 0.5 to recover the adjacency with no special-casing.
+This is intentional and scoped to GCA only; it is not a convention imposed on
+the other modules.
+
 ========
 Mirrors the other inner-attention modules:
 ``forward(query, key, value, mask_miss_k, mask_miss_q, pos, causal_mask,
@@ -308,7 +336,13 @@ class GatedCrossAttention(nn.Module):
             entropy = -(w * torch.log(w.clamp_min(1e-8))).sum(dim=-1)  # (B, L)
 
         aux = {"entropy": entropy, "l0_penalty": l0_penalty}
-        return out, A, aux
+        # GCA reuses the second slot to return the STRUCTURE GATE posterior
+        # (masked P(z>0), shape (B, L, S)) instead of the applied weight A=z*g.
+        # `out` above is already computed from A, and nothing downstream consumes
+        # this slot for reconstruction — only eval/DAG-extraction reads it, which
+        # wants the clean structural score (thresholdable at 0.5). Scoped to GCA.
+        return out, p_edge_masked, aux
+
 
     def __repr__(self):
         return (

@@ -101,15 +101,34 @@ class TestModuleForward:
 
 
 class TestFactorisationContract:
-    def test_A_equals_gate_times_gain_and_bounded(self):
-        """A = z * g with both factors in [0,1] → A in [0,1]."""
+    def test_second_return_is_gate_posterior_bounded(self):
+        """The 2nd return slot (GCA-specific) is the STRUCTURE gate posterior
+        P(z>0), a probability in (0,1) — NOT the applied weight A=z*g."""
         att = GatedCrossAttention(attention_dropout=0.0)
         att.eval()   # deterministic gate
         q, k = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         gq, gk = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         v = torch.randn(BATCH, S_SEQ_LEN, D_MODEL)
-        _, A, _ = att(q, k, v, gain_query=gq, gain_key=gk)
-        assert torch.all(A >= 0.0) and torch.all(A <= 1.0)
+        _, gate, _ = att(q, k, v, gain_query=gq, gain_key=gk)
+        assert gate.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN)
+        assert torch.all(gate >= 0.0) and torch.all(gate <= 1.0)
+        # The returned gate equals the batch-mean posterior exposed for eval.
+        assert torch.allclose(gate.mean(dim=0), att.last_p_edge_on, atol=1e-6)
+
+    def test_second_return_is_independent_of_gain(self):
+        """Changing ONLY the gain projections must not change the returned gate
+        posterior (structure), even though it changes the applied weight A=z*g
+        and therefore `out`."""
+        att = GatedCrossAttention(attention_dropout=0.0)
+        att.eval()
+        q, k = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
+        v = torch.randn(BATCH, S_SEQ_LEN, D_MODEL)
+        gq1, gk1 = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
+        gq2, gk2 = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
+        out1, gate1, _ = att(q, k, v, gain_query=gq1, gain_key=gk1)
+        out2, gate2, _ = att(q, k, v, gain_query=gq2, gain_key=gk2)
+        assert torch.allclose(gate1, gate2, atol=1e-6)        # structure unchanged
+        assert not torch.allclose(out1, out2, atol=1e-4)      # gain changed `out`
 
     def test_hard_mask_zeros_forbidden_edges(self):
         att = GatedCrossAttention()
@@ -118,14 +137,17 @@ class TestFactorisationContract:
         gq, gk = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, X_SEQ_LEN, D_QK)
         v = torch.randn(BATCH, X_SEQ_LEN, D_MODEL)
         mask = 1.0 - torch.eye(X_SEQ_LEN)   # no self-loops
-        _, A, _ = att(q, k, v, hard_mask=mask, gain_query=gq, gain_key=gk)
-        diag = torch.diagonal(A, dim1=-2, dim2=-1)
+        _, gate, _ = att(q, k, v, hard_mask=mask, gain_query=gq, gain_key=gk)
+        diag = torch.diagonal(gate, dim1=-2, dim2=-1)
         assert torch.allclose(diag, torch.zeros_like(diag))
 
     def test_gate_open_recovers_gain_weighted_target(self):
         """Anti-run_0: with the gate forced fully open, the bounded sigmoid gain
         ALONE linearly mixes the value stream — reconstruction is possible even
-        though the structure score is saturated (constant)."""
+        though the structure score is saturated (constant).
+
+        With the gate saturated open at eval z=1, the applied weight A=z*g equals
+        the gain g, so `out` must equal (gain @ v)."""
         att = GatedCrossAttention()
         att.eval()
         # Large positive structural logits → z ≈ 1 for every edge.
@@ -134,11 +156,14 @@ class TestFactorisationContract:
         gq = _proj(1, 2, D_QK)
         gk = _proj(1, 2, D_QK)
         v = torch.randn(1, 2, D_MODEL)
-        out, A, _ = att(q, k, v, gain_query=gq, gain_key=gk)
-        # out must equal A @ v exactly (aggregation contract) and A must be > 0
-        # (non-null) — i.e. information actually flows.
-        assert torch.allclose(out, torch.einsum("bls,bsd->bld", A, v), atol=1e-5)
-        assert A.abs().sum() > 0.0
+        out, gate, _ = att(q, k, v, gain_query=gq, gain_key=gk)
+        # Applied weight = z*g = 1*g = gain → out == gain @ v (info flows).
+        applied = _manual_gain(gq, gk)
+        assert torch.allclose(out, torch.einsum("bls,bsd->bld", applied, v), atol=1e-5)
+        assert applied.abs().sum() > 0.0
+        # The 2nd return is the gate posterior (≈1, saturated open), not z*g.
+        assert torch.all(gate > 0.5)
+
 
     def test_sparsity_signal_is_gate_only(self):
         """score_tensor_for_sparsity / last_p_edge_on are functions of the GATE,
@@ -172,8 +197,12 @@ class TestOptunaProtocol:
         q, k = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         gq, gk = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         v = torch.randn(BATCH, S_SEQ_LEN, D_MODEL)
-        _, A, _ = att(q, k, v, gain_query=gq, gain_key=gk)
-        assert torch.allclose(A, _manual_gain(gq, gk), atol=1e-5)
+        out, gate, _ = att(q, k, v, gain_query=gq, gain_key=gk)
+        # Gate frozen at 1 → applied weight z*g == gain → out == gain @ v.
+        applied = _manual_gain(gq, gk)
+        assert torch.allclose(out, torch.einsum("bls,bsd->bld", applied, v), atol=1e-5)
+        # The returned gate posterior is the frozen constant (1.0), not the gain.
+        assert torch.allclose(gate, torch.ones_like(gate), atol=1e-6)
 
     def test_protocol_half_scales_gain(self):
         att = GatedCrossAttention(optuna_protocol=0.5, attention_dropout=0.0)
@@ -181,8 +210,13 @@ class TestOptunaProtocol:
         q, k = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         gq, gk = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, S_SEQ_LEN, D_QK)
         v = torch.randn(BATCH, S_SEQ_LEN, D_MODEL)
-        _, A, _ = att(q, k, v, gain_query=gq, gain_key=gk)
-        assert torch.allclose(A, 0.5 * _manual_gain(gq, gk), atol=1e-5)
+        out, gate, _ = att(q, k, v, gain_query=gq, gain_key=gk)
+        # Gate frozen at 0.5 → applied weight z*g == 0.5*gain → out == (0.5g) @ v.
+        applied = 0.5 * _manual_gain(gq, gk)
+        assert torch.allclose(out, torch.einsum("bls,bsd->bld", applied, v), atol=1e-5)
+        # The returned gate posterior is the frozen constant (0.5).
+        assert torch.allclose(gate, 0.5 * torch.ones_like(gate), atol=1e-6)
+
 
     def test_protocol_gate_qk_receive_no_gradient(self):
         """Freezing the gate must detach the structural query/key from the loss."""
@@ -220,10 +254,13 @@ class TestOracleGate:
         gq, gk = _proj(BATCH, X_SEQ_LEN, D_QK), _proj(BATCH, X_SEQ_LEN, D_QK)
         v = torch.randn(BATCH, X_SEQ_LEN, D_MODEL)
         mask = (torch.rand(X_SEQ_LEN, X_SEQ_LEN) > 0.5).float()
-        out, A, _ = att(q, k, v, hard_mask=mask, oracle=True, gain_query=gq, gain_key=gk)
-        expected_A = mask.unsqueeze(0) * _manual_gain(gq, gk)
-        assert torch.allclose(A, expected_A, atol=1e-5)
-        assert torch.allclose(out, torch.einsum("bls,bsd->bld", A, v), atol=1e-5)
+        out, gate, _ = att(q, k, v, hard_mask=mask, oracle=True, gain_query=gq, gain_key=gk)
+        # Applied weight z*g == mask*gain → out == (mask*gain) @ v.
+        applied = mask.unsqueeze(0) * _manual_gain(gq, gk)
+        assert torch.allclose(out, torch.einsum("bls,bsd->bld", applied, v), atol=1e-5)
+        # The returned gate posterior IS the ground-truth adjacency (masked z=mask).
+        assert torch.allclose(gate, mask.unsqueeze(0).expand_as(gate), atol=1e-6)
+
 
     def test_oracle_requires_hard_mask(self):
         att = GatedCrossAttention()
@@ -314,7 +351,9 @@ def _make_gated_model(
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
-        orthogonal_fixed=orthogonal_fixed,
+        struct_embedding_type=(
+            "orthogonal_fixed" if orthogonal_fixed else "standard_learnable"
+        ),
         gain_stream_source=gain_stream_source,
     )
 
@@ -445,7 +484,130 @@ class TestOptunaProtocolLayer:
         )
 
 
+# ===========================================================================
+# Part 3 — Oracle experiment wiring (AttentionSelectorLayer + mask permutation)
+# ===========================================================================
+#
+# Backs the GCA oracle sweep
+# experiments/1_FOUNDATIONS/3_ORACLE/2_ATT_SEL/SWEEP_SEEDS_SHD_atsel_GCA_scm3c.
+#
+# Contract under test (GCA oracle semantics):
+#   * The loaded / CORRUPTED (permuted) GT combined mask substitutes the
+#     STRUCTURE GATE ONLY:  z := oracle_mask,  A = z * g = mask * g.
+#   * Forbidden edges (mask == 0) stay exactly 0 in the returned structure.
+#   * The reconstruction gain still receives gradient (it learns), while the
+#     structural gate Q/K receive NO gradient (structure is fixed by the mask).
+#   * Mask permutation (SHD > 0) produces a different — but still mask-respecting
+#     — structure / prediction, i.e. the oracle sweep axis actually bites.
+
+
+def _gt_combined_mask(seed: int = 0):
+    """Build a (L_X, L_S + L_X) ground-truth combined oracle mask.
+
+    Returns ``(cross, self_mask, combined)`` tensors.
+
+
+    S-block  (L_X x L_S): random 0/1 adjacency.
+    X-block  (L_X x L_X): strictly lower-triangular (acyclic, no self-loops).
+    """
+    rng = torch.Generator().manual_seed(seed)
+    cross = (torch.rand(X_SEQ_LEN, S_SEQ_LEN, generator=rng) > 0.5).float()
+    self_mask = torch.zeros(X_SEQ_LEN, X_SEQ_LEN)
+    for i in range(1, X_SEQ_LEN):
+        for j in range(i):
+            if torch.rand(1, generator=rng).item() < 0.5:
+                self_mask[i, j] = 1.0
+    return cross, self_mask, torch.cat([cross, self_mask], dim=1)
+
+
+class TestOracleLayerMaskPermutation:
+    """End-to-end oracle wiring: AttentionSelectorLayer + GatedCrossAttention
+    fed a (possibly corrupted) GT combined mask via `oracle_combined_mask`."""
+
+    def test_oracle_mask_substitutes_gate_only(self):
+        """Returned structure == the oracle mask; forbidden edges stay 0
+        (A = mask * g, so the mask acts as the gate, not the full score)."""
+        m = _make_gated_model()
+        m.eval()
+        source, x_actual, x_blanked = _make_inputs()
+        _, _, combined = _gt_combined_mask(seed=1)
+
+        _, attn, _ = m.forward_with_actual(
+            source, x_blanked, x_actual,
+            oracle=True, oracle_combined_mask=combined,
+        )
+        # (B, L_X, L_S + L_X); gate posterior == the oracle mask, broadcast over B.
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+        expected = combined.unsqueeze(0).expand_as(attn)
+        assert torch.allclose(attn, expected, atol=1e-6), (
+            "oracle mask must substitute the structure gate exactly (z := mask)."
+        )
+        # Forbidden edges (mask == 0) must carry zero weight.
+        forbidden = expected == 0
+        assert torch.all(attn[forbidden] == 0.0)
+
+    def test_oracle_freezes_gate_qk_but_trains_gain(self):
+        """Under the oracle, the structural gate Q/K get no gradient (structure
+        is fixed by the mask) while the reconstruction gain still learns."""
+        m = _make_gated_model()
+        m.train()
+        source, x_actual, x_blanked = _make_inputs()
+        _, _, combined = _gt_combined_mask(seed=2)
+
+        pred_x, _, _ = m.forward_with_actual(
+            source, x_blanked, x_actual,
+            oracle=True, oracle_combined_mask=combined,
+        )
+        pred_x.sum().backward()
+
+        gain_w = m.gain_q_embed_X.embedding.weight
+        assert gain_w.grad is not None and gain_w.grad.abs().sum() > 0, (
+            "reconstruction gain must still receive gradient in oracle mode."
+        )
+        gate_w = m.attention.query_projection.weight
+        assert gate_w.grad is None or gate_w.grad.abs().sum() == 0, (
+            "structural gate Q/K must receive NO gradient — structure is the "
+            "fixed oracle mask, so QK^T is bypassed."
+        )
+
+    def test_mask_permutation_changes_structure_and_prediction(self):
+        """A corrupted (permuted) oracle mask (SHD > 0) yields a different but
+        still mask-respecting structure/prediction — the sweep axis bites."""
+        from causaliT.core.utils import corrupt_dag_masks
+
+        m = _make_gated_model()
+        m.eval()
+        source, x_actual, x_blanked = _make_inputs()
+        cross, self_mask, combined_gt = _gt_combined_mask(seed=3)
+
+        corrupted, info = corrupt_dag_masks(
+            {"dec_cross": cross.clone(), "dec_self": self_mask.clone()},
+            seed=7, cross_shd=2, self_shd=2, X_len=X_SEQ_LEN,
+            preserve_sparsity=True,
+        )
+        combined_corr = torch.cat([corrupted["dec_cross"], corrupted["dec_self"]], dim=1)
+
+        # The permutation actually changed the mask (SHD > 0) ...
+        assert not torch.allclose(combined_corr, combined_gt), (
+            "corruption must change the mask (SHD > 0)."
+        )
+        # ... while preserving the edge count (preserve_sparsity=True).
+        assert combined_corr.sum() == combined_gt.sum()
+
+        pred_gt, attn_gt, _ = m.forward_with_actual(
+            source, x_blanked, x_actual,
+            oracle=True, oracle_combined_mask=combined_gt,
+        )
+        pred_corr, attn_corr, _ = m.forward_with_actual(
+            source, x_blanked, x_actual,
+            oracle=True, oracle_combined_mask=combined_corr,
+        )
+        # Each run uses its own mask as the gate ...
+        assert torch.allclose(attn_gt, combined_gt.unsqueeze(0).expand_as(attn_gt), atol=1e-6)
+        assert torch.allclose(attn_corr, combined_corr.unsqueeze(0).expand_as(attn_corr), atol=1e-6)
+        # ... and the corrupted structure moves the prediction.
+        assert not torch.allclose(pred_gt, pred_corr, atol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-

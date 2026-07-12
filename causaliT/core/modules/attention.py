@@ -8,6 +8,8 @@ import numpy as np
 from causaliT.core.modules.extra_layers import UniformAttentionMask, BatchConsistentKeyDropout
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.core.modules.gated_cross_attention import GatedCrossAttention
+from causaliT.core.modules.gated_self_attention import GatedSelfAttention
+
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List, Optional
 
@@ -1323,7 +1325,9 @@ class AttentionLayer(nn.Module):
         init_gamma: float = -0.1,
         init_zeta: float = 1.1,
         gain_tau: float = 1.0,
+        dir_tau: float = 2.0 / 3.0,
         shared_qk_inner: dict = None,
+
         shared_dag_across_heads: bool = True,
         dual_value: bool = False,
         batch_key_dropout: Optional[float] = None,
@@ -1404,7 +1408,27 @@ class AttentionLayer(nn.Module):
                     # at a constant (0/1) while the reconstruction gain learns.
                     optuna_protocol=optuna_protocol,
                 )
+            elif attention is GatedSelfAttention:
+                # GatedSelfAttention: direction-aware selector.  Toeplitz split
+                # of the structural score → symmetric HardConcrete existence gate
+                # (gamma/zeta, init_tau) × antisymmetric coupled direction gate
+                # (dir_tau) × sigmoid reconstruction gain (gain_tau).
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    gamma=init_gamma,
+                    zeta=init_zeta,
+                    dir_tau=dir_tau,
+                    gain_tau=gain_tau,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    optuna_protocol=optuna_protocol,
+                )
             elif attention is CausalCrossAttention:
+
 
                 # CausalCrossAttention also accepts the Optuna capacity-search
                 # protocol flag (constant-score override).
@@ -1489,13 +1513,16 @@ class AttentionLayer(nn.Module):
         # substrings "query_projection" / "key_projection" — so the name-based
         # gradient router classifies them as RECONSTRUCTION parameters (driven
         # by the MSE loss), keeping them disentangled from the structural gate.
-        self._gated_gain = (attention is GatedCrossAttention) and (shared_qk_inner is None)
+        self._gated_gain = (
+            attention in (GatedCrossAttention, GatedSelfAttention)
+        ) and (shared_qk_inner is None)
         if self._gated_gain:
             if not self.shared_dag_across_heads:
                 raise ValueError(
-                    "GatedCrossAttention requires shared_dag_across_heads=True "
-                    "(single structural head)."
+                    "GatedCrossAttention / GatedSelfAttention require "
+                    "shared_dag_across_heads=True (single structural head)."
                 )
+
             self.gain_q_proj = nn.Linear(d_model_queries, d_queries_keys)
             self.gain_k_proj = nn.Linear(d_model_keys, d_queries_keys)
         else:

@@ -36,12 +36,24 @@ from .eval_lib import predict_from_experiment, find_config_file, find_best_or_la
 
 def infer_checkpoint_type(config) -> str:
     """
-    Auto-detect which checkpoint type to use for ATE evaluation.
+    Determine which checkpoint type to use for evaluation.
 
-    Causal models (HSIC > 0 or causal model object) → ``"best_causal"``
-    Baseline / vanilla models                       → ``"best_reconstruction"``
+    Evaluation is performed on the **last** (final-epoch) checkpoint by default.
+    This is deliberate: the ``best_causal`` (min ``val_hsic_reg``) and
+    ``best_reconstruction`` (min ``val_x_mae``) checkpoints can be captured at
+    an epoch that does **not** reflect the end-state of the training protocol.
 
-    An explicit ``evaluation.checkpoint_type`` in the config always wins.
+    In particular, for the two-stage L0 protocol the min-``val_hsic_reg`` epoch
+    lands at the *start* of the structural stage — *before* the L0 penalty has
+    pruned the structure gate — so a DAG evaluated on ``best_causal`` looks
+    identical across ``lambda_l0`` values (the gate is still dense). Evaluating
+    on the last checkpoint makes the retrieved DAG reflect the actually-pruned
+    gate and keeps it consistent with the reported end-of-training ``test_*``
+    sparsity metrics.
+
+    An explicit ``evaluation.checkpoint_type`` in the config always wins, so a
+    specific experiment can still opt into ``"best_causal"`` /
+    ``"best_reconstruction"`` if desired.
 
     Args:
         config: OmegaConf or dict configuration.
@@ -49,7 +61,7 @@ def infer_checkpoint_type(config) -> str:
     Returns:
         One of ``"best_causal"``, ``"best_reconstruction"``, ``"best"``, ``"last"``.
     """
-    # Explicit override from config
+    # Explicit override from config always wins.
     explicit = (
         config.get("evaluation", {}).get("checkpoint_type", None)
         if hasattr(config, "get") else None
@@ -57,33 +69,9 @@ def infer_checkpoint_type(config) -> str:
     if explicit is not None:
         return str(explicit)
 
-    # Heuristic: any nonzero HSIC lambda → causal model.
-    # Check both the per-stream keys (lambda_hsic_cross / lambda_hsic_self used by
-    # older architectures) and the unified key (lambda_hsic used by
-    # AttentionSelectorForecaster / CausalCrossAttention experiments).
-    training = config.get("training", {}) if hasattr(config, "get") else {}
-    lambda_hsic_cross = float(training.get("lambda_hsic_cross", 0) or 0)
-    lambda_hsic_self  = float(training.get("lambda_hsic_self",  0) or 0)
-    lambda_hsic       = float(training.get("lambda_hsic",       0) or 0)
-
-    if lambda_hsic > 0 or lambda_hsic_cross > 0 or lambda_hsic_self > 0:
-        return "best_causal"
-
-    # Also check model_object for known causal types.
-    # AttentionSelectorLayer uses unified HSIC and CausalCrossAttention,
-    # so it must be listed here as a fallback.
-    model_obj = config.get("model", {}).get("model_object", "") if hasattr(config, "get") else ""
-    causal_models = {
-        "StageCausaliT",
-        "SingleCausalLayer",
-        "SingleCausalLayerRes",
-        "NoiseAwareSingleCausalLayer",
-        "AttentionSelectorLayer",   # uses unified lambda_hsic + CausalCrossAttention
-    }
-    if model_obj in causal_models:
-        return "best_causal"
-
-    return "best_reconstruction"
+    # Default: evaluate on the final-epoch (last) checkpoint. See docstring for
+    # why best_causal / best_reconstruction are NOT used by default.
+    return "last"
 
 
 # =============================================================================

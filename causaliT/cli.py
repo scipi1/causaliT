@@ -222,5 +222,55 @@ def anmtrain(exp_id, debug, cluster, exp_tag, scratch_path, best):
 cli.add_command(anmtrain)
 
 
+# ADAPTIVE ALTERNATING TRAINING
+@click.command()
+@click.option("--exp_id",       help="Experiment folder containing the config file")
+@click.option("--debug",        default=False, help="Debug mode")
+@click.option("--cluster",      default=False, help="On the cluster?")
+@click.option("--exp_tag",      default="NA",  help="Tag for model manifest")
+@click.option("--scratch_path", default=None,  help="SCRATCH path for cluster")
+@click.option("--best",         default=False, help="Collect best-checkpoint metrics")
+def adaptivetrain(exp_id, debug, cluster, exp_tag, scratch_path, best):
+    """
+    Run adaptive alternating training (metric-driven Structure/Reconstruct).
+
+    Unlike ``anmtrain`` (fixed per-stage epoch budgets, disk-chained
+    checkpoints), this runs a single in-memory ``pl.Trainer.fit()`` and switches
+    phases automatically based on monitored metrics defined in
+    config['adaptive_training'].  Requires training.use_gradient_routing=True.
+
+    Example:
+        python -m causaliT.cli adaptivetrain --exp_id 5_EXPLORATORY/PARTIAL_ANM/ADAPTIVE
+    """
+    from causaliT.training.adaptive_trainer import adaptive_trainer
+
+    ROOT_DIR = dirname(dirname(abspath(__file__)))
+
+    if not cluster:
+        print(f"Adaptive Alternating Training: {exp_id}")
+
+    exp_dir  = join(scratch_path) if scratch_path else join(ROOT_DIR, "experiments/", exp_id)
+    data_dir = join(ROOT_DIR, "data")
+
+    makedirs(join(ROOT_DIR, "logs"), exist_ok=True)
+
+    config, _ = find_yml_files(dir=exp_dir)
+
+    adaptive_trainer(
+        config=config,
+        data_dir=data_dir,
+        save_dir=exp_dir,
+        cluster=cluster,
+        experiment_tag=exp_tag,
+        debug=debug,
+        best=best,
+    )
+
+
+cli.add_command(adaptivetrain)
+
+
 if __name__ == "__main__":
     cli()
+
+

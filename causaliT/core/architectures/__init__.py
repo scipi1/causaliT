@@ -16,6 +16,7 @@ from causaliT.core.architectures.single_causal_res import SingleCausalLayerRes
 from causaliT.core.architectures.noise_aware import NoiseAwareSingleCausalLayer
 from causaliT.core.architectures.variance_causal import VarianceCausalLayer
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
+from causaliT.core.architectures.self_selector import SelfSelectorLayer
 
 __all__ = [
     'StageCausaliT',
@@ -24,4 +25,7 @@ __all__ = [
     'NoiseAwareSingleCausalLayer',
     'VarianceCausalLayer',
     'AttentionSelectorLayer',
+    'SelfSelectorLayer',
 ]
+
+

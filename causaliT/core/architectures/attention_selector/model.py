@@ -73,6 +73,14 @@ from causaliT.core.modules import (
 from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
 
 
+# Allowed values for ``struct_embedding_type`` (structural Q/K embedding scheme).
+STRUCT_EMBEDDING_TYPES = (
+    "standard_learnable",
+    "orthogonal_learnable",
+    "orthogonal_fixed",
+)
+
+
 class AttentionSelectorLayer(nn.Module):
     """
     AttentionSelectorLayer: single combined cross-attention causal discovery model.
@@ -111,30 +119,39 @@ class AttentionSelectorLayer(nn.Module):
         shared_dag_across_heads: When True (default), a single (B,L,S) score is
             shared across all value heads (SVFA-style). When False, each head
             has its own independent DAG score.
-        orthogonal_struct_embedding: When True, replace the structural stream
-            (Q/K) embeddings for both S and X with ``OrthogonalMaskEmbedding``
-            instances whose partitions tile the full d_model space without overlap:
+        struct_embedding_type: Selects the structural (Q/K) embedding scheme for
+            both S and X.  One of:
 
-                S occupies dims [0,           S_seq_len * k)
-                X occupies dims [S_seq_len*k, (S_seq_len+X_seq_len)*k)
+            * ``"standard_learnable"`` (default) — use the standard
+              ``ModularEmbedding`` (learnable ``nn_embedding``) for the
+              structural stream (original behaviour).
+            * ``"orthogonal_learnable"`` — replace the structural stream (Q/K)
+              embeddings for both S and X with ``OrthogonalMaskEmbedding``
+              instances whose partitions tile the full d_model space without
+              overlap:
 
-            where k = d_model // (S_seq_len + X_seq_len).  The value stream
-            (V, residual, MLP head) continues to use the standard ModularEmbedding.
-            Default False (original behaviour).  Mutually exclusive with
-            ``orthogonal_fixed``.
-        orthogonal_fixed: When True, replace the structural stream (Q/K)
-            embeddings for both S and X with ``FixedOrthonormalEmbedding``
-            instances.  Unlike ``orthogonal_struct_embedding`` (disjoint binary
-            blocks, so each variable lives on ``d_model // n_vars`` axis-aligned
-            dimensions with the remainder idle), this uses **dense frozen rows
-            spanning the FULL d_model space** that are still mutually orthonormal
-            (S and X share ONE frame via disjoint row slices, so all L_S + L_X
-            rows are pairwise orthogonal).  It is value-independent (identity
-            only), so the actual value must reach the output through the SVFA
-            value (V) stream.  Requires ``d_model >= S_seq_len + X_seq_len``.
-            The value stream is UNCHANGED.  Default False.  Mutually exclusive
-            with ``orthogonal_struct_embedding``.
-        orthogonal_fixed_frame_type: Frame construction for ``orthogonal_fixed``:
+                  S occupies dims [0,           S_seq_len * k)
+                  X occupies dims [S_seq_len*k, (S_seq_len+X_seq_len)*k)
+
+              where k = d_model // (S_seq_len + X_seq_len).  The value stream
+              (V, residual, MLP head) continues to use the standard
+              ``ModularEmbedding``.
+            * ``"orthogonal_fixed"`` — replace the structural stream (Q/K)
+              embeddings for both S and X with ``FixedOrthonormalEmbedding``
+              instances.  Unlike ``"orthogonal_learnable"`` (disjoint binary
+              blocks, so each variable lives on ``d_model // n_vars``
+              axis-aligned dimensions with the remainder idle), this uses
+              **dense frozen rows spanning the FULL d_model space** that are
+              still mutually orthonormal (S and X share ONE frame via disjoint
+              row slices, so all L_S + L_X rows are pairwise orthogonal).  It is
+              value-independent (identity only), so the actual value must reach
+              the output through the SVFA value (V) stream.  Requires
+              ``d_model >= S_seq_len + X_seq_len``.
+
+            In all cases the value stream (V, residual, FFN, MLP head) is
+            unchanged.  Default ``"standard_learnable"``.
+        orthogonal_fixed_frame_type: Frame construction for
+            ``struct_embedding_type="orthogonal_fixed"``:
             ``"random"`` (default) — QR of a Gaussian matrix, seeded from the
             global training seed so it varies per run; ``"dct"`` — deterministic
             DCT-II basis rows (seed-independent).
@@ -148,7 +165,7 @@ class AttentionSelectorLayer(nn.Module):
             With a single shared embedding, updating "X_i-as-child" also
             perturbs "X_i-as-parent", so ``X_i ← S`` and ``X_i ← X_j`` cannot be
             learned independently.  A separate query embedding removes this
-            coupling.  Works with or without ``orthogonal_struct_embedding``:
+            coupling.  Works with any ``struct_embedding_type``:
             the X KEY stream keeps whatever embedding is configured (orthogonal
             or standard), only the X QUERY structural stream is overridden.
             The value stream (V, residual, FFN, MLP head) is UNCHANGED.
@@ -160,8 +177,8 @@ class AttentionSelectorLayer(nn.Module):
             isometry preserves inner products, orthogonal raw keys (e.g. from
             ``OrthogonalMaskEmbedding``) stay orthogonal AFTER projection:
             ``<k_i W_K, k_j W_K> = <k_i, k_j>``.  Requires ``d_qk >= d_model``.
-            Most meaningful with ``orthogonal_struct_embedding=True`` and
-            ``n_heads=1``.
+            Most meaningful with ``struct_embedding_type="orthogonal_learnable"``
+            and ``n_heads=1``.
         orthogonal_key_scale: When ``key_projection_type="orthogonal"``, whether
             the ``OrthogonalLinear`` includes a learnable scalar scale factor
             (default True).  Ignored for ``"linear"``.
@@ -217,12 +234,12 @@ class AttentionSelectorLayer(nn.Module):
         output_mlp_dropout: float = 0.0,
         # Multi-head semantics
         shared_dag_across_heads: bool = True,
-        # Orthogonal structural embeddings (binary-mask, disjoint blocks)
-        orthogonal_struct_embedding: bool = False,
-        # Fixed dense orthonormal structural embeddings (spans full d_model,
-        # no idle dimensions; value-independent). Mutually exclusive with
-        # orthogonal_struct_embedding.
-        orthogonal_fixed: bool = False,
+        # Structural (Q/K) embedding scheme.  One of STRUCT_EMBEDDING_TYPES:
+        #   "standard_learnable"   → ModularEmbedding (nn_embedding)
+        #   "orthogonal_learnable" → OrthogonalMaskEmbedding (disjoint blocks)
+        #   "orthogonal_fixed"     → FixedOrthonormalEmbedding (dense frozen frame)
+        struct_embedding_type: str = "standard_learnable",
+        # Sub-options for struct_embedding_type="orthogonal_fixed".
         orthogonal_fixed_frame_type: str = "random",
         orthogonal_fixed_scale: float = 1.0,
         # Decoupled key/query embedding for X
@@ -255,8 +272,25 @@ class AttentionSelectorLayer(nn.Module):
         # Store embedding composition mode so callers (and diagnostics) can
         # inspect whether the model is operating in SVFA or standard mode.
         self.comps_embed_X = comps_embed_X
-        self.orthogonal_struct_embedding = orthogonal_struct_embedding
-        self.orthogonal_fixed = orthogonal_fixed
+
+        # ------------------------------------------------------------------
+        # Structural (Q/K) embedding scheme selection.
+        # A single key selects among three mutually-exclusive schemes; see the
+        # class docstring for ``struct_embedding_type``.  Convenience booleans
+        # ``orthogonal_struct_embedding`` / ``orthogonal_fixed`` are derived from
+        # it for readability in the forward pass and diagnostics.
+        # ------------------------------------------------------------------
+        if struct_embedding_type not in STRUCT_EMBEDDING_TYPES:
+            raise ValueError(
+                f"struct_embedding_type='{struct_embedding_type}' is invalid. "
+                f"Must be one of: {list(STRUCT_EMBEDDING_TYPES)}."
+            )
+        self.struct_embedding_type = struct_embedding_type
+        self.orthogonal_struct_embedding = (
+            struct_embedding_type == "orthogonal_learnable"
+        )
+        self.orthogonal_fixed = (struct_embedding_type == "orthogonal_fixed")
+
         self.free_query_embedding = free_query_embedding
         self.is_gated = (attention_type == "GatedCrossAttention")
         self.gain_stream_source = gain_stream_source
@@ -269,20 +303,12 @@ class AttentionSelectorLayer(nn.Module):
         # That is only safe when those inputs carry NO structural gradient
         # (frozen fixed orthonormal frame); otherwise the reconstruction loss
         # would leak into the structure via the shared embedding.
-        if self.is_gated and gain_stream_source == "shared" and not orthogonal_fixed:
+        if self.is_gated and gain_stream_source == "shared" and not self.orthogonal_fixed:
             raise ValueError(
-                "gain_stream_source='shared' requires orthogonal_fixed=True so "
-                "the shared struct embeddings carry no structural gradient. "
+                "gain_stream_source='shared' requires "
+                "struct_embedding_type='orthogonal_fixed' so the shared struct "
+                "embeddings carry no structural gradient. "
                 "Use gain_stream_source='separate' otherwise."
-            )
-
-
-        # The two structural-orthogonality schemes both override the Q/K stream
-        # via ``orth_embed_S`` / ``orth_embed_X`` and cannot be combined.
-        if orthogonal_struct_embedding and orthogonal_fixed:
-            raise ValueError(
-                "orthogonal_struct_embedding and orthogonal_fixed are mutually "
-                "exclusive; enable at most one structural-orthogonality scheme."
             )
 
         # Orthogonal (isometric) key projection.  When "orthogonal", the shared
@@ -413,21 +439,26 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
         # Orthogonal structural embeddings (optional override for Q/K stream)
         # ------------------------------------------------------------------
-        # Two mutually-exclusive schemes populate orth_embed_S / orth_embed_X:
+        # Dispatch on struct_embedding_type; the two orthogonal schemes populate
+        # orth_embed_S / orth_embed_X:
         #
-        #  (a) orthogonal_struct_embedding → OrthogonalMaskEmbedding: disjoint
-        #      binary blocks tiling d_model (k = d_model // n_vars dims/var; the
+        #  (a) "orthogonal_learnable" → OrthogonalMaskEmbedding: disjoint binary
+        #      blocks tiling d_model (k = d_model // n_vars dims/var; the
         #      remainder d_model % n_vars is idle). Value-modulated.
         #
-        #  (b) orthogonal_fixed → FixedOrthonormalEmbedding: dense frozen rows
+        #  (b) "orthogonal_fixed" → FixedOrthonormalEmbedding: dense frozen rows
         #      spanning ALL d_model dims, mutually orthonormal across S and X via
         #      a shared frame + disjoint row slices. Value-independent (identity
         #      only); the value reaches the output through the SVFA V stream.
         #
-        # In both cases the value stream (V, residual, FFN, MLP head) is UNCHANGED.
+        #  (c) "standard_learnable" → no override (orth_embed_{S,X} = None); the
+        #      standard ModularEmbedding above provides the structural stream.
+        #
+        # In the orthogonal cases the value stream (V, residual, FFN, MLP head)
+        # is UNCHANGED.
         self.orth_embed_S: Optional[nn.Module]
         self.orth_embed_X: Optional[nn.Module]
-        if orthogonal_struct_embedding:
+        if self.orthogonal_struct_embedding:
             total_vars = S_seq_len + X_seq_len
             k = d_model // total_vars
             if k <= 0:
@@ -452,12 +483,13 @@ class AttentionSelectorLayer(nn.Module):
                 freeze=False,
                 device=device,
             )
-        elif orthogonal_fixed:
+        elif self.orthogonal_fixed:
             total_vars = S_seq_len + X_seq_len
             if total_vars > d_model:
                 raise ValueError(
-                    f"orthogonal_fixed requires d_model >= S_seq_len + X_seq_len for "
-                    f"mutually orthonormal rows, got d_model={d_model} < {total_vars}."
+                    f"struct_embedding_type='orthogonal_fixed' requires "
+                    f"d_model >= S_seq_len + X_seq_len for mutually orthonormal "
+                    f"rows, got d_model={d_model} < {total_vars}."
                 )
             # Derive the frame seed from the global RNG (set by the training
             # seed_everything) so the frame varies across runs/seeds while both
@@ -485,6 +517,7 @@ class AttentionSelectorLayer(nn.Module):
                 device=device,
             )
         else:
+            # "standard_learnable": no structural override.
             self.orth_embed_S = None
             self.orth_embed_X = None
 
@@ -675,13 +708,14 @@ class AttentionSelectorLayer(nn.Module):
         xq_struct, xq_val = _emb_drop(self.embedding_X(X=x_blanked))
 
         # ---- Orthogonal structural stream override -----------------------
-        # When orthogonal_struct_embedding OR orthogonal_fixed is enabled,
-        # replace the structural (Q/K) embeddings with the orthogonal outputs
-        # (OrthogonalMaskEmbedding or FixedOrthonormalEmbedding respectively).
-        # The value stream (s_val, xk_val, xq_val) is UNCHANGED — it still comes
-        # from the standard ModularEmbedding above.
-        if self.orthogonal_struct_embedding or self.orthogonal_fixed:
-            assert self.orth_embed_S is not None and self.orth_embed_X is not None
+        # When struct_embedding_type selects an orthogonal scheme
+        # ("orthogonal_learnable" or "orthogonal_fixed"), replace the structural
+        # (Q/K) embeddings with the orthogonal outputs (OrthogonalMaskEmbedding
+        # or FixedOrthonormalEmbedding respectively).  The value stream (s_val,
+        # xk_val, xq_val) is UNCHANGED — it still comes from the standard
+        # ModularEmbedding above.
+        if self.orth_embed_S is not None:
+            assert self.orth_embed_X is not None
             s_struct  = self.dropout_emb(self.orth_embed_S(source_tensor))
             xk_struct = self.dropout_emb(self.orth_embed_X(x_actual))
             xq_struct = self.dropout_emb(self.orth_embed_X(x_blanked))

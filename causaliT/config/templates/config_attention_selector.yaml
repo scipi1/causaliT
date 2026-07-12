@@ -49,11 +49,16 @@ experiment:
   comps_embed: "svfa"
   use_gradient_routing: true
 
-  # Orthogonal structural embeddings (Q/K stream).
-  # When True, replace the standard nn_embedding structural role with
-  # OrthogonalMaskEmbedding modules whose disjoint d_model partitions make the
-  # S and X keys mutually orthogonal.  The value stream is unchanged.
-  orthogonal_struct_embedding: false
+  # Structural (Q/K stream) embedding scheme.  One of:
+  #   "standard_learnable"   — standard learnable nn_embedding (ModularEmbedding).
+  #   "orthogonal_learnable" — OrthogonalMaskEmbedding: learnable, but disjoint
+  #                            d_model partitions make S and X keys mutually
+  #                            orthogonal (gates zero out per-variable dims).
+  #   "orthogonal_fixed"     — FixedOrthonormalEmbedding: dense frozen rows
+  #                            spanning the full d_model space, mutually
+  #                            orthonormal and value-independent.
+  # The value stream is unchanged in all cases.
+  struct_embedding_type: "standard_learnable"
 
   # Decoupled key/query embedding for the predicted (X) nodes.
   # In the combined attention each X_i is used BOTH as a key (offered as a
@@ -147,8 +152,8 @@ model:
     init_tau: ${experiment.init_tau}
     shared_dag_across_heads: ${experiment.shared_dag_across_heads}
 
-    # Structural embedding variants (Q/K stream)
-    orthogonal_struct_embedding: ${experiment.orthogonal_struct_embedding}
+    # Structural embedding variant (Q/K stream); see experiment.struct_embedding_type.
+    struct_embedding_type: ${experiment.struct_embedding_type}
     # Decoupled X query embedding (Q only); see experiment.free_query_embedding.
     free_query_embedding: ${experiment.free_query_embedding}
 
@@ -190,6 +195,21 @@ training:
 
   loss_fn: "mse"
   lambda_recon: 1.0
+
+  # --- Structural reconstruction mixing (convex mix on structural pathway) ---
+  # Convex mix between HSIC and reconstruction on the STRUCTURAL loss (Q/K +
+  # structural embeddings), mirroring SingleCausalForecaster:
+  #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+  #              + score_sparse + group_l1 + notears + l0
+  # alpha = lambda_struct_recon in [0, 1]:
+  #   * 0.0 → pure-HSIC structural stream (original behaviour, default).
+  #   * >0  → re-inject a controlled dose of reconstruction signal into the
+  #           structural params.  Motivated by: causal parents must also be
+  #           predictive (aligns with fit-driven NOTEARS/DAG-GNN/GraN-DAG/DCDI).
+  # Only meaningful with use_gradient_routing: true (otherwise reconstruction
+  # already updates every parameter via the total loss).
+  lambda_struct_recon: 0.0
+
 
   batch_size: ${experiment.batch_size}
   max_epochs: ${experiment.max_epochs}
@@ -302,6 +322,51 @@ anm_training:
         functions:
           - eval_train_metrics
           - eval_attention_selector_scores
+
+
+# ---------------------------------------------------------------------------
+# Consumed by ``adaptive_trainer`` (causaliT.training.adaptive_trainer) when
+# this config is run via the ``adaptivetrain`` CLI entry point.  Unlike
+# ``anm_training`` (fixed per-stage epoch budgets, disk-chained checkpoints),
+# this runs a SINGLE in-memory pl.Trainer.fit() and switches between two
+# mutually-exclusive phases automatically by monitoring a metric:
+#
+#   * reconstruct — train reconstruction params only (structure frozen);
+#                   re-adapt the predictor to the current structure.
+#                   Stops on a validation-metric plateau or an epoch cap.
+#   * structure   — train structural params only (reconstruction frozen);
+#                   keep learning structure against a frozen good predictor.
+#                   Stops when the monitored metric degrades past a threshold
+#                   (default +20% over the per-phase best) or an epoch cap.
+#
+# Requires ``training.use_gradient_routing: true`` (true requires_grad freeze).
+adaptive_training:
+  total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
+  start_phase: reconstruct         # warm up the predictor before structure
+  max_cycles: 10                   # cap on the number of structure phases
+  starting_checkpoint: null        # optional warm-start (weights only)
+  reset_optimizer_state_on_switch: false
+  monitor: val_x_mae               # metric driving both phase triggers
+  eval_dag: true                   # capture DAG diagnostics at each switch
+  # Cross-fitting (DML/DARTS honest split): fraction of the training set given
+  # to the reconstruct phase; the disjoint remainder is used by the structure
+  # phase so residual-HSIC is measured out-of-sample w.r.t. the reconstruction
+  # fit.  null (or a value outside the open interval (0, 1)) disables it and
+  # both phases train on the full training set (default behaviour).
+  data_split_ratio: null
+
+
+  reconstruct:
+    max_epochs: 100                # per-phase safety cap
+    plateau_patience: 5            # stop after N val epochs w/o rel. improvement
+    plateau_min_delta: 1.0e-4      # relative improvement threshold
+
+  structure:
+    max_epochs: 200                # per-phase safety cap
+    lambda_hsic_cross: 1.0         # translated → lambda_hsic for AttentionSelectorLayer
+    lambda_hsic_self: 0.0
+    drop_pct: 0.20                 # switch when monitor rises 20% over phase best
+    drop_patience: 5
 
 
 data:

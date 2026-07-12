@@ -15,9 +15,15 @@ This document aims to collect the project status main findings, open problems an
 
 - F4: The `noise-aware` architecture and its variants underperform in reconstruction. From `experiments\2_ARCH_STUDY\OPTUNA_STUDY`, the R2 of those models saturates at 0.6 
 
-- F5: The oracle condition scores the minimum structural signal (from HSIC) for the noise-aware architecture. The single architecture shows better structural signal when it can cheat with spurious edges.
+- F5: The oracle condition scores the minimum structural signal (from HSIC) for the noise-aware architecture. The single architecture shows better structural signal when it can cheat with spurious edges. For the attention selector architecture, the oracle is the minimum in CC, GC attentions.
 
 - F6: *"Query/key decoupling helps contrast, not recovery."* In the ORTH_EMBED attention-selector study (`experiments/2_ARCH_STUDY/ORTH_EMBED_STUDY`), the combo `key_projection=orthogonal` + `free_query` (K_orth + Q+) raises the **edge/non-edge contrast** of the attention scores — the score-matrix rows stop being near-duplicates, so different edges are learned more independently ("disentangled edges"). On the sparse-init `CausalCrossAttention` run it is the clear winner on contrast (`E+ Korth Q+`: S→X **+0.09**, X→X **+0.14** at the structural stage), and there the fixed orthonormal frame additionally helps the endogenous X→X block. **BUT the gain is local to contrast: it does not improve SHD/recall** — on `CausalCross` the joint stage even adds spurious X→X edges, and on the dense-init `HardConcreteCrossAttention` run the same HSIC-favoured combo is among the *worst* on SHD/zeroness. That last point is a concrete instance of OQ1 (structural/HSIC signal ≠ recovery). Support is qualitative + zeroness-contrast so far, pending a dedicated `row_disentanglement` metric (see next steps).
+
+- F7: Scores are not only responsible for variable selection, they are needed for the functional learning of the reconstruction too. As a consequence, we implemented the `GatedCausalAttention`.
+
+- F8: Fixed key embeddings have shown to harm less the reconstruction quality of the predictor during the structural learning, compared to the learnable ones. This was especially observed for BKD and L0 regularization.
+
+- F9: *"Keep the GCA gain separate, global and unnormalized."* Now that the gate `z` owns causality (it is the only score thresholded for the DAG), we considered making the reconstruction gain `g` more expressive. Two options were evaluated and rejected: (i) **softmax normalization** — wrong functional form for an additive-noise mechanism (`X_i = Σ_j α_ij V_j + ε` is a sum, not a convex combination) and it recouples `g` to `z` (normalizing over gated edges makes MSE flow into the gate), breaking the product-of-independent-scores factorization that gives GCA its rigor (F7); (ii) **data-dependent / in-context gain** — deprioritized: reconstruction is already fine (R² ≈ 0.7–0.9), so the gain is not the binding constraint, and a richer reconstruction gradient would worsen the reconstruction-vs-structure gradient imbalance that already threatens the fragile HSIC signal (P1, F3, OQ3); H14 also shows a strong dense attention pathway hijacks DAG learning. **Trigger to reopen:** a constant-gate/`oracle` (`optuna_protocol`) ablation showing the global gain caps reconstruction (e.g. on strongly nonlinear mechanisms).
 
 ## Problems
 - P1: Optimizing the structure is challenging (see F3)
@@ -27,6 +33,7 @@ This document aims to collect the project status main findings, open problems an
 ## Open questions
 1. We see during training that often the SHD decreases. Is it because the model learns the causal structure or because the attention scores move away from the initialization during training? This is important because reporting a decreasing SHD $\neq$ the model is learning the causal structure.
 2. Is a low SHD actually needed for good ATE performance?
+3. Why GCA with learnable gates degrades reconstruction so badly during structural?
 
 
 ## Elaborations

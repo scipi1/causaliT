@@ -61,9 +61,18 @@ class StageCausalDataModule(pl.LightningDataModule):
         self.train_file = train_file
         self.test_file = test_file
         self.use_val_split = use_val_split
+        # Persistent workers are only valid when num_workers > 0.  They are also
+        # disabled by callers that reload the dataloader every epoch (e.g. the
+        # adaptive cross-fit trainer) to avoid worker/memory accumulation.
+        self.persistent_workers = num_workers > 0
+        # Cross-fit stage splits owned by the datamodule (see set_stage_splits).
+        self._stage_splits = None
+        self._stage_val_idx = None
+        self._stage_test_idx = None
         
         # Flag to track if Y (targets) exist
         self.has_targets = None
+
         
         # Store data as tensors
         self.S_tensor = None
@@ -361,6 +370,39 @@ class StageCausalDataModule(pl.LightningDataModule):
         else:
             print("Warning: update_idx() called before setup(). Datasets will be created when setup() is called.")
     
+    def set_stage_splits(self, stage_splits: dict = None,
+                         val_idx=None, test_idx=None) -> None:
+        """
+        Register per-phase training-index subsets for cross-fit / staged training.
+
+        The datamodule owns the split mapping so the phase orchestrator only needs
+        to request a phase by name (see ``set_active_phase``).  Validation/test
+        indices are stored once and reused across phases so metrics stay
+        comparable.
+        """
+        self._stage_splits = dict(stage_splits) if stage_splits else None
+        self._stage_val_idx = val_idx
+        self._stage_test_idx = test_idx
+    
+    def set_active_phase(self, phase: str):
+        """
+        Point ``train_ds`` at ``phase``'s registered cross-fit subset.
+
+        Returns the subset size (int) or ``None`` when no split is registered for
+        the phase (cross-fitting disabled).
+        """
+        if not self._stage_splits:
+            return None
+        subset = self._stage_splits.get(phase)
+        if subset is None:
+            return None
+        self.update_idx(
+            train_idx=subset,
+            val_idx=self._stage_val_idx,
+            test_idx=self._stage_test_idx,
+        )
+        return int(len(subset))
+    
     def setup(self, stage) -> None:
         """Setup method called by PyTorch Lightning."""
         self.prepare_data()
@@ -371,7 +413,7 @@ class StageCausalDataModule(pl.LightningDataModule):
             self.train_ds,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             shuffle=True,
         )
     
@@ -382,7 +424,7 @@ class StageCausalDataModule(pl.LightningDataModule):
             self.val_ds,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             shuffle=False,
         )
     
@@ -391,7 +433,7 @@ class StageCausalDataModule(pl.LightningDataModule):
             self.test_ds,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             shuffle=False,
         )
     
@@ -400,7 +442,7 @@ class StageCausalDataModule(pl.LightningDataModule):
             self.test_ds,
             batch_size=1,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             shuffle=False,
         )
     
@@ -409,6 +451,8 @@ class StageCausalDataModule(pl.LightningDataModule):
             self.all_ds,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            persistent_workers=True,
+            persistent_workers=self.persistent_workers,
             shuffle=False,
         )
+
+

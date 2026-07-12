@@ -74,6 +74,24 @@ STRUCTURAL_PATTERNS = [
     # In the standard DataSetEmbedding with role="structure", the module
     # label is "variable" and uses nn.Embedding.
     "structure_modules",
+    # Orthogonal structural key embeddings (AttentionSelectorLayer,
+    # struct_embedding_type="orthogonal_learnable"/"orthogonal_fixed").
+    # Both schemes are stored under the SAME attribute names
+    # (``orth_embed_S`` / ``orth_embed_X``) in the model, so one pair of
+    # patterns covers both:
+    #   * "orthogonal_learnable" -> OrthogonalMaskEmbedding, whose learnable
+    #     ``value_embedding`` (nn.Linear, freeze=False) builds the structural
+    #     keys that feed the gate score log_alpha = QK^T -> STRUCTURAL.
+    #   * "orthogonal_fixed"     -> FixedOrthonormalEmbedding, a frozen
+    #     buffer-only frame (no trainable params) -> matches nothing today,
+    #     but the rule stays consistent and future-proof.
+    # Without these, the learnable orthogonal key embeddings were wrongly
+    # routed to the reconstruction group (frozen in the structure phase,
+    # trained by HSIC/L0 in the reconstruct phase -- the exact inverse of the
+    # intended gradient routing).
+    "orth_embed_S",
+    "orth_embed_X",
+
     # Free query embedding (AttentionSelectorLayer, free_query_embedding=True).
     # This is the decoupled X *query* identity lookup table; it feeds only the
     # attention Query, so it is a structural parameter driven by HSIC /

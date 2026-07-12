@@ -409,7 +409,11 @@ _TRAINING_OVERRIDE_KEYS = frozenset({
     "lambda_hsic_cross",
     "lambda_hsic_self",
     "lambda_recon",
+    # Convex-mix reconstruction weight on the structural pathway
+    # (SingleCausalForecaster + AttentionSelectorForecaster).
+    "lambda_struct_recon",
     "lambda_self_score_sparse",
+
     "lambda_cross_score_sparse",
     # AttentionSelectorLayer: unified HSIC weight and score sparsity weight
     "lambda_hsic",

@@ -17,6 +17,8 @@ from .attention import (
     AttentionLayer,
 )
 from .gated_cross_attention import GatedCrossAttention
+from .gated_self_attention import GatedSelfAttention
+
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
 from .embedding import ModularEmbedding
@@ -34,7 +36,9 @@ __all__ = [
     'SigmoidCrossAttention',
     'HardConcreteCrossAttention',
     'GatedCrossAttention',
+    'GatedSelfAttention',
     'ToeplitzAttention',
+
     'AttentionLayer',
     'Encoder',
     'EncoderLayer',

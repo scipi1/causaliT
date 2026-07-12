@@ -153,7 +153,11 @@ def _make_model(
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
-        orthogonal_struct_embedding=orthogonal_struct_embedding,
+        struct_embedding_type=(
+            "orthogonal_learnable"
+            if orthogonal_struct_embedding
+            else "standard_learnable"
+        ),
         free_query_embedding=free_query_embedding,
     )
 

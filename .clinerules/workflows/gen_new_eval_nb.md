@@ -12,6 +12,7 @@ Analyze the experimental results provided and generate a new, tailored Jupyter e
 2. **Template and Structure Analysis**:
    - Read the reference `.ipynb` file to understand the baseline visualization libraries, standard evaluation metrics (e.g., loss curves, confusion matrices), and loading patterns used for prior experiments.
    - Understand optional experiment-specific information provided by the user. It will help you better tailoring the reference notebooks to the current use case.
+   - If the user has not specified any template, look for folders in the same level as the specified experiment and read `.ipynb` files. Then base the template on them.
 
 3. **Code Adaptation & Variable Mapping**:
    - Parse the unique parameters, path strings, and file names specific to the *new* experiment.
@@ -24,4 +25,10 @@ Analyze the experimental results provided and generate a new, tailored Jupyter e
 
 5. **Validation Verification**:
    - Inform the user that the notebook has been generated and is ready to be opened in the native VS Code Jupyter editor interface.
+
+
+6. **General Evaluation Hygiene**
+- If the experiment involves training a model and training metrics are available in the folder structure, make an initial cell evaluating the training itself. This is a pre-requisite before even looking at the experiment-specific results. 
+- If metrics like R2, MAE are present, report them and suggest the user to carefully analyze them. The R2 score is the best indicator to quickly understand if the fit was successful, it should have the highest priority.
+- If training and validation metrics logs are available, plot them against the epochs to visualize generalization, overfit and underfit.
 </detailed_sequence_of_steps>

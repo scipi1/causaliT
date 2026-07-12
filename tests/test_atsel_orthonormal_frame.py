@@ -9,9 +9,9 @@ binary blocks -- each variable lives on ``d_model // n_vars`` axis-aligned
 dimensions, and ``d_model % n_vars`` dimensions are left idle.  The observed
 downside is limited expressivity / "wasted" dimensions.
 
-``FixedOrthonormalEmbedding`` (config flag ``orthogonal_fixed``) keeps EXACT
-cross-variable orthogonality while using dense frozen rows that span the FULL
-``d_model`` space (no idle dims), analogous to fixed sinusoidal positional
+``FixedOrthonormalEmbedding`` (selected via ``struct_embedding_type="orthogonal_fixed"``)
+keeps EXACT cross-variable orthogonality while using dense frozen rows that span
+the FULL ``d_model`` space (no idle dims), analogous to fixed sinusoidal positional
 encodings but with a genuinely orthonormal frame.  S and X share ONE frame
 (same seed + total_variables) via disjoint row slices, so all ``L_S + L_X`` rows
 are pairwise orthonormal -- including S-vs-X.
@@ -27,10 +27,10 @@ These tests verify:
 4. **Determinism**: ``"dct"`` frames are seed-independent; ``"random"`` frames are
    reproducible given a seed and vary across seeds.
 5. **Guards**: ``total_variables > d_model``, bad ``frame_type``, bad ``row_offset``.
-6. **Model wiring**: ``orthogonal_fixed=True`` populates ``orth_embed_{S,X}`` with
-   ``FixedOrthonormalEmbedding``; forward shapes are unchanged; the model's S and
-   X frames are mutually orthogonal; mutual-exclusivity with
-   ``orthogonal_struct_embedding`` raises.
+6. **Model wiring**: ``struct_embedding_type="orthogonal_fixed"`` populates
+   ``orth_embed_{S,X}`` with ``FixedOrthonormalEmbedding``; forward shapes are
+   unchanged; the model's S and X frames are mutually orthogonal; an invalid
+   ``struct_embedding_type`` raises.
 7. **Korth preservation**: projecting the orthonormal raw keys through an
    isometric ``W_K`` keeps them orthogonal.
 
@@ -111,7 +111,18 @@ def _make_model(
     key_projection_type: str = "linear",
     frame_type: str = "random",
     d_qk: int = D_QK,
+    struct_embedding_type: str = None,
 ) -> AttentionSelectorLayer:
+    # Translate the legacy boolean helper flags to the single struct_embedding_type
+    # key.  ``struct_embedding_type`` (when passed explicitly) overrides the flags,
+    # allowing tests to inject invalid values.
+    if struct_embedding_type is None:
+        if orthogonal_fixed:
+            struct_embedding_type = "orthogonal_fixed"
+        elif orthogonal_struct_embedding:
+            struct_embedding_type = "orthogonal_learnable"
+        else:
+            struct_embedding_type = "standard_learnable"
     return AttentionSelectorLayer(
         model="test_model",
         ds_embed_S=_summation_embed_cfg(VOCAB_S),
@@ -135,8 +146,7 @@ def _make_model(
         d_qk=d_qk,
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
-        orthogonal_struct_embedding=orthogonal_struct_embedding,
-        orthogonal_fixed=orthogonal_fixed,
+        struct_embedding_type=struct_embedding_type,
         orthogonal_fixed_frame_type=frame_type,
         key_projection_type=key_projection_type,
     )
@@ -327,12 +337,14 @@ class TestGuards:
 class TestModelWiring:
     def test_flag_stored_and_modules_are_fixed_orthonormal(self):
         m = _make_model(orthogonal_fixed=True)
+        assert m.struct_embedding_type == "orthogonal_fixed"
         assert m.orthogonal_fixed is True
         assert isinstance(m.orth_embed_S, FixedOrthonormalEmbedding)
         assert isinstance(m.orth_embed_X, FixedOrthonormalEmbedding)
 
     def test_off_leaves_orth_embeds_none(self):
         m = _make_model(orthogonal_fixed=False)
+        assert m.struct_embedding_type == "standard_learnable"
         assert m.orth_embed_S is None and m.orth_embed_X is None
 
     def test_model_S_and_X_frames_are_mutually_orthogonal(self):
@@ -341,9 +353,11 @@ class TestModelWiring:
         gram = full @ full.T
         assert torch.allclose(gram, torch.eye(S_SEQ_LEN + X_SEQ_LEN), atol=1e-5)
 
-    def test_mutual_exclusivity_raises(self):
-        with pytest.raises(ValueError, match="mutually"):
-            _make_model(orthogonal_fixed=True, orthogonal_struct_embedding=True)
+    def test_invalid_struct_embedding_type_raises(self):
+        # The single struct_embedding_type key replaces the previous pair of
+        # mutually-exclusive booleans; an unknown value must raise.
+        with pytest.raises(ValueError, match="struct_embedding_type"):
+            _make_model(struct_embedding_type="orthogonal_both")
 
     def test_forward_shapes(self):
         m = _make_model(orthogonal_fixed=True)

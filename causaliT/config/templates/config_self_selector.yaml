@@ -1,0 +1,254 @@
+# SelfSelectorLayer Template
+#
+# Research question:
+#   Can a single direction-aware SELF-attention block recover the WHOLE directed
+#   acyclic graph over all N = L_S + L_X variables from observational data,
+#   WITHOUT assuming which variables are sources?
+#
+# Motivation vs AttentionSelectorLayer:
+#   AttentionSelectorLayer hard-codes the direction S -> X (S is only ever a key,
+#   never a query).  In a standard causal-discovery task we do NOT know the source
+#   set, so here every variable is treated homogeneously: each node is both a
+#   value-blanked QUERY (candidate child) and an actual-value KEY/VALUE (candidate
+#   parent).  A single GatedSelfAttention produces the full (N, N) posterior.
+#
+# Architecture (GatedSelfAttention — the ONLY supported attention_type):
+#   raw    = <q_i, k_j> / sqrt(E)
+#   S_sym  = (raw + raw^T)/2  -> SYMMETRIC   HardConcrete existence gate  z
+#   A_anti = (raw - raw^T)/2  -> ANTISYMMETRIC coupled direction gate     d  (d_ij+d_ji=1)
+#   A_ij   = z_ij * d_ij * g_ij               (g = separate reconstruction gain)
+#   Hard mask: off-diagonal only (no self-loops).  No assumed S -> X direction.
+#
+#   This fuses the Toeplitz directional parametrisation (symmetric existence +
+#   antisymmetric coupled direction) with the HardConcrete L0 selector of
+#   GatedCrossAttention → a differentiable, direction-aware variable selector.
+#
+# Homogeneous embedding:
+#   A SINGLE shared ModularEmbedding is applied to the concatenated [S, X] set.
+#   X variable-ids are offset by `training.x_var_id_offset` (default = S_seq_len)
+#   so S and X share ONE contiguous id namespace (set data.num_embeddings_shared
+#   to L_S + L_X + 1 to cover it, padding id 0 included).
+#
+# Suggested workflow:
+#   1. lambda_l0=0, lambda_hsic=0, lambda_score_sparse=0 → verify reconstruction.
+#   2. Add L0 (lambda_l0) to drive the symmetric existence gate sparse.
+#   3. Add HSIC (lambda_hsic) to push residual independence (orient/prune edges).
+#   4. Add NOTEARS (kappa) on the full (N, N) score to enforce acyclicity.
+#   5. Enable gradient routing for cleaner structure vs reconstruction separation.
+
+experiment:
+  d_model_set: 24
+  n_heads: 1
+  d_ff_mult: 2.0
+  d_qk_mult: 0.5
+  d_ff: null
+  d_qk: null
+  dropout: 0.0
+
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 2
+
+  # Only GatedSelfAttention is supported by SelfSelectorLayer.
+  attention_type: "GatedSelfAttention"
+  init_tau: 0.6666666667          # HardConcrete existence-gate temperature (beta)
+  init_gamma: -0.1                # HardConcrete stretch lower bound (< 0)
+  init_zeta: 1.1                  # HardConcrete stretch upper bound (> 1)
+  dir_tau: 0.6666666667           # direction-gate (Binary-Concrete) temperature
+  gain_tau: 1.0                   # reconstruction-gain sigmoid temperature
+
+  # A single structural head is REQUIRED (GatedSelfAttention).
+  shared_dag_across_heads: true
+
+  # Embedding composition mode:
+  #   "summation" — sub-modules summed into one d_model vector.
+  #   "svfa"      — SVFA multi-head values (requires n_heads > 1).
+  comps_embed: "svfa"
+  use_gradient_routing: true
+
+  # Structural (Q/K stream) embedding scheme; see model.kwargs.struct_embedding_type.
+  struct_embedding_type: "standard_learnable"
+  # Decouple node-as-child (query) from node-as-parent (key) identities.
+  free_query_embedding: false
+  # Reconstruction-gain stream source: "separate" (own gain tables) or "shared"
+  # (reuse frozen struct embeddings; requires struct_embedding_type=orthogonal_fixed).
+  gain_stream_source: "separate"
+
+
+model:
+  model_object: "SelfSelectorLayer"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+
+  kwargs:
+    model: ${model.model_object}
+
+    # SINGLE shared embedding over ALL N = L_S + L_X nodes.
+    # Applied to both the value-blanked query input and the actual key/value input.
+    ds_embed:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_shared}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed: ${experiment.comps_embed}
+
+    # Attention (GatedSelfAttention)
+    attention_type: ${experiment.attention_type}
+    n_heads: ${experiment.n_heads}
+    init_tau: ${experiment.init_tau}
+    init_gamma: ${experiment.init_gamma}
+    init_zeta: ${experiment.init_zeta}
+    dir_tau: ${experiment.dir_tau}
+    gain_tau: ${experiment.gain_tau}
+    shared_dag_across_heads: ${experiment.shared_dag_across_heads}
+
+    struct_embedding_type: ${experiment.struct_embedding_type}
+    free_query_embedding: ${experiment.free_query_embedding}
+    gain_stream_source: ${experiment.gain_stream_source}
+
+    # Dropout
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dropout_qkv: ${experiment.dropout}
+    attention_dropout: ${experiment.dropout}
+
+    # Architecture
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+
+    # Dimensions
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+
+    # Sequence lengths (used only to carve GT blocks in split_attention)
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+
+    # Output MLP head
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+
+  loss_fn: "mse"
+  lambda_recon: 1.0
+
+  # Offset applied to X variable-ids so S and X share one embedding namespace.
+  # Default (null) → S_seq_len.  Set explicitly if your data uses a different
+  # id layout.
+  x_var_id_offset: null
+
+  # Convex-mix reconstruction weight on the structural pathway (see AttentionSelector).
+  lambda_struct_recon: 0.0
+
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 1
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+
+  # --- Score sparsity (L1 on the directed posterior) ---
+  lambda_score_sparse: 0.0
+
+  # --- HSIC regularization (over the full N-node source) ---
+  lambda_hsic: 1.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: true
+  hsic_kernel_source: "rbf"
+  hsic_mode: "biased"
+  nhsic_epsilon: 0.01
+
+  # --- Group-L1 (embedding column sparsity) ---
+  lambda_group_l1: 0.0
+
+  # --- L0 regularization (HardConcrete existence gate) ---
+  # Expected number of active edges = sum P(z_ij > 0).  Set >0 to drive the
+  # symmetric existence gate sparse.
+  lambda_l0: 0.0
+
+  # --- NOTEARS acyclicity on the FULL (N, N) score ---
+  # h(A) = tr(exp(A ⊙ A)) - N; zero iff A is a DAG.  Set >0 to enforce acyclicity.
+  kappa: 0.0
+
+  # --- L0 <-> HSIC gradient-interference diagnostic ---
+  log_l0_hsic_interference: false
+  interference_log_every_n_epochs: 1
+
+  # --- Gradient routing ---
+  use_gradient_routing: ${experiment.use_gradient_routing}
+
+  # Oracle mode: use the GT (N, N) adjacency as the structure gate.
+  use_oracle_attention: false
+  use_hard_masks: false
+  # GT mask CSVs to build the full (N, N) oracle adjacency (dec_cross + dec_self).
+  hard_mask_files: null
+
+
+data:
+  dataset: "scm1_continuous"
+  filename_input: "ds.npz"
+
+  train_file: "ds_train.npz"
+  test_file: "ds_test.npz"
+
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  # Must cover L_S + L_X ids (+1 for padding id 0) for the SINGLE shared table.
+  num_embeddings_shared: null
+
+  feature_indices:
+    value: null
+    variable: null
+
+
+evaluation:
+  functions:
+    - "eval_train_metrics"
+
+special:
+  mode: []
