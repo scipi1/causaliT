@@ -61,6 +61,7 @@ from causaliT.core.modules import (
     ScaledDotAttention,
     HardConcreteCrossAttention,
     GatedCrossAttention,
+    GatedSelfAttention,
     AttentionLayer,
     ModularEmbedding,
     Normalization,
@@ -68,6 +69,7 @@ from causaliT.core.modules import (
     OrthogonalMaskEmbedding,
     FixedOrthonormalEmbedding,
 )
+
 # Imported directly from the submodule so the layer does not depend on the
 # package ``__init__`` re-export being present.
 from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
@@ -261,7 +263,21 @@ class AttentionSelectorLayer(nn.Module):
         gain_tau: float = 1.0,
         init_gamma: float = -0.1,
         init_zeta: float = 1.1,
+        # Direction-aware X→X self-attention block.  When None (default) the
+        # X→X interaction is modelled by the RIGHT-HAND columns of the single
+        # combined cross-attention (original behaviour, no directionality).
+        # When set to "GatedSelfAttention" the architecture SPLITS into:
+        #   * S→X  via the cross ``attention_type`` block  (keys/values = S only)
+        #   * X→X  via a dedicated ``GatedSelfAttention`` block that models edge
+        #          direction (antisymmetric gate: d_ij + d_ji = 1 suppresses
+        #          two-cycles), keys/values = X only.
+        # The two attention outputs are SUMMED into one unified value residual
+        # stream, so X is still reconstructed jointly from both S and X.
+        self_attention_type: Optional[str] = None,
+        # Direction-gate Binary-Concrete temperature (GatedSelfAttention only).
+        dir_tau: float = 2.0 / 3.0,
     ):
+
 
         super().__init__()
 
@@ -294,6 +310,23 @@ class AttentionSelectorLayer(nn.Module):
         self.free_query_embedding = free_query_embedding
         self.is_gated = (attention_type == "GatedCrossAttention")
         self.gain_stream_source = gain_stream_source
+
+        # ------------------------------------------------------------------
+        # Direction-aware X→X self-attention split.
+        # When ``self_attention_type`` is set, the X→X interaction is modelled
+        # by a dedicated ``GatedSelfAttention`` block (edge-direction aware)
+        # instead of the right-hand columns of the single combined cross block.
+        # ------------------------------------------------------------------
+        SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
+        self.self_attention_type = self_attention_type
+        self.split_xx = self_attention_type is not None
+        if self.split_xx and self_attention_type not in SELF_ATTENTION_TYPES:
+            raise ValueError(
+                f"self_attention_type='{self_attention_type}' is invalid. "
+                f"Must be None or one of: {list(SELF_ATTENTION_TYPES)}."
+            )
+        self.dir_tau = dir_tau
+
         if gain_stream_source not in ("separate", "shared"):
             raise ValueError(
                 f"gain_stream_source='{gain_stream_source}' is invalid. "
@@ -376,6 +409,11 @@ class AttentionSelectorLayer(nn.Module):
             )
         att_cls = att_cls_map[attention_type]
 
+        # In SPLIT mode the cross block attends to S ONLY (keys/values = S);
+        # the X→X interaction is handled by the dedicated self-attention block.
+        # In single (default) mode it attends to the combined [S, X] key set.
+        cross_key_seq_len = S_seq_len if self.split_xx else (S_seq_len + X_seq_len)
+
         self.attention = AttentionLayer(
             attention=att_cls,
             d_model_queries=d_model,
@@ -389,7 +427,7 @@ class AttentionSelectorLayer(nn.Module):
             register_entropy=True,
             layer_name="selector_att",
             query_seq_len=X_seq_len,
-            key_seq_len=S_seq_len + X_seq_len,
+            key_seq_len=cross_key_seq_len,
             init_tau=init_tau,
             shared_dag_across_heads=shared_dag_across_heads,
             # Isometric key projection (W_K^T W_K = I) when "orthogonal".
@@ -408,7 +446,47 @@ class AttentionSelectorLayer(nn.Module):
             gain_tau=gain_tau,
         )
 
-
+        # ------------------------------------------------------------------
+        # Direction-aware X→X self-attention block (split mode only).
+        # A dedicated ``GatedSelfAttention`` models X_i → X_j with an
+        # antisymmetric direction gate (d_ij + d_ji = 1) that suppresses
+        # two-cycles — the directionality the single combined cross block
+        # cannot express.  Q and K SHARE the same X structural identity
+        # embedding (a self-attention requirement for the symmetric/
+        # antisymmetric Toeplitz split); values are the X value stream.
+        # ------------------------------------------------------------------
+        self_att_cls_map = {"GatedSelfAttention": GatedSelfAttention}
+        if self.split_xx:
+            self_att_cls = self_att_cls_map[self_attention_type]
+            self.self_attention = AttentionLayer(
+                attention=self_att_cls,
+                d_model_queries=d_model,
+                d_model_keys=d_model,
+                d_model_values=d_model,
+                d_queries_keys=d_qk,
+                n_heads=n_heads,
+                mask_layer=None,
+                attention_dropout=attention_dropout,
+                dropout_qkv=dropout_qkv,
+                register_entropy=True,
+                layer_name="selector_self_att",
+                query_seq_len=X_seq_len,
+                key_seq_len=X_seq_len,
+                init_tau=init_tau,
+                shared_dag_across_heads=shared_dag_across_heads,
+                key_projection_type=key_projection_type,
+                orthogonal_scale=orthogonal_key_scale,
+                batch_key_dropout=batch_key_dropout,
+                batch_key_dropout_p_final=batch_key_dropout_p_final,
+                batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                optuna_protocol=optuna_protocol,
+                init_gamma=init_gamma,
+                init_zeta=init_zeta,
+                gain_tau=gain_tau,
+                dir_tau=dir_tau,
+            )
+        else:
+            self.self_attention = None
 
         # ------------------------------------------------------------------
         # Static combined hard mask: (L_X, L_S + L_X)
@@ -420,6 +498,17 @@ class AttentionSelectorLayer(nn.Module):
             "combined_mask",
             self._build_combined_mask(S_seq_len, X_seq_len),
         )
+
+        # Split-mode sub-masks: the S→X cross block is fully connected
+        # (all X may attend any S) and the X→X self block is off-diagonal
+        # (no self-loops).
+        self.register_buffer(
+            "cross_mask", torch.ones(X_seq_len, S_seq_len)
+        )
+        self.register_buffer(
+            "self_mask", 1.0 - torch.eye(X_seq_len)
+        )
+
 
         # ------------------------------------------------------------------
         # Post-attention sublayer: residual + norm + FFN + norm
@@ -757,8 +846,12 @@ class AttentionSelectorLayer(nn.Module):
         # in "shared" mode they reuse the (frozen) structural embeddings, so
         # gain_query/gain_key are left as None and the AttentionLayer falls
         # back to the structural q/k inputs internally.
+        # ``gk_S`` / ``gk_X`` are kept separately so the split path can feed the
+        # cross block S-only gain keys and the self block X-only gain keys.
         gain_query = None
         gain_key = None
+        gk_S = None
+        gk_X = None
         if self.is_gated and self.gain_stream_source == "separate":
             assert self.gain_q_embed_X is not None
             gain_query = self.dropout_emb(self.gain_q_embed_X(x_blanked))
@@ -766,19 +859,98 @@ class AttentionSelectorLayer(nn.Module):
             gk_X = self.dropout_emb(self.gain_k_embed_X(x_actual))
             gain_key = torch.cat([gk_S, gk_X], dim=1)       # (B, L_S+L_X, d)
 
-        attn_out, attention_weights, _aux = self.attention(
-            query=x_q_emb,
-            key=sx_keys,
-            value=sx_vals,
-            mask_miss_k=None,
-            mask_miss_q=None,
-            pos=None,
-            causal_mask=False,
-            hard_mask=hard_mask,
-            oracle=oracle,
-            gain_query=gain_query,
-            gain_key=gain_key,
-        )
+        if self.split_xx:
+            # ==============================================================
+            # SPLIT MODE — S→X cross block + direction-aware X→X self block.
+            # ==============================================================
+            if oracle:
+                raise NotImplementedError(
+                    "oracle mode is not implemented for the split "
+                    "(self_attention_type) X→X path yet."
+                )
+
+            # ---- S→X cross block (keys/values = S only) -----------------
+            out_sx, attn_sx, aux_sx = self.attention(
+                query=x_q_emb,
+                key=s_struct,
+                value=(s_val if s_val is not None else s_struct),
+                mask_miss_k=None,
+                mask_miss_q=None,
+                pos=None,
+                causal_mask=False,
+                hard_mask=self.cross_mask,
+                oracle=False,
+                gain_query=gain_query,
+                gain_key=gk_S,
+            )
+
+            # ---- X→X self block (keys/values = X only) ------------------
+            # Q and K SHARE the X structural identity (NOT the free query),
+            # as required by the symmetric/antisymmetric Toeplitz split.  The
+            # X key structural embedding ``xk_struct`` is value-independent
+            # (identity only) so it is the correct shared Q/K signal.
+            self_value = xk_val if xk_val is not None else xk_struct
+            self_gain_q = None
+            self_gain_k = None
+            if self.gain_stream_source == "separate" and self.gain_q_embed_X is not None:
+                # GatedSelfAttention always needs a gain stream; reuse the X
+                # gain identity tables (X-as-child query, X-as-parent key).
+                self_gain_q = self.dropout_emb(self.gain_q_embed_X(x_blanked))
+                self_gain_k = self.dropout_emb(self.gain_k_embed_X(x_actual))
+
+            out_xx, attn_xx, aux_xx = self.self_attention(
+                query=xk_struct,
+                key=xk_struct,
+                value=self_value,
+                mask_miss_k=None,
+                mask_miss_q=None,
+                pos=None,
+                causal_mask=False,
+                hard_mask=self.self_mask,
+                oracle=False,
+                gain_query=self_gain_q,
+                gain_key=self_gain_k,
+            )
+
+            # ---- Unified re-fusion --------------------------------------
+            # Both attention outputs land in the SAME value residual stream,
+            # so X is reconstructed jointly from S and X.
+            attn_out = out_sx + out_xx
+            # Re-assemble the combined (B, L_X, L_S+L_X) posterior so all
+            # downstream consumers (split_attention, DAG extraction, SHD) work
+            # unchanged.
+            attention_weights = torch.cat([attn_sx, attn_xx], dim=-1)
+
+            # Combine aux: sum the two L0 penalties; add the entropies.
+            def _combine(a, b):
+                if a is None:
+                    return b
+                if b is None:
+                    return a
+                return a + b
+            l0_sx = aux_sx.get("l0_penalty") if isinstance(aux_sx, dict) else None
+            l0_xx = aux_xx.get("l0_penalty") if isinstance(aux_xx, dict) else None
+            ent_sx = aux_sx.get("entropy") if isinstance(aux_sx, dict) else None
+            ent_xx = aux_xx.get("entropy") if isinstance(aux_xx, dict) else None
+            _aux = {
+                "entropy": _combine(ent_sx, ent_xx),
+                "l0_penalty": _combine(l0_sx, l0_xx),
+            }
+        else:
+            attn_out, attention_weights, _aux = self.attention(
+                query=x_q_emb,
+                key=sx_keys,
+                value=sx_vals,
+                mask_miss_k=None,
+                mask_miss_q=None,
+                pos=None,
+                causal_mask=False,
+                hard_mask=hard_mask,
+                oracle=oracle,
+                gain_query=gain_query,
+                gain_key=gain_key,
+            )
+
         # ---- Residual + Norm 1 -------------------------------------------
         # SVFA mode: the attention output (derived from the value V stream)
         # must go to the VALUE stream only.  The structure stream (x_struct =
@@ -831,6 +1003,37 @@ class AttentionSelectorLayer(nn.Module):
         return att_sx, att_xx
 
     # ------------------------------------------------------------------
+    # Unified score tensor for sparsity / NOTEARS regularisers
+    # ------------------------------------------------------------------
+
+    def get_score_tensor_for_sparsity(self) -> Optional[torch.Tensor]:
+        """Return the combined ``(L_X, L_S + L_X)`` structure score tensor.
+
+        This is the batch-mean, head-averaged edge posterior read by the
+        forecaster's score-sparsity (L1) and NOTEARS acyclicity terms.
+
+        * **Single mode**: the combined cross block already exposes the full
+          ``(L_X, L_S + L_X)`` score tensor directly.
+        * **Split mode**: concatenate the S→X cross gate posterior
+          ``(L_X, L_S)`` with the X→X ``GatedSelfAttention`` DIRECTED posterior
+          ``(L_X, L_X)`` along the last dim so the layout matches single mode
+          (the NOTEARS term then acts on the direction-aware X→X posterior).
+
+        Returns ``None`` if the underlying score tensors have not been populated
+        yet (e.g. before the first forward pass).
+        """
+        cross = getattr(self.attention.inner_attention, "score_tensor_for_sparsity", None)
+        if not self.split_xx:
+            return cross
+        assert self.self_attention is not None
+        self_score = getattr(
+            self.self_attention.inner_attention, "score_tensor_for_sparsity", None
+        )
+        if cross is None or self_score is None:
+            return None
+        return torch.cat([cross, self_score], dim=-1)   # (L_X, L_S + L_X)
+
+    # ------------------------------------------------------------------
     # Freezing utilities (mirrors SingleCausalLayer)
     # ------------------------------------------------------------------
 
@@ -853,10 +1056,17 @@ class AttentionSelectorLayer(nn.Module):
     def freeze_attention(self):
         for p in self.attention.parameters():
             p.requires_grad_(False)
+        if self.self_attention is not None:
+            for p in self.self_attention.parameters():
+                p.requires_grad_(False)
 
     def unfreeze_attention(self):
         for p in self.attention.parameters():
             p.requires_grad_(True)
+        if self.self_attention is not None:
+            for p in self.self_attention.parameters():
+                p.requires_grad_(True)
+
 
     def freeze_forecaster(self):
         for p in self.forecaster.parameters():

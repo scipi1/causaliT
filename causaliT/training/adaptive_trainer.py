@@ -57,6 +57,10 @@ Example ``config['adaptive_training']`` block::
 
       reconstruct:
         max_epochs: 100                # per-phase safety cap
+        min_epochs: 0                  # floor: suppress plateau exit before N epochs
+                                       # (applies to every reconstruct phase)
+        warmup_min_epochs: 0           # larger floor for the INITIAL warmup phase
+                                       # (falls back to min_epochs when unset)
         plateau_patience: 5            # stop after N val epochs w/o rel. improvement
         plateau_min_delta: 1.0e-4      # relative improvement threshold
 
@@ -180,6 +184,16 @@ class PhaseController(Callback):
         self.recon_max_epochs: int = int(self.recon_cfg.get("max_epochs", 100))
         self.plateau_patience: int = int(self.recon_cfg.get("plateau_patience", 5))
         self.plateau_min_delta: float = float(self.recon_cfg.get("plateau_min_delta", 1e-4))
+        # Minimum-epoch floors: suppress the plateau-based early exit until the
+        # phase has run at least this many epochs.  ``warmup_min_epochs`` applies
+        # only to the INITIAL warmup reconstruct phase (phase_index 0 when the run
+        # starts on reconstruct); ``min_epochs`` applies to every later reconstruct
+        # phase.  ``warmup_min_epochs`` falls back to ``min_epochs`` when unset.
+        self.recon_min_epochs: int = int(self.recon_cfg.get("min_epochs", 0))
+        self.recon_warmup_min_epochs: int = int(
+            self.recon_cfg.get("warmup_min_epochs", self.recon_min_epochs)
+        )
+
 
         # Structure-phase triggers
         self.struct_max_epochs: int = int(self.struct_cfg.get("max_epochs", 200))
@@ -439,11 +453,27 @@ class PhaseController(Callback):
                     self._phase_best = current
                 self._plateau_counter += 1
 
-            plateaued = self._plateau_counter >= self.plateau_patience
+            # Minimum-epoch floor: the plateau early-exit is suppressed until the
+            # phase has run at least ``effective_min`` epochs.  The initial warmup
+            # reconstruct phase (phase_index 0 with start_phase=reconstruct) uses
+            # the larger ``warmup_min_epochs`` floor to guarantee a fully-formed
+            # predictor before any structure learning begins.  The ``max_epochs``
+            # safety cap always takes precedence over the floor.
+            is_warmup = self._phase_index == 0 and self.start_phase == "reconstruct"
+            effective_min = (
+                self.recon_warmup_min_epochs if is_warmup else self.recon_min_epochs
+            )
+            min_epochs_reached = phase_epochs >= effective_min
+
+            plateaued = (
+                self._plateau_counter >= self.plateau_patience
+                and min_epochs_reached
+            )
             budget_hit = phase_epochs >= self.recon_max_epochs
 
             if plateaued or budget_hit:
                 reason = "recon_plateau" if plateaued else "recon_budget"
+
                 self._record_transition(
                     trainer, pl_module, reason,
                     from_phase="reconstruct", to_phase="structure",
@@ -655,7 +685,10 @@ def adaptive_trainer(
               f"{controller.drop_patience} epochs (cap {controller.struct_max_epochs})")
         print(f"  reconstruct trigger: plateau patience "
               f"{controller.plateau_patience} (cap {controller.recon_max_epochs})")
+        print(f"  reconstruct floor  : min_epochs {controller.recon_min_epochs}, "
+              f"warmup_min_epochs {controller.recon_warmup_min_epochs}")
         print(f"  max_cycles         : {controller.max_cycles}")
+
         print("=" * 70)
 
     # --- Single in-memory fit ---

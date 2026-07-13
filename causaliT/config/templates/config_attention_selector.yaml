@@ -358,8 +358,13 @@ adaptive_training:
 
   reconstruct:
     max_epochs: 100                # per-phase safety cap
+    min_epochs: 0                  # floor: no plateau early-exit before N epochs
+                                   # (applies to every reconstruct phase)
+    warmup_min_epochs: 0           # larger floor for the INITIAL warmup phase
+                                   # (falls back to min_epochs when unset)
     plateau_patience: 5            # stop after N val epochs w/o rel. improvement
     plateau_min_delta: 1.0e-4      # relative improvement threshold
+
 
   structure:
     max_epochs: 200                # per-phase safety cap

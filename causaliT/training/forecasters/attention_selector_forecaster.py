@@ -470,8 +470,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Score sparsity (L1 on raw attention weights)
         # CausalCrossAttention exposes score_tensor_for_sparsity = attention matrix
         # ----------------------------------------------------------------
-        inner_att = self.model.attention.inner_attention
-        score_tensor = getattr(inner_att, "score_tensor_for_sparsity", None)
+        # Unified score tensor for the sparsity / NOTEARS terms.  In split mode
+        # (self_attention_type set) this concatenates the S→X cross gate
+        # posterior with the direction-aware X→X GatedSelfAttention posterior,
+        # so the (L_X, L_S+L_X) layout is identical to single mode.  Falls back
+        # to the legacy inner-attention attribute for older checkpoints/models.
+        get_score = getattr(self.model, "get_score_tensor_for_sparsity", None)
+        if callable(get_score):
+            score_tensor = get_score()
+        else:
+            inner_att = self.model.attention.inner_attention
+            score_tensor = getattr(inner_att, "score_tensor_for_sparsity", None)
+
         if score_tensor is not None:
             score_sparse_value = score_tensor.abs().mean()
         else:

@@ -10,6 +10,7 @@ SUPPORTED MODELS
 - SingleCausalLayer / SingleCausalLayerRes
 - NoiseAwareSingleCausalLayer / NoiseAwareSingleCausalLayerRes
 - AttentionSelectorLayer
+- SelfSelectorLayer
 
 Note: StageCausaliT is intentionally excluded from the current Optuna scope
 because it uses a different metric naming convention (``val_mae_X`` instead
@@ -388,6 +389,23 @@ BASELINE_SAMPLING_BOUNDS = {
     "lr": {"low": 1e-4, "high": 1e-3, "log": True},
 }
 
+#: Widened profile for the SelfSelectorLayer (GatedSelfAttention) capacity study.
+#: The downstream SelfAttSel_orth_fix run severely UNDERFIT (train & val R2 ~0.28,
+#: no overfitting gap), so both the capacity ceiling and the learning-rate range
+#: are enlarged to give the value/gain reconstruction stream enough expressivity:
+#:   - d_model_set up to 256 (vs 128 baseline)  → 16 * {1..16}
+#:   - lr up to 5e-3 (vs 1e-3 baseline), log-uniform
+#: d_model_set stays a multiple of 16 so n_heads ∈ {1, 2, 4} always divides it,
+#: and (with d_qk_mult=1.0) d_qk == d_model >= N=10 for scm3_continuous, so the
+#: orthogonal_fixed / orthogonal-key-projection constraints always hold.
+#: ``dropout`` and ``n_layers`` are intentionally omitted: dropout is fixed at
+#: 0.0 and SelfSelectorLayer has no stacked-layer depth to sample.
+SELFSEL_EXPRESSIVE_SAMPLING_BOUNDS = {
+    "d_model_set":   {"low": 16, "high": 256, "step": 16},
+    "n_heads":       [1, 2, 4],
+    "lr": {"low": 1e-4, "high": 5e-3, "log": True},
+}
+
 #: Valid n_heads values — must always divide d_model_set (multiples of 16).
 #: {1, 2, 4} covers the useful range; 3 and non-power-of-2 values are excluded
 #: because they cannot divide 16.
@@ -395,7 +413,9 @@ N_HEADS_CHOICES = [1, 2, 4]
 
 SAMPLING_PROFILES = {
     "baseline": BASELINE_SAMPLING_BOUNDS,
+    "selfsel_expressive": SELFSEL_EXPRESSIVE_SAMPLING_BOUNDS,
 }
+
 
 # Module-level variable — updated by CLI flag before optimisation starts.
 SAMPLING_BOUNDS = BASELINE_SAMPLING_BOUNDS
@@ -505,10 +525,46 @@ def AttentionSelector_sample_params(trial):
     }
 
 
+def SelfSelector_sample_params(trial):
+    """
+    Capacity sampling for ``SelfSelectorLayer`` (GatedSelfAttention).
+
+    Like ``AttentionSelectorLayer`` this uses a *single* combined self-attention
+    block (no stacked decoder layers), so ``dec_layers`` is absent from the
+    search space.
+
+    Config keys sampled:
+      - d_model_set  : embedding / model dimension
+      - n_heads      : attention heads (categorical, from the profile's
+                       ``n_heads`` list, falling back to ``N_HEADS_CHOICES``)
+      - training.lr  : learning rate
+
+    NOT sampled (fixed in the config / derived):
+      - ``d_qk``  : derived as ``d_qk_mult=1.0 * d_model_set`` → d_qk == d_model,
+                    required for the orthogonal key projection isometry
+                    (W_K^T W_K = I) and for the orthogonal_fixed frame (needs
+                    d_model >= N).
+      - ``d_ff``  : derived as ``d_ff_mult=2.0 * d_model_set`` → d_ff == 2*d_model.
+      - ``dropout``: fixed at 0.0 (capacity is measured without dropout noise; the
+                    regime_uniform protocol already regularises via batch_key_dropout).
+
+    n_heads ∈ {1, 2, 4} always divides d_model_set (a multiple of 16); with
+    comps_embed="svfa" and n_heads=1 the SVFA path degrades gracefully to
+    summation-equivalent behaviour.
+    """
+    n_heads_choices = SAMPLING_BOUNDS.get("n_heads", N_HEADS_CHOICES)
+    return {
+        "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
+        "experiment.n_heads":     trial.suggest_categorical("n_heads", n_heads_choices),
+        "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
+    }
+
+
 
 # =============================================================================
 # DISPATCHER
 # =============================================================================
+
 
 #: Map from model_object string → sampling function
 _SAMPLING_DISPATCH = {
@@ -519,7 +575,9 @@ _SAMPLING_DISPATCH = {
     "NoiseAwareSingleCausalLayer":    SingleCausal_sample_params,
     "NoiseAwareSingleCausalLayerRes": SingleCausal_sample_params,
     "AttentionSelectorLayer":         AttentionSelector_sample_params,
+    "SelfSelectorLayer":              SelfSelector_sample_params,
 }
+
 
 
 def sample_params_for_optuna(trial, config):
@@ -679,8 +737,11 @@ def cli():
               type=click.Choice(["minimize", "maximize"]),
               help="Optimisation direction (default: minimize)")
 @click.option("--sampling_profile", default="baseline",
-              type=click.Choice(["baseline"]),
-              help="Sampling bounds profile (default: baseline)")
+              type=click.Choice(["baseline", "selfsel_expressive"]),
+              help="Sampling bounds profile (default: baseline). Use "
+                   "'selfsel_expressive' for the widened SelfSelectorLayer "
+                   "capacity search (d_model<=256, lr<=5e-3).")
+
 
 # ── Parallel execution (only with --mode resume --parallel) ──────────────────
 
