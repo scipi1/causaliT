@@ -1326,6 +1326,11 @@ class AttentionLayer(nn.Module):
         init_zeta: float = 1.1,
         gain_tau: float = 1.0,
         dir_tau: float = 2.0 / 3.0,
+        # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
+        # L2-normalise the structural query and use a fixed sqrt(query_fanin_scale)
+        # score scale in place of 1/sqrt(E).
+        normalize_query: bool = False,
+        query_fanin_scale: float = 1.0,
         shared_qk_inner: dict = None,
 
         shared_dag_across_heads: bool = True,
@@ -1401,6 +1406,8 @@ class AttentionLayer(nn.Module):
                     gamma=init_gamma,
                     zeta=init_zeta,
                     gain_tau=gain_tau,
+                    normalize_query=normalize_query,
+                    query_fanin_scale=query_fanin_scale,
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,

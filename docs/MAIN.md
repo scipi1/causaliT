@@ -11,7 +11,7 @@ This document aims to collect the project status main findings, open problems an
 
 - F2: *"On using the self (X)-/-cross (S) attention HSIC"*. Regarding the HSIC optimization, in normal SVFA, removing the contribution from the S helped because the system was not forced to learn a spurious edge. With the `SVFA_residual`, ameliorated this (Not documented). 
 
-- F3: In gradient routing, the structure optimization from the HSIC is challenging. It was observed that lower learning rate (1E-4) improves stability and noise but the optimization objective flattens. The optimization has also shown signs of chaotic dynamics: for the same seeds it led to very different results.
+- F3: In gradient routing, the structure optimization from the HSIC is challenging. It was observed that lower learning rate (1E-4) improves stability and noise but the optimization objective flattens. The optimization has also shown signs of chaotic dynamics: for the same seeds it led to very different results. Note: this result was observed when training structure and reconstruction at the same time. With adaptive training it improved.
 
 - F4: The `noise-aware` architecture and its variants underperform in reconstruction. From `experiments\2_ARCH_STUDY\OPTUNA_STUDY`, the R2 of those models saturates at 0.6 
 
@@ -21,9 +21,12 @@ This document aims to collect the project status main findings, open problems an
 
 - F7: Scores are not only responsible for variable selection, they are needed for the functional learning of the reconstruction too. As a consequence, we implemented the `GatedCausalAttention`.
 
-- F8: Fixed key embeddings have shown to harm less the reconstruction quality of the predictor during the structural learning, compared to the learnable ones. This was especially observed for BKD and L0 regularization.
+- F8: Fixed key embeddings have shown to harm less the reconstruction quality of the predictor during the structural learning, compared to the learnable ones. This was especially observed for BKD and L0 regularization. We found that this was due to the orthogonal embeddings being misclassified as "reconstruction parameter"
 
 - F9: *"Keep the GCA gain separate, global and unnormalized."* Now that the gate `z` owns causality (it is the only score thresholded for the DAG), we considered making the reconstruction gain `g` more expressive. Two options were evaluated and rejected: (i) **softmax normalization** — wrong functional form for an additive-noise mechanism (`X_i = Σ_j α_ij V_j + ε` is a sum, not a convex combination) and it recouples `g` to `z` (normalizing over gated edges makes MSE flow into the gate), breaking the product-of-independent-scores factorization that gives GCA its rigor (F7); (ii) **data-dependent / in-context gain** — deprioritized: reconstruction is already fine (R² ≈ 0.7–0.9), so the gain is not the binding constraint, and a richer reconstruction gradient would worsen the reconstruction-vs-structure gradient imbalance that already threatens the fragile HSIC signal (P1, F3, OQ3); H14 also shows a strong dense attention pathway hijacks DAG learning. **Trigger to reopen:** a constant-gate/`oracle` (`optuna_protocol`) ablation showing the global gain caps reconstruction (e.g. on strongly nonlinear mechanisms).
+
+- F10: very often, it was observed the emergence of horizontal/vertical blocks of variables, during their selection in structural learning. For example `experiments\5_EXPLORATORY\ADAPT_TRAIN\ADAPT_AttSel_SelfAttXX_scm3c_7046748\evaluate_experiment_run.ipynb`. From this analysis `experiments\5_EXPLORATORY\ADAPT_TRAIN\ADAPT_AttSel_SelfAttXX_scm3c_7046748\diagnose_block_dags.ipynb` it seems that the free query aligns with the key centroids and provides a high score with all keys, without deciding. This happens for dense initializations, where all nodes are participating to the prediction.
+
 
 ## Problems
 - P1: Optimizing the structure is challenging (see F3)

@@ -107,6 +107,7 @@ from typing import Optional
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GatedCrossAttention(nn.Module):
@@ -123,6 +124,17 @@ class GatedCrossAttention(nn.Module):
         zeta: float = 1.1,             # stretch upper bound (> 1)
         # Reconstruction-gain temperature (scales the sigmoid logit).
         gain_tau: float = 1.0,
+        # Centroid-collapse fix: L2-normalise the STRUCTURAL query before the
+        # score so its *direction* (not its norm) decides selection, and replace
+        # the 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  With
+        # unit query and (orthonormal) unit keys the raw score of a single
+        # aligned parent is sqrt(query_fanin_scale); a centroid over m parents
+        # gives sqrt(query_fanin_scale/m) per edge — so an all-on "block" row is
+        # sqrt(m) cheaper per edge and pays a growing L0 cost, while true parents
+        # (up to in-degree query_fanin_scale) stay clearly ON.  Only affects the
+        # structure gate, never the reconstruction gain.
+        normalize_query: bool = False,
+        query_fanin_scale: float = 1.0,
         # Batch-consistent key dropout (columns zeroed identically across batch).
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
@@ -151,6 +163,11 @@ class GatedCrossAttention(nn.Module):
         self.zeta = float(zeta)
 
         self.gain_tau = float(gain_tau)
+
+        # Centroid-collapse fix (structure gate only): unit-normalise the query
+        # and use a fixed sqrt(query_fanin_scale) score scale (see __init__ doc).
+        self.normalize_query = bool(normalize_query)
+        self.query_fanin_scale = float(query_fanin_scale)
 
         # Constant-score capacity protocol (gate-only override); see forward().
         self.optuna_protocol: Optional[float] = (
@@ -228,9 +245,21 @@ class GatedCrossAttention(nn.Module):
         _, S, _ = key.shape
 
         # ---- Structure gate: Hard-Concrete L0 gate -----------------------
-        # log_alpha = <q^s, k^s> / sqrt(E_s)     (B, L, S)
-        scale_s = 1.0 / math.sqrt(E_s)
-        log_alpha = torch.einsum("ble,bse->bls", query, key) * scale_s
+        # Default:            log_alpha = <q^s, k^s> / sqrt(E_s)
+        # normalize_query:    q̂ = q/||q||  and  log_alpha = <q̂, k^s> * sqrt(fanin)
+        #   -> the query DIRECTION (not its unbounded norm) decides selection,
+        #      killing the "point the query at the key centroid to light every
+        #      key at once" block shortcut.  A single aligned unit-key parent
+        #      then scores sqrt(fanin); a centroid over m parents scores
+        #      sqrt(fanin/m) per edge (blocks get sqrt(m)-cheaper per edge and
+        #      pay a growing L0 cost while true parents stay ON).
+        q_s = query
+        if self.normalize_query:
+            q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
+            scale_s = math.sqrt(self.query_fanin_scale)
+        else:
+            scale_s = 1.0 / math.sqrt(E_s)
+        log_alpha = torch.einsum("ble,bse->bls", q_s, key) * scale_s
 
         if oracle:
             # ---- Oracle gate: the ground-truth DAG IS the structure gate ----

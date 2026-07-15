@@ -73,6 +73,14 @@ experiment:
   # Reconstruction-gain stream source: "separate" (own gain tables) or "shared"
   # (reuse frozen struct embeddings; requires struct_embedding_type=orthogonal_fixed).
   gain_stream_source: "separate"
+  # Centroid-collapse fix: unit-normalise the STRUCTURAL query before scoring
+  # and use a fixed sqrt(query_fanin_scale) score scale (structure gate only).
+  # This makes the query DIRECTION (not its unbounded norm) drive parent
+  # selection, removing the "lazy" centroid-alignment block shortcut. Set
+  # query_fanin_scale to the max in-degree you want cleanly representable.
+  normalize_query: false
+  query_fanin_scale: 1.0
+
 
 
 model:

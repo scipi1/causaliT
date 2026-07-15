@@ -72,8 +72,24 @@ experiment:
   # gradient routing (feeds Q only).
   free_query_embedding: false
 
+  # Centroid-collapse fix (GatedCrossAttention / split GatedSelfAttention).
+  # When True, L2-normalise the STRUCTURAL query before scoring and replace the
+  # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  Rationale
+  # (see diagnose_block_dags / simulate_centroid_collapse): with a FREE query
+  # norm the cheapest way to raise a child's parent-scores is to align the query
+  # with the all-keys centroid, which lights EVERY key at once → a "block" row.
+  # Normalising the query makes its DIRECTION (not its unbounded norm) drive
+  # parent selection, so a flat centroid row no longer wins.  Pair with a
+  # positive gate offset (init_gamma < -init_zeta) so an undecided raw≈0 key
+  # defaults OFF.  ``query_fanin_scale`` is the score temperature: set it to the
+  # max in-degree you want cleanly representable (raw_on ≈ sqrt(scale/(m·E))).
+  # Structure gate only — never touches the value / reconstruction-gain streams.
+  normalize_query: false
+  query_fanin_scale: 1.0
+
 
 model:
+
   model_object: "AttentionSelectorLayer"
 
   embed_dim:
@@ -156,6 +172,10 @@ model:
     struct_embedding_type: ${experiment.struct_embedding_type}
     # Decoupled X query embedding (Q only); see experiment.free_query_embedding.
     free_query_embedding: ${experiment.free_query_embedding}
+    # Centroid-collapse fix (structure gate only); see experiment.normalize_query.
+    normalize_query: ${experiment.normalize_query}
+    query_fanin_scale: ${experiment.query_fanin_scale}
+
 
     # Dropout
     dropout_emb: ${experiment.dropout}
@@ -372,6 +392,21 @@ adaptive_training:
     lambda_hsic_self: 0.0
     drop_pct: 0.20                 # switch when monitor rises 20% over phase best
     drop_patience: 5
+    # HSIC-plateau early switch: watch the structural signal (``hsic_monitor``,
+    # lower is better) and switch back to reconstruct when it stops improving,
+    # freeing budget for an earlier reconstruction update instead of wasting
+    # epochs on a stalled HSIC.  Reason precedence at the switch is:
+    #   struct_drop (predictor stale) > struct_hsic_plateau > struct_budget (cap).
+    hsic_monitor: val_hsic         # structural signal watched (e.g. val_hsic / train_hsic)
+    hsic_patience: 0               # switch after N val epochs w/o HSIC improvement
+                                   # (0 = disabled; no behaviour change)
+    hsic_min_delta: 1.0e-4         # relative HSIC improvement threshold
+    min_epochs: 0                  # floor: suppress BOTH structure early-exits
+                                   # (struct_drop AND struct_hsic_plateau) before N
+                                   # epochs — guards against early structure-learning
+                                   # latency (the max_epochs cap always takes precedence)
+
+
 
 
 data:

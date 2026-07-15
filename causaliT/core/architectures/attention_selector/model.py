@@ -276,7 +276,19 @@ class AttentionSelectorLayer(nn.Module):
         self_attention_type: Optional[str] = None,
         # Direction-gate Binary-Concrete temperature (GatedSelfAttention only).
         dir_tau: float = 2.0 / 3.0,
+        # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
+        # L2-normalise the STRUCTURAL query before scoring and replace the
+        # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  This makes
+        # the query DIRECTION (not its unbounded norm) drive parent selection,
+        # removing the "lazy" centroid-alignment block shortcut.  Set
+        # ``query_fanin_scale`` to the max in-degree you want cleanly
+        # representable.  Only affects the structure gate, never the value /
+        # reconstruction-gain streams.  Threaded into BOTH the S→X cross block
+        # and (when split) the X→X self block.
+        normalize_query: bool = False,
+        query_fanin_scale: float = 1.0,
     ):
+
 
 
         super().__init__()
@@ -444,7 +456,12 @@ class AttentionSelectorLayer(nn.Module):
             init_gamma=init_gamma,
             init_zeta=init_zeta,
             gain_tau=gain_tau,
+            # Centroid-collapse fix: unit-normalise the structural query and use
+            # a fixed sqrt(query_fanin_scale) score scale (structure gate only).
+            normalize_query=normalize_query,
+            query_fanin_scale=query_fanin_scale,
         )
+
 
         # ------------------------------------------------------------------
         # Direction-aware X→X self-attention block (split mode only).
@@ -484,9 +501,13 @@ class AttentionSelectorLayer(nn.Module):
                 init_zeta=init_zeta,
                 gain_tau=gain_tau,
                 dir_tau=dir_tau,
+                # Centroid-collapse fix (structure gate only).
+                normalize_query=normalize_query,
+                query_fanin_scale=query_fanin_scale,
             )
         else:
             self.self_attention = None
+
 
         # ------------------------------------------------------------------
         # Static combined hard mask: (L_X, L_S + L_X)

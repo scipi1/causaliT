@@ -28,8 +28,11 @@ This module implements an **adaptive, in-memory** alternative:
       Keeps learning structure against a *frozen, currently-good* predictor.  As
       structure drifts, the frozen predictor goes stale and ``val_x_mae`` rises.
       Stops when ``val_x_mae`` exceeds the per-phase best by a configurable
-      fraction (default 20%) sustained for ``drop_patience`` validation epochs,
-      or a safety epoch cap.
+      fraction (default 20%) sustained for ``drop_patience`` validation epochs;
+      OR when the structural signal itself (``val_hsic``) stops improving for
+      ``hsic_patience`` validation epochs (an early switch that frees budget for
+      an earlier reconstruction update instead of wasting epochs on a stalled
+      HSIC); OR a safety epoch cap.
 
 The schedule alternates reconstruct ↔ structure, starting (by default) with a
 reconstruction warmup so structure always begins from a good predictor.  The run
@@ -70,7 +73,15 @@ Example ``config['adaptive_training']`` block::
         lambda_hsic_self: 0.0
         drop_pct: 0.20                 # switch when monitor rises 20% over phase best
         drop_patience: 5
+        hsic_monitor: val_hsic         # structural signal watched for a plateau
+        hsic_patience: 0               # switch after N val epochs w/o HSIC improvement
+                                       # (0 = disabled; no behaviour change)
+        hsic_min_delta: 1.0e-4         # relative HSIC improvement threshold
+        min_epochs: 0                  # floor: suppress BOTH structure early-exits
+                                       # (drop AND HSIC plateau) before N epochs
+                                       # (max_epochs still wins)
 """
+
 
 import copy
 import json
@@ -199,6 +210,21 @@ class PhaseController(Callback):
         self.struct_max_epochs: int = int(self.struct_cfg.get("max_epochs", 200))
         self.drop_pct: float = float(self.struct_cfg.get("drop_pct", 0.20))
         self.drop_patience: int = int(self.struct_cfg.get("drop_patience", 5))
+        # HSIC-plateau early switch: watch the structural signal (``hsic_monitor``,
+        # lower is better) and switch back to reconstruct when it stops improving.
+        # ``hsic_patience == 0`` disables it entirely (no behaviour change).  A
+        # ``min_epochs`` floor suppresses the early exit for the first N epochs of
+        # every structure phase; the ``max_epochs`` safety cap still takes
+        # precedence over the floor.
+        self.struct_hsic_monitor: str = str(
+            self.struct_cfg.get("hsic_monitor", "val_hsic")
+        )
+        self.struct_hsic_patience: int = int(self.struct_cfg.get("hsic_patience", 0))
+        self.struct_hsic_min_delta: float = float(
+            self.struct_cfg.get("hsic_min_delta", 1e-4)
+        )
+        self.struct_min_epochs: int = int(self.struct_cfg.get("min_epochs", 0))
+
 
         # Model object (for per-arch lambda translation)
         self.model_obj: str = config.get("model", {}).get("model_object", "")
@@ -213,8 +239,11 @@ class PhaseController(Callback):
         self._phase_best: float = float("inf")
         self._plateau_counter: int = 0   # consecutive no-improve epochs (recon)
         self._drop_counter: int = 0      # consecutive over-threshold epochs (struct)
+        self._hsic_best: float = float("inf")   # best (lowest) HSIC this struct phase
+        self._hsic_plateau_counter: int = 0     # consecutive no-improve epochs (HSIC)
         self._cycle_count: int = 0       # completed structure phases
         self._phase_index: int = 0       # 0-based phase counter across the run
+
 
         # Records
         self.transitions: List[Dict[str, Any]] = []
@@ -282,6 +311,9 @@ class PhaseController(Callback):
         self._phase_best = float("inf")
         self._plateau_counter = 0
         self._drop_counter = 0
+        self._hsic_best = float("inf")
+        self._hsic_plateau_counter = 0
+
 
         # Always emit to the Python logger so the active stage is visible in
         # cluster log files (where console ``print`` is suppressed).
@@ -482,7 +514,7 @@ class PhaseController(Callback):
                 self._phase_index += 1
                 self._apply_phase(trainer, pl_module, "structure")
 
-        # ---------------- Structure phase: drop / budget ----------------
+        # ---------- Structure phase: drop / HSIC plateau / budget ----------
         elif self.current_phase == "structure":
             if current < self._phase_best:
                 self._phase_best = current
@@ -493,12 +525,58 @@ class PhaseController(Callback):
             else:
                 self._drop_counter = 0
 
-            dropped = self._drop_counter >= self.drop_patience
+            # HSIC-plateau tracking: watch the structural signal (lower is
+            # better) and count consecutive validation epochs without a relative
+            # improvement.  Counting is disabled when ``hsic_patience == 0`` or
+            # the metric is unavailable / non-finite this epoch.
+            hsic_counter_ready = False
+            hsic_val = metrics.get(self.struct_hsic_monitor)
+            if self.struct_hsic_patience > 0 and hsic_val is not None:
+                hsic_current = float(hsic_val)
+                if np.isfinite(hsic_current):
+                    if hsic_current <= self._hsic_best * (1.0 - self.struct_hsic_min_delta):
+                        self._hsic_best = hsic_current
+                        self._hsic_plateau_counter = 0
+                    else:
+                        if hsic_current < self._hsic_best:
+                            self._hsic_best = hsic_current
+                        self._hsic_plateau_counter += 1
+                    hsic_counter_ready = (
+                        self._hsic_plateau_counter >= self.struct_hsic_patience
+                    )
+
+            pl_module.log(
+                "adaptive_hsic_plateau", float(self._hsic_plateau_counter),
+                on_step=False, on_epoch=True,
+            )
+
+            # ``min_epochs`` is a symmetric floor for the whole structure phase:
+            # it suppresses BOTH early-exit triggers (the stale-predictor drop and
+            # the HSIC plateau) until the phase has run at least this many epochs,
+            # so early structure-learning latency does not cause a premature
+            # switch.  The counters keep accumulating during the floor window, so
+            # a pending exit fires the moment the floor clears.  The ``max_epochs``
+            # safety cap always takes precedence over the floor.
+            min_epochs_reached = phase_epochs >= self.struct_min_epochs
+
+            dropped = (
+                self._drop_counter >= self.drop_patience and min_epochs_reached
+            )
+            hsic_plateaued = hsic_counter_ready and min_epochs_reached
             budget_hit = phase_epochs >= self.struct_max_epochs
 
-            if dropped or budget_hit:
-                reason = "struct_drop" if dropped else "struct_budget"
+
+            if dropped or hsic_plateaued or budget_hit:
+                # Reason precedence: a stale predictor (drop) first, then a
+                # stalled structural signal (HSIC plateau), then the safety cap.
+                if dropped:
+                    reason = "struct_drop"
+                elif hsic_plateaued:
+                    reason = "struct_hsic_plateau"
+                else:
+                    reason = "struct_budget"
                 self._cycle_count += 1
+
 
                 # Global stop check: max cycles reached
                 if self._cycle_count >= self.max_cycles:
@@ -683,6 +761,13 @@ def adaptive_trainer(
         print(f"  monitor            : {controller.monitor}")
         print(f"  structure trigger  : +{controller.drop_pct:.0%} for "
               f"{controller.drop_patience} epochs (cap {controller.struct_max_epochs})")
+        print(f"  structure floor    : min_epochs {controller.struct_min_epochs} "
+              f"(suppresses drop + HSIC early-exits)")
+        if controller.struct_hsic_patience > 0:
+            print(f"  structure HSIC exit: {controller.struct_hsic_monitor} "
+                  f"plateau patience {controller.struct_hsic_patience}")
+
+
         print(f"  reconstruct trigger: plateau patience "
               f"{controller.plateau_patience} (cap {controller.recon_max_epochs})")
         print(f"  reconstruct floor  : min_epochs {controller.recon_min_epochs}, "

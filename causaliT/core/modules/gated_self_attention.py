@@ -91,6 +91,7 @@ from typing import Optional
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class GatedSelfAttention(nn.Module):
@@ -109,6 +110,13 @@ class GatedSelfAttention(nn.Module):
         dir_tau: float = 2.0 / 3.0,    # beta_dir
         # Reconstruction-gain temperature (scales the sigmoid logit).
         gain_tau: float = 1.0,
+        # Centroid-collapse fix (structure score only): L2-normalise the query
+        # so its DIRECTION, not its norm, drives selection, and use a fixed
+        # sqrt(query_fanin_scale) score scale instead of 1/sqrt(E).  See
+        # GatedCrossAttention for the full rationale; here it feeds the symmetric
+        # existence gate (via S_sym) and the antisymmetric direction gate.
+        normalize_query: bool = False,
+        query_fanin_scale: float = 1.0,
         # Batch-consistent key dropout (columns zeroed identically across batch).
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
@@ -136,6 +144,10 @@ class GatedSelfAttention(nn.Module):
         self.zeta = float(zeta)
         self.dir_beta = float(dir_tau)
         self.gain_tau = float(gain_tau)
+
+        # Centroid-collapse fix (structure score only); see __init__ doc.
+        self.normalize_query = bool(normalize_query)
+        self.query_fanin_scale = float(query_fanin_scale)
 
         # Pre-computed L0 offset:  P(z>0) = sigmoid(log_alpha - beta*log(-gamma/zeta)).
         self._l0_offset: float = float(self.beta * math.log(-self.gamma / self.zeta))
@@ -258,8 +270,16 @@ class GatedSelfAttention(nn.Module):
         N = L
 
         # ---- Structural score, Toeplitz-decomposed ----------------------
-        scale_s = 1.0 / math.sqrt(E_s)
-        raw = torch.einsum("bne,bme->bnm", query, key) * scale_s   # (B, N, N)
+        # Centroid-collapse fix: unit-normalise the query so its DIRECTION (not
+        # its norm) drives selection, with a fixed sqrt(query_fanin_scale) score
+        # scale replacing 1/sqrt(E) (see GatedCrossAttention for the rationale).
+        q_s = query
+        if self.normalize_query:
+            q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
+            scale_s = math.sqrt(self.query_fanin_scale)
+        else:
+            scale_s = 1.0 / math.sqrt(E_s)
+        raw = torch.einsum("bne,bme->bnm", q_s, key) * scale_s   # (B, N, N)
         raw = torch.nan_to_num(raw, nan=0.0)
         S_sym = 0.5 * (raw + raw.transpose(-1, -2))                # symmetric
         A_anti = 0.5 * (raw - raw.transpose(-1, -2))               # antisymmetric

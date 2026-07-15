@@ -1,0 +1,123 @@
+# =============================================================================
+# ADAPTIVE TRAINING — reference template (all keys documented)
+# =============================================================================
+#
+# This file documents EVERY key understood by ``adaptive_trainer``
+# (causaliT.training.adaptive_trainer) under the top-level ``adaptive_training``
+# block.  It is a REFERENCE, not a standalone runnable config: an adaptive run
+# also needs the usual ``experiment`` / ``model`` / ``training`` / ``data`` /
+# ``evaluation`` sections (see e.g. ``config_attention_selector.yaml``).  Copy
+# the ``adaptive_training`` block below into a full model config and tune it.
+#
+# HARD REQUIREMENT
+#   ``training.use_gradient_routing: true`` — the controller performs a TRUE
+#   ``requires_grad_(False)`` freeze on the pre-classified structural /
+#   reconstruction parameter groups, so exactly one group trains per phase.
+#   Both SingleCausalForecaster and AttentionSelectorForecaster expose
+#   ``_structural_params`` / ``_reconstruction_params`` only in this mode.
+#
+# HOW IT WORKS
+#   A single in-memory ``pl.Trainer.fit()`` runs with a ``PhaseController``
+#   callback that switches between two mutually-exclusive phases at validation
+#   boundaries (nothing is reloaded from disk):
+#
+#     * reconstruct — train reconstruction params only (structure frozen).
+#                     Re-adapts the predictor to the CURRENT structure.
+#                     Ends on a validation-metric plateau or an epoch cap.
+#
+#     * structure   — train structural params only (reconstruction frozen).
+#                     Keeps learning structure against a frozen, currently-good
+#                     predictor.  Ends on ANY of three triggers (precedence):
+#                       1. struct_drop         — ``monitor`` (e.g. val_x_mae)
+#                          rises ``drop_pct`` over the per-phase best for
+#                          ``drop_patience`` epochs (frozen predictor gone stale).
+#                       2. struct_hsic_plateau — the structural signal
+#                          (``hsic_monitor``, lower is better) stops improving
+#                          for ``hsic_patience`` epochs.  Frees budget for an
+#                          earlier reconstruction update instead of wasting
+#                          epochs on a stalled HSIC.  (0 = disabled.)
+#                       3. struct_budget       — the ``max_epochs`` safety cap.
+#
+#   The schedule alternates reconstruct <-> structure, starting (by default)
+#   with a reconstruction warmup so structure always begins from a good
+#   predictor.  The run stops on ``total_epoch_budget`` or after ``max_cycles``
+#   completed structure phases.
+#
+# LOGGED CSV METRICS (aligned with the loss curves)
+#   adaptive_phase        0 = reconstruct, 1 = structure
+#   adaptive_phase_epochs epochs elapsed in the current phase
+#   adaptive_cycle        number of completed structure phases so far
+#   adaptive_hsic_plateau consecutive no-improve HSIC epochs (structure phase)
+# =============================================================================
+
+adaptive_training:
+  # --- Global schedule ------------------------------------------------------
+  total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
+  start_phase: reconstruct         # "reconstruct" (warm up predictor first) or
+                                   # "structure"
+  max_cycles: 10                   # stop after this many completed structure
+                                   # phases
+  starting_checkpoint: null        # optional warm-start (weights only), or null
+  reset_optimizer_state_on_switch: false  # clear optimizer moment estimates at
+                                          # each phase switch
+  monitor: val_x_mae               # metric driving the reconstruct-plateau and
+                                   # the structure-drop triggers (lower better)
+  eval_dag: true                   # capture DAG diagnostics + score margin at
+                                   # each switch (set false to skip / speed up)
+
+  # --- Cross-fitting (DML / DARTS "honest" split) ---------------------------
+  # Fraction of the training set assigned to the reconstruct phase; the disjoint
+  # remainder is used by the structure phase, so residual-HSIC is measured
+  # OUT-OF-SAMPLE w.r.t. the reconstruction fit.  null (or a value outside the
+  # open interval (0, 1)) disables it: both phases train on the full set.
+  # NOTE: when enabled, the trainer forces single-process dataloading
+  # (num_workers=0) on the reload path for correctness/speed on Windows+Linux.
+  data_split_ratio: null
+
+  # --- RECONSTRUCT phase ----------------------------------------------------
+  reconstruct:
+    max_epochs: 100                # per-phase safety cap
+    min_epochs: 0                  # floor: suppress the plateau early-exit until
+                                   # the phase has run >= N epochs (every
+                                   # reconstruct phase).  max_epochs still wins.
+    warmup_min_epochs: 0           # larger floor for the INITIAL warmup phase
+                                   # (phase_index 0 with start_phase=reconstruct);
+                                   # falls back to min_epochs when unset.
+    plateau_patience: 5            # switch after N val epochs w/o rel. improvement
+    plateau_min_delta: 1.0e-4      # relative improvement threshold:
+                                   # improved iff current <= best*(1 - min_delta)
+
+  # --- STRUCTURE phase ------------------------------------------------------
+  structure:
+    max_epochs: 200                # per-phase safety cap (struct_budget trigger)
+
+    # Loss weights applied when ENTERING the structure phase.  Any key starting
+    # with "lambda" is set as an attribute on the module.  For
+    # AttentionSelectorLayer, ``lambda_hsic_cross`` is translated to the unified
+    # ``lambda_hsic``; other architectures receive the attribute verbatim.
+    lambda_hsic_cross: 1.0
+    lambda_hsic_self: 0.0
+
+    # Trigger 1 — struct_drop: the frozen predictor going stale.
+    drop_pct: 0.20                 # switch when monitor rises 20% over phase best
+    drop_patience: 5               # sustained for N consecutive val epochs
+
+    # Trigger 2 — struct_hsic_plateau: the structural signal stalling.
+    hsic_monitor: val_hsic         # structural signal watched (lower is better);
+                                   # e.g. val_hsic / train_hsic
+    hsic_patience: 0               # switch after N val epochs w/o HSIC improvement
+                                   # (0 = DISABLED; backward-compatible default)
+    hsic_min_delta: 1.0e-4         # relative HSIC improvement threshold:
+                                   # improved iff current <= best*(1 - min_delta)
+
+    # Symmetric phase floor (mirrors reconstruct.min_epochs).
+    min_epochs: 0                  # floor: suppress BOTH structure early-exit
+                                   # triggers (struct_drop AND struct_hsic_plateau)
+                                   # until the phase has run >= N epochs, so early
+                                   # structure-learning latency does not cause a
+                                   # premature switch.  Counters keep accumulating
+                                   # during the floor window (a pending exit fires
+                                   # the moment it clears).  max_epochs (budget)
+                                   # always takes precedence.
+
+
