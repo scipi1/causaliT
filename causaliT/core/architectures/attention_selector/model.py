@@ -62,6 +62,7 @@ from causaliT.core.modules import (
     HardConcreteCrossAttention,
     GatedCrossAttention,
     GatedSelfAttention,
+    CommutatorSelfAttention,
     AttentionLayer,
     ModularEmbedding,
     Normalization,
@@ -246,7 +247,15 @@ class AttentionSelectorLayer(nn.Module):
         orthogonal_fixed_scale: float = 1.0,
         # Decoupled key/query embedding for X
         free_query_embedding: bool = False,
+        # Initialise the free X query embedding at the centroid of the (projected)
+        # keys so every query starts from the SAME point and reads all candidate
+        # parents uniformly (see init_query_at_key_centroid).  Requires
+        # free_query_embedding=True.  The actual write happens lazily on the first
+        # training batch (the forecaster calls the method), since value-modulated
+        # key embeddings need real data.
+        query_centroid_init: bool = False,
         # Orthogonal (isometric) key projection: W_K^T W_K = I
+
         key_projection_type: str = "linear",
         orthogonal_key_scale: bool = True,
         # Batch-consistent key dropout
@@ -261,9 +270,22 @@ class AttentionSelectorLayer(nn.Module):
         # disentangled structure-gate x reconstruction-gain. See gain_stream_source.
         gain_stream_source: str = "separate",
         gain_tau: float = 1.0,
+        # When False, bypass the learnable reconstruction gain in the gated
+        # attentions: the structure gate becomes the final attention weight.
+        use_gain: bool = True,
         init_gamma: float = -0.1,
         init_zeta: float = 1.1,
+        # Additive logit offset on the S→X cross existence gate ONLY, to balance
+        # its initialization against the directed X→X self edge.  The cross
+        # existence posterior is P = sigmoid(logα − init_edge_offset); with the
+        # default 0.0 the cross edge starts at ≈0.5 while a directed self edge
+        # (p_exist·direction) starts at ≈0.25, giving the (often spurious) S→X
+        # edges a 2× head start.  Setting init_edge_offset = ln 3 ≈ 1.0986 lands
+        # the cross init edge prob at 0.25, so S→X and X→X start balanced.  Only
+        # applies to GatedCrossAttention; the self block is never offset.
+        init_edge_offset: float = 0.0,
         # Direction-aware X→X self-attention block.  When None (default) the
+
         # X→X interaction is modelled by the RIGHT-HAND columns of the single
         # combined cross-attention (original behaviour, no directionality).
         # When set to "GatedSelfAttention" the architecture SPLITS into:
@@ -287,11 +309,97 @@ class AttentionSelectorLayer(nn.Module):
         # and (when split) the X→X self block.
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
+        # Elastic contraction of the query normalization (see
+        # causaliT.utils.elastic_query).  When enabled, the directional budget
+        # cap is relaxed to ``start_scale`` early (looser, exploration is free)
+        # and linearly contracted to ``end_scale`` (typically 1.0) between the
+        # two epochs, avoiding the premature budget-ceiling query damping.
+        query_norm_elastic: bool = False,
+        query_norm_elastic_start_epoch: int = 0,
+        query_norm_elastic_end_epoch: int = 0,
+        query_norm_elastic_start_scale: float = 1.0,
+        query_norm_elastic_end_scale: float = 1.0,
+        # Value-structure injection: concatenate a per-source-node identity code
+
+        # onto the (data-only) value stream before W_V, so V_j = W_V([v_j ; e_j])
+        # and the model can learn a per-source-node functional.  One of:
+        #   "none"           — disabled (default, original data-only value).
+        #   "separate"       — dedicated reconstruction-routed identity tables
+        #                      (val_id_embed_S / val_id_embed_X).
+        #   "struct_detached"— reuse the structural identity embeddings, detached
+        #                      before concat (zero new params, no gradient leak).
+        # Requires SVFA (comps_embed_X="svfa"); combination is concatenation.
+        value_structure_injection: str = "none",
+        # Value-structure QUERY injection: make the value additionally depend on
+        # the QUERY (child) node identity, so the shared W_V learns DIFFERENT
+        # functionals of the same parent depending on which child it feeds (e.g.
+        # X2 predicting X4 vs X5).  Same option set / SVFA requirement as
+        # ``value_structure_injection``; combination is an additive query term.
+        value_structure_query_injection: str = "none",
+        # Shared structural query projection (W_q) across the S→X cross block and
+        # the X→X self block (split mode only).  When True, the self block does
+        # NOT build its own ``query_projection``; instead the cross block's W_q is
+        # applied to the X structural embedding to produce the self block's query
+        # (fed via ``query_external=True``).  This ties "how a child reads its
+        # candidate parents" to a SINGLE projection regardless of whether the
+        # parent is an S or an X node — the S→X and X→X selectors then share one
+        # query geometry.  No effect unless ``self_attention_type`` is set.
+        shared_query: bool = False,
+        # Shared structural KEY projection (W_K) across the S→X cross block and
+        # the X→X self block (split mode only).  When True, the self block does
+        # NOT build its own ``key_projection``; instead the cross block's W_K is
+        # applied to the X structural embedding to produce the self block's key
+        # (fed via ``key_external=True``).  Motivation: with a fixed orthonormal
+        # struct embedding, the cross W_K is an isometry, so S keys and X keys
+        # projected through the SAME W_K stay mutually orthogonal — the shared
+        # free query then aligns on genuinely orthonormal key axes for BOTH the
+        # S and X subspaces, removing the cheap spurious X–X edges that flexible,
+        # per-block non-orthonormal self keys made possible.  Edge DIRECTION is
+        # still resolved by CommutatorSelfAttention's skew-query generator on the
+        # shared query alone (direction_mode="skew_query"), which keeps the Lie
+        # commutator valid even though query and key come from different
+        # embeddings.  No effect unless ``self_attention_type`` is set.
+        shared_key: bool = False,
+
+        # Remove the structural query/key projections entirely (read Q/K straight
+        # from the embeddings, dropping W_q / W_K) and/or freeze them at init.
+        # Threaded into BOTH the S->X cross block and (when split) the X->X self
+        # block; ignored on the self block when it borrows the cross projection
+        # via shared_query / shared_key (the shared projection then lives in — and
+        # is removed/frozen on — the cross block).  Motivation: the shared query
+        # projection couples every query and aligns them to the keys, numbing the
+        # per-node query embeddings (see the SELF_ATTENTION spurious-S3->X4
+        # investigation).  ``remove_*`` requires d_qk == d_model so the raw
+        # embedding width matches the score width.  ``freeze_*`` merely sets
+        # requires_grad=False (the freeze persists across adaptive phase switches
+        # because the gradient router keeps only requires_grad=True params).
+        remove_query_projection: bool = False,
+        remove_key_projection: bool = False,
+        freeze_query_projection: bool = False,
+        freeze_key_projection: bool = False,
+
+        # CommutatorSelfAttention direction-gate parametrisation (only used when
+
+        # self_attention_type="CommutatorSelfAttention").  "qk" (default) uses
+        # the antisymmetric part of the raw X→X alignment ½(QKᵀ−KQᵀ) as the
+        # direction score — a valid so(N) commutator ONLY when Q and K share the
+        # same embedding.  "skew_query" instead learns a genuine so(d) generator
+        # Ω on the QUERY alone (A_anti_ij = q_iᵀ Ω q_j), so edge direction stays
+        # a valid Lie generator even when the free shared query and the fixed
+        # orthonormal key come from DIFFERENT embeddings — the intended pairing
+        # with shared_query=True.  ``commutator_direction_rank`` sets the rank of
+        # Ω (defaults to full rank = d_qk).
+        commutator_direction_mode: str = "qk",
+        commutator_direction_rank: Optional[int] = None,
     ):
 
 
 
+
+
+
         super().__init__()
+
 
         self.model_name = model
         self.d_model = d_model
@@ -320,8 +428,63 @@ class AttentionSelectorLayer(nn.Module):
         self.orthogonal_fixed = (struct_embedding_type == "orthogonal_fixed")
 
         self.free_query_embedding = free_query_embedding
+        self.query_centroid_init = bool(query_centroid_init)
+        if self.query_centroid_init and not free_query_embedding:
+            raise ValueError(
+                "query_centroid_init=True requires free_query_embedding=True "
+                "(there is no dedicated X query embedding table to initialise "
+                "at the key centroid otherwise)."
+            )
         self.is_gated = (attention_type == "GatedCrossAttention")
+
         self.gain_stream_source = gain_stream_source
+
+        # ------------------------------------------------------------------
+        # Value-structure injection scheme selection.
+        # Concatenate a per-SOURCE-node identity code onto the (data-only) value
+        # stream before W_V, so V_j = W_V([v_j ; e_j]) and the shared W_V can
+        # specialise per source variable (a per-node functional).  The identity
+        # is the KEY/source identity, giving per-parent output functions while
+        # preserving SVFA's source-shared value.  Combination is concatenation.
+        # The extra width ``vsi_dim`` is threaded into the AttentionLayer(s) so
+        # the reconstruction ``value_projection`` accepts d_model + vsi_dim.
+        # ------------------------------------------------------------------
+        VALUE_STRUCTURE_INJECTION_TYPES = ("none", "separate", "struct_detached")
+        if value_structure_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
+            raise ValueError(
+                f"value_structure_injection='{value_structure_injection}' is "
+                f"invalid. Must be one of: {list(VALUE_STRUCTURE_INJECTION_TYPES)}."
+            )
+        self.value_structure_injection = value_structure_injection
+        self.inject_value_structure = value_structure_injection != "none"
+        if self.inject_value_structure and comps_embed_X != "svfa":
+            # In summation mode the value already carries the identity (K = V),
+            # so injection is redundant and the value width would be ambiguous.
+            raise ValueError(
+                "value_structure_injection requires SVFA "
+                "(comps_embed_X='svfa'); got comps_embed_X="
+                f"'{comps_embed_X}'."
+            )
+        # Width of the injected identity code (0 disables the widening).
+        vsi_dim = d_model if self.inject_value_structure else 0
+
+        # --- Value-structure QUERY injection (additive child-identity term) ---
+        if value_structure_query_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
+            raise ValueError(
+                f"value_structure_query_injection="
+                f"'{value_structure_query_injection}' is invalid. Must be one "
+                f"of: {list(VALUE_STRUCTURE_INJECTION_TYPES)}."
+            )
+        self.value_structure_query_injection = value_structure_query_injection
+        self.inject_value_structure_query = value_structure_query_injection != "none"
+        if self.inject_value_structure_query and comps_embed_X != "svfa":
+            raise ValueError(
+                "value_structure_query_injection requires SVFA "
+                f"(comps_embed_X='svfa'); got comps_embed_X='{comps_embed_X}'."
+            )
+        vsq_dim = d_model if self.inject_value_structure_query else 0
+
+
 
         # ------------------------------------------------------------------
         # Direction-aware X→X self-attention split.
@@ -329,7 +492,7 @@ class AttentionSelectorLayer(nn.Module):
         # by a dedicated ``GatedSelfAttention`` block (edge-direction aware)
         # instead of the right-hand columns of the single combined cross block.
         # ------------------------------------------------------------------
-        SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
+        SELF_ATTENTION_TYPES = ("GatedSelfAttention", "CommutatorSelfAttention")
         self.self_attention_type = self_attention_type
         self.split_xx = self_attention_type is not None
         if self.split_xx and self_attention_type not in SELF_ATTENTION_TYPES:
@@ -339,7 +502,29 @@ class AttentionSelectorLayer(nn.Module):
             )
         self.dir_tau = dir_tau
 
+        # Shared structural query projection (W_q) across the cross (S→X) and
+        # self (X→X) blocks.  Only meaningful in split mode; ignored otherwise.
+        self.shared_query = bool(shared_query)
+        if self.shared_query and not self.split_xx:
+            raise ValueError(
+                "shared_query=True requires self_attention_type to be set "
+                "(the shared W_q is shared between the S→X cross block and the "
+                "X→X self block, which only exists in split mode)."
+            )
+
+        # Shared structural key projection (W_K) across the cross (S→X) and
+        # self (X→X) blocks.  Only meaningful in split mode; ignored otherwise.
+        self.shared_key = bool(shared_key)
+        if self.shared_key and not self.split_xx:
+            raise ValueError(
+                "shared_key=True requires self_attention_type to be set "
+                "(the shared W_K is shared between the S→X cross block and the "
+                "X→X self block, which only exists in split mode)."
+            )
+
+
         if gain_stream_source not in ("separate", "shared"):
+
             raise ValueError(
                 f"gain_stream_source='{gain_stream_source}' is invalid. "
                 f"Must be one of: 'separate', 'shared'."
@@ -455,16 +640,41 @@ class AttentionSelectorLayer(nn.Module):
             # HardConcrete / GatedCrossAttention stretch params + gain temperature.
             init_gamma=init_gamma,
             init_zeta=init_zeta,
+            # Init-balancing offset on the S→X cross existence gate ONLY (see
+            # __init__ docstring); the self block below is never offset.
+            init_edge_offset=init_edge_offset,
             gain_tau=gain_tau,
+            use_gain=use_gain,
+
             # Centroid-collapse fix: unit-normalise the structural query and use
             # a fixed sqrt(query_fanin_scale) score scale (structure gate only).
             normalize_query=normalize_query,
             query_fanin_scale=query_fanin_scale,
+            query_norm_elastic=query_norm_elastic,
+            query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
+            query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
+            query_norm_elastic_start_scale=query_norm_elastic_start_scale,
+            query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+            # Remove / freeze the structural query & key projections (W_q / W_K).
+
+            # On the cross block these own the (optionally shared) projections,
+            # so this is where the removal / freeze actually takes effect.
+            remove_query_projection=remove_query_projection,
+            remove_key_projection=remove_key_projection,
+            freeze_query_projection=freeze_query_projection,
+            freeze_key_projection=freeze_key_projection,
+            # Value-structure injection: widen W_V to accept [v ; e_source].
+            value_structure_dim=vsi_dim,
+            # Value-structure QUERY injection: add W_V^q(e_child) query term.
+            value_structure_query_dim=vsq_dim,
         )
+
+
 
 
         # ------------------------------------------------------------------
         # Direction-aware X→X self-attention block (split mode only).
+
         # A dedicated ``GatedSelfAttention`` models X_i → X_j with an
         # antisymmetric direction gate (d_ij + d_ji = 1) that suppresses
         # two-cycles — the directionality the single combined cross block
@@ -472,7 +682,10 @@ class AttentionSelectorLayer(nn.Module):
         # embedding (a self-attention requirement for the symmetric/
         # antisymmetric Toeplitz split); values are the X value stream.
         # ------------------------------------------------------------------
-        self_att_cls_map = {"GatedSelfAttention": GatedSelfAttention}
+        self_att_cls_map = {
+            "GatedSelfAttention": GatedSelfAttention,
+            "CommutatorSelfAttention": CommutatorSelfAttention,
+        }
         if self.split_xx:
             self_att_cls = self_att_cls_map[self_attention_type]
             self.self_attention = AttentionLayer(
@@ -491,7 +704,18 @@ class AttentionSelectorLayer(nn.Module):
                 key_seq_len=X_seq_len,
                 init_tau=init_tau,
                 shared_dag_across_heads=shared_dag_across_heads,
+                # Shared structural query projection: when True the self block
+                # does NOT own a W_q; the cross block's W_q is applied to the X
+                # structural embedding and fed in as a pre-projected query.
+                query_external=self.shared_query,
+                # Shared structural key projection: when True the self block does
+                # NOT own a W_K; the cross block's W_K is applied to the X
+                # structural embedding and fed in as a pre-projected key.  Keeps
+                # S and X keys on the same isometric axes (orthogonal frame).
+                key_external=self.shared_key,
                 key_projection_type=key_projection_type,
+
+
                 orthogonal_scale=orthogonal_key_scale,
                 batch_key_dropout=batch_key_dropout,
                 batch_key_dropout_p_final=batch_key_dropout_p_final,
@@ -500,13 +724,38 @@ class AttentionSelectorLayer(nn.Module):
                 init_gamma=init_gamma,
                 init_zeta=init_zeta,
                 gain_tau=gain_tau,
+                use_gain=use_gain,
                 dir_tau=dir_tau,
+                # CommutatorSelfAttention direction-gate parametrisation
+                # ("qk" or "skew_query"); ignored by GatedSelfAttention.
+                direction_mode=commutator_direction_mode,
+                direction_rank=commutator_direction_rank,
                 # Centroid-collapse fix (structure gate only).
                 normalize_query=normalize_query,
                 query_fanin_scale=query_fanin_scale,
+                query_norm_elastic=query_norm_elastic,
+                query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
+                query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
+                query_norm_elastic_start_scale=query_norm_elastic_start_scale,
+                query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                # Remove / freeze the self block's OWN W_q / W_K.  No-op when it
+
+                # borrows the cross projection (query_external / key_external),
+                # since an external projection takes priority in AttentionLayer.
+                remove_query_projection=remove_query_projection,
+                remove_key_projection=remove_key_projection,
+                freeze_query_projection=freeze_query_projection,
+                freeze_key_projection=freeze_key_projection,
+                # Value-structure injection: widen W_V to accept [v ; e_source].
+                value_structure_dim=vsi_dim,
+                # Value-structure QUERY injection: add W_V^q(e_child) query term.
+                value_structure_query_dim=vsq_dim,
             )
+
         else:
             self.self_attention = None
+
+
 
 
         # ------------------------------------------------------------------
@@ -678,7 +927,42 @@ class AttentionSelectorLayer(nn.Module):
             self.gain_k_embed_X = None
 
         # ------------------------------------------------------------------
+        # Value-structure injection identity tables (value_structure_injection
+        # == "separate").  Dedicated free identity tables (one per S / X source
+        # variable) whose names ("val_id_") contain NO structural pattern, so
+        # the gradient router classifies them as RECONSTRUCTION parameters.
+        # The "struct_detached" scheme reuses the (detached) structural identity
+        # and needs no new parameters, so no tables are created there.
+        # ------------------------------------------------------------------
+        self.val_id_embed_S: Optional[FreeQueryEmbedding]
+        self.val_id_embed_X: Optional[FreeQueryEmbedding]
+        if self.value_structure_injection == "separate":
+            self.val_id_embed_S = FreeQueryEmbedding(
+                num_variables=S_seq_len, d_model=d_model, device=device,
+            )
+            self.val_id_embed_X = FreeQueryEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
+        else:
+            self.val_id_embed_S = None
+            self.val_id_embed_X = None
+
+        # Value-structure QUERY injection identity table (== "separate").  The
+        # query is always an X node (candidate child), so a single per-X-node
+        # code is enough.  Name ("val_q_id_") keeps it in the RECONSTRUCTION
+        # group; "struct_detached" reuses the detached X identity (0 params).
+        self.val_q_id_embed_X: Optional[FreeQueryEmbedding]
+        if self.value_structure_query_injection == "separate":
+            self.val_q_id_embed_X = FreeQueryEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
+        else:
+            self.val_q_id_embed_X = None
+
+
+        # ------------------------------------------------------------------
         # Output MLP head
+
         # ------------------------------------------------------------------
 
         mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
@@ -709,8 +993,101 @@ class AttentionSelectorLayer(nn.Module):
         return torch.cat([s_part, x_part], dim=1)  # (L_X, L_S + L_X)
 
     # ------------------------------------------------------------------
+    # Query centroid initialisation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _query_embedding_for_target(query_proj, target: torch.Tensor) -> torch.Tensor:
+        """Return an embedding ``e`` such that ``query_proj(e) ≈ target``.
+
+        Used to place the projected query on a chosen point (the key centroid)
+        by writing ONLY the query embedding — the query projection W_q itself is
+        left untouched.  Cases:
+
+        * ``None`` / ``nn.Identity`` (query projection removed) → ``e = target``.
+        * ``nn.Linear``  → least-squares solve ``W e = target - b`` (exact when
+          W is square/full-rank; minimum-residual otherwise).
+        * anything else  → fall back to ``target`` (assumes the projection
+          preserves the embedding space).
+        """
+        if query_proj is None or isinstance(query_proj, nn.Identity):
+            return target
+        if isinstance(query_proj, nn.Linear):
+            W = query_proj.weight.detach()                 # (out, in)
+            rhs = target
+            if query_proj.bias is not None:
+                rhs = target - query_proj.bias.detach()
+            sol = torch.linalg.lstsq(W, rhs.reshape(-1, 1)).solution
+            return sol.reshape(-1)
+        return target
+
+    @torch.no_grad()
+    def init_query_at_key_centroid(
+        self,
+        source_tensor: torch.Tensor,
+        x_actual: torch.Tensor,
+    ) -> None:
+        """Initialise the free X query embedding at the centroid of the keys.
+
+        Every real query row is overwritten with the SAME vector so all queries
+        start from one point and read every candidate parent uniformly (for an
+        orthonormal key frame the centroid yields identical ``<q, k_j>`` for all
+        ``j``), giving HSIC a symmetric starting point to break toward the true
+        parents *before* the directional budget saturates (see the SELF_ATTENTION
+        spurious-S3->X4 investigation).
+
+        The target is computed in the space the QK^T score lives in: the keys are
+        first passed through the KEY projection (if any), so the centroid changes
+        depending on whether the key projection is used.  Only the query
+        embedding is written — the QUERY projection W_q is left untouched and
+        inverted (least squares) when present, so the feature works both with and
+        without the query/key projections.
+
+        Requires ``free_query_embedding=True``.  Value-modulated key embeddings
+        (e.g. ``orthogonal_learnable`` / ``standard_learnable``) need real data,
+        which is why this is invoked lazily on the first training batch.
+        """
+        if self.query_embed_X is None:
+            raise RuntimeError(
+                "init_query_at_key_centroid requires free_query_embedding=True "
+                "(no query_embed_X table to initialise)."
+            )
+
+        def _struct(raw):
+            return raw[0] if isinstance(raw, tuple) else raw
+
+        # ---- Key structural embeddings (mirror forward_with_actual) -------
+        s_struct = _struct(self.embedding_S(X=source_tensor))
+        xk_struct = _struct(self.embedding_X(X=x_actual))
+        if self.orth_embed_S is not None:
+            assert self.orth_embed_X is not None
+            s_struct = self.orth_embed_S(source_tensor)
+            xk_struct = self.orth_embed_X(x_actual)
+        sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d_model)
+
+        # ---- Project keys into the scoring space (identity/none → raw) ----
+        key_proj = getattr(self.attention, "key_projection", None)
+        if key_proj is None:
+            k_proj = sx_keys
+        else:
+            k_proj = key_proj(sx_keys)
+
+        # ---- Centroid over all key tokens (S and X) and the batch ---------
+        centroid = k_proj.reshape(-1, k_proj.shape[-1]).mean(dim=0)   # (d_qk*H,)
+
+        # ---- Invert the query projection to land the query on the centroid -
+        query_proj = getattr(self.attention, "query_projection", None)
+        e = self._query_embedding_for_target(query_proj, centroid)    # (d_model,)
+
+        # ---- Write the SAME vector into every real query row (row 0 = pad) -
+        w = self.query_embed_X.embedding.weight
+        e = e.to(dtype=w.dtype, device=w.device)
+        w[1:].copy_(e.unsqueeze(0).expand(w.shape[0] - 1, -1))
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
 
     def forward(
         self,
@@ -880,7 +1257,41 @@ class AttentionSelectorLayer(nn.Module):
             gk_X = self.dropout_emb(self.gain_k_embed_X(x_actual))
             gain_key = torch.cat([gk_S, gk_X], dim=1)       # (B, L_S+L_X, d)
 
+        # ---- Value-structure injection identity codes -------------------
+        # Per-SOURCE-node identity concatenated onto the value stream before
+        # W_V (see __init__).  "separate" pulls dedicated reconstruction-routed
+        # tables; "struct_detached" reuses the (detached) structural identity so
+        # no gradient leaks into the structure.  vsi_S / vsi_X match the S / X
+        # value token order; vsi_SX is their concatenation for the single-block
+        # path.  All None when injection is disabled (value stream unchanged).
+        vsi_S = None
+        vsi_X = None
+        vsi_SX = None
+        if self.inject_value_structure:
+            if self.value_structure_injection == "separate":
+                assert self.val_id_embed_S is not None
+                assert self.val_id_embed_X is not None
+                vsi_S = self.dropout_emb(self.val_id_embed_S(source_tensor))
+                vsi_X = self.dropout_emb(self.val_id_embed_X(x_actual))
+            else:  # "struct_detached": reuse the structural identity, detached.
+                vsi_S = s_struct.detach()
+                vsi_X = xk_struct.detach()
+            vsi_SX = torch.cat([vsi_S, vsi_X], dim=1)       # (B, L_S+L_X, d)
+
+        # ---- Value-structure QUERY injection identity code ---------------
+        # Per-X-node (child) identity feeding the additive W_V^q term.  Same
+        # code for the S->X, X->X and single-block paths (queries are X nodes).
+        vsq_X = None
+        if self.inject_value_structure_query:
+            if self.value_structure_query_injection == "separate":
+                assert self.val_q_id_embed_X is not None
+                vsq_X = self.dropout_emb(self.val_q_id_embed_X(x_blanked))
+            else:  # "struct_detached": reuse the X identity, detached.
+                vsq_X = xk_struct.detach()
+
+
         if self.split_xx:
+
             # ==============================================================
             # SPLIT MODE — S→X cross block + direction-aware X→X self block.
             # ==============================================================
@@ -903,14 +1314,28 @@ class AttentionSelectorLayer(nn.Module):
                 oracle=False,
                 gain_query=gain_query,
                 gain_key=gk_S,
+                value_structure=vsi_S,
+                value_structure_query=vsq_X,
             )
 
+
+
             # ---- X→X self block (keys/values = X only) ------------------
-            # Q and K SHARE the X structural identity (NOT the free query),
-            # as required by the symmetric/antisymmetric Toeplitz split.  The
-            # X key structural embedding ``xk_struct`` is value-independent
-            # (identity only) so it is the correct shared Q/K signal.
+            # Key/value use the X structural identity ``xk_struct`` (a fixed
+            # orthonormal frame under struct_embedding_type="orthogonal_fixed").
+            # The QUERY, however, depends on ``shared_query`` (see below):
+            #   * shared_query=True  → the SHARED FREE query ``x_q_emb`` (the
+            #     same query the S→X cross block aligns with), so a single free
+            #     query aligns on BOTH the S and X subspaces.  Edge DIRECTION is
+            #     then resolved by the CommutatorSelfAttention direction gate on
+            #     that query alone (direction_mode="skew_query"), never by the
+            #     fixed keys — this removes the spurious X–X coupling that the
+            #     old symmetric ½(QKᵀ−KQᵀ) split introduced with non-orthonormal
+            #     shared Q/K.
+            #   * shared_query=False → the classic Toeplitz split with Q=K on
+            #     ``xk_struct`` (original behaviour).
             self_value = xk_val if xk_val is not None else xk_struct
+
             self_gain_q = None
             self_gain_k = None
             if self.gain_stream_source == "separate" and self.gain_q_embed_X is not None:
@@ -919,10 +1344,53 @@ class AttentionSelectorLayer(nn.Module):
                 self_gain_q = self.dropout_emb(self.gain_q_embed_X(x_blanked))
                 self_gain_k = self.dropout_emb(self.gain_k_embed_X(x_actual))
 
+            # ---- Shared structural query projection ---------------------
+            # When shared_query=True the self block owns NO W_q (built with
+            # query_external=True); project the SHARED FREE query ``x_q_emb``
+            # (the SAME query fed to the S→X cross block) with the CROSS block's
+            # W_q, then feed it as a PRE-PROJECTED query.  This is the crux of
+            # the design: ONE free query aligns on both the S and X subspaces,
+            # while the fixed orthonormal keys ``xk_struct`` no longer participate
+            # in a symmetric ½(QKᵀ−KQᵀ) direction split (which, with flexible
+            # non-orthonormal keys, produced spurious X–X edges).  Edge DIRECTION
+            # is instead resolved by CommutatorSelfAttention's skew-query
+            # generator qᵀΩq on this query alone.  We also apply the cross
+            # block's dropout_qkv so the shared query is regularised identically
+            # to the cross path.  When shared_query=False the self block projects
+            # ``xk_struct`` with its own W_q internally (original behaviour).
+            if self.shared_query:
+                self_query = self.attention.dropout_qkv(
+                    self.attention.query_projection(x_q_emb)
+                )
+            else:
+                self_query = xk_struct
+
+            # ---- Shared structural key projection -----------------------
+            # When shared_key=True the self block owns NO W_K (built with
+            # key_external=True); project the X structural identity ``xk_struct``
+            # with the CROSS block's W_K, then feed it as a PRE-PROJECTED key.
+            # Because the cross W_K is applied to BOTH the S keys (in the S→X
+            # block) and these X keys, S and X keys share the SAME projection —
+            # under a fixed orthonormal struct embedding W_K is an isometry, so
+            # they remain mutually orthogonal.  The shared free query then aligns
+            # on genuinely orthonormal key axes for both subspaces, removing the
+            # cheap spurious X–X edges.  When shared_key=False the self block
+            # projects ``xk_struct`` with its own W_K internally (original
+            # behaviour).
+            if self.shared_key:
+                self_key = self.attention.dropout_qkv(
+                    self.attention.key_projection(xk_struct)
+                )
+            else:
+                self_key = xk_struct
+
+
             out_xx, attn_xx, aux_xx = self.self_attention(
-                query=xk_struct,
-                key=xk_struct,
+                query=self_query,
+                key=self_key,
+
                 value=self_value,
+
                 mask_miss_k=None,
                 mask_miss_q=None,
                 pos=None,
@@ -931,7 +1399,11 @@ class AttentionSelectorLayer(nn.Module):
                 oracle=False,
                 gain_query=self_gain_q,
                 gain_key=self_gain_k,
+                value_structure=vsi_X,
+                value_structure_query=vsq_X,
             )
+
+
 
             # ---- Unified re-fusion --------------------------------------
             # Both attention outputs land in the SAME value residual stream,
@@ -970,7 +1442,11 @@ class AttentionSelectorLayer(nn.Module):
                 oracle=oracle,
                 gain_query=gain_query,
                 gain_key=gain_key,
+                value_structure=vsi_SX,
+                value_structure_query=vsq_X,
             )
+
+
 
         # ---- Residual + Norm 1 -------------------------------------------
         # SVFA mode: the attention output (derived from the value V stream)

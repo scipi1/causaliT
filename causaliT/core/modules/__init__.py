@@ -18,6 +18,7 @@ from .attention import (
 )
 from .gated_cross_attention import GatedCrossAttention
 from .gated_self_attention import GatedSelfAttention
+from .commutator_self_attention import CommutatorSelfAttention
 
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
@@ -37,6 +38,7 @@ __all__ = [
     'HardConcreteCrossAttention',
     'GatedCrossAttention',
     'GatedSelfAttention',
+    'CommutatorSelfAttention',
     'ToeplitzAttention',
 
     'AttentionLayer',

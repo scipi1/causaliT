@@ -97,7 +97,15 @@ STRUCTURAL_PATTERNS = [
     # attention Query, so it is a structural parameter driven by HSIC /
     # score-sparsity — NOT the reconstruction loss.
     "query_embed_X",
+    # CommutatorSelfAttention direction generator (direction_mode="skew_query").
+    # The bias-free projections ``direction_proj_a`` / ``direction_proj_b`` build
+    # the learnable so(d) commutator Ω = W_a W_bᵀ − W_b W_aᵀ that resolves EDGE
+    # DIRECTION; they are driven by HSIC / score-sparsity → STRUCTURAL.  The
+    # substring "direction_proj" does not collide with the reconstruction
+    # "value_projection" / "out_projection" patterns.
+    "direction_proj",
     # Attention internal parameters (gain, temperature, Gumbel tau, etc.)
+
     "inner_attention.log_gain",
     "inner_attention.log_tau",
     "inner_attention.temperature",

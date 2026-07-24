@@ -40,8 +40,13 @@
 #
 #   The schedule alternates reconstruct <-> structure, starting (by default)
 #   with a reconstruction warmup so structure always begins from a good
-#   predictor.  The run stops on ``total_epoch_budget`` or after ``max_cycles``
-#   completed structure phases.
+#   predictor.  The run is bounded by a SINGLE resource budget —
+#   ``total_epoch_budget`` (-> pl.Trainer max_epochs) — and does as many
+#   reconstruct/structure cycles as fit within it.  ``max_cycles`` is an
+#   OPTIONAL safety guard (default: null = unbounded), not a budget: it only
+#   caps degenerate fast cycling (phases that exit almost immediately, each
+#   incurring a checkpoint + DAG-diagnostics write).
+
 #
 # LOGGED CSV METRICS (aligned with the loss curves)
 #   adaptive_phase        0 = reconstruct, 1 = structure
@@ -55,8 +60,12 @@ adaptive_training:
   total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
   start_phase: reconstruct         # "reconstruct" (warm up predictor first) or
                                    # "structure"
-  max_cycles: 10                   # stop after this many completed structure
-                                   # phases
+  max_cycles: null                 # OPTIONAL safety cap on completed structure
+                                   # phases. null = unbounded (do as many cycles
+                                   # as fit within total_epoch_budget). Set to an
+                                   # int only to guard against degenerate fast
+                                   # cycling.
+
   starting_checkpoint: null        # optional warm-start (weights only), or null
   reset_optimizer_state_on_switch: false  # clear optimizer moment estimates at
                                           # each phase switch

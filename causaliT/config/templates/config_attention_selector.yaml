@@ -72,7 +72,23 @@ experiment:
   # gradient routing (feeds Q only).
   free_query_embedding: false
 
+  # Initialise the free X query at the centroid of the (projected) keys.
+  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): starting
+  # every query from the SAME point makes it read all candidate parents
+  # uniformly (identical <q, k_j> for an orthonormal key frame), giving HSIC a
+  # symmetric start to break toward the TRUE parents before the directional
+  # budget saturates — instead of falling into an early spurious basin.
+  # Only the X QUERY embedding is written (the query projection W_q is left
+  # untouched and inverted via least squares when present), so it works both
+  # WITH and WITHOUT the query/key projections; when the KEY projection is used
+  # the centroid is taken in the projected key space, so it adapts accordingly.
+  # Requires free_query_embedding=true.  The write happens lazily on the first
+  # training batch (value-modulated key embeddings need real data) and is NOT
+  # re-applied on warm-start/resume (a trained query is never clobbered).
+  query_centroid_init: false
+
   # Centroid-collapse fix (GatedCrossAttention / split GatedSelfAttention).
+
   # When True, L2-normalise the STRUCTURAL query before scoring and replace the
   # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  Rationale
   # (see diagnose_block_dags / simulate_centroid_collapse): with a FREE query
@@ -87,8 +103,123 @@ experiment:
   normalize_query: false
   query_fanin_scale: 1.0
 
+  # Elastic contraction of the query normalization (only active when
+  # normalize_query=true).  See causaliT/utils/elastic_query.py.  The unit-norm
+  # cap imposes a HARD directional budget (sum_j cos^2(q_hat, k_j) <= 1) from the
+  # first step; the SELF_ATTENTION spurious-S3->X4 study showed this budget is
+  # hit almost immediately, so every candidate edge lights up, saturates, and is
+  # then shoved into a zero-sum pushback that damps genuinely good multi-parent
+  # moves before they pay off.  Elastic contraction relaxes the effective query
+  # norm to ``start_scale`` (>1, looser budget = free exploration) EARLY and
+  # linearly contracts it back to ``end_scale`` (typically 1.0, the original
+  # hard cap) between ``start_epoch`` and ``end_epoch`` (GLOBAL epochs).  The
+  # query DIRECTION still drives selection; only its scheduled norm changes, so
+  # the budget is ``M(epoch)^2``.  Disabled (or start_scale==end_scale==1.0)
+  # reproduces plain unit-normalisation exactly.
+  query_norm_elastic: false
+  query_norm_elastic_start_epoch: 0
+  query_norm_elastic_end_epoch: 0
+  query_norm_elastic_start_scale: 1.0
+  query_norm_elastic_end_scale: 1.0
+
+  # Reconstruction-gain bypass (GatedCrossAttention / GatedSelfAttention only).
+  # By default (true) the final attention weight is the causal structure gate
+  # MULTIPLIED by a learnable reconstruction gain: A = z * g.  When set to false
+  # the gain is bypassed entirely and the structure gate becomes the final
+  # attention score (A = z), i.e. the reconstruction magnitude is carried solely
+  # by the value stream.  Ignored for non-gated attention types.
+  use_gain: true
+
+  # Value-structure injection (SVFA only).  By default ("none") the value
+  # projection depends on DATA ONLY (standard Structure-Value Factorized
+  # attention), so W_V cannot learn a per-source-node functional.  When set, a
+  # per-SOURCE-node identity code is CONCATENATED onto the value before W_V
+  # (V_j = W_V([v_j ; e_j])), letting the shared W_V specialise per parent while
+  # preserving SVFA's source-shared value.  One of:
+  #   "none"            — disabled (default; original data-only value).
+  #   "separate"        — dedicated reconstruction-routed identity tables.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  Identity tables are classified as
+  # RECONSTRUCTION parameters by gradient routing.
+  value_structure_injection: "none"
+
+  # Value-structure QUERY injection (SVFA only).  Complements
+  # ``value_structure_injection`` (which keys the value on the SOURCE/parent
+  # node) by additionally conditioning the value on the QUERY (child) node.
+  # A per-child identity code is mapped by a dedicated bias-free W_V^q and ADDED
+  # to the value output, so the shared W_V can learn DIFFERENT functionals of the
+  # same parent depending on which child it feeds (e.g. X2 predicting X4 vs X5).
+  # Because the query term is key-independent it factors out of the softmax as
+  # ``(sum_j A_ij) * W_V^q(e_i)`` — an exact, memory-cheap decomposition. One of:
+  #   "none"            — disabled (default; value independent of the child).
+  #   "separate"        — dedicated reconstruction-routed child identity table.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  The W_V^q projection and the identity table
+  # are classified as RECONSTRUCTION parameters by gradient routing.
+  value_structure_query_injection: "none"
+
+  # Direction-aware X→X self-attention split.  By default (null) the X→X
+  # interaction is modelled by the SAME combined cross block used for S→X, which
+  # cannot express edge direction (double-edges / two-cycles).  When set, the
+  # X→X sub-block is SPLIT into a dedicated direction-aware self block whose
+  # antisymmetric direction gate suppresses two-cycles.  One of:
+  #   null                       — no split (default, single combined block).
+  #   "GatedSelfAttention"       — SYMMETRIC Hard-Concrete existence gate (on the
+  #                                symmetric Toeplitz part) x antisymmetric
+  #                                direction gate x reconstruction gain.
+  #   "CommutatorSelfAttention"  — UNIFIED existence gate: an ASYMMETRIC
+  #                                Hard-Concrete L0 gate applied directly to the
+  #                                raw alignment score (identical mechanism/L0
+  #                                semantics to the S→X GatedCrossAttention),
+  #                                x the same antisymmetric direction gate x gain.
+  #                                Prefer this to keep S→X and X→X edge existence
+  #                                on ONE gating code path.
+  self_attention_type: null
+  # Direction-gate Binary-Concrete temperature (GatedSelfAttention /
+  # CommutatorSelfAttention only).  Lower = sharper direction commitment.
+  dir_tau: 0.6667
+
+  # Shared structural query projection (W_q) across the S→X cross block and the
+  # X→X self block.  SPLIT MODE ONLY (requires ``self_attention_type`` set).
+
+  # When true, the self block does NOT own its own W_q; the cross block's W_q is
+  # applied to the X structural identity and fed to the self block as a
+  # pre-projected query.  This ties "how a child reads a candidate parent" to a
+  # SINGLE projection whether the parent is an S or an X node, so the S→X and
+  # X→X selectors share one query geometry (fewer params, consistent selection).
+  #   false — each block owns an independent W_q (default, original behaviour).
+  #   true  — one shared W_q across both blocks.
+  shared_query: false
+
+  # --- Remove / freeze the structural query & key projections (W_q / W_K) ---
+  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): the
+  # shared query projection W_q couples every node's query together and aligns
+  # them to the keys, "numbing" the per-node query embeddings (they receive a
+  # single-node gradient while W_q aggregates all nodes).  These levers let the
+  # query/key be read DIRECTLY from the (identity) embeddings.
+  #   remove_query_projection — drop W_q entirely: the structural query is the
+  #     raw query embedding (Q = e_q).  Requires d_qk == d_model.
+  #   remove_key_projection   — drop W_K entirely: the structural key is the raw
+  #     key embedding (K = e_k).  Requires d_qk == d_model.
+  #   freeze_query_projection — keep W_q but set requires_grad=False (frozen at
+  #     init); the freeze persists across adaptive phase switches.
+  #   freeze_key_projection   — same, for W_K.
+  # ``remove_*`` and ``freeze_*`` for the same stream are mutually exclusive
+  # (removing already means "no learnable projection").  Threaded into BOTH the
+  # S->X cross block and (when split) the X->X self block; on the self block
+  # they are a no-op whenever it borrows the projection via shared_query /
+  # shared_key (the shared W_q / W_K then lives in — and is removed/frozen on —
+  # the cross block).
+  remove_query_projection: false
+  remove_key_projection: false
+  freeze_query_projection: false
+  freeze_key_projection: false
+
 
 model:
+
+
+
 
   model_object: "AttentionSelectorLayer"
 
@@ -172,12 +303,44 @@ model:
     struct_embedding_type: ${experiment.struct_embedding_type}
     # Decoupled X query embedding (Q only); see experiment.free_query_embedding.
     free_query_embedding: ${experiment.free_query_embedding}
+    # Initialise the free X query at the key centroid; see experiment.query_centroid_init.
+    query_centroid_init: ${experiment.query_centroid_init}
     # Centroid-collapse fix (structure gate only); see experiment.normalize_query.
+
     normalize_query: ${experiment.normalize_query}
     query_fanin_scale: ${experiment.query_fanin_scale}
+    # Elastic contraction of the query normalization; see experiment.query_norm_elastic.
+    query_norm_elastic: ${experiment.query_norm_elastic}
+    query_norm_elastic_start_epoch: ${experiment.query_norm_elastic_start_epoch}
+    query_norm_elastic_end_epoch: ${experiment.query_norm_elastic_end_epoch}
+    query_norm_elastic_start_scale: ${experiment.query_norm_elastic_start_scale}
+    query_norm_elastic_end_scale: ${experiment.query_norm_elastic_end_scale}
+    # Reconstruction-gain bypass (gated attentions only); see experiment.use_gain.
+    use_gain: ${experiment.use_gain}
+    # Value-structure injection (SVFA only); see experiment.value_structure_injection.
+    value_structure_injection: ${experiment.value_structure_injection}
+    # Value-structure QUERY injection (SVFA only); see experiment.value_structure_query_injection.
+    value_structure_query_injection: ${experiment.value_structure_query_injection}
+    # Direction-aware X→X self-attention split; see experiment.self_attention_type.
+    self_attention_type: ${experiment.self_attention_type}
+    # Direction-gate temperature (split self attentions); see experiment.dir_tau.
+    dir_tau: ${experiment.dir_tau}
+    # Shared structural query projection across cross/self blocks (split only);
+    # see experiment.shared_query.
+    shared_query: ${experiment.shared_query}
+    # Remove / freeze the structural query & key projections (W_q / W_K);
+    # see experiment.remove_query_projection etc.
+    remove_query_projection: ${experiment.remove_query_projection}
+    remove_key_projection: ${experiment.remove_key_projection}
+    freeze_query_projection: ${experiment.freeze_query_projection}
+    freeze_key_projection: ${experiment.freeze_key_projection}
+
+
 
 
     # Dropout
+
+
     dropout_emb: ${experiment.dropout}
     dropout_attn_out: ${experiment.dropout}
     dropout_ff: ${experiment.dropout}
@@ -363,7 +526,10 @@ anm_training:
 adaptive_training:
   total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
   start_phase: reconstruct         # warm up the predictor before structure
-  max_cycles: 10                   # cap on the number of structure phases
+  max_cycles: null                 # OPTIONAL safety cap on structure phases
+                                   # (null = unbounded; total_epoch_budget is
+                                   # the real budget)
+
   starting_checkpoint: null        # optional warm-start (weights only)
   reset_optimizer_state_on_switch: false
   monitor: val_x_mae               # metric driving both phase triggers

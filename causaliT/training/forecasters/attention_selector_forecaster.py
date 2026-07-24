@@ -81,6 +81,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
+from causaliT.utils.elastic_query import set_elastic_query_epoch
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -111,8 +112,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Build model
         self.model = AttentionSelectorLayer(**config["model"]["kwargs"])
 
+        # ----------------------------------------------------------------
+        # Query centroid initialisation (see AttentionSelectorLayer
+        # .init_query_at_key_centroid).  Value-modulated key embeddings need
+        # real data, so the write is deferred to the FIRST training batch.
+        # ``_query_centroid_init_done`` is a plain (non-persistent) flag so it
+        # does NOT enter the state_dict; on resume it is re-armed to True in
+        # on_load_checkpoint whenever a trained query embedding is present, so
+        # we never clobber a learned query on warm-start.
+        # ----------------------------------------------------------------
+        self._query_centroid_init = bool(
+            config["model"]["kwargs"].get("query_centroid_init", False)
+        )
+        self._query_centroid_init_done = False
+
         # Data indices
         self.val_idx = config["data"]["val_idx"]
+
         self.S_seq_len = config["data"]["S_seq_len"]
         self.X_seq_len = config["data"]["X_seq_len"]
 
@@ -800,8 +816,33 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # Lightning hooks
     # ------------------------------------------------------------------
 
+    def _maybe_init_query_centroid(self, batch) -> None:
+        """Lazily initialise the free X query embedding at the key centroid.
+
+        Runs at most once, on the first training batch, when
+        ``query_centroid_init=True``.  Deferred to the first batch because
+        value-modulated key embeddings need real data to define the centroid
+        (see AttentionSelectorLayer.init_query_at_key_centroid).
+        """
+        if not self._query_centroid_init or self._query_centroid_init_done:
+            return
+        if getattr(self.model, "query_embed_X", None) is None:
+            # Nothing to initialise (free_query_embedding disabled); latch off.
+            self._query_centroid_init_done = True
+            return
+        S, X = batch[0], batch[1]
+        self.model.init_query_at_key_centroid(S, X)
+        self._query_centroid_init_done = True
+        logger.info(
+            "Initialised X query embedding at the key centroid "
+            "(query_centroid_init=True; all queries start from the same point)."
+        )
+
     def training_step(self, batch, batch_idx):
+        # One-off: place every X query at the key centroid before the first step.
+        self._maybe_init_query_centroid(batch)
         if self.use_gradient_routing:
+
             # --- Manual optimization with dual backward ---
             # Both backward passes must complete BEFORE any optimizer step,
             # otherwise in-place parameter updates invalidate the computation graph.
@@ -867,12 +908,19 @@ class AttentionSelectorForecaster(pl.LightningModule):
         lr = self.config["training"].get("lr", 1e-3)
         weight_decay = self.config["training"].get("weight_decay", 0.01)
         optimizer_name = self.config["training"].get("optimizer", "adamw").lower()
+        # Extra kwargs forwarded to the optimizer constructor, e.g.
+        # {momentum: 0.9, nesterov: true} for SGD.
+        optimizer_kwargs = self.config["training"].get("optimizer_kwargs", {}) or {}
 
         def _make_optimizer(params):
             if optimizer_name == "adamw":
                 return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
             elif optimizer_name == "adam":
                 return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+            elif optimizer_name == "sgd":
+                return torch.optim.SGD(
+                    params, lr=lr, weight_decay=weight_decay, **optimizer_kwargs
+                )
             else:
                 raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
@@ -917,7 +965,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if "state_dict" not in checkpoint:
             return
 
+        # Re-arm the centroid-init latch: if the checkpoint already carries a
+        # (trained) X query embedding, mark the one-off init as DONE so a warm-
+        # start / resume never overwrites the learned query with the centroid.
+        if any(
+            k.endswith("query_embed_X.embedding.weight")
+            for k in checkpoint["state_dict"]
+        ):
+            self._query_centroid_init_done = True
+
         current_keys = set(self.state_dict().keys())
+
         ckpt_keys = set(checkpoint["state_dict"].keys())
 
         # Keys in checkpoint that the current model doesn't have
@@ -989,9 +1047,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # requires_grad state for this stage.
         self._interference_blocks = None
 
+    def on_train_epoch_start(self) -> None:
+        """Advance the elastic query-norm schedule.
+
+        Pushes the current (global) epoch into every structural attention
+        submodule carrying an ``_elastic_epoch`` buffer, so the epoch-based
+        elastic contraction of the query normalization (see
+        ``causaliT.utils.elastic_query``) evolves as training proceeds.
+
+        ``self.current_epoch`` is the trainer's epoch counter, which the
+        adaptive trainer runs as a single monotonically increasing GLOBAL
+        epoch across phases (it does not reset per phase), so the schedule
+        endpoints are interpreted in global-epoch terms.  A no-op (0 modules
+        updated) when the elastic feature is disabled.
+        """
+        set_elastic_query_epoch(self.model, int(self.current_epoch))
+
     # ------------------------------------------------------------------
     # Convenience: expose split attention for post-hoc evaluation
     # ------------------------------------------------------------------
+
 
     def get_split_attention(
         self,

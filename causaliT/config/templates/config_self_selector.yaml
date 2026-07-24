@@ -56,6 +56,12 @@ experiment:
   init_zeta: 1.1                  # HardConcrete stretch upper bound (> 1)
   dir_tau: 0.6666666667           # direction-gate (Binary-Concrete) temperature
   gain_tau: 1.0                   # reconstruction-gain sigmoid temperature
+  # Reconstruction-gain bypass.  When true (default) the final attention weight
+  # is the direction-aware structure gate MULTIPLIED by a learnable gain
+  # (A = z * d * g).  When false the gain is bypassed and the structure gate is
+  # the final attention score (A = z * d); reconstruction magnitude is carried
+  # solely by the value stream.
+  use_gain: true
 
   # A single structural head is REQUIRED (GatedSelfAttention).
   shared_dag_across_heads: true
@@ -81,9 +87,37 @@ experiment:
   normalize_query: false
   query_fanin_scale: 1.0
 
+  # Value-structure injection (SVFA only).  By default ("none") the value
+  # projection depends on DATA ONLY, so W_V cannot learn a per-node functional.
+  # When set, a per-NODE identity code is CONCATENATED onto the value before W_V
+  # (V_j = W_V([v_j ; e_j])), letting the shared W_V specialise per source node.
+  # One of:
+  #   "none"            — disabled (default; original data-only value).
+  #   "separate"        — dedicated reconstruction-routed identity table.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  The identity table is placed in the
+  # RECONSTRUCTION parameter group by parameter_groups().
+  value_structure_injection: "none"
+
+  # Value-structure QUERY injection (SVFA only).  Complements
+  # ``value_structure_injection`` (which keys the value on the SOURCE/parent
+  # node) by additionally conditioning the value on the QUERY (child) node.
+  # A per-child identity code is mapped by a dedicated bias-free W_V^q and ADDED
+  # to the value output, so the shared W_V can learn DIFFERENT functionals of the
+  # same parent depending on which child it feeds (e.g. X2 predicting X4 vs X5).
+  # Because the query term is key-independent it factors out of the aggregation
+  # as ``(sum_j A_ij) * W_V^q(e_i)`` — an exact, memory-cheap decomposition. One of:
+  #   "none"            — disabled (default; value independent of the child).
+  #   "separate"        — dedicated reconstruction-routed child identity table.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  The W_V^q projection and identity table are
+  # placed in the RECONSTRUCTION parameter group by parameter_groups().
+  value_structure_query_injection: "none"
+
 
 
 model:
+
   model_object: "SelfSelectorLayer"
 
   embed_dim:
@@ -133,11 +167,16 @@ model:
     init_zeta: ${experiment.init_zeta}
     dir_tau: ${experiment.dir_tau}
     gain_tau: ${experiment.gain_tau}
+    use_gain: ${experiment.use_gain}
     shared_dag_across_heads: ${experiment.shared_dag_across_heads}
 
     struct_embedding_type: ${experiment.struct_embedding_type}
     free_query_embedding: ${experiment.free_query_embedding}
     gain_stream_source: ${experiment.gain_stream_source}
+    # Value-structure injection (SVFA only); see experiment.value_structure_injection.
+    value_structure_injection: ${experiment.value_structure_injection}
+    # Value-structure QUERY injection (SVFA only); see experiment.value_structure_query_injection.
+    value_structure_query_injection: ${experiment.value_structure_query_injection}
 
     # Dropout
     dropout_emb: ${experiment.dropout}

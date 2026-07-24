@@ -1,89 +1,63 @@
 """
-GatedSelfAttention: direction-aware differentiable variable selector.
+CommutatorSelfAttention: unified-gating, direction-aware variable selector.
 
 Motivation
 ==========
-``GatedCrossAttention`` (GCA) disentangles each edge score into a structure
-gate ``z`` (a Hard-Concrete L0 selector) times a reconstruction gain ``g``.  It
-assumes a KNOWN set of source nodes S (the cross-attention is X -> [S, X]).  In
-a standard causal-discovery setting we do NOT know which variables are sources:
-the model must infer the WHOLE directed acyclic graph over all variables.
-
-This module performs **self-attention over a single set of N variables** (every
-variable may be a parent of every other) and factorises each edge into three
-disentangled, target-conditioned components.  The novelty is that it fuses the
-Hard-Concrete L0 selector of GCA with the **directional Toeplitz
-parametrisation**: a differentiable, direction-aware variable selector.
+``GatedSelfAttention`` (GSA) fuses a **symmetric** Hard-Concrete existence gate
+(on the symmetric Toeplitz part ``S_sym``) with an **antisymmetric** direction
+gate (on ``A_anti``).  This module keeps the direction machinery but **unifies
+the existence gate with ``GatedCrossAttention`` (GCA)**: the edge-existence gate
+is a plain Hard-Concrete gate applied *directly* to the raw alignment score
+``raw = Q Kᵀ`` — exactly the same mechanism GCA uses for S→X edges.  The X→X
+existence decision is therefore made with the *identical* gate as the S→X one
+(one gating code path, one L0 semantics — directed edges), while the direction
+is resolved by the commutator/antisymmetric score.
 
 Design
 ======
-One structural score, decomposed Toeplitz-style into orthogonal parts::
+One structural score ``raw`` feeds two disentangled factors::
 
-    raw    = <q^s_i, k^s_j> / sqrt(E_s)          # (B, N, N), asymmetric
-    S_sym  = (raw + raw^T) / 2                    # symmetric      -> edge EXISTENCE
-    A_anti = (raw - raw^T) / 2                    # antisymmetric  -> edge DIRECTION
+    raw    = <q_i, k_j> * scale                    # (B, N, N), asymmetric alignment
+    A_anti = (raw - raw^T) / 2 = ½(Q Kᵀ - K Qᵀ)    # antisymmetric  -> DIRECTION
 
-**Existence gate** ``z_edge`` — a SYMMETRIC Hard-Concrete L0 gate on ``S_sym``.
-The stochastic training draw uses ONE uniform per unordered pair (mirrored to
-the lower triangle) so ``z_edge_ij == z_edge_ji`` for every sample.  Its
-expected-active-edge count ``sum_{i<j} P(z_edge>0)`` is the L0 penalty (each
-undirected edge counted once).  This is the clean, thresholdable SELECTION
-signal — driven by HSIC + L0 only.
+**Existence gate** ``z_edge`` — a Hard-Concrete L0 gate on ``raw`` itself
+(GCA-style, asymmetric).  One independent uniform per *directed* edge, so
+``z_edge_ij`` and ``z_edge_ji`` are independent.  Its expected-active-edge count
+``sum_{i != j} P(z_edge>0)`` is the L0 penalty (each directed edge counted once,
+matching GCA).  Driven by HSIC + L0.
 
-**Direction gate** ``d`` — an ANTISYMMETRIC coupled Binary-Concrete gate on
-``A_anti`` (Option B: stochastic, so orientation is *explored* during training).
-The training draw shares ONE logistic noise per unordered pair, ANTI-mirrored to
-the lower triangle (``eps_ji = -eps_ij``).  Because both the logit and the noise
-are antisymmetric::
-
-    d_ij = sigmoid((eps_ij + A_anti_ij) / beta_dir)
-    d_ji = sigmoid((-eps_ij - A_anti_ij) / beta_dir) = 1 - d_ij       (per sample)
-
-i.e. sampling ``i->j`` with probability ``p`` forces ``j->i`` to be ``1-p`` —
-exactly the Toeplitz ``d_ij + d_ji = 1`` two-cycle-suppression property, now
-realised inside the stochastic gate.
+**Direction gate** ``d`` — the ANTISYMMETRIC coupled Binary-Concrete gate on
+``A_anti = ½(Q Kᵀ - K Qᵀ)`` (the antisymmetric part of the *projected* score
+matrix — the operative so(N) "commutator").  Because both the logit and the
+shared logistic noise are antisymmetric, ``d_ij + d_ji = 1`` per sample: the
+Toeplitz two-cycle-suppression property, realised inside the stochastic gate.
+For parallel/sibling embeddings (``e_i ∥ e_j``) ``A_anti_ij → 0`` so ``d → 0.5``
+(undecided) — edge *removal* then rests entirely on the existence gate.
 
 **Reconstruction gain** ``g`` — bounded sigmoid score from a SEPARATE gain
-query/key pair (identical to GCA); driven by the MSE reconstruction loss only.
+query/key pair (identical to GCA / GSA); driven by the MSE reconstruction loss.
 
 Combined edge weight::
 
     A_ij = z_edge_ij * d_ij * g_ij     (diagonal zeroed, hard_mask applied)
 
-Key invariant: ``A_ij + A_ji`` is proportional to ``z_edge`` (the pair's total
-edge mass is the sparse existence gate, merely split by direction).  All three
-outcomes are reachable: no edge (``z_edge ~ 0``), ``i->j`` (``d_ij ~ 1``),
-``j->i`` (``d_ij ~ 0``).
+Why keeping direction as a SEPARATE factor is still required
+-----------------------------------------------------------
+If direction were folded into the existence logit alone, ``sigmoid(A - c)`` and
+``sigmoid(-A - c)`` would be locked together and "no edge" would be
+unrepresentable.  Here existence (``z_edge``) and direction (``d``) are separate
+multiplicative factors, so ``z_edge -> 0`` still means "no edge" and sparsity is
+preserved.
 
-Why a SINGLE antisymmetric gate is NOT enough
----------------------------------------------
-If one folded direction into the Hard-Concrete logit alone (antisymmetric
-logit), the two open-probabilities ``sigmoid(A - c)`` and ``sigmoid(-A - c)``
-are locked together: one can be pushed down only by pushing the other up, so
-BOTH cannot approach zero — "no edge" becomes unrepresentable and sparsity is
-lost.  The symmetric existence factor is therefore mandatory.
-
-Gradient routing
-=================
-``query`` / ``key`` are the *structural* (gate) projections; both ``S_sym`` and
-``A_anti`` derive from them, so the L0 penalty and the direction gate are driven
-by the structural loss.  ``gain_query`` / ``gain_key`` are the *reconstruction*
-projections (named ``gain_*`` so the name-based router classifies them as
-reconstruction).  Must be trained with ``use_gradient_routing=True`` so the
-product ``z*d*g`` does not re-conflate structure and gain.
-
-Contract (mirrors the other inner-attention modules)
-=====================================================
+Contract
+========
+Mirrors ``GatedSelfAttention`` exactly:
 ``forward(query, key, value, mask_miss_k, mask_miss_q, pos, causal_mask,
-          hard_mask=None, oracle=False, gain_query=None, gain_key=None)``
-returns ``(out, attn, aux)`` with ``aux = {"entropy": ..., "l0_penalty": ...}``.
-
-Like GCA, the second return slot ``attn`` is NOT the applied weight ``A``; it is
-the **directed structure posterior** ``P(z_edge>0) * d`` (masked), values in
-``(0, 1)``, so evaluation can threshold it at 0.5 to recover the adjacency.
-``query`` / ``key`` MUST be a single structural head (3-D: ``(B, N, E)``) with
-``L == S`` (square self-attention).  ``value`` may be 3-D ``(B, N, d)`` or 4-D
-``(B, N, H, d)``.
+          hard_mask=None, oracle=False, gain_query=None, gain_key=None,
+          value_query=None)`` returns ``(out, p_directed, aux)`` with
+``aux = {"entropy": ..., "l0_penalty": ...}``.  The second slot ``p_directed``
+is the DIRECTED structure posterior ``P(z_edge>0) * d`` (masked), thresholdable
+at 0.5 to recover the adjacency (GCA convention).
 """
 
 from typing import Optional
@@ -100,8 +74,8 @@ from causaliT.utils.elastic_query import (
 
 
 
-class GatedSelfAttention(nn.Module):
-    """Direction-aware selector: symmetric L0 existence x antisymmetric direction x gain."""
+class CommutatorSelfAttention(nn.Module):
+    """Unified-gating selector: asymmetric GCA L0 existence x antisymmetric direction x gain."""
 
     def __init__(
         self,
@@ -112,42 +86,53 @@ class GatedSelfAttention(nn.Module):
         init_tau: float = 2.0 / 3.0,   # beta: existence-gate temperature
         gamma: float = -0.1,           # stretch lower bound (< 0)
         zeta: float = 1.1,             # stretch upper bound (> 1)
-        # Direction-gate Binary-Concrete temperature (Option B, coupled stochastic).
+        # Direction-gate Binary-Concrete temperature (coupled stochastic).
         dir_tau: float = 2.0 / 3.0,    # beta_dir
         # Reconstruction-gain temperature (scales the sigmoid logit).
         gain_tau: float = 1.0,
-        # When False, BYPASS the learnable reconstruction gain entirely: the
-        # directed structure gate (z_edge * direction) becomes the final
-        # attention weight (A = structure) instead of A = structure * g.
-        # ``gain_query`` / ``gain_key`` are then optional and the gain
-        # projections/embeddings can be omitted upstream.  Default True preserves
-        # the original disentangled structure-gate x gain behaviour.
+        # When False, bypass the learnable reconstruction gain: A = structure.
         use_gain: bool = True,
-        # Centroid-collapse fix (structure score only): L2-normalise the query
-        # so its DIRECTION, not its norm, drives selection, and use a fixed
-        # sqrt(query_fanin_scale) score scale instead of 1/sqrt(E).  See
-        # GatedCrossAttention for the full rationale; here it feeds the symmetric
-        # existence gate (via S_sym) and the antisymmetric direction gate.
+        # Centroid-collapse fix: L2-normalise the query so its DIRECTION (not its
+        # norm) drives selection, with a fixed sqrt(query_fanin_scale) score
+        # scale replacing 1/sqrt(E). Feeds BOTH the existence gate (via raw) and
+        # the direction gate (via A_anti).
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
         # Elastic contraction of the query normalization (see
         # ``causaliT/utils/elastic_query.py``); only active with
         # ``normalize_query=True``.  Relaxes the unit-norm cap early and linearly
-        # contracts it to ``end_scale`` between the two epochs.  Disabled (or
-        # both scales 1.0) == original unit normalisation.
+        # contracts it to ``end_scale``.  Disabled (or both scales 1.0) ==
+        # original unit normalisation.
         query_norm_elastic: bool = False,
         query_norm_elastic_start_epoch: int = 0,
         query_norm_elastic_end_epoch: int = 0,
         query_norm_elastic_start_scale: float = 1.0,
         query_norm_elastic_end_scale: float = 1.0,
-        # Batch-consistent key dropout (columns zeroed identically across batch).
+        # Direction-gate parametrisation.  "qk" (default) derives the
 
+        # antisymmetric direction score from the SAME raw alignment used by the
+        # existence gate: A_anti = ½(QKᵀ − KQᵀ).  That is a valid so(N)
+        # commutator ONLY when Q and K share the same embedding.  "skew_query"
+        # instead builds a genuine so(d) commutator on the QUERY alone:
+        #     A_anti_ij = q_iᵀ Ω q_j ,   Ω = W_a W_bᵀ − W_b W_aᵀ
+        # (Ω antisymmetric ⇒ d_ij + d_ji = 1, and q_i = q_j ⇒ A_anti = 0 →
+        # "undecided"), so the direction stays a valid Lie generator even when
+        # the query and key come from DIFFERENT embeddings (e.g. a free query
+        # aligning to a fixed orthonormal key frame).  See Option B in the
+        # shared-query design.
+        direction_mode: str = "qk",
+        # Width of the (projected) query fed to the skew generator; REQUIRED
+        # when direction_mode="skew_query".  ``direction_rank`` sets the rank of
+        # Ω (defaults to direction_dim → full rank).
+        direction_dim: Optional[int] = None,
+        direction_rank: Optional[int] = None,
+        # Batch-consistent key dropout (columns zeroed identically across batch).
         batch_key_dropout: Optional[float] = None,
+
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
-        # Constant-score capacity protocol (Optuna): when not None the STRUCTURE
-        # gate (existence) is frozen at this constant on every edge while the
-        # reconstruction gain g stays learnable.
+        # Constant-score capacity protocol (Optuna): freeze the existence gate at
+        # this constant on every edge while the gain g stays learnable.
         optuna_protocol: Optional[float] = None,
     ):
         super().__init__()
@@ -162,17 +147,15 @@ class GatedSelfAttention(nn.Module):
         self.register_entropy = register_entropy
         self.layer_name = layer_name
 
-        # Gate params are non-learnable constants (matching HardConcreteCrossAttention).
+        # Gate params are non-learnable constants (matching GatedCrossAttention).
         self.beta = float(init_tau)
         self.gamma = float(gamma)
         self.zeta = float(zeta)
         self.dir_beta = float(dir_tau)
         self.gain_tau = float(gain_tau)
 
-        # When False the reconstruction gain is bypassed and A = structure.
         self.use_gain = bool(use_gain)
 
-        # Centroid-collapse fix (structure score only); see __init__ doc.
         self.normalize_query = bool(normalize_query)
         self.query_fanin_scale = float(query_fanin_scale)
 
@@ -194,10 +177,36 @@ class GatedSelfAttention(nn.Module):
         )
 
 
+        # ---- Direction-gate parametrisation -----------------------------
+        if direction_mode not in ("qk", "skew_query"):
+            raise ValueError(
+                f"direction_mode='{direction_mode}' is invalid. "
+                f"Must be one of: 'qk', 'skew_query'."
+            )
+        self.direction_mode = str(direction_mode)
+        if self.direction_mode == "skew_query":
+            if direction_dim is None:
+                raise ValueError(
+                    "direction_mode='skew_query' requires direction_dim "
+                    "(the projected-query width) to build the so(d) generator."
+                )
+            r = int(direction_rank) if direction_rank is not None else int(direction_dim)
+            # A_anti_ij = q_iᵀ Ω q_j with Ω = W_a W_bᵀ − W_b W_aᵀ, realised by
+            # antisymmetrising the bilinear form ⟨W_a q_i, W_b q_j⟩ (see forward).
+            self.direction_proj_a = nn.Linear(int(direction_dim), r, bias=False)
+            self.direction_proj_b = nn.Linear(int(direction_dim), r, bias=False)
+            # Small init so A_anti ≈ 0 at start → direction ≈ 0.5 (undecided),
+            # letting orientation be EXPLORED rather than committed at init.
+            nn.init.normal_(self.direction_proj_a.weight, std=0.02)
+            nn.init.normal_(self.direction_proj_b.weight, std=0.02)
+        else:
+            self.direction_proj_a = None
+            self.direction_proj_b = None
+
         # Pre-computed L0 offset:  P(z>0) = sigmoid(log_alpha - beta*log(-gamma/zeta)).
+
         self._l0_offset: float = float(self.beta * math.log(-self.gamma / self.zeta))
 
-        # Constant-score capacity protocol (gate-only override); see forward().
         self.optuna_protocol: Optional[float] = (
             float(optuna_protocol) if optuna_protocol is not None else None
         )
@@ -213,13 +222,6 @@ class GatedSelfAttention(nn.Module):
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
 
         # Diagnostics / regularisation hooks (populated in forward).
-        #   score_tensor_for_sparsity — DIRECTED posterior P(z_edge>0)*d (B-mean),
-        #     read by the L1 score-sparsity and NOTEARS terms.
-        #   last_p_edge_on           — same DIRECTED posterior (B-mean), thresholded
-        #     at eval to obtain the recovered adjacency.
-        #   last_p_edge_undirected   — SYMMETRIC skeleton posterior P(z_edge>0) (B-mean).
-        #   last_direction           — direction gate d (B-mean), diagnostics only.
-        #   last_gain                — reconstruction gain g (B-mean), diagnostics only.
         self.score_tensor_for_sparsity: Optional[torch.Tensor] = None
         self.last_p_edge_on: Optional[torch.Tensor] = None
         self.last_p_edge_undirected: Optional[torch.Tensor] = None
@@ -238,26 +240,13 @@ class GatedSelfAttention(nn.Module):
         return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
 
     # ------------------------------------------------------------------
-    # Noise helpers (upper-triangle draws mirrored to enforce pair-consistency)
+    # Noise helpers
     # ------------------------------------------------------------------
     @staticmethod
     def _logit(u: torch.Tensor) -> torch.Tensor:
         """Logistic (inverse-sigmoid) noise from a uniform sample."""
         u = u.clamp(1e-6, 1.0 - 1e-6)
         return torch.log(u) - torch.log1p(-u)
-
-    @staticmethod
-    def _symmetric_noise(shape, device, dtype) -> torch.Tensor:
-        """A symmetric logistic-noise matrix: eps_ij == eps_ji, diagonal irrelevant.
-
-        One draw per unordered pair (upper triangle), mirrored to the lower
-        triangle, so the existence gate is identical for both directions.
-        """
-        B, N, _ = shape
-        u = torch.rand(B, N, N, device=device, dtype=dtype)
-        eps = GatedSelfAttention._logit(u)
-        triu = torch.triu(eps, diagonal=1)          # strictly-upper entries
-        return triu + triu.transpose(-1, -2)        # symmetric, zero diagonal
 
     @staticmethod
     def _antisymmetric_noise(shape, device, dtype) -> torch.Tensor:
@@ -268,7 +257,7 @@ class GatedSelfAttention(nn.Module):
         """
         B, N, _ = shape
         u = torch.rand(B, N, N, device=device, dtype=dtype)
-        eps = GatedSelfAttention._logit(u)
+        eps = CommutatorSelfAttention._logit(u)
         triu = torch.triu(eps, diagonal=1)          # strictly-upper entries
         return triu - triu.transpose(-1, -2)        # antisymmetric, zero diagonal
 
@@ -288,42 +277,37 @@ class GatedSelfAttention(nn.Module):
         oracle: bool = False,
         gain_query: Optional[torch.Tensor] = None,
         gain_key: Optional[torch.Tensor] = None,
-        # Value-structure QUERY injection: per-QUERY value term already projected
-        # to the value output width (shape (B, N, d) or (B, N, H, d)).  Added as
-        # ``(sum_j A_ij) * value_query`` — the exact, memory-cheap decomposition
-        # of concatenating the query identity into a (linear, bias-free) W_V^q.
         value_query: Optional[torch.Tensor] = None,
     ):
         if causal_mask:
             raise NotImplementedError(
-                "GatedSelfAttention does not support causal masking."
+                "CommutatorSelfAttention does not support causal masking."
             )
 
         if query.dim() != 3 or key.dim() != 3:
             raise ValueError(
-                "GatedSelfAttention expects a single structural head "
+                "CommutatorSelfAttention expects a single structural head "
                 "(3-D query/key: (B, N, E)); use shared_dag_across_heads=True."
             )
         B, L, E_s = query.shape
         _, S, _ = key.shape
         if L != S:
             raise ValueError(
-                "GatedSelfAttention requires SQUARE self-attention scores "
-                f"(L == S) for the Toeplitz symmetric/antisymmetric split, "
-                f"got L={L}, S={S}."
+                "CommutatorSelfAttention requires SQUARE self-attention scores "
+                f"(L == S) for the antisymmetric direction split, got L={L}, S={S}."
             )
         if self.use_gain and (gain_query is None or gain_key is None):
             raise ValueError(
-                "GatedSelfAttention requires gain_query and gain_key "
+                "CommutatorSelfAttention requires gain_query and gain_key "
                 "(the reconstruction-gain projections) when use_gain=True."
             )
 
         N = L
 
-        # ---- Structural score, Toeplitz-decomposed ----------------------
+        # ---- Structural alignment score ---------------------------------
         # Centroid-collapse fix: unit-normalise the query so its DIRECTION (not
         # its norm) drives selection, with a fixed sqrt(query_fanin_scale) score
-        # scale replacing 1/sqrt(E) (see GatedCrossAttention for the rationale).
+        # scale replacing 1/sqrt(E).
         q_s = query
         if self.normalize_query:
             # Elastic contraction: q̂ * M(epoch); M==1 -> plain unit-norm.
@@ -336,44 +320,57 @@ class GatedSelfAttention(nn.Module):
 
         raw = torch.einsum("bne,bme->bnm", q_s, key) * scale_s   # (B, N, N)
         raw = torch.nan_to_num(raw, nan=0.0)
-        S_sym = 0.5 * (raw + raw.transpose(-1, -2))                # symmetric
-        A_anti = 0.5 * (raw - raw.transpose(-1, -2))               # antisymmetric
+
+        # ---- Direction score (antisymmetric) ----------------------------
+        if self.direction_mode == "skew_query":
+            # Genuine so(d) commutator on the QUERY alone: A_anti_ij = q_iᵀ Ω q_j
+            # with Ω = W_a W_bᵀ − W_b W_aᵀ.  Antisymmetrising the bilinear form
+            # ⟨W_a q_i, W_b q_j⟩ realises exactly q_iᵀ skew(W_a W_bᵀ) q_j, so the
+            # direction stays a valid Lie generator even when the query and key
+            # come from DIFFERENT embeddings (free query ↔ fixed orthonormal key).
+            a = self.direction_proj_a(q_s)                         # (B, N, r)
+            b = self.direction_proj_b(q_s)                         # (B, N, r)
+            form = torch.einsum("bnr,bmr->bnm", a, b)              # (B, N, N)
+            form = torch.nan_to_num(form, nan=0.0)
+            A_anti = 0.5 * (form - form.transpose(-1, -2))         # antisymmetric
+        else:
+            # "qk": antisymmetric part of the raw alignment (the so(N)
+            # commutator).  Valid only when Q and K share the same embedding.
+            A_anti = 0.5 * (raw - raw.transpose(-1, -2))           # antisymmetric
+
 
         if oracle:
             # ---- Oracle: the ground-truth DAG IS the structure gate ------
-            # z_ij = hard_mask_ij (true topology).  Direction/existence are
-            # taken directly from the oracle adjacency; only the learned gain g
-            # modulates edge magnitude.
             if hard_mask is None:
                 raise ValueError(
-                    "GatedSelfAttention oracle mode requires hard_mask "
+                    "CommutatorSelfAttention oracle mode requires hard_mask "
                     "(the ground-truth adjacency used as the structure gate)."
                 )
             hm_gate = hard_mask
             if hm_gate.dim() == 2:
                 hm_gate = hm_gate.unsqueeze(0)                      # (1, N, N)
             structure = hm_gate.to(raw.dtype).expand(B, N, N)
-            p_edge_undirected = structure                          # diagnostics
+            p_exist = structure                                    # diagnostics
             direction = structure                                  # diagnostics
             p_directed = structure                                 # directed posterior
         elif self.optuna_protocol is not None:
             # ---- Constant-score capacity protocol (gate-only override) ----
             c = float(self.optuna_protocol)
-            structure = torch.full_like(S_sym, c)
-            p_edge_undirected = torch.full_like(S_sym, c)
-            direction = torch.full_like(S_sym, 0.5)
-            p_directed = torch.full_like(S_sym, c) * direction
+            structure = torch.full_like(raw, c)
+            p_exist = torch.full_like(raw, c)
+            direction = torch.full_like(raw, 0.5)
+            p_directed = torch.full_like(raw, c) * direction
         else:
-            # ---- Existence gate: SYMMETRIC Hard-Concrete -----------------
+            # ---- Existence gate: ASYMMETRIC Hard-Concrete on raw (GCA-style)
             if self.training:
-                eps_e = self._symmetric_noise(
-                    (B, N, N), device=S_sym.device, dtype=S_sym.dtype
+                u = torch.zeros_like(raw).uniform_().clamp_(1e-8, 1.0 - 1e-8)
+                s_e = torch.sigmoid(
+                    (torch.log(u) - torch.log1p(-u) + raw) / self.beta
                 )
-                s_e = torch.sigmoid((eps_e + S_sym) / self.beta)
             else:
-                s_e = torch.sigmoid(S_sym / self.beta)
+                s_e = torch.sigmoid(raw / self.beta)
             s_bar = s_e * (self.zeta - self.gamma) + self.gamma
-            z_edge = s_bar.clamp(0.0, 1.0)                         # (B, N, N), symmetric
+            z_edge = s_bar.clamp(0.0, 1.0)                         # (B, N, N), asymmetric
 
             # ---- Direction gate: ANTISYMMETRIC coupled Binary-Concrete ----
             if self.training:
@@ -386,9 +383,9 @@ class GatedSelfAttention(nn.Module):
 
             structure = z_edge * direction                        # directed structure gate
 
-            # Posterior that the (undirected) edge exists: P(z_edge > 0).
-            p_edge_undirected = torch.sigmoid(S_sym - self._l0_offset)
-            p_directed = p_edge_undirected * direction
+            # Posterior that the (directed) edge exists: P(z_edge > 0).
+            p_exist = torch.sigmoid(raw - self._l0_offset)
+            p_directed = p_exist * direction
 
         # ---- Reconstruction gain: bounded sigmoid score -----------------
         if self.use_gain:
@@ -396,10 +393,8 @@ class GatedSelfAttention(nn.Module):
             scale_g = 1.0 / (self.gain_tau * math.sqrt(E_g))
             gain_logit = torch.einsum("bne,bme->bnm", gain_query, gain_key) * scale_g
             g = torch.sigmoid(gain_logit)                         # (B, N, N) in (0, 1)
-            # ---- Combined edge weight -----------------------------------
             A = structure * g                                     # (B, N, N)
         else:
-            # ---- Gain bypassed: the directed structure gate IS the weight -
             g = None
             A = structure                                         # (B, N, N)
 
@@ -416,17 +411,15 @@ class GatedSelfAttention(nn.Module):
             hm = hm.to(A.dtype)
             A = A * hm
             p_directed = p_directed * hm
-            p_edge_masked = p_edge_undirected * hm
+            p_exist_masked = p_exist * hm
         else:
-            p_edge_masked = p_edge_undirected.masked_fill(diag, 0.0)
+            p_exist_masked = p_exist.masked_fill(diag, 0.0)
 
-        # ---- L0 penalty: expected active (allowed) UNDIRECTED edges ------
-        # Count each unordered pair once (strictly-upper triangle) since the
-        # existence posterior is symmetric.
-        triu_mask = torch.triu(
-            torch.ones(N, N, device=A.device, dtype=A.dtype), diagonal=1
-        ).unsqueeze(0)
-        l0_penalty = (p_edge_masked * triu_mask).sum(dim=(-2, -1)).mean()
+        # ---- L0 penalty: expected active (allowed) DIRECTED edges --------
+        # Count each DIRECTED edge once (all off-diagonal), matching GCA — the
+        # existence posterior is asymmetric here.
+        off_diag = (~torch.eye(N, device=A.device, dtype=torch.bool)).unsqueeze(0).to(A.dtype)
+        l0_penalty = (p_exist_masked * off_diag).sum(dim=(-2, -1)).mean()
 
         # ---- Batch-consistent key dropout -------------------------------
         bkd_p = self._current_bkd_p()
@@ -445,16 +438,10 @@ class GatedSelfAttention(nn.Module):
             out = torch.einsum("bnm,bmd->bnd", A, value)          # (B, N, d)
         else:
             raise ValueError(
-                f"GatedSelfAttention value must be 3-D or 4-D, got {value.dim()}-D."
+                f"CommutatorSelfAttention value must be 3-D or 4-D, got {value.dim()}-D."
             )
 
         # ---- Value-structure QUERY injection (additive query term) --------
-        # V_ij = W_V([v_j;e_j]) + W_V^q(e_i^q).  W_V^q(e_i^q) is independent of
-        # the key j, so it factors out of the aggregation as
-        # ``(sum_j A_ij) * value_query_i`` — the exact, memory-cheap equivalent
-        # of concatenating the query identity into a linear, bias-free W_V.
-        # ``A`` here is the TRUE applied weight (structure * gain, diagonal
-        # zeroed, masked, dropped).
         if value_query is not None:
             row_sum = A.sum(dim=-1)                                # (B, N)
             if out.dim() == 4:
@@ -462,13 +449,11 @@ class GatedSelfAttention(nn.Module):
             else:
                 out = out + row_sum[:, :, None] * value_query         # (B, N, d)
 
-
         # ---- Diagnostics / regularisation signals -----------------------
         self.score_tensor_for_sparsity = p_directed.mean(dim=0)   # (N, N) directed
         self.last_p_edge_on = p_directed.mean(dim=0)              # (N, N) directed
-        self.last_p_edge_undirected = p_edge_undirected.mean(dim=0)  # (N, N) skeleton
+        self.last_p_edge_undirected = p_exist.mean(dim=0)         # (N, N) existence
         self.last_direction = direction.mean(dim=0).detach()      # (N, N) diag only
-        # last_gain is None when the gain is bypassed (use_gain=False).
         self.last_gain = None if g is None else g.mean(dim=0).detach()  # (N, N) diag
 
         # ---- Entropy (over the combined weights, for logging) -----------
@@ -478,12 +463,13 @@ class GatedSelfAttention(nn.Module):
             entropy = -(w * torch.log(w.clamp_min(1e-8))).sum(dim=-1)  # (B, N)
 
         aux = {"entropy": entropy, "l0_penalty": l0_penalty}
-        # Second slot: the DIRECTED structure posterior P(z_edge>0)*d (masked),
-        # thresholdable at 0.5 to recover the adjacency (GCA convention).
         return out, p_directed, aux
 
     def __repr__(self):
         return (
-            f"GatedSelfAttention(beta={self.beta}, gamma={self.gamma}, "
-            f"zeta={self.zeta}, dir_beta={self.dir_beta}, gain_tau={self.gain_tau})"
+            f"CommutatorSelfAttention(beta={self.beta}, gamma={self.gamma}, "
+            f"zeta={self.zeta}, dir_beta={self.dir_beta}, gain_tau={self.gain_tau}, "
+            f"direction_mode={self.direction_mode})"
         )
+
+

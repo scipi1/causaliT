@@ -36,7 +36,13 @@ This module implements an **adaptive, in-memory** alternative:
 
 The schedule alternates reconstruct ↔ structure, starting (by default) with a
 reconstruction warmup so structure always begins from a good predictor.  The run
-stops on a global epoch budget or a maximum number of cycles.
+is bounded by a **single resource budget** — the global epoch budget
+(``total_epoch_budget`` → ``pl.Trainer.max_epochs``) — and does as many
+reconstruct/structure cycles as fit within it.  ``max_cycles`` is an *optional*
+safety guard (default: unbounded), not a budget: it only exists to cap
+degenerate fast cycling (phases that exit almost immediately, each incurring a
+checkpoint + DAG-diagnostics write).
+
 
 Requirements
 ------------
@@ -48,9 +54,11 @@ pre-classified parameter groups, so it requires ``use_gradient_routing=True``
 Example ``config['adaptive_training']`` block::
 
     adaptive_training:
-      total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
+      total_epoch_budget: 800          # THE budget: global cap = pl.Trainer max_epochs
       start_phase: reconstruct         # warm up the predictor first
-      max_cycles: 10                   # optional cap on struct phases
+      max_cycles: null                 # optional safety cap on # cycles
+                                       # (null = unbounded: as many as fit the budget)
+
       starting_checkpoint: null        # optional warm-start (weights only)
       reset_optimizer_state_on_switch: false
       monitor: val_x_mae               # metric driving both triggers
@@ -182,7 +190,15 @@ class PhaseController(Callback):
 
         self.monitor: str = str(ad.get("monitor", "val_x_mae"))
         self.start_phase: str = str(ad.get("start_phase", "reconstruct")).lower()
-        self.max_cycles: int = int(ad.get("max_cycles", 10))
+        # ``max_cycles`` is NOT a budget — ``total_epoch_budget`` (→ Trainer
+        # max_epochs) is the single authoritative resource cap.  ``max_cycles``
+        # is an OPTIONAL safety guard against degenerate fast cycling (phases
+        # that exit almost immediately, each incurring a checkpoint + DAG
+        # diagnostics write).  Default ``None`` ⇒ unbounded: the run does as
+        # many reconstruct/structure cycles as fit within the epoch budget.
+        _mc = ad.get("max_cycles", None)
+        self.max_cycles: Optional[int] = None if _mc is None else int(_mc)
+
         self.reset_opt_on_switch: bool = bool(
             ad.get("reset_optimizer_state_on_switch", False)
         )
@@ -578,8 +594,12 @@ class PhaseController(Callback):
                 self._cycle_count += 1
 
 
-                # Global stop check: max cycles reached
-                if self._cycle_count >= self.max_cycles:
+                # Optional safety guard: stop only when an explicit max_cycles is
+                # configured and has been reached.  When ``max_cycles is None``
+                # (default) the run is bounded solely by ``total_epoch_budget``
+                # (Trainer max_epochs) — i.e. it does as many cycles as fit.
+                if self.max_cycles is not None and self._cycle_count >= self.max_cycles:
+
                     self._record_transition(
                         trainer, pl_module, f"{reason}_final",
                         from_phase="structure", to_phase="stop",
@@ -772,7 +792,9 @@ def adaptive_trainer(
               f"{controller.plateau_patience} (cap {controller.recon_max_epochs})")
         print(f"  reconstruct floor  : min_epochs {controller.recon_min_epochs}, "
               f"warmup_min_epochs {controller.recon_warmup_min_epochs}")
-        print(f"  max_cycles         : {controller.max_cycles}")
+        print(f"  max_cycles         : "
+              f"{'unbounded (epoch-budget only)' if controller.max_cycles is None else controller.max_cycles}")
+
 
         print("=" * 70)
 

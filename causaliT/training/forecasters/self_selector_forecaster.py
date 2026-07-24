@@ -53,6 +53,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.self_selector import SelfSelectorLayer
 from causaliT.core.utils import load_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
+from causaliT.utils.elastic_query import set_elastic_query_epoch
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -515,9 +516,16 @@ class SelfSelectorForecaster(pl.LightningModule):
             print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
         self._interference_blocks = None
 
+    def on_train_epoch_start(self) -> None:
+        """Advance the elastic query-norm schedule (see
+        ``causaliT.utils.elastic_query``) by pushing the current global epoch
+        into every structural attention submodule.  No-op when disabled."""
+        set_elastic_query_epoch(self.model, int(self.current_epoch))
+
     # ------------------------------------------------------------------
     # Convenience: split attention for post-hoc evaluation
     # ------------------------------------------------------------------
+
 
     def get_split_attention(self, data_source: torch.Tensor, data_intermediate: torch.Tensor):
         """Run forward and return the four split blocks (dict) + source scores."""

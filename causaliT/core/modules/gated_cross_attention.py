@@ -109,6 +109,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from causaliT.utils.elastic_query import (
+    ElasticQueryNormConfig,
+    elastic_normalize_query,
+)
+
+
 
 class GatedCrossAttention(nn.Module):
     """Structure-gate x reconstruction-gain cross attention (see module docstring)."""
@@ -122,8 +128,26 @@ class GatedCrossAttention(nn.Module):
         init_tau: float = 2.0 / 3.0,   # beta: gate temperature
         gamma: float = -0.1,           # stretch lower bound (< 0)
         zeta: float = 1.1,             # stretch upper bound (> 1)
+        # Additive logit offset on the STRUCTURE gate (init-balancing).  The
+        # effective alignment logit becomes ``log_alpha - init_edge_offset`` in
+        # BOTH the Hard-Concrete sample and the P(z>0) posterior, so at init
+        # (``log_alpha ~= 0``) the edge-existence posterior is
+        # ``sigmoid(-init_edge_offset)`` instead of 0.5.  Set it to ``ln 3``
+        # (~1.0986) to bring a directed S->X cross edge to the same 0.25 init
+        # probability a directed X->X self edge gets from its undecided
+        # direction gate (P = p_exist * 0.5), removing the 2x head start the
+        # cross edges otherwise enjoy (see COND_INDEPENDENCE investigation
+        # investigate_S2_X5_spurious_first.ipynb).  Default 0.0 = no offset.
+        init_edge_offset: float = 0.0,
         # Reconstruction-gain temperature (scales the sigmoid logit).
         gain_tau: float = 1.0,
+
+        # When False, BYPASS the learnable reconstruction gain entirely: the
+        # structure gate ``z`` becomes the final attention weight (A = z) instead
+        # of A = z * g.  ``gain_query`` / ``gain_key`` are then optional and the
+        # gain projections/embeddings can be omitted upstream.  Default True
+        # preserves the original disentangled structure-gate x gain behaviour.
+        use_gain: bool = True,
         # Centroid-collapse fix: L2-normalise the STRUCTURAL query before the
         # score so its *direction* (not its norm) decides selection, and replace
         # the 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  With
@@ -135,7 +159,20 @@ class GatedCrossAttention(nn.Module):
         # structure gate, never the reconstruction gain.
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
+        # Elastic contraction of the query normalization (see
+        # ``causaliT/utils/elastic_query.py``).  Only meaningful when
+        # ``normalize_query=True``: relaxes the unit-norm cap to
+        # ``query_norm_elastic_start_scale`` early (looser directional budget so
+        # exploration is free) and linearly contracts it to
+        # ``query_norm_elastic_end_scale`` (typically 1.0) between the two
+        # epochs.  ``enabled=False`` (or both scales 1.0) == original behaviour.
+        query_norm_elastic: bool = False,
+        query_norm_elastic_start_epoch: int = 0,
+        query_norm_elastic_end_epoch: int = 0,
+        query_norm_elastic_start_scale: float = 1.0,
+        query_norm_elastic_end_scale: float = 1.0,
         # Batch-consistent key dropout (columns zeroed identically across batch).
+
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
@@ -162,14 +199,41 @@ class GatedCrossAttention(nn.Module):
         self.gamma = float(gamma)
         self.zeta = float(zeta)
 
+        # Additive logit offset on the structure gate (init-balancing); see the
+        # ``init_edge_offset`` docstring above.  Non-learnable constant.
+        self.edge_offset = float(init_edge_offset)
+
         self.gain_tau = float(gain_tau)
+
+
+        # When False the reconstruction gain is bypassed and A = z (the gate).
+        self.use_gain = bool(use_gain)
 
         # Centroid-collapse fix (structure gate only): unit-normalise the query
         # and use a fixed sqrt(query_fanin_scale) score scale (see __init__ doc).
         self.normalize_query = bool(normalize_query)
         self.query_fanin_scale = float(query_fanin_scale)
 
+        # Elastic query-norm schedule (only active with normalize_query=True).
+        self.elastic_query_cfg = ElasticQueryNormConfig(
+            enabled=query_norm_elastic,
+            start_epoch=query_norm_elastic_start_epoch,
+            end_epoch=query_norm_elastic_end_epoch,
+            start_scale=query_norm_elastic_start_scale,
+            end_scale=query_norm_elastic_end_scale,
+        )
+        # Current training epoch, pushed by the trainer's on_train_epoch_start
+        # via causaliT.utils.elastic_query.set_elastic_query_epoch.  Defaults to
+        # end_epoch so an un-pushed module evaluates M=end_scale (== original
+        # unit normalisation when end_scale=1.0).
+        self.register_buffer(
+            "_elastic_epoch",
+            torch.tensor(int(query_norm_elastic_end_epoch), dtype=torch.long),
+            persistent=False,
+        )
+
         # Constant-score capacity protocol (gate-only override); see forward().
+
         self.optuna_protocol: Optional[float] = (
             float(optuna_protocol) if optuna_protocol is not None else None
         )
@@ -223,22 +287,28 @@ class GatedCrossAttention(nn.Module):
         oracle: bool = False,
         gain_query: Optional[torch.Tensor] = None,
         gain_key: Optional[torch.Tensor] = None,
+        # Value-structure QUERY injection: per-QUERY value term already projected
+        # to the value output width (shape (B, L, d) or (B, L, H, d)).  Added as
+        # ``(sum_j A_ij) * value_query`` — the exact, memory-cheap decomposition
+        # of concatenating the query identity into a (linear, bias-free) W_V^q.
+        value_query: Optional[torch.Tensor] = None,
     ):
         if causal_mask:
 
             raise NotImplementedError(
                 "GatedCrossAttention does not support causal masking."
             )
+
         if query.dim() != 3 or key.dim() != 3:
             raise ValueError(
                 "GatedCrossAttention expects a single structural head "
                 "(3-D query/key: (B, L, E) / (B, S, E)); use "
                 "shared_dag_across_heads=True."
             )
-        if gain_query is None or gain_key is None:
+        if self.use_gain and (gain_query is None or gain_key is None):
             raise ValueError(
                 "GatedCrossAttention requires gain_query and gain_key "
-                "(the reconstruction-gain projections)."
+                "(the reconstruction-gain projections) when use_gain=True."
             )
 
         B, L, E_s = query.shape
@@ -255,10 +325,14 @@ class GatedCrossAttention(nn.Module):
         #      pay a growing L0 cost while true parents stay ON).
         q_s = query
         if self.normalize_query:
-            q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
-            scale_s = math.sqrt(self.query_fanin_scale)
+            # Elastic contraction: q̂ * M(epoch); M==1 -> plain unit-norm.
+            q_s, scale_s = elastic_normalize_query(
+                q_s, self.query_fanin_scale,
+                self.elastic_query_cfg, int(self._elastic_epoch.item()),
+            )
         else:
             scale_s = 1.0 / math.sqrt(E_s)
+
         log_alpha = torch.einsum("ble,bse->bls", q_s, key) * scale_s
 
         if oracle:
@@ -287,31 +361,41 @@ class GatedCrossAttention(nn.Module):
             z = torch.full_like(log_alpha, float(self.optuna_protocol))
             p_edge_on = torch.full_like(log_alpha, float(self.optuna_protocol))
         else:
+            # Additive init-balancing offset: shift the alignment logit so that
+            # at init (log_alpha ~= 0) the edge posterior is sigmoid(-offset)
+            # rather than 0.5.  Applied consistently to the sample AND the
+            # posterior so the gate's expected behaviour and its P(z>0) agree.
+            la = log_alpha - self.edge_offset
             if self.training:
                 # Stochastic Hard-Concrete sample.
-                u = torch.rand_like(log_alpha).clamp_(1e-6, 1.0 - 1e-6)
-                s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + log_alpha) / self.beta)
+                u = torch.rand_like(la).clamp_(1e-6, 1.0 - 1e-6)
+                s = torch.sigmoid((torch.log(u) - torch.log1p(-u) + la) / self.beta)
             else:
                 # Deterministic (mean) gate at eval.
-                s = torch.sigmoid(log_alpha / self.beta)
+                s = torch.sigmoid(la / self.beta)
             s_bar = s * (self.zeta - self.gamma) + self.gamma
             z = s_bar.clamp(0.0, 1.0)                     # (B, L, S) in [0, 1]
 
             # Posterior probability that the gate is open: P(z > 0).
-            #   P(z>0) = sigmoid(log_alpha - beta * log(-gamma / zeta))
+            #   P(z>0) = sigmoid(la - beta * log(-gamma / zeta))
             p_edge_on = torch.sigmoid(
-                log_alpha - self.beta * math.log(-self.gamma / self.zeta)
+                la - self.beta * math.log(-self.gamma / self.zeta)
             )
 
 
-        # ---- Reconstruction gain: bounded sigmoid score ------------------
-        E_g = gain_query.shape[-1]
-        scale_g = 1.0 / (self.gain_tau * math.sqrt(E_g))
-        gain_logit = torch.einsum("ble,bse->bls", gain_query, gain_key) * scale_g
-        g = torch.sigmoid(gain_logit)                   # (B, L, S) in (0, 1)
 
-        # ---- Combined edge weight ----------------------------------------
-        A = z * g                                        # (B, L, S)
+        # ---- Reconstruction gain: bounded sigmoid score ------------------
+        if self.use_gain:
+            E_g = gain_query.shape[-1]
+            scale_g = 1.0 / (self.gain_tau * math.sqrt(E_g))
+            gain_logit = torch.einsum("ble,bse->bls", gain_query, gain_key) * scale_g
+            g = torch.sigmoid(gain_logit)               # (B, L, S) in (0, 1)
+            # ---- Combined edge weight ------------------------------------
+            A = z * g                                    # (B, L, S)
+        else:
+            # ---- Gain bypassed: the structure gate IS the final weight ---
+            g = None
+            A = z                                        # (B, L, S)
 
         # ---- Structural hard mask (allowed-edge topology) ----------------
         # Applied to BOTH the aggregation weight and the L0 penalty so that
@@ -351,12 +435,27 @@ class GatedCrossAttention(nn.Module):
                 f"GatedCrossAttention value must be 3-D or 4-D, got {value.dim()}-D."
             )
 
+        # ---- Value-structure QUERY injection (additive query term) --------
+        # V_ij = W_V([v_j;e_j]) + W_V^q(e_i^q).  Since W_V^q(e_i^q) is
+        # independent of the key j, it factors out of the aggregation as
+        # ``(sum_j A_ij) * value_query_i`` — the exact, memory-cheap equivalent
+        # of concatenating the query identity into a linear, bias-free W_V.
+        # ``A`` here is the TRUE applied weight (gate * gain, masked, dropped).
+        if value_query is not None:
+            row_sum = A.sum(dim=-1)                            # (B, L)
+            if out.dim() == 4:
+                out = out + row_sum[:, :, None, None] * value_query   # (B, L, H, d)
+            else:
+                out = out + row_sum[:, :, None] * value_query         # (B, L, d)
+
+
         # ---- Diagnostics / regularisation signals (gate-only) ------------
         # Batch-mean (2-D) tensors so the forecaster's score-sparsity / NOTEARS
         # paths (which expect 2-D score tensors) operate on the GATE.
         self.score_tensor_for_sparsity = p_edge_on.mean(dim=0)   # (L, S) gate
         self.last_p_edge_on = p_edge_on.mean(dim=0)              # (L, S) gate
-        self.last_gain = g.mean(dim=0).detach()                 # (L, S) diag only
+        # last_gain is None when the gain is bypassed (use_gain=False).
+        self.last_gain = None if g is None else g.mean(dim=0).detach()  # (L, S) diag
 
         # ---- Entropy (over the combined weights, for logging) ------------
         entropy = None

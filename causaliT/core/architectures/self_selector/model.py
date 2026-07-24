@@ -153,6 +153,9 @@ class SelfSelectorLayer(nn.Module):
         init_zeta: float = 1.1,
         dir_tau: float = 2.0 / 3.0,
         gain_tau: float = 1.0,
+        # When False, bypass the learnable reconstruction gain: the direction-
+        # aware structure gate becomes the final attention weight.
+        use_gain: bool = True,
         # MLP output head
         output_mlp_layers: int = 1,
         output_mlp_hidden: Optional[int] = None,
@@ -177,8 +180,25 @@ class SelfSelectorLayer(nn.Module):
         optuna_protocol: Optional[float] = None,
         # Reconstruction-gain stream
         gain_stream_source: str = "separate",
+        # Value-structure injection: concatenate a per-NODE identity code onto
+        # the (data-only) value stream before W_V so V_j = W_V([v_j ; e_j]) and
+        # the shared W_V can learn a per-source-node functional.  One of:
+        #   "none"            — disabled (default; original data-only value).
+        #   "separate"        — dedicated reconstruction-routed identity table.
+        #   "struct_detached" — reuse the structural identity, detached (0 params).
+        # Requires SVFA (comps_embed="svfa"); combination is concatenation.
+        value_structure_injection: str = "none",
+        # Value-structure QUERY injection: make the value additionally depend on
+        # the QUERY (child) node identity, so V_ij = W_V([v_j ; e_j]) + W_V^q(e_i^q).
+        # This lets the shared value learn DIFFERENT functionals of the same
+        # parent j depending on the child i it is being aggregated for (e.g. X2
+        # predicting X4 vs X5).  Same option set / SVFA requirement as
+        # ``value_structure_injection``; combination is the additive query term.
+        value_structure_query_injection: str = "none",
     ):
         super().__init__()
+
+
 
         self.model_name = model
         self.d_model = d_model
@@ -228,7 +248,53 @@ class SelfSelectorLayer(nn.Module):
                 "Use gain_stream_source='separate' otherwise."
             )
 
+        # ------------------------------------------------------------------
+        # Value-structure injection scheme selection (concatenation).
+        # A per-NODE identity code is concatenated onto the data value before the
+        # (widened) reconstruction W_V.  The extra width ``vsi_dim`` is threaded
+        # into the AttentionLayer so ``value_projection`` accepts d_model + vsi_dim.
+        # ------------------------------------------------------------------
+        VALUE_STRUCTURE_INJECTION_TYPES = ("none", "separate", "struct_detached")
+        if value_structure_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
+            raise ValueError(
+                f"value_structure_injection='{value_structure_injection}' is "
+                f"invalid. Must be one of: {list(VALUE_STRUCTURE_INJECTION_TYPES)}."
+            )
+        self.value_structure_injection = value_structure_injection
+        self.inject_value_structure = value_structure_injection != "none"
+        if self.inject_value_structure and comps_embed != "svfa":
+            # In summation mode the value already carries the identity (K = V),
+            # so injection is redundant and the value width would be ambiguous.
+            raise ValueError(
+                "value_structure_injection requires SVFA "
+                f"(comps_embed='svfa'); got comps_embed='{comps_embed}'."
+            )
+        vsi_dim = d_model if self.inject_value_structure else 0
+
+        # ------------------------------------------------------------------
+        # Value-structure QUERY injection scheme selection (additive term).
+        # A per-QUERY (child) identity code is mapped by a dedicated bias-free
+        # W_V^q to the value output width and added as ``(sum_j A_ij) * W_V^q(e_i)``.
+        # The extra input width ``vsq_dim`` is threaded into the AttentionLayer.
+        # ------------------------------------------------------------------
+        if value_structure_query_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
+            raise ValueError(
+                f"value_structure_query_injection="
+                f"'{value_structure_query_injection}' is invalid. Must be one "
+                f"of: {list(VALUE_STRUCTURE_INJECTION_TYPES)}."
+            )
+        self.value_structure_query_injection = value_structure_query_injection
+        self.inject_value_structure_query = value_structure_query_injection != "none"
+        if self.inject_value_structure_query and comps_embed != "svfa":
+            raise ValueError(
+                "value_structure_query_injection requires SVFA "
+                f"(comps_embed='svfa'); got comps_embed='{comps_embed}'."
+            )
+        vsq_dim = d_model if self.inject_value_structure_query else 0
+
         self.key_projection_type = key_projection_type
+
+
         if key_projection_type not in ("linear", "orthogonal"):
             raise ValueError(
                 f"key_projection_type='{key_projection_type}' is invalid. "
@@ -278,7 +344,13 @@ class SelfSelectorLayer(nn.Module):
             init_zeta=init_zeta,
             dir_tau=dir_tau,
             gain_tau=gain_tau,
+            use_gain=use_gain,
+            # Value-structure injection: widen W_V to accept [v ; e_node].
+            value_structure_dim=vsi_dim,
+            # Value-structure QUERY injection: add W_V^q(e_i^q) query term.
+            value_structure_query_dim=vsq_dim,
         )
+
 
         # ------------------------------------------------------------------
         # Static self-loop mask: (N, N) off-diagonal ones (no self-loops).
@@ -374,6 +446,36 @@ class SelfSelectorLayer(nn.Module):
             self.gain_k_embed = None
 
         # ------------------------------------------------------------------
+        # Value-structure injection identity table (value_structure_injection
+        # == "separate").  Name ("val_id_") carries no structural pattern and is
+        # NOT added to ``parameter_groups`` structural_modules, so it lands in
+        # the RECONSTRUCTION group.  "struct_detached" reuses the detached
+        # structural identity and needs no new parameters.
+        # ------------------------------------------------------------------
+        self.val_id_embed: Optional[FreeQueryEmbedding]
+        if self.value_structure_injection == "separate":
+            self.val_id_embed = FreeQueryEmbedding(
+                num_variables=self.N, d_model=d_model, device=device,
+            )
+        else:
+            self.val_id_embed = None
+
+        # ------------------------------------------------------------------
+        # Value-structure QUERY injection identity table (== "separate").  Same
+        # routing rationale as ``val_id_embed`` (name carries no structural
+        # pattern → RECONSTRUCTION group).  "struct_detached" reuses the detached
+        # QUERY structural identity; "none" needs no table.
+        # ------------------------------------------------------------------
+        self.val_q_id_embed: Optional[FreeQueryEmbedding]
+        if self.value_structure_query_injection == "separate":
+            self.val_q_id_embed = FreeQueryEmbedding(
+                num_variables=self.N, d_model=d_model, device=device,
+            )
+        else:
+            self.val_q_id_embed = None
+
+
+        # ------------------------------------------------------------------
         # Output MLP head
         # ------------------------------------------------------------------
         mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
@@ -457,6 +559,29 @@ class SelfSelectorLayer(nn.Module):
             gain_query = self.dropout_emb(self.gain_q_embed(all_blanked))
             gain_key = self.dropout_emb(self.gain_k_embed(all_actual))
 
+        # ---- Value-structure injection identity code ---------------------
+        # Per-NODE identity concatenated onto the value stream before W_V.
+        # "separate" pulls the dedicated reconstruction-routed table;
+        # "struct_detached" reuses the (detached) structural identity so no
+        # gradient leaks into the structure.  None disables the concat.
+        vsi = None
+        if self.inject_value_structure:
+            if self.value_structure_injection == "separate":
+                assert self.val_id_embed is not None
+                vsi = self.dropout_emb(self.val_id_embed(all_actual))
+            else:  # "struct_detached"
+                vsi = k_struct.detach()
+
+        # ---- Value-structure QUERY injection identity code ---------------
+        # Per-QUERY (child) identity feeding the additive W_V^q term.
+        vsq = None
+        if self.inject_value_structure_query:
+            if self.value_structure_query_injection == "separate":
+                assert self.val_q_id_embed is not None
+                vsq = self.dropout_emb(self.val_q_id_embed(all_blanked))
+            else:  # "struct_detached"
+                vsq = q_struct.detach()
+
         attn_out, attn, aux = self.attention(
             query=q_struct,
             key=k_struct,
@@ -469,7 +594,10 @@ class SelfSelectorLayer(nn.Module):
             oracle=oracle,
             gain_query=gain_query,
             gain_key=gain_key,
+            value_structure=vsi,
+            value_structure_query=vsq,
         )
+
 
         # ---- Residual + Norm 1 -------------------------------------------
         is_svfa = q_val is not None

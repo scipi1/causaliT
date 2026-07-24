@@ -9,6 +9,7 @@ from causaliT.core.modules.extra_layers import UniformAttentionMask, BatchConsis
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.core.modules.gated_cross_attention import GatedCrossAttention
 from causaliT.core.modules.gated_self_attention import GatedSelfAttention
+from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List, Optional
@@ -901,12 +902,19 @@ class ScaledDotAttention(nn.Module):
         causal_mask: bool,
         hard_mask: torch.Tensor = None,
         oracle: bool = False,
+        # Value-structure QUERY injection: per-QUERY value term already
+        # projected to the value output width (shape (B, L, d) or (B, L, H, d)).
+        # Added as ``(sum_j A_ij) * value_query`` — the exact, memory-cheap
+        # decomposition of concatenating the query identity into a linear,
+        # bias-free W_V^q.
+        value_query: torch.Tensor = None,
     ):
         if oracle:
             raise NotImplementedError(
                 "Oracle attention mode is not implemented for ScaledDotAttention. "
                 "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
             )
+
 
         is_multihead = query.dim() == 4
 
@@ -1324,29 +1332,148 @@ class AttentionLayer(nn.Module):
         gate_bias_trainable: bool = True,
         init_gamma: float = -0.1,
         init_zeta: float = 1.1,
+        # Additive init-balancing logit offset on the GatedCrossAttention
+        # structure gate only (ignored by all other inner attentions).  See
+        # GatedCrossAttention.init_edge_offset; ln 3 (~1.0986) lands the cross
+        # S->X init edge probability at 0.25 to match a directed self edge.
+        init_edge_offset: float = 0.0,
         gain_tau: float = 1.0,
         dir_tau: float = 2.0 / 3.0,
+
+        # CommutatorSelfAttention direction-gate parametrisation (see that
+        # module).  "qk" (default) keeps the antisymmetric-of-raw direction;
+        # "skew_query" builds a learnable so(d) commutator on the query alone
+        # (Option B).  ``direction_dim`` is derived internally from the
+        # projected-query width; ``direction_rank`` sets the rank of Ω.
+        direction_mode: str = "qk",
+        direction_rank: Optional[int] = None,
+
+        # When False, bypass the learnable reconstruction gain in the gated
+        # attentions (GatedCrossAttention / GatedSelfAttention): the structure
+        # gate becomes the final attention weight (A = z instead of A = z*g).
+        use_gain: bool = True,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
         # L2-normalise the structural query and use a fixed sqrt(query_fanin_scale)
         # score scale in place of 1/sqrt(E).
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
+        # Elastic contraction of the query normalization (only meaningful with
+        # ``normalize_query=True``); threaded into the gated inner attentions.
+        # Both scales 1.0 (or disabled) == original unit normalisation.
+        query_norm_elastic: bool = False,
+        query_norm_elastic_start_epoch: int = 0,
+        query_norm_elastic_end_epoch: int = 0,
+        query_norm_elastic_start_scale: float = 1.0,
+        query_norm_elastic_end_scale: float = 1.0,
         shared_qk_inner: dict = None,
 
+        # Externally-projected query.  When True, this layer does NOT build its
+        # own structural ``query_projection`` (W_q).  Instead the caller passes
+        # an ALREADY-PROJECTED query tensor of shape
+        # ``(B, L, d_queries_keys * n_heads_struct)`` to ``forward`` and it is
+        # fed straight to the inner attention (bypassing W_q and its dropout).
+        # This lets several AttentionLayer blocks share ONE W_q owned by the
+        # parent module (e.g. a cross S→X block and a self X→X block sharing the
+        # same ``Q = emb(X) W_q``).  The key/value projections and the inner
+        # attention remain per-layer.  Mutually exclusive with ``shared_qk_inner``.
+        query_external: bool = False,
+
+        # Externally-projected key.  Symmetric to ``query_external``: when True,
+        # this layer does NOT build its own structural ``key_projection`` (W_K).
+        # Instead the caller passes an ALREADY-PROJECTED key tensor of shape
+        # ``(B, S, d_queries_keys * n_heads_struct)`` to ``forward`` and it is
+        # fed straight to the inner attention (bypassing W_K and its dropout).
+        # This lets a self X→X block reuse the SINGLE W_K owned by the parent's
+        # cross S→X block, so S and X keys pass through the same (isometric)
+        # projection and stay mutually orthogonal.  Mutually exclusive with
+        # ``shared_qk_inner``.
+        key_external: bool = False,
+
+        # Remove the structural query/key projections entirely: read the query /
+        # keys DIRECTLY from the (structural) embeddings, dropping W_q / W_K.
+        # Implemented as an ``nn.Identity`` in place of the ``nn.Linear`` so all
+        # forward paths (including the shared-projection self block) work
+        # unchanged; the score becomes <e_i^q, e_j^k> on the raw embeddings.
+        # Requires the embedding width to match the inner-attention Q/K width
+        # (``d_queries_keys * n_heads_struct``) — true when ``d_qk == d_model``
+        # and ``shared_dag_across_heads=True``.  Mutually superseded by the
+        # ``*_external`` flags (a shared/external projection takes priority).
+        # Motivation: the shared W_q couples every query and aligns them to the
+        # keys, numbing the per-node query embeddings (see the SELF_ATTENTION
+        # spurious-S3->X4 investigation); dropping it isolates the single-node
+        # embedding gradient.
+        remove_query_projection: bool = False,
+        remove_key_projection: bool = False,
+        # Freeze the structural query/key projections at initialisation
+        # (``requires_grad=False``).  Because ``classify_parameters`` keeps only
+        # ``requires_grad=True`` params, a frozen projection is dropped from the
+        # structural optimiser group and the freeze PERSISTS across adaptive
+        # phase switches.  No-op for external (None) or removed (Identity)
+        # projections, which own no parameters.
+        freeze_query_projection: bool = False,
+        freeze_key_projection: bool = False,
+
+
         shared_dag_across_heads: bool = True,
+
         dual_value: bool = False,
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
         optuna_protocol: Optional[float] = None,
+        # Value-structure injection (source-node identity concatenated onto the
+        # value stream before W_V).  When >0, the reconstruction value_projection
+        # accepts ``d_model_values + value_structure_dim`` inputs and the caller
+        # must pass a ``value_structure`` tensor of that trailing width to
+        # ``forward``.  0 (default) preserves the original data-only value stream.
+        value_structure_dim: int = 0,
+        # Value-structure QUERY injection (target/child identity).  When >0 the
+        # value additionally depends on the QUERY node:
+        #     V_ij = W_V([v_j ; e_j])  +  W_V^q(e_i^q).
+        # Because W_V is linear this decomposes into the existing source-shared
+        # value PLUS an additive term contributed by the query identity, scaled
+        # by the attention row-sum ``sum_j A_ij`` (computed inside the inner
+        # attention, where the TRUE applied weights are known).  A dedicated
+        # bias-free ``value_query_proj`` maps the query identity of width
+        # ``value_structure_query_dim`` to the value output width; the caller
+        # passes a per-QUERY ``value_structure_query`` tensor of that trailing
+        # width to ``forward``.  Only the gated (GatedCrossAttention /
+        # GatedSelfAttention) and ScaledDotAttention inner modules support the
+        # additive query term.  0 (default) disables it.
+        value_structure_query_dim: int = 0,
     ):
         super(AttentionLayer, self).__init__()
 
 
+
+
         self._uses_shared_structure = shared_qk_inner is not None
+        self._query_external = bool(query_external)
+        if self._query_external and self._uses_shared_structure:
+            raise ValueError(
+                "query_external=True is mutually exclusive with shared_qk_inner "
+                "(the query projection is either externally owned OR shared via "
+                "the shared_qk_inner bundle, not both)."
+            )
+        self._key_external = bool(key_external)
+        if self._key_external and self._uses_shared_structure:
+            raise ValueError(
+                "key_external=True is mutually exclusive with shared_qk_inner "
+                "(the key projection is either externally owned OR shared via "
+                "the shared_qk_inner bundle, not both)."
+            )
+
+        # Remove-projection flags (read Q/K straight from the embeddings).  An
+        # external / shared projection takes priority (nothing is built here in
+        # that case), so removal only applies to a locally-owned projection.
+        self._remove_query_projection = bool(remove_query_projection)
+        self._remove_key_projection = bool(remove_key_projection)
+
         self.shared_dag_across_heads = bool(shared_dag_across_heads)
+
         n_heads_struct = 1 if self.shared_dag_across_heads else n_heads
         self._n_heads_struct = n_heads_struct
+
 
         if shared_qk_inner is not None:
             # ===== SHARED MODE =====
@@ -1405,15 +1532,59 @@ class AttentionLayer(nn.Module):
                     init_tau=init_tau,
                     gamma=init_gamma,
                     zeta=init_zeta,
+                    # Init-balancing offset on the S->X existence gate (lands the
+                    # cross init edge prob at sigmoid(-offset); ln 3 -> 0.25).
+                    init_edge_offset=init_edge_offset,
                     gain_tau=gain_tau,
+                    use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
+                    query_norm_elastic=query_norm_elastic,
+                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
+                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
+                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
+                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
                     batch_key_dropout=batch_key_dropout,
+
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                     # Optuna capacity-search protocol: freeze the STRUCTURE gate
                     # at a constant (0/1) while the reconstruction gain learns.
                     optuna_protocol=optuna_protocol,
+                )
+
+            elif attention is CommutatorSelfAttention:
+                # CommutatorSelfAttention: GCA-style asymmetric HardConcrete
+                # existence gate on the raw alignment × antisymmetric direction
+                # gate × sigmoid reconstruction gain.  The direction gate is
+                # parametrised by ``direction_mode`` ("qk" antisymmetric-of-raw,
+                # or "skew_query" learnable so(d) commutator on the query — the
+                # ``direction_dim`` is the projected-query width).
+                self.inner_attention = attention(
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    gamma=init_gamma,
+                    zeta=init_zeta,
+                    dir_tau=dir_tau,
+                    gain_tau=gain_tau,
+                    use_gain=use_gain,
+                    normalize_query=normalize_query,
+                    query_fanin_scale=query_fanin_scale,
+                    query_norm_elastic=query_norm_elastic,
+                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
+                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
+                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
+                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    optuna_protocol=optuna_protocol,
+                    direction_mode=direction_mode,
+
+                    direction_dim=d_queries_keys * n_heads_struct,
+                    direction_rank=direction_rank,
                 )
             elif attention is GatedSelfAttention:
                 # GatedSelfAttention: direction-aware selector.  Toeplitz split
@@ -1429,12 +1600,22 @@ class AttentionLayer(nn.Module):
                     zeta=init_zeta,
                     dir_tau=dir_tau,
                     gain_tau=gain_tau,
+                    use_gain=use_gain,
+                    normalize_query=normalize_query,
+                    query_fanin_scale=query_fanin_scale,
+                    query_norm_elastic=query_norm_elastic,
+                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
+                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
+                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
+                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                     optuna_protocol=optuna_protocol,
                 )
             elif attention is CausalCrossAttention:
+
+
 
 
                 # CausalCrossAttention also accepts the Optuna capacity-search
@@ -1470,13 +1651,51 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
 
-            # Q and K projections
-            self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads_struct)
+            # Q and K projections.  When ``query_external`` the query arrives
+            # already projected (a parent block owns the shared W_q), so this
+            # block must NOT create its own W_q — otherwise it would register an
+            # unused parameter that never receives gradients.
+            _q_out = d_queries_keys * n_heads_struct
+            if self._query_external:
+                self.query_projection = None
+            elif self._remove_query_projection:
+                # No W_q: the projected query IS the (structural) query embedding.
+                # Requires the embedding width to equal the inner-attention query
+                # width so the raw embedding can be scored directly.
+                if d_model_queries != _q_out:
+                    raise ValueError(
+                        "remove_query_projection=True requires d_model_queries == "
+                        f"d_queries_keys * n_heads_struct, got {d_model_queries} != "
+                        f"{_q_out}.  Set d_qk so d_qk == d_model and keep "
+                        "shared_dag_across_heads=True."
+                    )
+                self.query_projection = nn.Identity()
+            else:
+                self.query_projection = nn.Linear(d_model_queries, _q_out)
+
 
             self.key_projection_type = key_projection_type
-            if key_projection_type == "linear":
+            _k_out = d_queries_keys * n_heads_struct
+            if self._key_external:
+                # Externally-owned W_K: a parent block projects the key and passes
+                # it in already projected.  Build no key_projection here so this
+                # layer registers no unused parameter (mirrors query_external).
+                self.key_projection = None
+            elif self._remove_key_projection:
+                # No W_K: keys are read straight from the (structural) embedding;
+                # ``key_projection_type`` is intentionally bypassed.
+                if d_model_keys != _k_out:
+                    raise ValueError(
+                        "remove_key_projection=True requires d_model_keys == "
+                        f"d_queries_keys * n_heads_struct, got {d_model_keys} != "
+                        f"{_k_out}."
+                    )
+                self.key_projection = nn.Identity()
+            elif key_projection_type == "linear":
+
                 self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads_struct)
             elif key_projection_type == "orthogonal":
+
                 out_features = d_queries_keys * n_heads_struct
                 in_features = d_model_keys
                 if out_features < in_features:
@@ -1496,11 +1715,67 @@ class AttentionLayer(nn.Module):
                     f"Must be one of: 'linear', 'orthogonal'"
                 )
 
-        # V projection, output projection, and dropout are always per-layer
-        self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
+        # ---- Optional freeze of the structural Q/K projections --------------
+        # Set requires_grad=False so ``classify_parameters`` (which keeps only
+        # requires_grad=True params) drops them from the structural optimiser
+        # group; the freeze then PERSISTS across adaptive phase switches.  No-op
+        # for external (None) or removed (Identity) projections, which own no
+        # parameters.
+        if freeze_query_projection and self.query_projection is not None:
+            for _p in self.query_projection.parameters():
+                _p.requires_grad_(False)
+        if freeze_key_projection and self.key_projection is not None:
+            for _p in self.key_projection.parameters():
+                _p.requires_grad_(False)
+
+        # V projection, output projection, and dropout are always per-layer.
+
+        # Value-structure injection: when ``value_structure_dim > 0`` the value
+        # projection accepts the data value CONCATENATED with a source-node
+        # identity code of that width (``V_j = W_V([v_j ; e_j])``), giving the
+        # otherwise data-only value stream a per-source-node functional.  The
+        # output width (``d_model_values * n_heads``) is unchanged.
+        self.value_structure_dim = int(value_structure_dim)
+        self.value_projection = nn.Linear(
+            d_model_values + self.value_structure_dim, d_model_values * n_heads
+        )
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
+
+        # Value-structure QUERY injection.  A bias-free projection maps the
+        # per-QUERY identity code (width ``value_structure_query_dim``) to the
+        # value output width (``d_model_values * n_heads``).  The additive query
+        # term ``(sum_j A_ij) * W_V^q(e_i^q)`` is applied INSIDE the inner
+        # attention (which alone knows the true applied weights A).  The
+        # projection is deliberately bias-free: the bias already lives in the
+        # key/value path ``value_projection`` — see the linearity decomposition
+        # in the constructor docstring.  Named ``value_query_proj`` (NOT
+        # "query_projection") so the name-based gradient router classifies it as
+        # a RECONSTRUCTION parameter.
+        self.value_structure_query_dim = int(value_structure_query_dim)
+        # Which inner attentions support the additive query term.
+        self._value_query_capable = attention in (
+            GatedCrossAttention,
+            GatedSelfAttention,
+            CommutatorSelfAttention,
+            ScaledDotAttention,
+        )
+        if self.value_structure_query_dim > 0:
+            if not self._value_query_capable:
+                raise ValueError(
+                    "value_structure_query_dim > 0 requires an inner attention "
+                    "that supports the additive query term "
+                    "(GatedCrossAttention, GatedSelfAttention, ScaledDotAttention); "
+                    f"got {attention.__name__}."
+                )
+            self.value_query_proj = nn.Linear(
+                self.value_structure_query_dim, d_model_values * n_heads, bias=False
+            )
+        else:
+            self.value_query_proj = None
+
+
 
         # Dual-value (SVFA dual-residual)
         self.dual_value = bool(dual_value)
@@ -1521,13 +1796,14 @@ class AttentionLayer(nn.Module):
         # gradient router classifies them as RECONSTRUCTION parameters (driven
         # by the MSE loss), keeping them disentangled from the structural gate.
         self._gated_gain = (
-            attention in (GatedCrossAttention, GatedSelfAttention)
+            attention in (GatedCrossAttention, GatedSelfAttention, CommutatorSelfAttention)
         ) and (shared_qk_inner is None)
         if self._gated_gain:
             if not self.shared_dag_across_heads:
                 raise ValueError(
-                    "GatedCrossAttention / GatedSelfAttention require "
-                    "shared_dag_across_heads=True (single structural head)."
+                    "GatedCrossAttention / GatedSelfAttention / "
+                    "CommutatorSelfAttention require shared_dag_across_heads=True "
+                    "(single structural head)."
                 )
 
             self.gain_q_proj = nn.Linear(d_model_queries, d_queries_keys)
@@ -1562,25 +1838,69 @@ class AttentionLayer(nn.Module):
         key_value: torch.Tensor = None,
         gain_query: torch.Tensor = None,
         gain_key: torch.Tensor = None,
+        value_structure: torch.Tensor = None,
+        value_structure_query: torch.Tensor = None,
     ):
         B, L, _ = query.shape
         _, S, _ = key.shape
         H = self.n_heads
         H_struct = self._n_heads_struct
 
+
+        # External-query mode: ``query`` is ALREADY projected by a W_q owned by
+        # the parent module (shape (B, L, d_queries_keys * H_struct)).  Feed it
+        # straight through, bypassing this layer's (absent) query_projection and
+        # its dropout — the parent is responsible for any query dropout.
         if H_struct > 1:
-            q = self.dropout_qkv(self.query_projection(query)).view(B, L, H_struct, -1)
-            k = self.dropout_qkv(self.key_projection(key)).view(B, S, H_struct, -1)
+            if self._query_external:
+                q = query.view(B, L, H_struct, -1)
+            else:
+                q = self.dropout_qkv(self.query_projection(query)).view(B, L, H_struct, -1)
+            if self._key_external:
+                k = key.view(B, S, H_struct, -1)
+            else:
+                k = self.dropout_qkv(self.key_projection(key)).view(B, S, H_struct, -1)
         else:
-            q = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
-            k = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
+            if self._query_external:
+                q = query.view(B, L, -1)
+            else:
+                q = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
+            if self._key_external:
+                k = key.view(B, S, -1)
+            else:
+                k = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
+
+
+
+        # Value-structure injection: concatenate the per-source-node identity
+        # code onto the data value BEFORE the (widened) reconstruction W_V, so
+        # V_j = W_V([v_j ; e_j]).  Only active when the layer was built with
+        # value_structure_dim > 0 AND a value_structure tensor is supplied.
+        if self.value_structure_dim > 0 and value_structure is not None:
+            value = torch.cat([value, value_structure], dim=-1)
 
         if H > 1:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)
         else:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
 
+        # Value-structure QUERY injection: project the per-QUERY identity code
+        # to the value output width and reshape to match the value-head layout.
+        # The additive term ``(sum_j A_ij) * value_query`` is applied INSIDE the
+        # inner attention (only there are the true applied weights A available).
+        value_query = None
+        if self.value_query_proj is not None and value_structure_query is not None:
+            vq = self.value_query_proj(value_structure_query)  # (B, L, d_model_values * H)
+            if H > 1:
+                value_query = vq.view(B, L, H, -1)
+            else:
+                value_query = vq.view(B, L, -1)
+        # Only pass ``value_query`` to inner attentions that support it; other
+        # attention types do not accept the kwarg.
+        vq_kwargs = {"value_query": value_query} if self._value_query_capable else {}
+
         if self._gated_gain:
+
             # Reconstruction-gain stream (GatedCrossAttention).  gain_query /
             # gain_key default to the structural query/key inputs when the
             # caller does not supply dedicated gain embeddings (shared mode).
@@ -1600,6 +1920,7 @@ class AttentionLayer(nn.Module):
                 oracle=oracle,
                 gain_query=gq,
                 gain_key=gk,
+                **vq_kwargs,
             )
         else:
             out, attn, aux = self.inner_attention(
@@ -1612,7 +1933,9 @@ class AttentionLayer(nn.Module):
                 causal_mask=causal_mask,
                 hard_mask=hard_mask,
                 oracle=oracle,
+                **vq_kwargs,
             )
+
 
         if H > 1:
             out = out.contiguous().view(B, L, -1)

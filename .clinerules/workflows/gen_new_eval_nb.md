@@ -31,4 +31,12 @@ Analyze the experimental results provided and generate a new, tailored Jupyter e
 - If the experiment involves training a model and training metrics are available in the folder structure, make an initial cell evaluating the training itself. This is a pre-requisite before even looking at the experiment-specific results. 
 - If metrics like R2, MAE are present, report them and suggest the user to carefully analyze them. The R2 score is the best indicator to quickly understand if the fit was successful, it should have the highest priority.
 - If training and validation metrics logs are available, plot them against the epochs to visualize generalization, overfit and underfit.
+
+
+7. **Notebook reusability**
+- The notebook could be reused in another compatible experiment by simply copy-pasting it in the new experiment folder.
+- Avoid long detailed particular description in the first creation phase
+- Experiment-specific parameters can be extracted from the experiment configuration, so that it can be effortless adapted to other experiments with the same config structure.
+
+
 </detailed_sequence_of_steps>
