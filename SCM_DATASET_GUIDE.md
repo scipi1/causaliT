@@ -836,4 +836,83 @@ For more examples, see the pre-defined datasets in `scm_ds/datasets.py`:
 - `ds_scm_1_to_1_ct`: One-to-one with cross-talk
 - `ds_scm_1_to_1_ct_2`: Alternative configuration with different parent relationships
 
+---
+
+## Random SCM/DAG Sampling
+
+When you need to stress-test models on **larger DAGs** and across **many structural
+regimes** (size x degree x linearity x noise), authoring every SCM by hand in
+`datasets.py` becomes impractical. The `scm_ds/random_scm.py` module *samples* random
+SCMs from a compact, reproducible configuration and returns a standard `SCMDataset`,
+so the full generation pipeline (`generate_ds`, attention masks, metadata, ATE ground
+truth, graph) works unchanged.
+
+### Configuration (`RandomSCMConfig`)
+
+| Field | Meaning |
+|-------|---------|
+| `n_nodes` | Total nodes (S sources + X inputs). |
+| `degree` | ER-k expected edges **per node**; target total edges `m = round(degree * n_nodes)`. |
+| `seed` | Master seed. Same config + seed => identical DAG, equations, weights and noise. |
+| `linearity` | `"linear"`, `"nonlinear"`, or `"mixed"` (per node). |
+| `noise` | `"gaussian"`, `"nongaussian"`, or `"mixed"` for the X-node noise. |
+| `n_sources` / `s_x_ratio` | Number (or fraction) of source `S` nodes. Defaults to ~30%. |
+| `weight_range` | Magnitude range for structural weights (sign is random). |
+| `rescale_by_indegree` | If `True`, bakes `w / sqrt(in_degree)` for variance stability. |
+| `exact_edges` | If `True`, samples exactly `m` edges; else Bernoulli(p). |
+
+### Structure and guarantees
+
+- **S/X paradigm**: the first `n_sources` nodes are sources `S` (no incoming edges);
+  the rest are inputs `X`. Only `S->X` and `X->X` edges are produced, matching the
+  cross-/self-attention masks. `target_labels` is empty (no `Y` stage).
+- **Acyclicity by construction**: edges only go from an earlier to a later position in
+  a fixed topological layout, so the DAG is always valid.
+- **Reproducibility**: a single `seed` drives DAG sampling, equation-family choices,
+  weight sampling and per-node noise-type choices. The full config is stored in
+  `dataset.meta["random_scm_config"]`, so a generated dataset is exactly regenerable
+  from its `meta.json`.
+
+### Quick start
+
+```python
+from scm_ds.random_scm import RandomSCMConfig, sample_random_scm_dataset
+
+cfg = RandomSCMConfig(
+    n_nodes=30,
+    degree=2,          # ER-2 -> ~60 edges
+    seed=42,
+    linearity="mixed",
+    noise="mixed",
+    s_x_ratio=0.3,
+)
+ds = sample_random_scm_dataset(cfg)   # a standard SCMDataset
+
+ds.generate_ds(
+    mode="flat",
+    n=50_000,
+    save_dir="data/random_n30_k2",
+    normalize_method="minmax",
+    shared_embedding=False,
+)
+```
+
+### Sweeping many configurations
+
+```python
+for n in (10, 30, 60):
+    for k in (1, 2, 3):
+        for lin in ("linear", "nonlinear", "mixed"):
+            for noise in ("gaussian", "nongaussian", "mixed"):
+                cfg = RandomSCMConfig(n_nodes=n, degree=k, seed=0,
+                                      linearity=lin, noise=noise)
+                ds = sample_random_scm_dataset(cfg)
+                ds.generate_ds(mode="flat", n=20_000,
+                               save_dir=f"data/{cfg.name or 'random'}",
+                               normalize_method="minmax")
+```
+
+See `tests/test_random_scm.py` for the reproducibility, ER-k edge-count, structure and
+end-to-end guarantees this module is validated against.
+
 Happy dataset generation! 🎲📊
