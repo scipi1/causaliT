@@ -25,26 +25,29 @@ python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -f experiments/eul
 
 ```bash
 python -m causaliT.evaluation.eval_funs.eval_fun_cli evaluate -e experiments/my_exp \
-  --functions eval_train_metrics eval_attention_scores --no-show
+  --functions eval_attention_scores eval_interventions --no-show
 ```
 
 **Available functions:**
 
 | Function | Description | Status |
 |----------|-------------|--------|
-| `eval_train_metrics` | Training curves, loss analysis, and instability metrics | ✓ Active |
-| `eval_attention_scores` | DAG recovery metrics (phi, attention) - FAST | ✓ Active |
-| `eval_attention_evolution` | Track attention/phi across epochs - SLOW | ⚠ Disabled |
+| `eval_attention_scores` | DAG recovery metrics from attention (tables only, no figures) | ✓ Active |
 | `eval_interventions` | Causal intervention tests (ATE) | ✓ Active |
-| `eval_d_model_sweep` | d_model × seed sweep analysis | ✓ Active |
-| `eval_seed_sweep` | Aggregate metrics across seeds for paper reporting | ✓ Active |
-| `eval_dyconex_predictions` | Dyconex-specific prediction evaluation | ✓ Active |
+| `eval_seed_sweep` | Aggregate DAG + ATE metrics across seeds for paper reporting | ✓ Active |
 | `fix_kfold_summary` | Fix tensor strings in kfold_summary.json | ✓ Active |
 | `enrich_kfold_summary` | Add aggregated statistics to kfold_summary | ✓ Active |
-| `eval_embed` | Embedding evolution analysis | ⚠ Disabled |
-| `eval_embedding_dag_correlation` | Embedding-DAG correlation | ⚠ Disabled |
 
-> **Note:** `eval_embed` and `eval_embedding_dag_correlation` are currently disabled in the wrapper functions.
+> **Scope note:** this package now covers **DAG recovery** and **interventions** only.
+> The following evaluations were retired to `_OLD/` and are no longer importable or
+> callable through the CLI: `eval_train_metrics`, `eval_attention_evolution`,
+> `eval_embed`, `eval_embedding_dag_correlation`, `eval_ans`,
+> `eval_anm_residual_hsic`, `eval_d_model_sweep`, `eval_dyconex_predictions`,
+> plus the plotting library `eval_plot_lib`.
+>
+> Some config templates still list `eval_train_metrics` / `eval_dyconex_predictions`
+> under `evaluation.functions`; those entries now log `✗ Unknown function` and are
+> skipped. Remove them from the templates when convenient.
 
 ---
 
@@ -101,32 +104,15 @@ df = eval_seed_sweep("experiments/baseline/euler/vanilla_transformer_scm1_615550
 
 ---
 
-## Evaluate Attention Necessity Score (ANS)
-
-```bash
-python -m causaliT.evaluation.eval_funs.eval_ans experiments/ANS_sweep_exp --no-show
-```
-
----
-
 ## Checkpoint Selection
 
-For causal discovery evaluations (`eval_attention_scores`, `load_attention_data`), the **last checkpoint** is used by default instead of the "best" checkpoint. This is because:
+`eval_attention_scores` and `eval_interventions` both resolve the checkpoint via
+`infer_checkpoint_type(config)`: causal models are read from `best_causal`,
+baselines from `best_reconstruction`. The rationale for not simply taking the
+prediction-"best" checkpoint:
 
-- **"best"** selects based on prediction loss, not causal correctness
+- **"best"** selects on prediction loss, not causal correctness
 - Causal regularizers (HSIC, sparsity) may need more epochs to converge
-- **"last"** represents the model's final DAG hypothesis
-
-To override this behavior in the Python API:
-```python
-from causaliT.evaluation.eval_funs import load_attention_data
-
-# Use last checkpoint (default for causal analysis)
-data = load_attention_data("experiments/my_exp", checkpoint_type="last")
-
-# Use best checkpoint (prediction-optimized)
-data = load_attention_data("experiments/my_exp", checkpoint_type="best")
-```
 
 ---
 
@@ -134,20 +120,42 @@ data = load_attention_data("experiments/my_exp", checkpoint_type="best")
 
 ```python
 from causaliT.evaluation.eval_funs import (
-    eval_train_metrics,
     eval_attention_scores,
-    eval_embed,
     eval_interventions,
+    eval_seed_sweep,
     run_all_evaluations,
     update_experiments_manifest,
 )
 
-# Run specific evaluation
-eval_train_metrics("experiments/my_exp", show_plots=False)
+# DAG recovery metrics for one experiment
+eval_attention_scores("experiments/my_exp", show_plots=False)
 
-# Run all evaluations
+# Run all evaluations (DAG + interventions + kfold_summary maintenance)
 run_all_evaluations("experiments/my_exp", show_plots=False)
 
 # Update manifest
 update_experiments_manifest("experiments/my_exp")
 ```
+
+---
+
+## Architecture-agnostic DAG extraction
+
+`eval_attention_scores` has a single extraction path for every architecture:
+
+```
+best checkpoint -> predict_test_from_ckpt -> query_dag_blocks -> compute_dag_metrics
+```
+
+`eval_dag_query.query_dag_blocks(attention, L_S, L_X)` classifies each attention
+tensor **by its shape**, so no architecture registry is involved:
+
+| Shape | Interpretation |
+|-------|----------------|
+| `(L_X, L_S)` | `cross` block (S->X) |
+| `(L_X, L_X)` | `self` block (X->X) |
+| `(L_X, L_S + L_X)` | combined block, split at `L_S` into `cross` + `self` |
+
+Every architecture therefore emits the same canonical block names, and
+`dag_metrics.json` / `learned_dag_edges.json` are comparable across models.
+MEC metrics require both blocks and are skipped for cross-only models.

@@ -25,6 +25,7 @@ from causaliT.evaluation.predictors import (
     SingleCausalResPredictor,
     NoiseAwareCausalPredictor,
     NoiseAwareCausalResPredictor,
+    AttentionSelectorPredictor,
 )
 
 
@@ -57,6 +58,7 @@ def create_predictor(
         "SingleCausalLayerRes": SingleCausalResPredictor,
         "NoiseAwareSingleCausalLayer": NoiseAwareCausalPredictor,
         "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResPredictor,
+        "AttentionSelectorLayer": AttentionSelectorPredictor,
     }
     
     predictor_class = PREDICTOR_REGISTRY.get(model_obj)

@@ -142,6 +142,13 @@ _DAG_METRIC_COLUMNS = [
     # Zeroness contrast = mean_edge - mean_nonedge (separation between true edges and non-edges)
     "zeroness_cross_contrast",
     "zeroness_self_contrast",
+    # Classification metrics from thresholded confusion matrix (percentages)
+    "tpr_cross",              # True Positive Rate (Recall) [%]
+    "tpr_self",
+    "fdr_cross",              # False Discovery Rate [%]
+    "fdr_self",
+    "precision_cross",        # Precision [%]
+    "precision_self",
     # MEC (Markov Equivalence Class) metrics on the combined full DAG
     "mec_distance",
     "mec_membership_rate",
@@ -220,6 +227,15 @@ def _extract_dag_metrics_per_seed(dag_data: Dict[str, Any]) -> Dict[str, float]:
         out["zeroness_cross_contrast"] = float(zc)
     if zs is not None:
         out["zeroness_self_contrast"] = float(zs)
+
+    # --- Classification metrics from thresholded confusion matrix -----------
+    # Extracted from standard_shd_* per_fold_details (tpr, fdr, precision)
+    for block in ("cross", "self"):
+        per_fold_details = _safe_get(dag_data, f"standard_shd_{block}", "per_fold_details")
+        for field in ("tpr", "fdr", "precision"):
+            v = _mean_per_fold_field(per_fold_details, field)
+            if v is not None:
+                out[f"{field}_{block}"] = float(v)
 
     # --- MEC distance, membership, and threshold ----------------------------
     mec_mean = _safe_get(dag_data, "mec_distance", "mean")

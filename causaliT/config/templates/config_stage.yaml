@@ -179,6 +179,7 @@ data:
 
 
 evaluation:
+  dag_threshold: 0.5
   functions: []
 
 

@@ -7,7 +7,7 @@ Usage:
     # Run evaluations on experiments
     python -m notebooks.eval_funs.eval_fun_cli evaluate -e path/to/exp1 -e path/to/exp2
     python -m notebooks.eval_funs.eval_fun_cli evaluate -f path/to/experiments/euler
-    python -m notebooks.eval_funs.eval_fun_cli evaluate -e path/to/exp --functions eval_train_metrics
+    python -m notebooks.eval_funs.eval_fun_cli evaluate -e path/to/exp --functions eval_attention_scores
     
     # Update manifest only (for experiments that already have evaluations)
     python -m notebooks.eval_funs.eval_fun_cli manifest -e path/to/exp1 -e path/to/exp2
@@ -17,13 +17,10 @@ Usage:
     python -m notebooks.eval_funs.eval_fun_cli evaluate -e path/to/exp --update-manifest
 
 Available evaluation functions:
-    - eval_train_metrics: Training curves and loss analysis
     - eval_attention_scores: DAG recovery metrics  
-    - eval_embed: Embedding evolution analysis
-    - eval_interventions: Causal intervention tests
-    - eval_embedding_dag_correlation: Embedding-DAG correlation
-    - eval_dyconex_predictions: Dyconex-specific prediction evaluation
-    - eval_ans: Attention Necessity Score (ANS) for sweep experiments
+    - eval_interventions: Causal intervention tests (ATE)
+    - eval_seed_sweep: Aggregate DAG + ATE metrics across seeds
+    - fix_kfold_summary / enrich_kfold_summary: kfold_summary.json maintenance
 """
 
 import sys
@@ -37,7 +34,7 @@ import click
 # Import from sibling modules
 from .eval_utils import root_path
 from .eval_funs_wraps import run_all_evaluations, run_evaluations_from_config
-from .update_manifest import batch_update_manifest, MANIFEST_PATH
+from ._OLD.update_manifest import batch_update_manifest, MANIFEST_PATH
 
 
 # =============================================================================
@@ -45,13 +42,8 @@ from .update_manifest import batch_update_manifest, MANIFEST_PATH
 # =============================================================================
 
 AVAILABLE_FUNCTIONS = [
-    "eval_train_metrics",
-    "eval_attention_scores",      # FAST: final checkpoint DAG metrics
-    "eval_attention_evolution",   # SLOW: evolution tracking across epochs
-    "eval_interventions",
-    "eval_dyconex_predictions",
-    "eval_ans",                   # ANS evaluation for sweep experiments
-    "eval_d_model_sweep",         # d_model × seed sweep evaluation
+    "eval_attention_scores",      # Final checkpoint DAG metrics
+    "eval_interventions",         # ATE / intervention tests
     "eval_seed_sweep",            # Aggregate metrics across seeds for paper reporting
     "fix_kfold_summary",
     "enrich_kfold_summary",

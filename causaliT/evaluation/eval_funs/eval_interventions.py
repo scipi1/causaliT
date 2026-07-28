@@ -19,19 +19,18 @@ import numpy as np
 import torch
 import pandas as pd
 from omegaconf import OmegaConf
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional
 from pathlib import Path
 
 # Import shared utilities
 from .eval_utils import root_path, load_dataset_metadata
 
 # Import from project modules
-from causaliT.evaluation.predict import create_intervention_fn, predict_test_from_ckpt, create_predictor
+from causaliT.evaluation.predict import create_predictor
 from causaliT.training.experiment_control import update_config
-from causaliT.training.dataloader import ProcessDataModule
 
 # Import from local eval_funs modules
-from .eval_lib import predict_from_experiment, find_config_file, find_best_or_last_checkpoint
+from .eval_lib import find_config_file, find_best_or_last_checkpoint
 
 
 def infer_checkpoint_type(config) -> str:
@@ -229,8 +228,7 @@ def run_mc_predictions(
         DataFrame with predictions for all interventions
     """
     from os.path import isdir
-    import os
-    
+
     # Load config
     config_path = find_config_file(experiment_path)
     config = OmegaConf.load(config_path)
@@ -929,195 +927,3 @@ def eval_ate(experiment: str, n_samples: int = 50000, seed: int = 42, **kwargs) 
 def eval_interventions(experiment: str, **kwargs) -> pd.DataFrame:
     """Backward-compatible alias for eval_ate()."""
     return eval_ate(experiment, **kwargs)
-
-
-# =============================================================================
-# Legacy Evaluation Function (Test-Split Based) - DEPRECATED
-# =============================================================================
-
-# def eval_ate_legacy(experiment: str) -> pd.DataFrame:
-#     """
-#     [DEPRECATED] Evaluate ATE using test split.
-#     
-#     This method uses the test split S values for model evaluation, which may not
-#     match the Monte Carlo sampling used for ground truth. Use eval_ate_mc() instead.
-#     
-#     Interventions are loaded from the dataset's ate_ground_truth.json file.
-#     This allows different datasets to define their own intervention configurations.
-#     
-#     Args:
-#         experiment: Path to the experiment folder
-#         
-#     Returns:
-#         DataFrame with ATE metrics per intervention × variable × fold
-#         
-#     Output Files:
-#         experiment/eval/eval_ate/files/ate_metrics.csv
-#         experiment/eval/eval_ate/files/ate_metrics.json
-#     """
-#     print(f"[DEPRECATED] Evaluating ATE (test-split) for: {experiment}")
-#     print(f"  Consider using eval_ate_mc() for consistency with ground truth.")
-#     
-#     # =========================================================================
-#     # Load metadata
-#     # =========================================================================
-#     config_files = [f for f in listdir(experiment) if f.startswith("config") and f.endswith(".yaml")]
-#     if not config_files:
-#         raise ValueError(f"No config file found in {experiment}")
-#     
-#     config = OmegaConf.load(join(experiment, config_files[0]))
-#     dataset_name = config.get("data", {}).get("dataset")
-#     
-#     datadir_path = join(root_path, "data")
-#     metadata = load_dataset_metadata(datadir_path, dataset_name)
-#     if not metadata:
-#         raise ValueError(f"Dataset metadata not found for '{dataset_name}'")
-#     
-#     print(f"  Dataset: {dataset_name}")
-#     
-#     # =========================================================================
-#     # Load ATE ground truth and normalization
-#     # =========================================================================
-#     ate_ground_truth = load_ate_ground_truth(datadir_path, dataset_name)
-#     norm_stats = load_normalization_stats(datadir_path, dataset_name)
-#     
-#     if ate_ground_truth is None:
-#         raise ValueError(f"ate_ground_truth.json not found for '{dataset_name}'")
-#     if norm_stats is None:
-#         raise ValueError(f"normalization.json not found for '{dataset_name}'")
-#     
-#     # =========================================================================
-#     # Setup output directories
-#     # =========================================================================
-#     eval_path = join(experiment, "eval", "eval_ate", "files")
-#     makedirs(eval_path, exist_ok=True)
-#     
-#     predictions_file = join(eval_path, "predictions.csv")
-#     ate_csv_file = join(eval_path, "ate_metrics.csv")
-#     ate_json_file = join(eval_path, "ate_metrics.json")
-#     
-#     # =========================================================================
-#     # Load interventions from ate_ground_truth.json
-#     # =========================================================================
-#     intervention_config = get_interventions_from_ground_truth(ate_ground_truth)
-#     
-#     if not intervention_config:
-#         raise ValueError(
-#             f"No interventions found in ate_ground_truth.json for '{dataset_name}'. "
-#             f"Ensure the 'interventions' key is present or regenerate the dataset."
-#         )
-#     
-#     source_labels = metadata["variable_info"].get("source_labels", [])
-#     var_idx_map = metadata.get("variable_index_map", {})
-#     input_labels = metadata["variable_info"].get("input_labels", [])
-#     
-#     # Build intervention functions from config
-#     # IMPORTANT: Intervention values in ate_ground_truth.json are in RAW scale
-#     # but the model expects NORMALIZED inputs. We must normalize the intervention values.
-#     interventions = []
-#     for src_var, values in intervention_config.items():
-#         src_idx = var_idx_map.get(src_var)
-#         if src_idx is not None:
-#             for val_raw in values:
-#                 # Normalize the intervention value to match model's expected input scale
-#                 val_normalized = normalize_intervention_value(val_raw, norm_stats)
-#                 interventions.append(
-#                     (create_intervention_fn(interventions={src_idx: val_normalized}), f"{src_var}={val_raw}")
-#                 )
-#     
-#     print(f"  Interventions (from dataset): {[label for _, label in interventions]}")
-#     print(f"  Note: Intervention values normalized using source stats: {norm_stats.get('source', 'N/A')}")
-#     
-#     # =========================================================================
-#     # Run predictions (or load cached)
-#     # =========================================================================
-#     if exists(predictions_file):
-#         print("  Loading cached predictions...")
-#         df = pd.read_csv(predictions_file)
-#     else:
-#         print("  Running predictions...")
-#         # Baseline
-#         df = predict_from_experiment(experiment, input_conditioning_fn=None)
-#         df["intervention"] = "baseline"
-#         
-#         # Interventions
-#         for do_fn, do_label in interventions:
-#             df_do = predict_from_experiment(experiment, input_conditioning_fn=do_fn)
-#             df_do["intervention"] = do_label
-#             df = pd.concat([df, df_do], axis=0)
-#         
-#         df.to_csv(predictions_file, index=False)
-#         print(f"  Saved predictions to {predictions_file}")
-#     
-#     # =========================================================================
-#     # Compute ATE metrics
-#     # =========================================================================
-#     df_ate = compute_ate_metrics(
-#         df=df,
-#         ate_ground_truth=ate_ground_truth,
-#         norm_stats=norm_stats,
-#         input_labels=input_labels,
-#     )
-#     
-#     # Save CSV
-#     df_ate.to_csv(ate_csv_file, index=False)
-#     
-#     # =========================================================================
-#     # Compute summary and save JSON
-#     # =========================================================================
-#     abs_errors = df_ate["abs_error"].dropna()
-#     rel_errors = df_ate["rel_error"].dropna()
-#     
-#     # Per-intervention-variable summary
-#     summary_records = []
-#     for intervention in df_ate["intervention"].unique():
-#         for variable in df_ate["variable"].unique():
-#             mask = (df_ate["intervention"] == intervention) & (df_ate["variable"] == variable)
-#             subset = df_ate[mask]
-#             if len(subset) == 0:
-#                 continue
-#             
-#             abs_err = subset["abs_error"].dropna()
-#             rel_err = subset["rel_error"].dropna()
-#             
-#             summary_records.append({
-#                 "intervention": intervention,
-#                 "variable": variable,
-#                 "true_ate": float(subset["true_ate"].iloc[0]) if subset["true_ate"].notna().any() else None,
-#                 "true_baseline": float(subset["true_baseline"].iloc[0]) if subset["true_baseline"].notna().any() else None,
-#                 "true_treatment": float(subset["true_treatment"].iloc[0]) if subset["true_treatment"].notna().any() else None,
-#                 "model_ate_mean": float(subset["model_ate"].mean()),
-#                 "model_ate_std": float(subset["model_ate"].std()),
-#                 "abs_error_mean": float(abs_err.mean()) if len(abs_err) > 0 else None,
-#                 "abs_error_std": float(abs_err.std()) if len(abs_err) > 0 else None,
-#                 "rel_error_mean": float(rel_err.mean()) if len(rel_err) > 0 else None,
-#                 "n_folds": len(subset),
-#             })
-#     
-#     ate_json = {
-#         "dataset": dataset_name,
-#         "interventions": list(intervention_config.keys()),
-#         "summary": {
-#             "mean_absolute_error": float(abs_errors.mean()) if len(abs_errors) > 0 else None,
-#             "std_absolute_error": float(abs_errors.std()) if len(abs_errors) > 0 else None,
-#             "median_absolute_error": float(abs_errors.median()) if len(abs_errors) > 0 else None,
-#             "mean_relative_error": float(rel_errors.mean()) if len(rel_errors) > 0 else None,
-#             "n_comparisons": len(df_ate),
-#         },
-#         "per_intervention_variable": summary_records,
-#     }
-#     
-#     with open(ate_json_file, 'w') as f:
-#         json.dump(ate_json, f, indent=2)
-#     
-#     # =========================================================================
-#     # Print summary
-#     # =========================================================================
-#     print(f"\n  === ATE Results ===")
-#     print(f"  Mean Absolute Error: {abs_errors.mean():.4f} ± {abs_errors.std():.4f}" if len(abs_errors) > 0 else "  No ATE computed")
-#     if len(rel_errors) > 0:
-#         print(f"  Mean Relative Error: {rel_errors.mean():.2%}")
-#     print(f"  Saved: {ate_csv_file}")
-#     print(f"  Saved: {ate_json_file}")
-#     
-#     return df_ate

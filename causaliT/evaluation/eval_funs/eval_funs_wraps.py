@@ -10,13 +10,9 @@ import traceback
 from typing import List
 
 # Import evaluation functions from sibling modules
-from .eval_training import eval_train_metrics
-from .eval_attention import eval_attention_scores, eval_attention_evolution
-from .eval_attention_selector import eval_attention_selector_scores
-from .eval_embeddings import eval_embed, eval_embedding_dag_correlation
+from .eval_attention import eval_attention_scores
 from .eval_interventions import eval_interventions
-from .eval_anm import eval_anm_residual_hsic
-from .update_manifest import fix_kfold_summary, enrich_kfold_summary
+from ._OLD.update_manifest import fix_kfold_summary, enrich_kfold_summary
 
 
 # =============================================================================
@@ -40,12 +36,9 @@ def run_evaluations_from_config(
         datadir_path: Path to data directory. If None, uses default.
         show_plots: If True, display plots. If False, only save to files.
         functions: List of function names to run. Available functions:
-            - "eval_train_metrics": Training curves and loss analysis
-            - "eval_attention_scores": DAG recovery metrics (FAST - final checkpoint)
-            - "eval_attention_evolution": Track attention/phi across epochs (SLOW - optional)
+            - "eval_attention_scores": DAG recovery metrics (final checkpoint)
             - "eval_interventions": Causal intervention tests (ATE)
-            - "eval_d_model_sweep": d_model × seed sweep evaluation
-            - "eval_dyconex_predictions": Dyconex-specific prediction evaluation
+            - "eval_seed_sweep": Aggregate DAG + ATE metrics across seeds
             - "fix_kfold_summary": Fix tensor strings in kfold_summary.json
             - "enrich_kfold_summary": Add aggregated statistics to kfold_summary
             
@@ -54,8 +47,8 @@ def run_evaluations_from_config(
         
     Example:
         >>> results = run_evaluations_from_config(
-        ...     experiment="../experiments/stage/dyconex_exp",
-        ...     functions=["eval_train_metrics", "eval_dyconex_predictions"]
+        ...     experiment="../experiments/single/euler/my_experiment",
+        ...     functions=["eval_attention_scores", "eval_interventions"]
         ... )
     """
     import traceback
@@ -76,35 +69,16 @@ def run_evaluations_from_config(
         return run_all_evaluations(experiment, datadir_path, show_plots)
     
     # Function registry - maps function names to callables
-    # Import dyconex functions only when needed
     FUNCTION_REGISTRY = {
-        "eval_train_metrics": lambda exp: eval_train_metrics(exp, show_plots=show_plots),
         "eval_attention_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
-        "eval_attention_evolution": lambda exp: eval_attention_evolution(exp, show_plots=show_plots),  # SLOW: evolution tracking
-        # "eval_embed": lambda exp: eval_embed(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "eval_interventions": lambda exp: eval_interventions(exp, show_plots=show_plots),
-        # "eval_embedding_dag_correlation": lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots),  # Disabled: k-fold seeding bug fixed
         "fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
         "enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
-        # ANM residual-HSIC: per-edge HSIC diagnostic for partial ANM experiments
-        "eval_anm_residual_hsic": lambda exp: eval_anm_residual_hsic(exp, show_plots=show_plots),
-        # AttentionSelectorLayer: combined S→X and X→X evaluation from single cross-attention
-        "eval_attention_selector_scores": lambda exp: eval_attention_selector_scores(exp, show_plots=show_plots),
+        # [DEPRECATED ALIAS] AttentionSelectorLayer is handled by
+        # eval_attention_scores, which classifies the attention blocks by shape
+        # (cross only, self only, or both) and assembles the DAG accordingly.
+        "eval_attention_selector_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
     }
-    
-    # Dyconex-specific functions (lazy import)
-    def _get_dyconex_predictions(exp):
-        from .eval_dyconex import eval_dyconex_predictions
-        return eval_dyconex_predictions(exp, datadir_path=datadir_path, show_plots=show_plots)
-    
-    FUNCTION_REGISTRY["eval_dyconex_predictions"] = _get_dyconex_predictions
-    
-    # d_model sweep evaluation (lazy import)
-    def _get_d_model_sweep(exp):
-        from .eval_d_model_sweep import eval_d_model_sweep
-        return eval_d_model_sweep(exp, show_plots=show_plots)
-    
-    FUNCTION_REGISTRY["eval_d_model_sweep"] = _get_d_model_sweep
     
     # Seed sweep evaluation for paper reporting (lazy import)
     def _get_seed_sweep(exp):
@@ -206,13 +180,8 @@ def run_all_evaluations(
     # Step 3: Run all evaluation functions (hard-coded list)
     # Order matters: some evaluations depend on others
     eval_functions = [
-        ("eval_train_metrics", lambda exp: eval_train_metrics(exp, show_plots=show_plots)),
         ("eval_attention_scores", lambda exp: eval_attention_scores(exp, show_plots=show_plots)),
-        ("eval_attention_evolution", lambda exp: eval_attention_evolution(exp, show_plots=show_plots)),
-        # ("eval_embed", lambda exp: eval_embed(exp, show_plots=show_plots)),  # Disabled: k-fold seeding bug fixed
         ("eval_interventions", lambda exp: eval_interventions(exp, show_plots=show_plots)),
-        # eval_embedding_dag_correlation requires eval_embed and eval_attention_scores to run first
-        # ("eval_embedding_dag_correlation", lambda exp: eval_embedding_dag_correlation(exp, show_plots=show_plots)),  # Disabled: k-fold seeding bug fixed
     ]
     
     for idx, (name, func) in enumerate(eval_functions, start=3):

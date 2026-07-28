@@ -1,21 +1,26 @@
 """
-Evaluation Functions for CausaliT Experiments - Self-Contained Package.
+Evaluation Functions for CausaliT Experiments.
 
-This subpackage contains modular evaluation functions organized by category.
-All dependencies are local - can be moved to causaliT/evaluation when ready.
+Scope: **DAG recovery** and **causal interventions**.  Everything else that used
+to live here has been retired to ``_OLD/`` (see the bottom of this docstring).
 
 Modules:
-    eval_utils: Shared utility functions (setup directories, DAG metrics, etc.)
-    eval_lib: Data loading and model utilities (AttentionData, load_*, save_*, etc.)
-    eval_plot_lib: Plotting functions (plot_attention_scores, plot_attention_evolution)
-    eval_training: Training metrics evaluation (eval_train_metrics)
-    eval_embeddings: Embedding evaluation (eval_embed, eval_embedding_dag_correlation)
-    eval_attention: Attention scores and DAG recovery (eval_attention_scores, load_attention_evolution)
-    eval_interventions: Intervention evaluation (eval_interventions)
-    eval_ans: Attention Necessity Score (ANS) evaluation for sweep experiments
-    update_manifest: Manifest update functions (update_experiments_manifest, etc.)
-    eval_funs_wraps: Evaluation wrappers (run_all_evaluations, run_evaluations_from_config)
-    eval_dyconex: Dyconex-specific evaluation functions
+    eval_utils: Shared utilities (eval directories, true-DAG masks, metric helpers)
+    eval_lib: Checkpoint/config discovery
+    eval_dag_query: Model-free, shape-based extraction of the canonical DAG blocks
+    eval_dag_scores: Shared metric core (soft Hamming, SHD, DAG confidence, MEC)
+    eval_attention: DAG recovery from attention scores (eval_attention_scores)
+    eval_interventions: Intervention / ATE evaluation (eval_interventions)
+    eval_seed_sweep: Cross-seed aggregation of DAG + ATE metrics (paper reporting)
+    update_manifest: Manifest and kfold_summary maintenance
+    eval_funs_wraps: Dispatchers (run_all_evaluations, run_evaluations_from_config)
+
+Retired to ``_OLD/`` and no longer importable from this package:
+``eval_train_metrics`` (eval_training), ``eval_embed`` /
+``eval_embedding_dag_correlation`` (eval_embeddings), ``eval_ans``,
+``eval_anm_residual_hsic``, ``eval_d_model_sweep``, ``eval_dyconex_predictions``
+and the plotting library ``eval_plot_lib`` - together with the per-epoch
+``eval_attention_evolution`` / ``load_attention_evolution`` pair that used it.
 """
 
 # Utility functions
@@ -25,92 +30,49 @@ from .eval_utils import (
     _save_readme,
     _save_variable_labels,
     _create_cline_template,
-    find_all_checkpoints,
-    _select_evenly_spaced_checkpoints,
     _compute_soft_hamming,
     _compute_standard_shd,
     _load_true_dag_mask,
     load_dataset_metadata,
-    _get_learned_dag,
     _compute_dag_confidence,
-    _get_learned_dag_per_fold,
-    # Architecture registry
-    ARCHITECTURE_REGISTRY,
-    get_architecture_config,
-    # Metric plotting helpers
-    _should_use_log_scale,
-    _is_column_plottable,
-    _plot_metric_pair,
-    _discover_metric_pairs,
-    _filter_metric_pairs,
-    # Training instability metrics
-    _compute_spike_ratio,
-    _compute_coefficient_of_variation,
-    _compute_max_jump,
-    _compute_trend_instability,
-    compute_instability_metrics,
-    # Plot format configuration
-    DEFAULT_PLOT_FORMAT,
 )
 
-# Data loading and model utilities (self-contained library)
+# Checkpoint/config discovery
 from .eval_lib import (
-    AttentionData,
     find_config_file,
     find_best_or_last_checkpoint,
     get_architecture_type,
-    load_attention_data,
-    load_attention_data_from_file,
-    save_attention_data,
-    load_embeddings_evolution,
-    load_training_metrics,
-    predict_from_experiment,
-    predictions_to_long_df,
+    extract_phi_from_model,
 )
 
-# Plotting functions (self-contained library)
-from .eval_plot_lib import (
-    plot_attention_scores,
-    plot_attention_evolution,
-    plot_phi_evolution,
+# Architecture-agnostic DAG query (shape-based block classification)
+from .eval_dag_query import (
+    CROSS,
+    SELF,
+    canonical_block_name,
+    query_dag_blocks,
+    assemble_full_dag,
+    describe_topology,
+    block_axis_labels,
 )
 
-# Training metrics evaluation
-from .eval_training import eval_train_metrics, compute_training_instability
-
-# Embedding evaluation
-from .eval_embeddings import (
-    eval_embed,
-    eval_embedding_dag_correlation,
-)
+# Shared DAG metric core
+from .eval_dag_scores import compute_dag_metrics, make_json_serializable
 
 # Attention/DAG evaluation
-from .eval_attention import (
-    load_attention_evolution,  # Deprecated, use eval_attention_evolution
-    eval_attention_scores,     # FAST: final checkpoint DAG metrics
-    eval_attention_evolution,  # SLOW: evolution tracking across epochs
-)
+from .eval_attention import eval_attention_scores
 
-# AttentionSelector evaluation (self-contained, writes to eval_attention_scores/ path)
-from .eval_attention_selector import eval_attention_selector_scores
+# AttentionSelector evaluation (deprecated alias of eval_attention_scores)
+from ._OLD.eval_attention_selector import eval_attention_selector_scores
 
 # Intervention evaluation
 from .eval_interventions import eval_interventions
-
-# ANS evaluation (sweep experiments only)
-from .eval_ans import eval_ans
-
-# ANM residual-HSIC evaluation (partial ANM regression experiments)
-from .eval_anm import eval_anm_residual_hsic
-
-# d_model sweep evaluation
-from .eval_d_model_sweep import eval_d_model_sweep, analyze_hsic_ate_correlation
 
 # Seed sweep evaluation (paper reporting)
 from .eval_seed_sweep import eval_seed_sweep
 
 # Manifest functions
-from .update_manifest import (
+from ._OLD.update_manifest import (
     fix_kfold_summary,
     enrich_kfold_summary,
     update_experiments_manifest,
@@ -125,12 +87,6 @@ from .eval_funs_wraps import (
     run_evaluations_from_config,
 )
 
-# Dyconex-specific (optional import)
-try:
-    from .eval_dyconex import eval_dyconex_predictions
-except ImportError:
-    pass
-
 __all__ = [
     # Utils
     "root_path",
@@ -138,65 +94,32 @@ __all__ = [
     "_save_readme",
     "_save_variable_labels",
     "_create_cline_template",
-    "find_all_checkpoints",
-    "_select_evenly_spaced_checkpoints",
     "_compute_soft_hamming",
+    "_compute_standard_shd",
     "_load_true_dag_mask",
     "load_dataset_metadata",
-    "_get_learned_dag",
     "_compute_dag_confidence",
-    "_get_learned_dag_per_fold",
-    # Metric plotting helpers
-    "_should_use_log_scale",
-    "_is_column_plottable",
-    "_plot_metric_pair",
-    "_discover_metric_pairs",
-    "_filter_metric_pairs",
-    # Data loading (eval_lib)
-    "AttentionData",
+    # Checkpoint / config discovery (eval_lib)
     "find_config_file",
     "find_best_or_last_checkpoint",
     "get_architecture_type",
-    "load_attention_data",
-    "load_attention_data_from_file",
-    "save_attention_data",
-    "load_embeddings_evolution",
-    "load_training_metrics",
-    "predict_from_experiment",
-    "predictions_to_long_df",
-    # Plotting (eval_plot_lib)
-    "plot_attention_scores",
-    "plot_attention_evolution",
-    "plot_phi_evolution",
-    # Training instability metrics
-    "_compute_spike_ratio",
-    "_compute_coefficient_of_variation",
-    "_compute_max_jump",
-    "_compute_trend_instability",
-    "compute_instability_metrics",
-    "compute_training_instability",
-    # Training
-    "eval_train_metrics",
-    # Embeddings
-    "eval_embed",
-    "eval_embedding_dag_correlation",
-    # Attention
-    "load_attention_evolution",  # Deprecated
+    "extract_phi_from_model",
+    # DAG query
+    "CROSS",
+    "SELF",
+    "canonical_block_name",
+    "query_dag_blocks",
+    "assemble_full_dag",
+    "describe_topology",
+    "block_axis_labels",
+    # DAG metrics
+    "compute_dag_metrics",
+    "make_json_serializable",
+    # Attention / DAG evaluation
     "eval_attention_scores",
-    "eval_attention_evolution",
     "eval_attention_selector_scores",
-    # Architecture registry
-    "ARCHITECTURE_REGISTRY",
-    "get_architecture_config",
     # Interventions
     "eval_interventions",
-    # ANS (sweep experiments only)
-    "eval_ans",
-    # ANM residual-HSIC (partial ANM regression experiments)
-    "eval_anm_residual_hsic",
-    # d_model sweep evaluation
-    "eval_d_model_sweep",
-    "analyze_hsic_ate_correlation",
     # Seed sweep evaluation (paper reporting)
     "eval_seed_sweep",
     # Manifest
@@ -209,8 +132,4 @@ __all__ = [
     # Wrappers
     "run_all_evaluations",
     "run_evaluations_from_config",
-    # Dyconex
-    "eval_dyconex_predictions",
-    # Plot format configuration
-    "DEFAULT_PLOT_FORMAT",
 ]

@@ -9,6 +9,7 @@ from .single_causal_predictor import SingleCausalPredictor
 from .single_causal_res_predictor import SingleCausalResPredictor
 from .noise_aware_predictor import NoiseAwareCausalPredictor
 from .noise_aware_res_predictor import NoiseAwareCausalResPredictor
+from .attention_selector_predictor import AttentionSelectorPredictor
 
 __all__ = [
     'BasePredictor',
@@ -19,4 +20,5 @@ __all__ = [
     'SingleCausalResPredictor',
     'NoiseAwareCausalPredictor',
     'NoiseAwareCausalResPredictor',
+    'AttentionSelectorPredictor',
 ]

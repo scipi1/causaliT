@@ -604,6 +604,7 @@ data:
 
 
 evaluation:
+  dag_threshold: 0.5
   functions:
     - "eval_train_metrics"
     - "eval_attention_selector_scores"

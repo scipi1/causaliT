@@ -19,7 +19,7 @@ import pandas as pd
 from omegaconf import OmegaConf
 
 # Import root_path from eval_utils
-from .eval_utils import root_path
+from ..eval_utils import root_path
 
 # Default manifest location
 MANIFEST_PATH = join(root_path, "experiments", "experiments_manifest.csv")

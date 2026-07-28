@@ -17,7 +17,7 @@ import os
 import sys
 import traceback
 
-from causaliT.evaluation.eval_funs.eval_attention_selector import (
+from causaliT.evaluation.eval_funs._OLD.eval_attention_selector import (
     eval_attention_selector_scores,
 )
 
