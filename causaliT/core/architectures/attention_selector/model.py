@@ -309,16 +309,17 @@ class AttentionSelectorLayer(nn.Module):
         # and (when split) the X→X self block.
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
-        # Elastic contraction of the query normalization (see
-        # causaliT.utils.elastic_query).  When enabled, the directional budget
-        # cap is relaxed to ``start_scale`` early (looser, exploration is free)
-        # and linearly contracted to ``end_scale`` (typically 1.0) between the
-        # two epochs, avoiding the premature budget-ceiling query damping.
-        query_norm_elastic: bool = False,
-        query_norm_elastic_start_epoch: int = 0,
-        query_norm_elastic_end_epoch: int = 0,
-        query_norm_elastic_start_scale: float = 1.0,
-        query_norm_elastic_end_scale: float = 1.0,
+        # Learnable per-node query-norm multiplier (see causaliT.utils.query_norm).
+        # When enabled, each child owns ``M_i = exp(log_scale_i)`` (init
+        # ``query_norm_init_scale``) scaling its unit query so it can ADAPTIVELY
+        # overspend the directional budget whenever the structural signal pays
+        # for it; the structural loss charges ``relu(M_i - query_norm_target)^2``.
+        # Threaded into BOTH the S->X cross block and (when split) the X->X self
+        # block; under ``shared_query=True`` a single multiplier is TIED across
+        # the two blocks.  Disabled (or init_scale=1.0) == plain unit-norm cap.
+        query_norm_learnable: bool = False,
+        query_norm_init_scale: float = 1.0,
+        query_norm_target: float = 1.0,
         # Value-structure injection: concatenate a per-source-node identity code
 
         # onto the (data-only) value stream before W_V, so V_j = W_V([v_j ; e_j])
@@ -650,11 +651,9 @@ class AttentionSelectorLayer(nn.Module):
             # a fixed sqrt(query_fanin_scale) score scale (structure gate only).
             normalize_query=normalize_query,
             query_fanin_scale=query_fanin_scale,
-            query_norm_elastic=query_norm_elastic,
-            query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
-            query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
-            query_norm_elastic_start_scale=query_norm_elastic_start_scale,
-            query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+            query_norm_learnable=query_norm_learnable,
+            query_norm_init_scale=query_norm_init_scale,
+            query_norm_target=query_norm_target,
             # Remove / freeze the structural query & key projections (W_q / W_K).
 
             # On the cross block these own the (optionally shared) projections,
@@ -733,11 +732,9 @@ class AttentionSelectorLayer(nn.Module):
                 # Centroid-collapse fix (structure gate only).
                 normalize_query=normalize_query,
                 query_fanin_scale=query_fanin_scale,
-                query_norm_elastic=query_norm_elastic,
-                query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
-                query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
-                query_norm_elastic_start_scale=query_norm_elastic_start_scale,
-                query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                query_norm_learnable=query_norm_learnable,
+                query_norm_init_scale=query_norm_init_scale,
+                query_norm_target=query_norm_target,
                 # Remove / freeze the self block's OWN W_q / W_K.  No-op when it
 
                 # borrows the cross projection (query_external / key_external),
@@ -751,6 +748,23 @@ class AttentionSelectorLayer(nn.Module):
                 # Value-structure QUERY injection: add W_V^q(e_child) query term.
                 value_structure_query_dim=vsq_dim,
             )
+
+            # Tie the learnable per-node query-norm multiplier across the cross
+            # (S->X) and self (X->X) blocks under ``shared_query=True``: both
+            # blocks score the SAME children (query rows = X_seq_len), so a
+            # single shared multiplier keeps "how hard a child spends its
+            # directional budget" consistent regardless of whether the parent is
+            # an S or an X node.  Assigning the SAME nn.Parameter object makes
+            # ``named_parameters()`` dedup it (one structural param) and
+            # ``collect_query_norm_penalty`` charge it exactly once (by id).
+            if self.shared_query and query_norm_learnable:
+                cross_ia = self.attention.inner_attention
+                self_ia = self.self_attention.inner_attention
+                if (
+                    getattr(cross_ia, "query_norm_log_scale", None) is not None
+                    and getattr(self_ia, "query_norm_log_scale", None) is not None
+                ):
+                    self_ia.query_norm_log_scale = cross_ia.query_norm_log_scale
 
         else:
             self.self_attention = None

@@ -53,7 +53,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.self_selector import SelfSelectorLayer
 from causaliT.core.utils import load_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
-from causaliT.utils.elastic_query import set_elastic_query_epoch
+from causaliT.utils.query_norm import collect_query_norm_penalty, query_norm_stats
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -125,6 +125,10 @@ class SelfSelectorForecaster(pl.LightningModule):
 
         # L0
         self.lambda_l0 = float(config["training"].get("lambda_l0", 0.0))
+
+        # Query-norm over-spend penalty (learnable per-node budget); charged
+        # relu(M_i - target)^2 on the STRUCTURAL loss only (query_norm.py).
+        self.lambda_query_norm = float(config["training"].get("lambda_query_norm", 0.0))
 
         # L0 <-> HSIC interference diagnostic
         self.log_l0_hsic_interference = bool(
@@ -341,6 +345,14 @@ class SelfSelectorForecaster(pl.LightningModule):
         )
 
         # Gradient-routing loss split (convex HSIC/recon mix on structural path)
+        # Query-norm over-spend penalty (structural pathway only): each node's
+        # learnable budget M_i charged relu(M_i - target)^2 (deduped across
+        # tied cross/self blocks).
+        qn_penalty = collect_query_norm_penalty(self.model)
+        if qn_penalty is None:
+            qn_penalty = torch.tensor(0.0, device=X.device)
+        qn_reg = self.lambda_query_norm * qn_penalty
+
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
         self._last_loss_components = {
@@ -349,6 +361,7 @@ class SelfSelectorForecaster(pl.LightningModule):
                 (1.0 - alpha) * hsic_reg
                 + struct_recon_reg
                 + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
+                + qn_reg
             ),
         }
         self._last_hsic_reg = hsic_reg
@@ -362,6 +375,12 @@ class SelfSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
         self.log(f"{stage}_struct_recon_reg", struct_recon_reg, on_step=False, on_epoch=True)
         self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+        # Query-norm diagnostics: weighted penalty + mean / max budget M_i.
+        self.log(f"{stage}_query_norm_reg", qn_reg, on_step=False, on_epoch=True)
+        mean_M, max_M = query_norm_stats(self.model)
+        if mean_M is not None:
+            self.log("query_norm/mean_M", mean_M, on_step=False, on_epoch=True)
+            self.log("query_norm/max_M", max_M, on_step=False, on_epoch=True)
         for name, metric in [("mae", self.mae_x), ("rmse", self.rmse_x), ("r2", self.r2_x)]:
             metric_eval = metric(pred.reshape(-1), target.reshape(-1))
             self.log(f"{stage}_x_{name}", metric_eval, on_step=False, on_epoch=True,
@@ -515,12 +534,6 @@ class SelfSelectorForecaster(pl.LightningModule):
                 p.requires_grad_(False)
             print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
         self._interference_blocks = None
-
-    def on_train_epoch_start(self) -> None:
-        """Advance the elastic query-norm schedule (see
-        ``causaliT.utils.elastic_query``) by pushing the current global epoch
-        into every structural attention submodule.  No-op when disabled."""
-        set_elastic_query_epoch(self.model, int(self.current_epoch))
 
     # ------------------------------------------------------------------
     # Convenience: split attention for post-hoc evaluation

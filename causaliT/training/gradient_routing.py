@@ -104,6 +104,10 @@ STRUCTURAL_PATTERNS = [
     # substring "direction_proj" does not collide with the reconstruction
     # "value_projection" / "out_projection" patterns.
     "direction_proj",
+    # Learnable per-node query-norm budget (M_i = exp(log_scale_i)).  It scales
+    # the structural query direction and is charged the over-spend penalty on
+    # the STRUCTURAL loss, so it belongs to the structural group.
+    "query_norm_log_scale",
     # Attention internal parameters (gain, temperature, Gumbel tau, etc.)
 
     "inner_attention.log_gain",

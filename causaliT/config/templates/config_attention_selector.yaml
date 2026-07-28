@@ -103,24 +103,22 @@ experiment:
   normalize_query: false
   query_fanin_scale: 1.0
 
-  # Elastic contraction of the query normalization (only active when
-  # normalize_query=true).  See causaliT/utils/elastic_query.py.  The unit-norm
-  # cap imposes a HARD directional budget (sum_j cos^2(q_hat, k_j) <= 1) from the
-  # first step; the SELF_ATTENTION spurious-S3->X4 study showed this budget is
-  # hit almost immediately, so every candidate edge lights up, saturates, and is
-  # then shoved into a zero-sum pushback that damps genuinely good multi-parent
-  # moves before they pay off.  Elastic contraction relaxes the effective query
-  # norm to ``start_scale`` (>1, looser budget = free exploration) EARLY and
-  # linearly contracts it back to ``end_scale`` (typically 1.0, the original
-  # hard cap) between ``start_epoch`` and ``end_epoch`` (GLOBAL epochs).  The
-  # query DIRECTION still drives selection; only its scheduled norm changes, so
-  # the budget is ``M(epoch)^2``.  Disabled (or start_scale==end_scale==1.0)
-  # reproduces plain unit-normalisation exactly.
-  query_norm_elastic: false
-  query_norm_elastic_start_epoch: 0
-  query_norm_elastic_end_epoch: 0
-  query_norm_elastic_start_scale: 1.0
-  query_norm_elastic_end_scale: 1.0
+  # Adaptive learnable per-node query-norm budget (only active when
+  # normalize_query=true).  See causaliT/utils/query_norm.py.  Plain
+  # unit-normalisation HARD-caps the directional budget
+  # (sum_j cos^2(q_hat, k_j) <= 1); the SELF_ATTENTION spurious-S3->X4 study
+  # showed a node sometimes needs to OVERSPEND that budget (host several parents
+  # at once), and — after removing W_q/W_K — this saturation bites LATE, past any
+  # preset epoch window.  Instead of an epoch schedule, each child i owns a
+  # learnable multiplier ``M_i = exp(log_scale_i)`` (init ``query_norm_init_scale``)
+  # scaling its unit query: ``q_eff = (q/||q||) * M_i``.  The structural loss
+  # charges ``lambda_query_norm * sum_i relu(M_i - query_norm_target)^2`` so a
+  # node raises its own budget only when the structural signal (HSIC / L0) pays
+  # for it, exactly when saturation actually bites.  Disabled (or init_scale=1.0
+  # with lambda_query_norm=0) reproduces plain unit-normalisation.
+  query_norm_learnable: false
+  query_norm_init_scale: 1.0
+  query_norm_target: 1.0
 
   # Reconstruction-gain bypass (GatedCrossAttention / GatedSelfAttention only).
   # By default (true) the final attention weight is the causal structure gate
@@ -309,12 +307,10 @@ model:
 
     normalize_query: ${experiment.normalize_query}
     query_fanin_scale: ${experiment.query_fanin_scale}
-    # Elastic contraction of the query normalization; see experiment.query_norm_elastic.
-    query_norm_elastic: ${experiment.query_norm_elastic}
-    query_norm_elastic_start_epoch: ${experiment.query_norm_elastic_start_epoch}
-    query_norm_elastic_end_epoch: ${experiment.query_norm_elastic_end_epoch}
-    query_norm_elastic_start_scale: ${experiment.query_norm_elastic_start_scale}
-    query_norm_elastic_end_scale: ${experiment.query_norm_elastic_end_scale}
+    # Adaptive learnable per-node query-norm budget; see experiment.query_norm_learnable.
+    query_norm_learnable: ${experiment.query_norm_learnable}
+    query_norm_init_scale: ${experiment.query_norm_init_scale}
+    query_norm_target: ${experiment.query_norm_target}
     # Reconstruction-gain bypass (gated attentions only); see experiment.use_gain.
     use_gain: ${experiment.use_gain}
     # Value-structure injection (SVFA only); see experiment.value_structure_injection.
@@ -425,6 +421,14 @@ training:
   # Expected number of active edges = sum P(z_ij > 0).  Set >0 to encourage
   # sparse hard-concrete gates.  Ignored for non-HardConcrete attention types.
   lambda_l0: 0.0
+
+  # --- Query-norm over-spend penalty (learnable per-node budget) ---
+  # Weight on ``sum_i relu(M_i - query_norm_target)^2`` (see
+  # experiment.query_norm_learnable and causaliT/utils/query_norm.py).  Charged
+  # on the STRUCTURAL loss only.  0.0 lets each budget grow unpenalised; a small
+  # positive value keeps M_i near the target unless the structural signal pays
+  # for over-spending.  Ignored when query_norm_learnable=false.
+  lambda_query_norm: 0.0
 
   # --- L0 <-> HSIC gradient-interference diagnostic ---
   # When True AND attention_type == "HardConcreteCrossAttention" AND

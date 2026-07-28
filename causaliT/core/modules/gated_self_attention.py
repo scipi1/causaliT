@@ -93,10 +93,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from causaliT.utils.elastic_query import (
-    ElasticQueryNormConfig,
-    elastic_normalize_query,
+from causaliT.utils.query_norm import (
+    apply_query_norm,
+    make_query_norm_log_scale,
+    overspend_penalty,
 )
+
 
 
 
@@ -130,16 +132,18 @@ class GatedSelfAttention(nn.Module):
         # existence gate (via S_sym) and the antisymmetric direction gate.
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
-        # Elastic contraction of the query normalization (see
-        # ``causaliT/utils/elastic_query.py``); only active with
-        # ``normalize_query=True``.  Relaxes the unit-norm cap early and linearly
-        # contracts it to ``end_scale`` between the two epochs.  Disabled (or
-        # both scales 1.0) == original unit normalisation.
-        query_norm_elastic: bool = False,
-        query_norm_elastic_start_epoch: int = 0,
-        query_norm_elastic_end_epoch: int = 0,
-        query_norm_elastic_start_scale: float = 1.0,
-        query_norm_elastic_end_scale: float = 1.0,
+        # Learnable per-node query-norm multiplier (see
+        # ``causaliT/utils/query_norm.py``); only active with
+        # ``normalize_query=True``.  Each child owns ``M_i = exp(log_scale_i)``
+        # (init ``query_norm_init_scale``) scaling its unit query so it can
+        # ADAPTIVELY overspend the directional budget when the structural signal
+        # pays for it; the structural loss charges ``relu(M_i - target)^2``.
+        # ``query_norm_num_nodes`` is the number of query rows (children).
+        query_norm_learnable: bool = False,
+        query_norm_init_scale: float = 1.0,
+        query_norm_target: float = 1.0,
+        query_norm_num_nodes: Optional[int] = None,
+
         # Batch-consistent key dropout (columns zeroed identically across batch).
 
         batch_key_dropout: Optional[float] = None,
@@ -176,22 +180,19 @@ class GatedSelfAttention(nn.Module):
         self.normalize_query = bool(normalize_query)
         self.query_fanin_scale = float(query_fanin_scale)
 
-        # Elastic query-norm schedule (only active with normalize_query=True).
-        self.elastic_query_cfg = ElasticQueryNormConfig(
-            enabled=query_norm_elastic,
-            start_epoch=query_norm_elastic_start_epoch,
-            end_epoch=query_norm_elastic_end_epoch,
-            start_scale=query_norm_elastic_start_scale,
-            end_scale=query_norm_elastic_end_scale,
-        )
-        # Current training epoch, pushed by the trainer's on_train_epoch_start
-        # via causaliT.utils.elastic_query.set_elastic_query_epoch; defaults to
-        # end_epoch so an un-pushed module behaves like the original unit-norm.
-        self.register_buffer(
-            "_elastic_epoch",
-            torch.tensor(int(query_norm_elastic_end_epoch), dtype=torch.long),
-            persistent=False,
-        )
+        # Learnable per-node query-norm multiplier (only active with
+        # normalize_query=True).  ``M_i = exp(log_scale_i)`` init at
+        # ``query_norm_init_scale``; classified STRUCTURAL via the
+        # ``query_norm_log_scale`` name (gradient_routing).
+        self.query_norm_learnable = bool(query_norm_learnable) and self.normalize_query
+        self.query_norm_target = float(query_norm_target)
+        if self.query_norm_learnable:
+            self.query_norm_log_scale = make_query_norm_log_scale(
+                int(query_norm_num_nodes), query_norm_init_scale
+            )
+        else:
+            self.query_norm_log_scale = None
+
 
 
         # Pre-computed L0 offset:  P(z>0) = sigmoid(log_alpha - beta*log(-gamma/zeta)).
@@ -326,11 +327,16 @@ class GatedSelfAttention(nn.Module):
         # scale replacing 1/sqrt(E) (see GatedCrossAttention for the rationale).
         q_s = query
         if self.normalize_query:
-            # Elastic contraction: q̂ * M(epoch); M==1 -> plain unit-norm.
-            q_s, scale_s = elastic_normalize_query(
-                q_s, self.query_fanin_scale,
-                self.elastic_query_cfg, int(self._elastic_epoch.item()),
-            )
+            if self.query_norm_learnable:
+                # q̂ * M_i (per-node learnable budget); scale = sqrt(fanin).
+                q_s, scale_s = apply_query_norm(
+                    q_s, self.query_norm_log_scale, self.query_fanin_scale
+                )
+            else:
+                # Plain unit-norm cap (M == 1).
+                q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
+                scale_s = math.sqrt(self.query_fanin_scale)
+
         else:
             scale_s = 1.0 / math.sqrt(E_s)
 

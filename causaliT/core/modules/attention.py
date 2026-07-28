@@ -1357,15 +1357,19 @@ class AttentionLayer(nn.Module):
         # score scale in place of 1/sqrt(E).
         normalize_query: bool = False,
         query_fanin_scale: float = 1.0,
-        # Elastic contraction of the query normalization (only meaningful with
+        # Learnable per-node query-norm multiplier (only meaningful with
         # ``normalize_query=True``); threaded into the gated inner attentions.
-        # Both scales 1.0 (or disabled) == original unit normalisation.
-        query_norm_elastic: bool = False,
-        query_norm_elastic_start_epoch: int = 0,
-        query_norm_elastic_end_epoch: int = 0,
-        query_norm_elastic_start_scale: float = 1.0,
-        query_norm_elastic_end_scale: float = 1.0,
+        # Each child owns ``M_i = exp(log_scale_i)`` (init ``query_norm_init_scale``)
+        # scaling its unit query so it can ADAPTIVELY overspend the directional
+        # budget when the structural signal pays for it; the structural loss
+        # charges ``relu(M_i - query_norm_target)^2``.  The per-node count is the
+        # number of query rows (children) = ``query_seq_len``.  Disabled (or
+        # init_scale=1.0) reproduces the plain unit-norm cap.
+        query_norm_learnable: bool = False,
+        query_norm_init_scale: float = 1.0,
+        query_norm_target: float = 1.0,
         shared_qk_inner: dict = None,
+
 
         # Externally-projected query.  When True, this layer does NOT build its
         # own structural ``query_projection`` (W_q).  Instead the caller passes
@@ -1539,11 +1543,10 @@ class AttentionLayer(nn.Module):
                     use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
-                    query_norm_elastic=query_norm_elastic,
-                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
-                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
-                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
-                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                    query_norm_learnable=query_norm_learnable,
+                    query_norm_init_scale=query_norm_init_scale,
+                    query_norm_target=query_norm_target,
+                    query_norm_num_nodes=query_seq_len,
                     batch_key_dropout=batch_key_dropout,
 
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
@@ -1572,11 +1575,10 @@ class AttentionLayer(nn.Module):
                     use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
-                    query_norm_elastic=query_norm_elastic,
-                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
-                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
-                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
-                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                    query_norm_learnable=query_norm_learnable,
+                    query_norm_init_scale=query_norm_init_scale,
+                    query_norm_target=query_norm_target,
+                    query_norm_num_nodes=query_seq_len,
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
@@ -1603,11 +1605,10 @@ class AttentionLayer(nn.Module):
                     use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
-                    query_norm_elastic=query_norm_elastic,
-                    query_norm_elastic_start_epoch=query_norm_elastic_start_epoch,
-                    query_norm_elastic_end_epoch=query_norm_elastic_end_epoch,
-                    query_norm_elastic_start_scale=query_norm_elastic_start_scale,
-                    query_norm_elastic_end_scale=query_norm_elastic_end_scale,
+                    query_norm_learnable=query_norm_learnable,
+                    query_norm_init_scale=query_norm_init_scale,
+                    query_norm_target=query_norm_target,
+                    query_norm_num_nodes=query_seq_len,
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,

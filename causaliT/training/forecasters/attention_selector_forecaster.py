@@ -81,7 +81,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
-from causaliT.utils.elastic_query import set_elastic_query_epoch
+from causaliT.utils.query_norm import collect_query_norm_penalty, query_norm_stats
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -200,6 +200,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # L0 regularization (HardConcreteCrossAttention only)
         # ----------------------------------------------------------------
         self.lambda_l0 = float(config["training"].get("lambda_l0", 0.0))
+
+        # ----------------------------------------------------------------
+        # Query-norm over-spend penalty (learnable per-node budget).  Charges
+        # ``relu(M_i - target)^2`` on the STRUCTURAL loss only (see
+        # causaliT.utils.query_norm); 0.0 (default) leaves behaviour unchanged.
+        # ----------------------------------------------------------------
+        self.lambda_query_norm = float(config["training"].get("lambda_query_norm", 0.0))
 
         # ----------------------------------------------------------------
         # L0 ↔ HSIC gradient-interference logging (diagnostic).
@@ -601,6 +608,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # attention weights with no extra forward/backward pass.  The
         # reconstruction params keep their pure-recon gradients via the
         # save/restore logic in training_step, so theta_R is unaffected.
+        # Query-norm over-spend penalty (structural pathway only): each child's
+        # learnable budget M_i is charged relu(M_i - target)^2, summed over
+        # nodes (deduped across tied cross/self blocks).
+        qn_penalty = collect_query_norm_penalty(self.model)
+        if qn_penalty is None:
+            qn_penalty = torch.tensor(0.0, device=X.device)
+        qn_reg = self.lambda_query_norm * qn_penalty
+
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
         self._last_loss_components = {
@@ -609,6 +624,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 (1.0 - alpha) * hsic_reg
                 + struct_recon_reg
                 + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
+                + qn_reg
             ),
         }
 
@@ -631,6 +647,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # reconstruction signal is shaping the structural parameters.
         self.log(f"{stage}_struct_recon_reg", struct_recon_reg, on_step=False, on_epoch=True)
         self.log(f"{stage}_group_l1", group_l1_loss, on_step=False, on_epoch=True)
+        # Query-norm diagnostics: weighted penalty + mean / max budget M_i.
+        self.log(f"{stage}_query_norm_reg", qn_reg, on_step=False, on_epoch=True)
+        mean_M, max_M = query_norm_stats(self.model)
+        if mean_M is not None:
+            self.log("query_norm/mean_M", mean_M, on_step=False, on_epoch=True)
+            self.log("query_norm/max_M", max_M, on_step=False, on_epoch=True)
 
 
         for name, metric in [("mae", self.mae_x), ("rmse", self.rmse_x), ("r2", self.r2_x)]:
@@ -1046,22 +1068,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Rebuild the interference block mapping so it reflects the current
         # requires_grad state for this stage.
         self._interference_blocks = None
-
-    def on_train_epoch_start(self) -> None:
-        """Advance the elastic query-norm schedule.
-
-        Pushes the current (global) epoch into every structural attention
-        submodule carrying an ``_elastic_epoch`` buffer, so the epoch-based
-        elastic contraction of the query normalization (see
-        ``causaliT.utils.elastic_query``) evolves as training proceeds.
-
-        ``self.current_epoch`` is the trainer's epoch counter, which the
-        adaptive trainer runs as a single monotonically increasing GLOBAL
-        epoch across phases (it does not reset per phase), so the schedule
-        endpoints are interpreted in global-epoch terms.  A no-op (0 modules
-        updated) when the elastic feature is disabled.
-        """
-        set_elastic_query_epoch(self.model, int(self.current_epoch))
 
     # ------------------------------------------------------------------
     # Convenience: expose split attention for post-hoc evaluation
