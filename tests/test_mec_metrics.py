@@ -12,7 +12,7 @@ These tests verify the correctness of:
 import numpy as np
 import pytest
 
-from causaliT.evaluation.eval_funs.eval_utils import (
+from causaliT.evaluation.eval_funs.helpers.eval_utils import (
     _dag_to_skeleton,
     _find_v_structures,
     _combine_attention_to_full_dag,

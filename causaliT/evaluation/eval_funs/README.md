@@ -147,7 +147,7 @@ update_experiments_manifest("experiments/my_exp")
 best checkpoint -> predict_test_from_ckpt -> query_dag_blocks -> compute_dag_metrics
 ```
 
-`eval_dag_query.query_dag_blocks(attention, L_S, L_X)` classifies each attention
+`helpers.eval_dag_query.query_dag_blocks(attention, L_S, L_X)` classifies each attention
 tensor **by its shape**, so no architecture registry is involved:
 
 | Shape | Interpretation |

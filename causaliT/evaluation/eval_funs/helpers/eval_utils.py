@@ -13,7 +13,7 @@ matplotlib or mutates global rcParams at import time.
 
 import re
 import json
-from os.path import dirname, abspath, join, exists
+from os.path import join, exists
 from os import makedirs
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime
@@ -22,9 +22,12 @@ import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
 
-# Setup root path for local imports
-# Go up FOUR levels: eval_funs -> evaluation -> causaliT -> project root
-root_path = dirname(dirname(dirname(dirname(abspath(__file__)))))
+from causaliT.paths import ROOT_DIR
+
+# Project root, as a string (callers pass it to os.path.join).
+# Taken from causaliT.paths so it stays correct regardless of how deeply
+# nested this module is, and honours the PROT_ROOT override.
+root_path = str(ROOT_DIR)
 
 
 # =============================================================================

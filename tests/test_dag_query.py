@@ -10,7 +10,7 @@ from the *shape* of the attention tensors, without a live model.
 import numpy as np
 import pytest
 
-from causaliT.evaluation.eval_funs.eval_dag_query import (
+from causaliT.evaluation.eval_funs.helpers.eval_dag_query import (
     CROSS,
     SELF,
     block_layer_index,

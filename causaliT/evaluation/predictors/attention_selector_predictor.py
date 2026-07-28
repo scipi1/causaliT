@@ -39,7 +39,7 @@ class AttentionSelectorPredictor(SingleCausalPredictor):
     The returned ``attention_weights`` dict contains the single key
     ``"att_combined"``.  Splitting into the canonical ``cross`` (S->X) and
     ``self`` (X->X) DAG blocks is *not* done here: it is the job of
-    ``eval_funs.eval_dag_query.query_dag_blocks()``, which inspects which
+    ``eval_funs.helpers.eval_dag_query.query_dag_blocks()``, which inspects which
     attention modules actually exist on the model.  Keeping one tensor here
     avoids storing the same values three times for the whole test split.
     """

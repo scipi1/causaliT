@@ -288,7 +288,7 @@ def _compute_score_margin(
         if not dataset_name or not data_dir:
             return result
 
-        from causaliT.evaluation.eval_funs.eval_utils import _load_true_dag_mask
+        from causaliT.evaluation.eval_funs.helpers.eval_utils import _load_true_dag_mask
 
         # ------------------------------------------------------------------
         # AttentionSelectorLayer branch

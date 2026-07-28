@@ -23,7 +23,6 @@ Available evaluation functions:
     - fix_kfold_summary / enrich_kfold_summary: kfold_summary.json maintenance
 """
 
-import sys
 import traceback
 from os import listdir
 from os.path import join, exists, isdir
@@ -32,7 +31,6 @@ from typing import List, Tuple
 import click
 
 # Import from sibling modules
-from .eval_utils import root_path
 from .eval_funs_wraps import run_all_evaluations, run_evaluations_from_config
 from ._OLD.update_manifest import batch_update_manifest, MANIFEST_PATH
 

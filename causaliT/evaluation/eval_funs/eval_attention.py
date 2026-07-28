@@ -40,7 +40,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 # Import shared utilities
-from .eval_utils import (
+from .helpers.eval_utils import (
     root_path,
     _setup_eval_directories,
     _save_readme,
@@ -53,16 +53,16 @@ from .eval_utils import (
 # Import from project modules
 from causaliT.evaluation.predict import predict_test_from_ckpt
 
-# Import from local eval_funs modules (self-contained)
-from .eval_lib import (
+# Import from the local support layer
+from .helpers.eval_lib import (
     get_architecture_type,
     find_best_or_last_checkpoint,
 )
 from .eval_interventions import infer_checkpoint_type
 
 # Architecture-agnostic DAG query + shared metric core
-from .eval_dag_query import query_dag_blocks, describe_topology
-from .eval_dag_scores import compute_dag_metrics, make_json_serializable
+from .helpers.eval_dag_query import query_dag_blocks, describe_topology
+from .helpers.eval_dag_scores import compute_dag_metrics, make_json_serializable
 
 
 # =============================================================================

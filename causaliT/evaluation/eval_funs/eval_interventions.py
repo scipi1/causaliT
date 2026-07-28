@@ -23,14 +23,14 @@ from typing import Dict, List, Optional
 from pathlib import Path
 
 # Import shared utilities
-from .eval_utils import root_path, load_dataset_metadata
+from .helpers.eval_utils import root_path, load_dataset_metadata
 
 # Import from project modules
 from causaliT.evaluation.predict import create_predictor
 from causaliT.training.experiment_control import update_config
 
-# Import from local eval_funs modules
-from .eval_lib import find_config_file, find_best_or_last_checkpoint
+# Import from the local support layer
+from .helpers.eval_lib import find_config_file, find_best_or_last_checkpoint
 
 
 def infer_checkpoint_type(config) -> str:

@@ -151,7 +151,7 @@ def _extract_learned_dag(model: pl.LightningModule) -> Dict[str, Optional[np.nda
         Each maps to a 2D numpy array of edge probabilities in [0, 1], or None.
         Also includes backward-compat keys "cross" and "self" (layer 0 or average).
     """
-    from causaliT.evaluation.eval_funs.eval_lib import extract_phi_from_model
+    from causaliT.evaluation.eval_funs.helpers.eval_lib import extract_phi_from_model
 
     # Determine architecture type from model class name
     arch_type = type(model).__name__

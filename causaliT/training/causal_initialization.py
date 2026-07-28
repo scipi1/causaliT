@@ -182,7 +182,7 @@ def evaluate_dag_from_model(
             - soft_hamming_cross: soft Hamming to true DAG for cross (or None)
             - soft_hamming_self: soft Hamming to true DAG for self (or None)
     """
-    from causaliT.evaluation.eval_funs.eval_lib import (
+    from causaliT.evaluation.eval_funs.helpers.eval_lib import (
         extract_phi_from_model,
         get_architecture_type,
     )
@@ -220,7 +220,7 @@ def _evaluate_dag_from_model_impl(
     mode is restored via try/finally regardless of how this body returns or
     raises.
     """
-    from causaliT.evaluation.eval_funs.eval_lib import (
+    from causaliT.evaluation.eval_funs.helpers.eval_lib import (
         extract_phi_from_model,
         get_architecture_type,
     )
@@ -282,7 +282,7 @@ def _evaluate_dag_from_model_impl(
     dataset_name = config.get("data", {}).get("dataset")
     if dataset_name and data_dir:
         try:
-            from causaliT.evaluation.eval_funs.eval_utils import (
+            from causaliT.evaluation.eval_funs.helpers.eval_utils import (
                 _compute_soft_hamming,
                 _load_true_dag_mask,
             )
