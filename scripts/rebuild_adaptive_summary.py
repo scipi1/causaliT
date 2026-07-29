@@ -5,9 +5,9 @@ run (Option B — lightweight, CSV-only reconstruction).
 The adaptive trainer (``causaliT/training/adaptive_trainer.py``) only writes
 ``adaptive_training_summary.json`` at the very end of ``adaptive_trainer()``.  If
 the process is killed before that final write, the per-phase checkpoints
-(``adaptive/phase_*_end.ckpt``) and the per-epoch log
-(``adaptive_run/k_0/logs/csv/version_0/metrics.csv``) still exist, but the
-summary the evaluation notebook expects is gone.
+(``stage_checkpoints/phase_*_end.ckpt``) and the per-epoch log
+(``k_0/logs/csv/version_0/metrics.csv``) still exist, but the summary the
+evaluation notebook expects is gone.
 
 This script reconstructs a summary with the SAME schema the notebook consumes,
 using ONLY the surviving CSV + checkpoint filenames (no model loading):
@@ -51,8 +51,8 @@ PHASE_NAME = {0.0: "reconstruct", 1.0: "structure"}
 
 
 def _find_metrics_csv(experiment_dir: str) -> str:
-    """Locate the per-epoch metrics.csv under the adaptive_run tree."""
-    pattern = join(experiment_dir, "adaptive_run", "*", "logs", "csv", "*", "metrics.csv")
+    """Locate the per-epoch metrics.csv under the fold (``k_*``) tree."""
+    pattern = join(experiment_dir, "k_*", "logs", "csv", "*", "metrics.csv")
     hits = sorted(glob.glob(pattern))
     if not hits:
         raise FileNotFoundError(f"No metrics.csv found under {pattern}")
@@ -128,7 +128,7 @@ def rebuild_summary(experiment_dir: str) -> dict:
         data_split_ratio = ad.get("data_split_ratio", None)
 
     # --- discover ordered phase-end checkpoints ---
-    ckpts = sorted(glob.glob(join(experiment_dir, "adaptive", "phase_*_end.ckpt")))
+    ckpts = sorted(glob.glob(join(experiment_dir, "stage_checkpoints", "phase_*_end.ckpt")))
     parsed = [(_parse_phase_ckpt(p)[0], _parse_phase_ckpt(p)[1], p) for p in ckpts]
     parsed = [t for t in parsed if t[0] is not None]
     parsed.sort(key=lambda t: t[0])
@@ -252,7 +252,7 @@ def rebuild_summary(experiment_dir: str) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("experiment_dir", help="Path to the experiment folder (contains adaptive/ and adaptive_run/).")
+    ap.add_argument("experiment_dir", help="Path to the experiment folder (contains stage_checkpoints/ and k_*/).")
     ap.add_argument("--out", default=None, help="Output path (default: <experiment_dir>/adaptive_training_summary.json).")
     args = ap.parse_args()
 

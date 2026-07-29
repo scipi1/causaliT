@@ -4,10 +4,12 @@ Run with:  pytest tests/test_atsel_self_attention_xx.py -v
 
 Motivation
 ----------
-The single combined cross-attention parametrises the X→X interaction with the
-SAME (undirected) mechanism used for S→X, so it cannot express edge direction
-and produces two-cycles / double edges.  Setting ``self_attention_type=
-"GatedSelfAttention"`` SPLITS the layer into:
+The legacy single combined cross-attention parametrised the X→X interaction with
+the SAME (undirected) mechanism used for S→X, so it could not express edge
+direction and produced two-cycles / double edges.  That variant has been
+REMOVED: ``self_attention_type`` is now MANDATORY and always SPLITS the layer
+into:
+
 
   * S→X  via the cross ``attention_type`` block  (keys/values = S only)
   * X→X  via a dedicated ``GatedSelfAttention`` block whose antisymmetric
@@ -18,13 +20,17 @@ unified representation of X (reconstructed from both S and X) is preserved.
 
 These tests verify:
 
-1. Construction wiring (``self_attention`` present iff the type is set).
+1. Construction wiring (``self_attention`` is always built; a missing/invalid
+   ``self_attention_type`` raises ``ValueError``).
+
 2. Forward shapes + combined-attention round-trip equals ``cat(attn_sx, attn_xx)``.
 3. Two-cycle suppression on the X→X directed posterior (``p_ij + p_ji <= 1``).
 4. ``get_score_tensor_for_sparsity`` returns the ``(L_X, L_S+L_X)`` combined tensor.
 5. Gradient routing classifies the self block's Q/K as STRUCTURAL and its
    gain / value / out projections as RECONSTRUCTION.
-6. ``oracle=True`` raises ``NotImplementedError`` in split mode.
+6. ``oracle=True`` works in split mode: the GT ``(L_X, L_S+L_X)`` mask is sliced
+   into its cross / self halves and forwarded to both blocks.
+
 7. Backward smoke: gradients reach the self-block structural params.
 """
 
@@ -86,7 +92,8 @@ def _svfa_embed_cfg(vocab: int, d_model: int = D_MODEL) -> dict:
 
 
 def _make_model(
-    self_attention_type=None,
+    self_attention_type="GatedSelfAttention",
+
     free_query_embedding: bool = True,
     gain_stream_source: str = "separate",
 ) -> AttentionSelectorLayer:
@@ -147,13 +154,16 @@ def _make_inputs():
 class TestConstruction:
     def test_split_flag(self):
         assert _make_model(self_attention_type="GatedSelfAttention").split_xx is True
-        assert _make_model(self_attention_type=None).split_xx is False
 
-    def test_self_attention_present_only_when_enabled(self):
+    def test_self_attention_always_built(self):
         m_on = _make_model(self_attention_type="GatedSelfAttention")
-        m_off = _make_model(self_attention_type=None)
         assert m_on.self_attention is not None
-        assert m_off.self_attention is None
+
+    def test_self_attention_type_is_mandatory(self):
+        """The legacy cross-only variant is gone: ``None`` must raise."""
+        with pytest.raises(ValueError, match="self_attention_type"):
+            _make_model(self_attention_type=None)
+
 
     def test_cross_block_keys_are_S_only_in_split(self):
         m = _make_model(self_attention_type="GatedSelfAttention")
@@ -193,14 +203,15 @@ class TestForwardShapes:
         assert att_xx.shape == (BATCH, X_SEQ_LEN, X_SEQ_LEN)
         assert torch.allclose(torch.cat([att_sx, att_xx], dim=-1), attn)
 
-    def test_single_mode_still_works(self):
-        """Regression guard: self_attention_type=None reproduces the combined block."""
-        model = _make_model(self_attention_type=None)
-        model.eval()
-        source, x_actual, x_blanked = _make_inputs()
-        pred_x, attn, _ = model.forward_with_actual(source, x_blanked, x_actual)
-        assert pred_x.shape == (BATCH, X_SEQ_LEN, 1)
-        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+    def test_combined_mask_buffer_removed(self):
+        """The legacy single-block ``combined_mask`` buffer no longer exists;
+        split mode exposes exactly ``cross_mask`` + ``self_mask``."""
+        model = _make_model(self_attention_type="GatedSelfAttention")
+        buffer_names = {n for n, _ in model.named_buffers()}
+        assert "combined_mask" not in buffer_names
+        assert "cross_mask" in buffer_names
+        assert "self_mask" in buffer_names
+
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +285,47 @@ class TestParameterClassification:
 
 
 class TestOracleGuard:
-    def test_oracle_raises_in_split_mode(self):
+    def test_oracle_without_gt_mask_falls_back_to_structural_masks(self):
+        """``oracle=True`` with no GT mask is a documented sanity baseline: each
+        block falls back to its own structural mask (uniform oracle attention)."""
         model = _make_model(self_attention_type="GatedSelfAttention")
+        model.eval()
         source, x_actual, x_blanked = _make_inputs()
-        with pytest.raises(NotImplementedError):
-            model.forward_with_actual(source, x_blanked, x_actual, oracle=True)
+        _, attn, _ = model.forward_with_actual(
+            source, x_blanked, x_actual, oracle=True
+        )
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+        # The X→X half must respect the off-diagonal structural mask (no self loops).
+        xx = attn[:, :, S_SEQ_LEN:]
+        assert torch.all(torch.diagonal(xx, dim1=1, dim2=2) == 0.0)
+
+    def test_oracle_slices_combined_mask_into_both_blocks(self):
+
+        """The GT ``(L_X, L_S+L_X)`` mask is split into ``[:, :L_S]`` (cross) and
+        ``[:, L_S:]`` (self); forbidden edges must carry zero weight."""
+        model = _make_model(self_attention_type="GatedSelfAttention")
+        model.eval()
+        source, x_actual, x_blanked = _make_inputs()
+
+        g = torch.Generator().manual_seed(0)
+        cross = (torch.rand(X_SEQ_LEN, S_SEQ_LEN, generator=g) > 0.5).float()
+        self_m = torch.zeros(X_SEQ_LEN, X_SEQ_LEN)
+        for i in range(1, X_SEQ_LEN):
+            for j in range(i):
+                self_m[i, j] = 1.0
+        combined = torch.cat([cross, self_m], dim=1)
+
+        _, attn, _ = model.forward_with_actual(
+            source, x_blanked, x_actual,
+            oracle=True, oracle_combined_mask=combined,
+        )
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+        forbidden = combined.unsqueeze(0).expand_as(attn) == 0
+        assert torch.all(attn[forbidden] == 0.0), (
+            "Edges absent from the GT oracle mask must carry zero weight in "
+            "BOTH the cross and the self block."
+        )
+
 
 
 # ---------------------------------------------------------------------------

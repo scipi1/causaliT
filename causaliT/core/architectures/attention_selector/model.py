@@ -9,6 +9,33 @@ The model answers one focused question:
      of each X variable from observational data, when given the actual values of
      all candidate parents (S and X) as keys?"
 
+Two modes (``homogeneous_nodes``)
+
+**Split mode** (``homogeneous_nodes=False``, default) — the S -> X direction is
+ASSUMED: S nodes appear only as keys, never as queries.  Two attention blocks:
+
+    * ``attention``      — S -> X cross block  (``attention_type``, keys/values = S)
+    * ``self_attention`` — X -> X self  block  (``self_attention_type``, keys/values = X)
+
+Their outputs are summed into one value residual stream and their posteriors are
+re-concatenated into the canonical ``(B, L_X, L_S + L_X)`` layout.  Both blocks
+are MANDATORY: the historical cross-only variant (a single combined block whose
+right-hand columns modelled X -> X without direction) has been REMOVED, so
+``self_attention_type`` must always be set.
+
+**Homogeneous mode** (``homogeneous_nodes=True``) — the S/X prior is IGNORED.
+The data stream is treated as a single homogeneous set of ``N = L_S + L_X``
+nodes: every node is simultaneously a value-blanked query (candidate child) and
+an actual-value key/value (candidate parent).  ONE square attention block —
+built from ``self_attention_type`` and stored in ``self.attention`` so all
+downstream tooling (score sparsity, gradient routing, freezing, interference
+probes) keeps working — produces the full directed ``(B, N, N)`` posterior, and
+the regression head reconstructs ALL N variables (S included).  The cross
+``attention_type`` is ignored entirely in this mode.  This subsumes
+``SelfSelectorLayer`` while keeping every AttentionSelector feature (SVFA,
+orthogonal/fixed structural embeddings, free queries, BKD, value-structure
+injection, learnable query norms, ...).
+
 Forward pass
 ------------
 
@@ -284,18 +311,26 @@ class AttentionSelectorLayer(nn.Module):
         # the cross init edge prob at 0.25, so S→X and X→X start balanced.  Only
         # applies to GatedCrossAttention; the self block is never offset.
         init_edge_offset: float = 0.0,
-        # Direction-aware X→X self-attention block.  When None (default) the
-
-        # X→X interaction is modelled by the RIGHT-HAND columns of the single
-        # combined cross-attention (original behaviour, no directionality).
-        # When set to "GatedSelfAttention" the architecture SPLITS into:
-        #   * S→X  via the cross ``attention_type`` block  (keys/values = S only)
-        #   * X→X  via a dedicated ``GatedSelfAttention`` block that models edge
-        #          direction (antisymmetric gate: d_ij + d_ji = 1 suppresses
-        #          two-cycles), keys/values = X only.
-        # The two attention outputs are SUMMED into one unified value residual
-        # stream, so X is still reconstructed jointly from both S and X.
+        # Direction-aware self-attention block.  MANDATORY (the legacy
+        # cross-only variant, where the right-hand columns of one combined cross
+        # block modelled X→X without direction, has been REMOVED).
+        #   * homogeneous_nodes=False (split): S→X via the cross
+        #     ``attention_type`` block (keys/values = S) + X→X via this
+        #     direction-aware block (keys/values = X).  Outputs are SUMMED into
+        #     one value residual stream; posteriors re-concatenated.
+        #   * homogeneous_nodes=True: THIS is the only block — a square (N, N)
+        #     attention over all nodes; ``attention_type`` is ignored.
         self_attention_type: Optional[str] = None,
+        # Homogeneous N-node mode: ignore the S/X (source) prior entirely.  The
+        # whole datastream [S ; X] becomes one set of N = L_S + L_X nodes, each
+        # simultaneously a value-blanked QUERY (candidate child) and an
+        # actual-value KEY/VALUE (candidate parent).  ONE square self-attention
+        # block (``self_attention_type``, stored in ``self.attention``) yields
+        # the full directed (B, N, N) posterior and the regression head
+        # reconstructs ALL N variables (S included).  Requires
+        # ``self_attention_type``; forbids ``shared_query`` / ``shared_key``
+        # (there is a single block, so sharing is intrinsic).  Default False.
+        homogeneous_nodes: bool = False,
         # Direction-gate Binary-Concrete temperature (GatedSelfAttention only).
         dir_tau: float = 2.0 / 3.0,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
@@ -410,6 +445,10 @@ class AttentionSelectorLayer(nn.Module):
         # inspect whether the model is operating in SVFA or standard mode.
         self.comps_embed_X = comps_embed_X
 
+        # Homogeneous N-node mode (no S/X prior); N = L_S + L_X.
+        self.homogeneous_nodes = bool(homogeneous_nodes)
+        self.N = S_seq_len + X_seq_len
+
         # ------------------------------------------------------------------
         # Structural (Q/K) embedding scheme selection.
         # A single key selects among three mutually-exclusive schemes; see the
@@ -436,7 +475,12 @@ class AttentionSelectorLayer(nn.Module):
                 "(there is no dedicated X query embedding table to initialise "
                 "at the key centroid otherwise)."
             )
-        self.is_gated = (attention_type == "GatedCrossAttention")
+        # In homogeneous mode the single block is ALWAYS a gated self attention,
+        # so the reconstruction-gain stream is always active (and its identity
+        # tables must be built) regardless of the ignored ``attention_type``.
+        self.is_gated = (
+            attention_type == "GatedCrossAttention" or self.homogeneous_nodes
+        )
 
         self.gain_stream_source = gain_stream_source
 
@@ -495,32 +539,38 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
         SELF_ATTENTION_TYPES = ("GatedSelfAttention", "CommutatorSelfAttention")
         self.self_attention_type = self_attention_type
-        self.split_xx = self_attention_type is not None
-        if self.split_xx and self_attention_type not in SELF_ATTENTION_TYPES:
+        if self_attention_type not in SELF_ATTENTION_TYPES:
             raise ValueError(
                 f"self_attention_type='{self_attention_type}' is invalid. "
-                f"Must be None or one of: {list(SELF_ATTENTION_TYPES)}."
+                f"It is now MANDATORY: the legacy cross-only variant (a single "
+                f"combined cross block whose right-hand columns modelled X→X "
+                f"without direction) has been REMOVED. "
+                f"Must be one of: {list(SELF_ATTENTION_TYPES)}."
             )
+        # In homogeneous mode the ONE square (N, N) block IS the self attention
+        # (stored in ``self.attention``), so there is no separate split block.
+        self.split_xx = not self.homogeneous_nodes
         self.dir_tau = dir_tau
 
         # Shared structural query projection (W_q) across the cross (S→X) and
         # self (X→X) blocks.  Only meaningful in split mode; ignored otherwise.
         self.shared_query = bool(shared_query)
-        if self.shared_query and not self.split_xx:
+        if self.shared_query and self.homogeneous_nodes:
             raise ValueError(
-                "shared_query=True requires self_attention_type to be set "
-                "(the shared W_q is shared between the S→X cross block and the "
-                "X→X self block, which only exists in split mode)."
+                "shared_query=True is invalid with homogeneous_nodes=True: "
+                "there is a SINGLE attention block, so the query projection is "
+                "shared by construction."
             )
 
         # Shared structural key projection (W_K) across the cross (S→X) and
         # self (X→X) blocks.  Only meaningful in split mode; ignored otherwise.
         self.shared_key = bool(shared_key)
-        if self.shared_key and not self.split_xx:
+        if self.shared_key and self.homogeneous_nodes:
             raise ValueError(
-                "shared_key=True requires self_attention_type to be set "
-                "(the shared W_K is shared between the S→X cross block and the "
-                "X→X self block, which only exists in split mode)."
+                "shared_key=True is invalid with homogeneous_nodes=True: "
+                "there is a SINGLE attention block, so the key projection is "
+                "shared by construction (all N keys pass through the same W_K, "
+                "which preserves the orthogonality of the structural keys)."
             )
 
 
@@ -600,17 +650,31 @@ class AttentionSelectorLayer(nn.Module):
             "GatedCrossAttention": GatedCrossAttention,
         }
 
-        if attention_type not in att_cls_map:
-            raise ValueError(
-                f"attention_type='{attention_type}' is not supported for "
-                f"AttentionSelectorLayer.  Choose from: {list(att_cls_map)}"
-            )
-        att_cls = att_cls_map[attention_type]
+        self_att_cls_map = {
+            "GatedSelfAttention": GatedSelfAttention,
+            "CommutatorSelfAttention": CommutatorSelfAttention,
+        }
 
-        # In SPLIT mode the cross block attends to S ONLY (keys/values = S);
-        # the X→X interaction is handled by the dedicated self-attention block.
-        # In single (default) mode it attends to the combined [S, X] key set.
-        cross_key_seq_len = S_seq_len if self.split_xx else (S_seq_len + X_seq_len)
+        if self.homogeneous_nodes:
+            # HOMOGENEOUS: ONE square (N, N) self-attention block over all
+            # nodes.  The cross ``attention_type`` is IGNORED entirely; the
+            # block is stored in ``self.attention`` (the canonical attribute) so
+            # every downstream consumer (score sparsity, gradient routing,
+            # freezing, interference probes, centroid init) keeps working.
+            att_cls = self_att_cls_map[self_attention_type]
+            query_seq_len = self.N
+            cross_key_seq_len = self.N
+        else:
+            if attention_type not in att_cls_map:
+                raise ValueError(
+                    f"attention_type='{attention_type}' is not supported for "
+                    f"AttentionSelectorLayer.  Choose from: {list(att_cls_map)}"
+                )
+            att_cls = att_cls_map[attention_type]
+            # SPLIT: the cross block attends to S ONLY (keys/values = S); the
+            # X→X interaction is handled by the self-attention block below.
+            query_seq_len = X_seq_len
+            cross_key_seq_len = S_seq_len
 
         self.attention = AttentionLayer(
             attention=att_cls,
@@ -624,9 +688,15 @@ class AttentionSelectorLayer(nn.Module):
             dropout_qkv=dropout_qkv,
             register_entropy=True,
             layer_name="selector_att",
-            query_seq_len=X_seq_len,
+            query_seq_len=query_seq_len,
             key_seq_len=cross_key_seq_len,
             init_tau=init_tau,
+            # Direction-gate parameters: consumed only when THIS block is the
+            # square (N, N) self attention (homogeneous mode); the cross
+            # attentions ignore them.
+            dir_tau=dir_tau,
+            direction_mode=commutator_direction_mode,
+            direction_rank=commutator_direction_rank,
             shared_dag_across_heads=shared_dag_across_heads,
             # Isometric key projection (W_K^T W_K = I) when "orthogonal".
             key_projection_type=key_projection_type,
@@ -681,10 +751,6 @@ class AttentionSelectorLayer(nn.Module):
         # embedding (a self-attention requirement for the symmetric/
         # antisymmetric Toeplitz split); values are the X value stream.
         # ------------------------------------------------------------------
-        self_att_cls_map = {
-            "GatedSelfAttention": GatedSelfAttention,
-            "CommutatorSelfAttention": CommutatorSelfAttention,
-        }
         if self.split_xx:
             self_att_cls = self_att_cls_map[self_attention_type]
             self.self_attention = AttentionLayer(
@@ -773,25 +839,24 @@ class AttentionSelectorLayer(nn.Module):
 
 
         # ------------------------------------------------------------------
-        # Static combined hard mask: (L_X, L_S + L_X)
-        #   S-block  [cols 0 .. L_S-1]:       all 1s (attend to any S)
-        #   X-block  [cols L_S .. L_S+L_X-1]: off-diagonal 1s (no self-loop)
-        # Registered as a buffer so it moves to the correct device automatically.
+        # Static hard masks (allowed-edge topology).  Registered as buffers so
+        # they follow the module to the right device.
+        #   * homogeneous: ONE (N, N) off-diagonal mask (no self-loops); the
+        #     S→X direction is NOT assumed.
+        #   * split: the S→X cross block is fully connected (all X may attend
+        #     any S) and the X→X self block is off-diagonal (no self-loops).
         # ------------------------------------------------------------------
-        self.register_buffer(
-            "combined_mask",
-            self._build_combined_mask(S_seq_len, X_seq_len),
-        )
-
-        # Split-mode sub-masks: the S→X cross block is fully connected
-        # (all X may attend any S) and the X→X self block is off-diagonal
-        # (no self-loops).
-        self.register_buffer(
-            "cross_mask", torch.ones(X_seq_len, S_seq_len)
-        )
-        self.register_buffer(
-            "self_mask", 1.0 - torch.eye(X_seq_len)
-        )
+        if self.homogeneous_nodes:
+            self.register_buffer(
+                "homogeneous_mask", 1.0 - torch.eye(self.N)
+            )
+        else:
+            self.register_buffer(
+                "cross_mask", torch.ones(X_seq_len, S_seq_len)
+            )
+            self.register_buffer(
+                "self_mask", 1.0 - torch.eye(X_seq_len)
+            )
 
 
         # ------------------------------------------------------------------
@@ -901,15 +966,26 @@ class AttentionSelectorLayer(nn.Module):
         # identity embedding, decoupling "X_i as child" (query) from "X_i as
         # parent" (key).  The X KEY stream is untouched (it keeps the orthogonal
         # or standard embedding).  The value stream is also UNCHANGED.
+        # In homogeneous mode S is ALSO a query (candidate child), so it gets its
+        # own free query table too.
         self.query_embed_X: Optional[FreeQueryEmbedding]
+        self.query_embed_S: Optional[FreeQueryEmbedding]
         if free_query_embedding:
             self.query_embed_X = FreeQueryEmbedding(
                 num_variables=X_seq_len,
                 d_model=d_model,
                 device=device,
             )
+            self.query_embed_S = (
+                FreeQueryEmbedding(
+                    num_variables=S_seq_len, d_model=d_model, device=device,
+                )
+                if self.homogeneous_nodes
+                else None
+            )
         else:
             self.query_embed_X = None
+            self.query_embed_S = None
 
         # ------------------------------------------------------------------
         # Gain-stream embeddings (GatedCrossAttention, gain_stream_source="separate")
@@ -922,7 +998,9 @@ class AttentionSelectorLayer(nn.Module):
         # so the gradient router classifies them as RECONSTRUCTION parameters.
         # In "shared" mode the gain stream reuses the (frozen) structural inputs
         # and no separate tables are created.
+        # In homogeneous mode S is also a child, so it needs a gain QUERY table.
         self.gain_q_embed_X: Optional[FreeQueryEmbedding]
+        self.gain_q_embed_S: Optional[FreeQueryEmbedding]
         self.gain_k_embed_S: Optional[FreeQueryEmbedding]
         self.gain_k_embed_X: Optional[FreeQueryEmbedding]
         if self.is_gated and self.gain_stream_source == "separate":
@@ -935,8 +1013,16 @@ class AttentionSelectorLayer(nn.Module):
             self.gain_k_embed_X = FreeQueryEmbedding(
                 num_variables=X_seq_len, d_model=d_model, device=device,
             )
+            self.gain_q_embed_S = (
+                FreeQueryEmbedding(
+                    num_variables=S_seq_len, d_model=d_model, device=device,
+                )
+                if self.homogeneous_nodes
+                else None
+            )
         else:
             self.gain_q_embed_X = None
+            self.gain_q_embed_S = None
             self.gain_k_embed_S = None
             self.gain_k_embed_X = None
 
@@ -966,12 +1052,22 @@ class AttentionSelectorLayer(nn.Module):
         # code is enough.  Name ("val_q_id_") keeps it in the RECONSTRUCTION
         # group; "struct_detached" reuses the detached X identity (0 params).
         self.val_q_id_embed_X: Optional[FreeQueryEmbedding]
+        self.val_q_id_embed_S: Optional[FreeQueryEmbedding]
         if self.value_structure_query_injection == "separate":
             self.val_q_id_embed_X = FreeQueryEmbedding(
                 num_variables=X_seq_len, d_model=d_model, device=device,
             )
+            # Homogeneous mode: S nodes are queries (children) too.
+            self.val_q_id_embed_S = (
+                FreeQueryEmbedding(
+                    num_variables=S_seq_len, d_model=d_model, device=device,
+                )
+                if self.homogeneous_nodes
+                else None
+            )
         else:
             self.val_q_id_embed_X = None
+            self.val_q_id_embed_S = None
 
 
         # ------------------------------------------------------------------
@@ -989,22 +1085,6 @@ class AttentionSelectorLayer(nn.Module):
             dropout=output_mlp_dropout,
             bias=(output_mlp_layers > 1),
         )
-
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_combined_mask(S_seq_len: int, X_seq_len: int) -> torch.Tensor:
-        """Build the static (L_X, L_S + L_X) combined hard mask.
-
-        S-block  (L_X × L_S):  all ones  — X_i may attend to any S_j.
-        X-block  (L_X × L_X):  off-diagonal ones — X_i may attend to X_j ≠ X_i.
-        The diagonal of the X-block is zeroed to prevent self-loops.
-        """
-        s_part = torch.ones(X_seq_len, S_seq_len)
-        x_part = 1.0 - torch.eye(X_seq_len)   # 0 on diagonal, 1 elsewhere
-        return torch.cat([s_part, x_part], dim=1)  # (L_X, L_S + L_X)
 
     # ------------------------------------------------------------------
     # Query centroid initialisation
@@ -1094,9 +1174,15 @@ class AttentionSelectorLayer(nn.Module):
         e = self._query_embedding_for_target(query_proj, centroid)    # (d_model,)
 
         # ---- Write the SAME vector into every real query row (row 0 = pad) -
-        w = self.query_embed_X.embedding.weight
-        e = e.to(dtype=w.dtype, device=w.device)
-        w[1:].copy_(e.unsqueeze(0).expand(w.shape[0] - 1, -1))
+        # In homogeneous mode the S query table is written with the SAME vector,
+        # so every node (S and X) starts from the identical point.
+        tables = [self.query_embed_X]
+        if self.query_embed_S is not None:
+            tables.append(self.query_embed_S)
+        for table in tables:
+            w = table.embedding.weight
+            e_w = e.to(dtype=w.dtype, device=w.device)
+            w[1:].copy_(e_w.unsqueeze(0).expand(w.shape[0] - 1, -1))
 
     # ------------------------------------------------------------------
     # Forward
@@ -1147,6 +1233,7 @@ class AttentionSelectorLayer(nn.Module):
         x_actual: torch.Tensor,
         oracle: bool = False,
         oracle_combined_mask: Optional[torch.Tensor] = None,
+        s_blanked: Optional[torch.Tensor] = None,
     ):
         """
         Full forward pass with separate blanked (query) and actual (key) X.
@@ -1208,6 +1295,17 @@ class AttentionSelectorLayer(nn.Module):
         # must NOT be discarded.
         xq_struct, xq_val = _emb_drop(self.embedding_X(X=x_blanked))
 
+        # ---- Homogeneous mode: S is ALSO a query (candidate child) --------
+        sq_struct = None
+        sq_val = None
+        if self.homogeneous_nodes:
+            if s_blanked is None:
+                raise ValueError(
+                    "homogeneous_nodes=True requires s_blanked (S with the "
+                    "value column zeroed) so S can act as a query."
+                )
+            sq_struct, sq_val = _emb_drop(self.embedding_S(X=s_blanked))
+
         # ---- Orthogonal structural stream override -----------------------
         # When struct_embedding_type selects an orthogonal scheme
         # ("orthogonal_learnable" or "orthogonal_fixed"), replace the structural
@@ -1220,6 +1318,8 @@ class AttentionSelectorLayer(nn.Module):
             s_struct  = self.dropout_emb(self.orth_embed_S(source_tensor))
             xk_struct = self.dropout_emb(self.orth_embed_X(x_actual))
             xq_struct = self.dropout_emb(self.orth_embed_X(x_blanked))
+            if self.homogeneous_nodes:
+                sq_struct = self.dropout_emb(self.orth_embed_S(s_blanked))
 
         # ---- Free query embedding override (X QUERY stream only) ---------
         # When free_query_embedding=True, the X query uses its OWN learnable
@@ -1229,6 +1329,9 @@ class AttentionSelectorLayer(nn.Module):
         if self.free_query_embedding:
             assert self.query_embed_X is not None
             xq_struct = self.dropout_emb(self.query_embed_X(x_blanked))
+            if self.homogeneous_nodes:
+                assert self.query_embed_S is not None
+                sq_struct = self.dropout_emb(self.query_embed_S(s_blanked))
 
         # Q/K always use the structural embedding; V uses value embedding if SVFA.
         sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L_S+L_X, d)
@@ -1237,20 +1340,6 @@ class AttentionSelectorLayer(nn.Module):
         else:
             sx_vals = sx_keys                                # summation: K = V
         x_q_emb = xq_struct                                 # query tensor
-
-        # ---- Single cross-attention --------------------------------------
-        # Q: X_blanked struct  (B, L_X,       d)
-        # K: [S, X_actual] struct (B, L_S+L_X, d)
-        # V: [S, X_actual] val    (B, L_S+L_X, d)   (same as K in summation mode)
-        #
-        # hard_mask selection:
-        #   oracle=True  + oracle_combined_mask provided → GT DAG combined mask
-        #   oracle=True  + no oracle_combined_mask       → structural mask (fallback)
-        #   oracle=False                                 → structural mask (learned att)
-        if oracle and oracle_combined_mask is not None:
-            hard_mask = oracle_combined_mask
-        else:
-            hard_mask = self.combined_mask
 
         # ---- Reconstruction-gain stream (GatedCrossAttention only) -------
         # Build the gain query/key identity signals.  In "separate" mode they
@@ -1270,6 +1359,11 @@ class AttentionSelectorLayer(nn.Module):
             gk_S = self.dropout_emb(self.gain_k_embed_S(source_tensor))
             gk_X = self.dropout_emb(self.gain_k_embed_X(x_actual))
             gain_key = torch.cat([gk_S, gk_X], dim=1)       # (B, L_S+L_X, d)
+            if self.homogeneous_nodes:
+                # S is a child too: prepend its gain query identity.
+                assert self.gain_q_embed_S is not None
+                gq_S = self.dropout_emb(self.gain_q_embed_S(s_blanked))
+                gain_query = torch.cat([gq_S, gain_query], dim=1)
 
         # ---- Value-structure injection identity codes -------------------
         # Per-SOURCE-node identity concatenated onto the value stream before
@@ -1303,17 +1397,58 @@ class AttentionSelectorLayer(nn.Module):
             else:  # "struct_detached": reuse the X identity, detached.
                 vsq_X = xk_struct.detach()
 
+        # Homogeneous mode: the query-identity code covers ALL N children.
+        vsq_all = vsq_X
+        if self.homogeneous_nodes and self.inject_value_structure_query:
+            if self.value_structure_query_injection == "separate":
+                assert self.val_q_id_embed_S is not None
+                vsq_S = self.dropout_emb(self.val_q_id_embed_S(s_blanked))
+            else:  # "struct_detached"
+                vsq_S = s_struct.detach()
+            vsq_all = torch.cat([vsq_S, vsq_X], dim=1)      # (B, N, d)
 
-        if self.split_xx:
+        if self.homogeneous_nodes:
+            # ==============================================================
+            # HOMOGENEOUS MODE — ONE square (N, N) self-attention block.
+            # Q: [S_blanked, X_blanked] struct   (B, N, d)
+            # K: [S_actual,  X_actual ] struct   (B, N, d)
+            # V: [S_actual,  X_actual ] val      (B, N, d)  (= K in summation)
+            # The whole datastream is passed to the attention and the regression
+            # reconstructs the S variables too — no S→X direction is assumed.
+            # ==============================================================
+            all_q_emb = torch.cat([sq_struct, x_q_emb], dim=1)   # (B, N, d)
+            if oracle and oracle_combined_mask is not None:
+                hard_mask = oracle_combined_mask                  # (N, N) GT DAG
+            else:
+                hard_mask = self.homogeneous_mask
+            attn_out, attention_weights, _aux = self.attention(
+                query=all_q_emb,
+                key=sx_keys,
+                value=sx_vals,
+                mask_miss_k=None,
+                mask_miss_q=None,
+                pos=None,
+                causal_mask=False,
+                hard_mask=hard_mask,
+                oracle=oracle,
+                gain_query=gain_query,
+                gain_key=gain_key,
+                value_structure=vsi_SX,
+                value_structure_query=vsq_all,
+            )
+        else:
 
             # ==============================================================
             # SPLIT MODE — S→X cross block + direction-aware X→X self block.
             # ==============================================================
-            if oracle:
-                raise NotImplementedError(
-                    "oracle mode is not implemented for the split "
-                    "(self_attention_type) X→X path yet."
-                )
+            # Oracle: slice the GT (L_X, L_S+L_X) combined mask into the two
+            # per-block hard masks so each block receives its own GT adjacency.
+            if oracle and oracle_combined_mask is not None:
+                cross_hard = oracle_combined_mask[:, : self.S_seq_len]
+                self_hard = oracle_combined_mask[:, self.S_seq_len :]
+            else:
+                cross_hard = self.cross_mask
+                self_hard = self.self_mask
 
             # ---- S→X cross block (keys/values = S only) -----------------
             out_sx, attn_sx, aux_sx = self.attention(
@@ -1324,8 +1459,8 @@ class AttentionSelectorLayer(nn.Module):
                 mask_miss_q=None,
                 pos=None,
                 causal_mask=False,
-                hard_mask=self.cross_mask,
-                oracle=False,
+                hard_mask=cross_hard,
+                oracle=oracle,
                 gain_query=gain_query,
                 gain_key=gk_S,
                 value_structure=vsi_S,
@@ -1409,8 +1544,8 @@ class AttentionSelectorLayer(nn.Module):
                 mask_miss_q=None,
                 pos=None,
                 causal_mask=False,
-                hard_mask=self.self_mask,
-                oracle=False,
+                hard_mask=self_hard,
+                oracle=oracle,
                 gain_query=self_gain_q,
                 gain_key=self_gain_k,
                 value_structure=vsi_X,
@@ -1443,23 +1578,6 @@ class AttentionSelectorLayer(nn.Module):
                 "entropy": _combine(ent_sx, ent_xx),
                 "l0_penalty": _combine(l0_sx, l0_xx),
             }
-        else:
-            attn_out, attention_weights, _aux = self.attention(
-                query=x_q_emb,
-                key=sx_keys,
-                value=sx_vals,
-                mask_miss_k=None,
-                mask_miss_q=None,
-                pos=None,
-                causal_mask=False,
-                hard_mask=hard_mask,
-                oracle=oracle,
-                gain_query=gain_query,
-                gain_key=gain_key,
-                value_structure=vsi_SX,
-                value_structure_query=vsq_X,
-            )
-
 
 
         # ---- Residual + Norm 1 -------------------------------------------
@@ -1467,15 +1585,27 @@ class AttentionSelectorLayer(nn.Module):
         # must go to the VALUE stream only.  The structure stream (x_struct =
         # xq_struct) passes through UNCHANGED — no residual is applied to it.
         # Standard (summation) mode: single fused stream (original behaviour).
+        # In homogeneous mode the residual stream spans ALL N query nodes, so
+        # the S rows are reconstructed alongside the X rows.
         is_svfa = xq_val is not None
         if is_svfa:
             # Value stream: accumulate the attention output.
             # Structure stream: unchanged (xq_struct is held implicitly; it is
             # not modified here and is not passed to the FFN or forecaster,
             # preserving the separation of the two signals).
-            x = self.norm1(xq_val + self.dropout_attn_out(attn_out))
+            q_val_stream = (
+                torch.cat([sq_val, xq_val], dim=1)
+                if self.homogeneous_nodes
+                else xq_val
+            )
+            x = self.norm1(q_val_stream + self.dropout_attn_out(attn_out))
         else:
-            x = self.norm1(x_q_emb + self.dropout_attn_out(attn_out))
+            q_struct_stream = (
+                torch.cat([sq_struct, x_q_emb], dim=1)
+                if self.homogeneous_nodes
+                else x_q_emb
+            )
+            x = self.norm1(q_struct_stream + self.dropout_attn_out(attn_out))
 
         # ---- FFN (value stream in SVFA, single stream in standard) -------
         x_ff = self.dropout_ff(self._act_fn(self.linear1(x)))
@@ -1502,16 +1632,61 @@ class AttentionSelectorLayer(nn.Module):
         self, attention_weights: torch.Tensor
     ):
         """
-        Split the combined (B, L_X, L_S+L_X) attention matrix.
+        Split the attention matrix into the canonical S→X / X→X DAG blocks.
+
+        Shape-aware, so the same call works in both modes:
+
+        * split mode ``(B, L_X, L_S+L_X)`` → columns are cut at ``L_S``.
+        * homogeneous mode ``(B, N, N)``   → the X child ROWS are selected
+          first, then the S / X parent columns, i.e. ``A[:, L_S:, :L_S]`` and
+          ``A[:, L_S:, L_S:]``.  The extra ``X→S`` / ``S→S`` blocks (which only
+          exist in homogeneous mode) are available via
+          :meth:`split_attention_blocks`.
 
         Returns:
             att_sx: (B, L_X, L_S)  — S→X sub-matrix (learned S→X edges).
             att_xx: (B, L_X, L_X)  — X→X sub-matrix (learned X→X edges,
                                        diagonal = 0 by construction).
         """
+        if self.homogeneous_nodes:
+            rows = attention_weights[:, self.S_seq_len :, :]
+            return rows[:, :, : self.S_seq_len], rows[:, :, self.S_seq_len :]
         att_sx = attention_weights[:, :, : self.S_seq_len]
         att_xx = attention_weights[:, :, self.S_seq_len :]
         return att_sx, att_xx
+
+    def split_attention_blocks(self, attention_weights: torch.Tensor) -> dict:
+        """
+        Split a ``(.., N, N)`` homogeneous posterior into all four blocks, using
+        the convention that entry ``[i, j]`` is the edge ``j -> i``.
+
+        Returns dict with ``"s_to_x"``, ``"x_to_x"``, ``"x_to_s"``, ``"s_to_s"``.
+        In split mode only ``"s_to_x"`` / ``"x_to_x"`` exist (the S rows are not
+        modelled), so the other two keys are ``None``.
+        """
+        S = self.S_seq_len
+        if not self.homogeneous_nodes:
+            att_sx, att_xx = self.split_attention(attention_weights)
+            return {
+                "s_to_x": att_sx,
+                "x_to_x": att_xx,
+                "x_to_s": None,
+                "s_to_s": None,
+            }
+        return {
+            "s_to_x": attention_weights[..., S:, :S],
+            "x_to_x": attention_weights[..., S:, S:],
+            "x_to_s": attention_weights[..., :S, S:],
+            "s_to_s": attention_weights[..., :S, :S],
+        }
+
+    def source_scores(self, attention_weights: torch.Tensor) -> torch.Tensor:
+        """
+        Per-node incoming-edge mass (sum over the parent axis).  A LOW value
+        means the node has (almost) no parents and is therefore likely a SOURCE.
+        Only informative in homogeneous mode, where S nodes are queries too.
+        """
+        return attention_weights.sum(dim=-1)
 
     # ------------------------------------------------------------------
     # Unified score tensor for sparsity / NOTEARS regularisers

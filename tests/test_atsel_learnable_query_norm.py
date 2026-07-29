@@ -220,7 +220,10 @@ def _summation_embed_cfg(vocab: int, d_model: int = D_MODEL) -> dict:
     }
 
 
-def _make_model(self_attention_type=None, shared_query=False) -> AttentionSelectorLayer:
+def _make_model(
+    self_attention_type="GatedSelfAttention", shared_query=False
+) -> AttentionSelectorLayer:
+
     return AttentionSelectorLayer(
         model="test_learnable_qnorm",
         ds_embed_S=_summation_embed_cfg(VOCAB_S),

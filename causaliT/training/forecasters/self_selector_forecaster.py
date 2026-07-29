@@ -1,6 +1,27 @@
 """
 SelfSelectorForecaster: PyTorch Lightning wrapper for SelfSelectorLayer.
 
+.. deprecated::
+    **Use ``AttentionSelectorForecaster`` with
+    ``model.kwargs.homogeneous_nodes: true`` instead.**
+
+    ``AttentionSelectorLayer`` now implements the identical homogeneous N-node
+    topology (one square ``(N, N)`` block over ``[S ; X]``, every node both a
+    value-blanked query and an actual-value key/value), and
+    ``AttentionSelectorForecaster`` carries the full wiring for it: the
+    ``(B, N)`` target, the square ``(N, N)`` oracle mask, NOTEARS on the full
+    matrix, gradient routing of the S-side query table, the shape-aware eval DAG
+    query and the ANM staged trainer.  That path is the one under regression
+    test (``tests/test_atsel_homogeneous.py``).
+
+    Migration: point ``model.model_object`` at ``AttentionSelectorLayer``, set
+    ``homogeneous_nodes: true`` and ``self_attention_type: GatedSelfAttention``,
+    split the single ``ds_embed`` / ``comps_embed`` into the
+    ``ds_embed_S`` / ``ds_embed_X`` (+ ``comps_embed_S`` / ``comps_embed_X``)
+    pair — no id re-indexing needed, since each side keeps its own table — and
+    leave ``shared_query`` / ``shared_key`` false (homogeneous mode rejects
+    them).  This module is kept only for backward compatibility.
+
 Research objective
 ==================
 Test whether a single direction-aware self-attention block can recover the WHOLE
@@ -64,7 +85,13 @@ logger = logging.getLogger(__name__)
 
 
 class SelfSelectorForecaster(pl.LightningModule):
-    """Lightning wrapper for SelfSelectorLayer (homogeneous whole-graph discovery)."""
+    """Lightning wrapper for SelfSelectorLayer (homogeneous whole-graph discovery).
+
+    .. deprecated:: Use ``AttentionSelectorForecaster`` with
+        ``model.kwargs.homogeneous_nodes=True`` (see the module docstring for the
+        migration recipe).  Constructing this class emits a
+        ``DeprecationWarning`` via the underlying ``SelfSelectorLayer``.
+    """
 
     def __init__(self, config: dict, data_dir: str = None):
         super().__init__()

@@ -1,6 +1,33 @@
 """
 SelfSelectorLayer: whole-graph causal discovery via direction-aware self-attention.
 
+.. deprecated::
+    **Use ``AttentionSelectorLayer(homogeneous_nodes=True)`` instead.**
+
+    ``AttentionSelectorLayer`` has been harmonized with this layer and now
+    implements the very same homogeneous N-node topology behind the
+    ``homogeneous_nodes=True`` switch: ONE square ``(N, N)`` block over
+    ``[S ; X]`` built from ``self_attention_type``, a value-blanked query AND an
+    actual-value key/value for EVERY node, ``homogeneous_mask = 1 - eye(N)``, and
+    the same ``split_attention`` / ``split_attention_blocks`` / ``source_scores``
+    helpers.
+
+    The ONLY remaining difference is embedding bookkeeping: this layer uses a
+    single shared ``ModularEmbedding`` over a unified variable-id namespace, while
+    ``AttentionSelectorLayer`` keeps two instances (``embedding_S`` /
+    ``embedding_X``).  They are mathematically equivalent (in particular for the
+    orthogonal structural schemes, whose frames are per-node anyway), and the
+    two-table variant additionally saves the caller from re-indexing the X ids by
+    ``L_S``.
+
+    Everything needed for homogeneous mode is wired and tested against
+    ``AttentionSelectorLayer`` — gradient routing (``query_embed_S`` included),
+    score sparsity, freezing, the square ``(N, N)`` oracle mask, NOTEARS on the
+    full matrix, the eval DAG query and the ANM staged trainer — so NEW work
+    should target that class (``tests/test_atsel_homogeneous.py``).  This module
+    is kept only so existing configs/checkpoints keep loading; it emits a
+    ``DeprecationWarning`` on construction and receives no new features.
+
 Motivation
 ==========
 ``AttentionSelectorLayer`` assumes a KNOWN set of source nodes S: it hard-codes
@@ -46,6 +73,8 @@ Evaluation
 * :meth:`source_scores` returns the per-node incoming-edge mass (row sum); a low
   value means the node is likely a source.
 """
+
+import warnings
 
 import torch
 import torch.nn as nn
@@ -198,7 +227,21 @@ class SelfSelectorLayer(nn.Module):
     ):
         super().__init__()
 
-
+        # Deprecated in favour of the harmonized
+        # AttentionSelectorLayer(homogeneous_nodes=True), which implements the
+        # identical topology and is the variant wired end-to-end through
+        # training / evaluation.  Kept functional for backward compatibility.
+        warnings.warn(
+            "SelfSelectorLayer is deprecated: use "
+            "AttentionSelectorLayer(homogeneous_nodes=True, "
+            "self_attention_type='GatedSelfAttention', ...) instead.  It "
+            "implements the same homogeneous N-node topology and is the variant "
+            "wired end-to-end (gradient routing, square oracle mask, NOTEARS on "
+            "the full matrix, eval DAG query).  This class is kept only for "
+            "backward compatibility and receives no new features.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         self.model_name = model
         self.d_model = d_model

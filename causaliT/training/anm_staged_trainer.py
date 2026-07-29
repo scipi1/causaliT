@@ -310,8 +310,25 @@ def _compute_score_margin(
                 scores_np = combined_score_t.detach().cpu().numpy()
                 S_seq_len = getattr(inner_model, "S_seq_len", None)
                 if S_seq_len is not None and scores_np.ndim == 2:
+                    # ------------------------------------------------------
+                    # Shape-aware row selection.
+                    #   * split mode        -> (L_X, L_S+L_X): rows are already
+                    #     the X children, slice the columns directly.
+                    #   * homogeneous_nodes -> (N, N) with N = L_S+L_X: EVERY
+                    #     node is a child, so first keep the X child rows
+                    #     ``[S_seq_len:, :]`` and only then split the columns,
+                    #     which restores the (L_X, L_S+L_X) layout below.
+                    # ------------------------------------------------------
+                    X_seq_len = getattr(inner_model, "X_seq_len", None)
+                    if (
+                        X_seq_len is not None
+                        and scores_np.shape[0] == scores_np.shape[1] == S_seq_len + X_seq_len
+                    ):
+                        scores_np = scores_np[S_seq_len:, :]      # (L_X, N)
+
                     cross_scores_np = scores_np[:, :S_seq_len]    # (L_X, L_S)
                     self_scores_np  = scores_np[:, S_seq_len:]    # (L_X, L_X)
+
 
                     # --- S→X (cross) margin ---
                     true_cross = _load_true_dag_mask(

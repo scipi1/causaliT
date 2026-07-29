@@ -102,6 +102,9 @@ def _make_model(
         comps_embed_S="summation",
         comps_embed_X="summation",
         attention_type="ScaledDotProduct",
+        # MANDATORY since the legacy cross-only variant was removed.
+        self_attention_type="GatedSelfAttention",
+
         n_heads=1,
         dropout_emb=0.0,
         dropout_attn_out=0.0,

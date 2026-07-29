@@ -80,6 +80,7 @@ def _make_model(
     key_projection_type: str = "linear",
     free_query_embedding: bool = False,
     d_qk: int = D_QK,
+    homogeneous_nodes: bool = False,
 ) -> AttentionSelectorLayer:
     return AttentionSelectorLayer(
         model="test_model",
@@ -88,6 +89,9 @@ def _make_model(
         comps_embed_S="summation",
         comps_embed_X="summation",
         attention_type="ScaledDotProduct",
+        # MANDATORY since the legacy cross-only variant was removed.
+        self_attention_type="GatedSelfAttention",
+
         n_heads=1,
         dropout_emb=0.0,
         dropout_attn_out=0.0,
@@ -107,6 +111,7 @@ def _make_model(
         struct_embedding_type=struct_embedding_type,
         key_projection_type=key_projection_type,
         free_query_embedding=free_query_embedding,
+        homogeneous_nodes=homogeneous_nodes,
     )
 
 
@@ -226,6 +231,62 @@ class TestPhaseFreezingConsistency:
         for n, p in m.named_parameters():
             if n.startswith("orth_embed_S") or n.startswith("orth_embed_X"):
                 assert id(p) in struct_ids
+
+
+# ---------------------------------------------------------------------------
+# Free query embeddings: the router keys on the ``query_embed`` PREFIX, so the
+# S-side table introduced by ``homogeneous_nodes=True`` (where S nodes are
+# children too) must be routed STRUCTURAL exactly like the X-side one.  Keying
+# on the old exact name ``query_embed_X`` would have silently dropped
+# ``query_embed_S`` into the reconstruction group.
+# ---------------------------------------------------------------------------
+
+
+class TestFreeQueryEmbeddingRouting:
+    def test_query_embed_x_is_structural_in_split_mode(self):
+        m = _make_model("standard_learnable", free_query_embedding=True)
+        struct_names, recon_names = _named_groups(m)
+
+        assert any(n.startswith("query_embed_X") for n in struct_names)
+        assert not any(n.startswith("query_embed") for n in recon_names)
+
+    def test_both_query_tables_are_structural_in_homogeneous_mode(self):
+        m = _make_model(
+            "standard_learnable",
+            free_query_embedding=True,
+            homogeneous_nodes=True,
+        )
+        assert m.query_embed_S is not None, (
+            "homogeneous_nodes must build an S-side query table (S is a child)."
+        )
+        struct_names, recon_names = _named_groups(m)
+
+        query_names = {
+            n for n in (struct_names | recon_names) if n.startswith("query_embed")
+        }
+        assert any(n.startswith("query_embed_S") for n in query_names)
+        assert any(n.startswith("query_embed_X") for n in query_names)
+        assert query_names <= struct_names, (
+            "All query_embed_* params must be STRUCTURAL; these were not: "
+            f"{query_names - struct_names}"
+        )
+        assert not (query_names & recon_names), (
+            f"query_embed_* leaked into RECONSTRUCTION: {query_names & recon_names}"
+        )
+
+    def test_query_embed_s_survives_the_structure_phase(self):
+        """Freezing the reconstruction group must not freeze the S query table."""
+        m = _make_model(
+            "standard_learnable",
+            free_query_embedding=True,
+            homogeneous_nodes=True,
+        )
+        _, recon_params = classify_parameters(m)
+        for p in recon_params:
+            p.requires_grad_(False)
+
+        assert m.query_embed_S.embedding.weight.requires_grad
+        assert m.query_embed_X.embedding.weight.requires_grad
 
 
 if __name__ == "__main__":

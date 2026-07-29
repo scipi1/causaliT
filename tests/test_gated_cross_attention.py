@@ -334,6 +334,9 @@ def _make_gated_model(
         comps_embed_S="summation",
         comps_embed_X="svfa",
         attention_type="GatedCrossAttention",
+        # MANDATORY since the legacy cross-only variant was removed.
+        self_attention_type="GatedSelfAttention",
+
         n_heads=1,
         dropout_emb=0.0,
         dropout_attn_out=0.0,

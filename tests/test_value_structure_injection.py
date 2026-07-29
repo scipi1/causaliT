@@ -149,6 +149,10 @@ def _make_atsel(
         comps_embed_S="svfa" if comps_embed_X == "svfa" else "summation",
         comps_embed_X=comps_embed_X,
         attention_type=attention_type,
+        # MANDATORY since the legacy cross-only variant was removed: the X→X
+        # posterior now always comes from a dedicated direction-aware block.
+        self_attention_type="GatedSelfAttention",
+
         n_heads=1,
         dropout_emb=0.0,
         dropout_attn_out=0.0,

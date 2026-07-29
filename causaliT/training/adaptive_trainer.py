@@ -65,6 +65,10 @@ Example ``config['adaptive_training']`` block::
       eval_dag: true                   # capture DAG diagnostics at each switch
       data_split_ratio: null           # cross-fit: fraction of train samples for
                                        # the reconstruct phase (null = off)
+      run_final_evaluations: true      # run the standard post-training evaluation
+                                       # suite on <save_dir> once the fit ends
+                                       # (the functions themselves are selected by
+                                       # the top-level ``evaluation.functions``)
 
       reconstruct:
         max_epochs: 100                # per-phase safety cap
@@ -92,6 +96,7 @@ Example ``config['adaptive_training']`` block::
 
 
 import copy
+import glob
 import json
 import logging
 from collections import defaultdict
@@ -102,8 +107,11 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
+from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import Callback
+
+from causaliT.training.callbacks import KFoldResultsTracker
 
 # Reuse plain-container coercion, score-margin helper, cross-fit partitioner and
 # JSON serializer from the rigid trainer so the two trainers stay consistent.
@@ -149,7 +157,7 @@ class PhaseController(Callback):
         config:          Full configuration dict (``adaptive_training`` block read).
         data_dir:        Root data directory (for DAG diagnostics).
         save_dir:        Parent save directory (transition checkpoints go under
-                         ``<save_dir>/adaptive/``).
+                         ``<save_dir>/stage_checkpoints/``).
         cluster:         Suppress console prints when True.
         dm:              Data module to swap training subsets on (cross-fitting).
                          ``None`` disables cross-fitting.
@@ -246,7 +254,7 @@ class PhaseController(Callback):
         self.model_obj: str = config.get("model", {}).get("model_object", "")
 
         # Output dir for transition checkpoints
-        self.out_dir = Path(save_dir) / "adaptive"
+        self.out_dir = Path(save_dir) / "stage_checkpoints"
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Runtime state ---
@@ -623,6 +631,69 @@ class PhaseController(Callback):
 
 
 # =============================================================================
+# OUTPUT-LAYOUT HELPERS (evaluation-suite compatibility)
+# =============================================================================
+
+def _save_config_snapshot(config: dict, save_dir: str) -> Optional[str]:
+    """
+    Persist the *resolved* run config as ``<save_dir>/config.yaml``.
+
+    The evaluation suite (``eval_attention_scores`` / ``eval_interventions``)
+    locates the experiment config by globbing ``config*.yaml`` in the experiment
+    root and taking the first hit.  A run launched through the CLI already has a
+    hand-written ``config_*.yaml`` there; the sweeper writes ``config.yaml``
+    before training.  In both cases a file exists and we must NOT add a second
+    candidate (it would make the "first hit" ambiguous), so this is a no-op then.
+
+    When nothing is present (e.g. ``save_dir`` is a fresh scratch directory), we
+    write the *resolved* config — sequence lengths populated from the dataset,
+    ``k_fold=1`` and the adaptive epoch budget applied — so the run is
+    self-describing for offline evaluation.  Mirrors
+    ``anm_staged_trainer._save_stage_config``.
+
+    Returns the path written, or ``None`` when a config was already present.
+    """
+    existing = glob.glob(str(Path(save_dir) / "config*.yaml"))
+    if existing:
+        return None
+
+    config_path = Path(save_dir) / "config.yaml"
+    try:
+        cfg = OmegaConf.create(_to_plain_container(config))
+        OmegaConf.save(config=cfg, f=str(config_path), resolve=True)
+    except Exception as exc:
+        logger.warning(
+            "adaptive_trainer: failed to write config snapshot to %s: %s",
+            config_path, exc,
+        )
+        return None
+    return str(config_path)
+
+
+def _write_kfold_summary(save_dir: str, fold_metrics: dict) -> None:
+    """
+    Write ``<save_dir>/kfold_summary.json`` for the single adaptive fold.
+
+    The default evaluation suite maintains this file
+    (``fix_kfold_summary`` / ``enrich_kfold_summary``) and the experiments
+    manifest reads its aggregated statistics.  ``trainer()`` produces it via
+    ``KFoldResultsTracker``; the adaptive run does the same for its one fold so
+    both trainers leave an identical artefact set behind.
+
+    ``fold_metrics`` is copied before the private ``_best_checkpoint_path`` key
+    is popped, so the caller's dict (used for the adaptive summary JSON) is left
+    untouched.
+    """
+    metrics = dict(fold_metrics)
+    best_ckpt_path = metrics.pop("_best_checkpoint_path", None)
+    try:
+        tracker = KFoldResultsTracker(str(save_dir), k_folds=1)
+        tracker.add_fold_result(0, metrics, best_ckpt_path)
+    except Exception as exc:
+        logger.warning("adaptive_trainer: failed to write kfold_summary.json: %s", exc)
+
+
+# =============================================================================
 # MAIN ORCHESTRATOR
 # =============================================================================
 
@@ -645,9 +716,10 @@ def adaptive_trainer(
         config:          Full configuration dict (``adaptive_training`` required,
                          ``training.use_gradient_routing`` must be True).
         data_dir:        Root data directory.
-        save_dir:        Parent save directory.  Training output goes under
-                         ``<save_dir>/adaptive_run/`` and transition checkpoints
-                         under ``<save_dir>/adaptive/``.
+        save_dir:        Parent save directory.  Training output goes directly
+                         under ``<save_dir>/k_0/`` (same layout as ``trainer()``)
+                         and phase-transition checkpoints under
+                         ``<save_dir>/stage_checkpoints/``.
         cluster:         Suppress progress bar / use 1-GPU mode.
         experiment_tag:  Passed to ``train_single_fold`` for the run manifest.
         debug:           Enable anomaly detection, memory logger, etc.
@@ -662,6 +734,7 @@ def adaptive_trainer(
         _make_fold_splits,
         create_model_instance,
         train_single_fold,
+        _run_post_training_evaluations,
     )
     from causaliT.training.config_utils import populate_seq_lengths_from_dataset
 
@@ -704,8 +777,9 @@ def adaptive_trainer(
     if config["training"].get("save_ckpt_every_n_epochs") is None:
         config["training"]["save_ckpt_every_n_epochs"] = total_budget
 
-    run_dir = Path(save_dir) / "adaptive_run"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # Training output goes straight into save_dir (train_single_fold appends the
+    # ``k_{fold}`` subfolder), matching the layout produced by ``trainer()``.
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     # Optional warm-start (weights only)
     starting_ckpt: Optional[str] = _to_plain_container(
@@ -808,7 +882,7 @@ def adaptive_trainer(
         val_local_idx=val_local_idx,
         test_idx=test_idx,
         train_val_idx=train_val_idx,
-        save_dir=str(run_dir),
+        save_dir=str(save_dir),
         trainable_params=0,
         cluster=cluster,
         resume_ckpt=None,
@@ -819,6 +893,16 @@ def adaptive_trainer(
         extra_callbacks=[controller],
         reload_dataloaders_every_n_epochs=reload_every_n,
     )
+
+    # --- Evaluation-suite artefacts --------------------------------------------
+    # The default evaluation suite (causaliT/evaluation/eval_funs) expects the
+    # standard experiment layout: a ``config*.yaml`` in the experiment root, one
+    # ``k_*`` fold folder with checkpoints (produced by train_single_fold) and a
+    # ``kfold_summary.json`` it fixes/enriches.  Emit the two root-level files
+    # here so an adaptive run is indistinguishable from a ``trainer()`` run as
+    # far as evaluation is concerned.
+    _write_kfold_summary(save_dir, fold_metrics)
+    _save_config_snapshot(config, save_dir)
 
     # --- Summary JSON ---
     summary = {
@@ -852,6 +936,14 @@ def adaptive_trainer(
         print(f"  cycles      : {controller._cycle_count}")
         print(f"  summary     : {summary_path}")
         print("=" * 70)
+
+    # --- Post-training evaluations --------------------------------------------
+    # Same dispatcher (and same failure isolation) as ``trainer()``: WHICH
+    # functions run is controlled by ``config['evaluation']['functions']``;
+    # ``adaptive_training.run_final_evaluations: false`` skips the step entirely
+    # (useful for long sweeps that evaluate all arms in one later pass).
+    if bool(ad_cfg.get("run_final_evaluations", True)):
+        _run_post_training_evaluations(config, str(save_dir), data_dir)
 
     df = pd.DataFrame(controller.phase_rows)
     return df

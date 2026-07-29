@@ -3,17 +3,48 @@ AttentionSelectorForecaster: PyTorch Lightning wrapper for AttentionSelectorLaye
 
 Research objective
 ==================
-Test whether a single cross-attention block — with X queries (blanked) and
-[S_actual, X_actual] as keys/values — can recover causal parent sets from
-observational data when trained with MSE reconstruction + HSIC independence
-regularization + score sparsity.
+Test whether attention over value-blanked queries and actual-value keys/values
+can recover causal parent sets from observational data when trained with MSE
+reconstruction + HSIC independence regularization + score sparsity.
+
+Two node topologies (``model.kwargs.homogeneous_nodes``)
+=======================================================
+SPLIT mode (``homogeneous_nodes=False``, the default) keeps the **S/X prior**:
+S nodes are exogenous parents (keys/values only) and X nodes are the only
+children (queries).  Two attention blocks (S->X cross + X->X self) are
+re-concatenated by the layer into ONE posterior::
+
+    attention  (B, L_X, L_S + L_X)     pred / target  (B, L_X, .) / (B, L_X)
+      - columns 0 .. L_S-1   -> learned S->X edges
+      - columns L_S .. end   -> learned X->X edges (diagonal = 0 by mask)
+
+HOMOGENEOUS mode (``homogeneous_nodes=True``) DROPS that prior: ``[S ; X]`` is
+ONE set of ``N = L_S + L_X`` nodes and every node is simultaneously a
+value-blanked **query** (candidate child) and an actual-value **key/value**
+(candidate parent).  There is exactly ONE square block, built from
+``self_attention_type`` (the cross ``attention_type`` is IGNORED), hence::
+
+    attention  (B, N, N)               pred / target  (B, N, .) / (B, N)
+
+Everything below applies to both layouts; the mode-specific differences are:
+
+* ``forward`` builds ``s_blanked`` (S with its value column zeroed) and hands it
+  to ``model.forward_with_actual`` -- mandatory in homogeneous mode;
+* ``_step`` targets ``cat([S_values, X_values], dim=1)`` -> ``(B, N)`` instead of
+  the X values alone, so the MSE, the torchmetrics, the residuals and the ANM
+  diagnostics all follow the N-row layout;
+* the oracle mask is assembled as the square ``(N, N)`` GT adjacency (the S rows
+  are all-zero: by dataset convention nothing points into a source);
+* NOTEARS runs on the FULL square score tensor (see 3. below);
+* the HSIC candidate-parent set is the target itself (already all N nodes).
 
 Design differences from SingleCausalForecaster
 ===============================================
-1. **Single combined attention** (no separate cross/self blocks).
-   The attention matrix has shape (B, L_X, L_S + L_X):
-     - columns 0 .. L_S-1   → learned S→X edges
-     - columns L_S .. end   → learned X→X edges (diagonal = 0 by mask)
+1. **One combined posterior** -- see the two topologies above.  Downstream code
+   never sees two separate tensors: ``split_attention()`` (shape-aware) recovers
+   the canonical ``(L_X, L_S)`` / ``(L_X, L_X)`` DAG blocks in BOTH modes, and
+   ``split_attention_blocks()`` additionally exposes the X->S / S->S blocks that
+   exist only when S nodes are children too.
 
 2. **Unified HSIC over combined [S, X] source**.
    `source = cat([S_values, X_values], dim=1)` is passed to
@@ -21,18 +52,21 @@ Design differences from SingleCausalForecaster
    (i, j) pairs in one call.  No lambda weighting between S and X parts:
    the combined loss naturally penalizes dependence from any source.
 
-3. **NOTEARS acyclicity** (``training.kappa``) — applied to the **X→X
-   sub-block** of the combined score tensor (columns ``S_seq_len:``),
-   which is a square ``(L_X, L_X)`` directed edge matrix.  The S→X
-   block is bipartite and inherently acyclic, so no NOTEARS term is
-   added there.  With ``use_gradient_routing=True`` the NOTEARS penalty
-   rides on the structural pathway (same as HSIC), updating Q/K
-   projections and structural embeddings.
+3. **NOTEARS acyclicity** (``training.kappa``).  In SPLIT mode it is applied to
+   the **X->X sub-block** of the score tensor (columns ``S_seq_len:``), a square
+   ``(L_X, L_X)`` directed edge matrix; the S->X block is bipartite and
+   inherently acyclic, so no term is added there.  In HOMOGENEOUS mode the FULL
+   ``(N, N)`` score tensor already IS the square directed edge matrix over all
+   nodes -- and S->S / X->S cycles are now expressible -- so NOTEARS is applied
+   to it in full.  With ``use_gradient_routing=True`` the NOTEARS penalty rides
+   on the structural pathway (same as HSIC), updating Q/K projections and
+   structural embeddings.
 
 4. **Gradient routing** works unchanged: query_projection and key_projection
    are structural params; value_projection, out_projection, FFN, forecaster
    are reconstruction params.  The classify_parameters() function identifies
-   them by name without any modification.
+   them by name without any modification (it keys on the ``query_embed``
+   PREFIX, so the homogeneous S-side query table routes structural too).
 
 Logged metrics
 ==============
@@ -45,22 +79,34 @@ Logged metrics
                              (lambda_struct_recon * loss_x); 0 unless > 0.
 - train/val_group_l1       : Group-L1 embedding regularization
 
-- train/val_notears        : NOTEARS acyclicity penalty on X→X sub-block
+- train/val_notears        : NOTEARS acyclicity penalty (X->X sub-block in split
+                             mode, full (N, N) matrix in homogeneous mode)
 - train_interf_cos_<block> : (diagnostic) per-structural-block cosine
                              similarity between the L0 and HSIC gradients.
                              Only logged when the attention exposes a
-                             differentiable L0 gate — i.e.
+                             differentiable L0 gate -- i.e.
                              HardConcreteCrossAttention or GatedCrossAttention
-                             — and lambda_l0>0, lambda_hsic>0, and
+                             -- and lambda_l0>0, lambda_hsic>0, and
                              ``training.log_l0_hsic_interference=True``.
+                             In homogeneous mode the gate is read off
+                             ``self_attention_type`` (the type that actually
+                             builds the single block).
 
 
 Attention splitting for evaluation
 ====================================
-After training, use model.split_attention(A) to get:
-    att_sx  (B, L_X, L_S)  — S→X attention (compare to S→X ground truth)
-    att_xx  (B, L_X, L_X)  — X→X attention (compare to X→X ground truth)
+After training, use ``split_attention(A)`` (on the forecaster or on the layer)
+to get, in BOTH modes:
+    att_sx  (B, L_X, L_S)  -- S->X attention (compare to S->X ground truth)
+    att_xx  (B, L_X, L_X)  -- X->X attention (compare to X->X ground truth)
 Then threshold and compute SHD.
+
+For homogeneous-mode diagnostics the forecaster also forwards:
+    ``split_attention_blocks(A)`` -- all four blocks, including ``x_to_s`` and
+        ``s_to_s`` (``None`` in split mode, where S is never a child);
+    ``source_scores(A)``          -- per-node incoming-edge mass; LOW means the
+        node is likely a SOURCE, i.e. it RECOVERS the S/X partition that
+        homogeneous mode no longer assumes.
 """
 
 import json
@@ -131,6 +177,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         self.S_seq_len = config["data"]["S_seq_len"]
         self.X_seq_len = config["data"]["X_seq_len"]
+
+        # ------------------------------------------------------------------
+        # Node-topology mode (mirrors AttentionSelectorLayer).
+        #   False (default) → SPLIT: only the L_X variables are children; the
+        #       posterior is (B, L_X, L_S+L_X) and the target is the X values.
+        #   True            → HOMOGENEOUS: the S/X prior is dropped, all
+        #       N = L_S + L_X nodes are simultaneously blanked queries and
+        #       actual-value keys.  The posterior is the square (B, N, N)
+        #       directed adjacency and the target is cat([S_values, X_values]).
+        # ------------------------------------------------------------------
+        self.homogeneous_nodes = bool(
+            config["model"]["kwargs"].get("homogeneous_nodes", False)
+        )
+        self.N = self.S_seq_len + self.X_seq_len
+
 
         # Loss function
         if config["training"]["loss_fn"] == "mse":
@@ -227,7 +288,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.interference_log_every_n_epochs = int(
             config["training"].get("interference_log_every_n_epochs", 1)
         )
-        self._attention_type = config["model"]["kwargs"].get("attention_type", "")
+        # Effective attention type for the interference gate.  In homogeneous
+        # mode the cross ``attention_type`` is IGNORED by the architecture — the
+        # single square block is built from ``self_attention_type`` — so that is
+        # the type whose L0 gate the probe would see.
+        self._attention_type = (
+            config["model"]["kwargs"].get("self_attention_type", "")
+            if self.homogeneous_nodes
+            else config["model"]["kwargs"].get("attention_type", "")
+        )
         # Cached block → parameter-list mapping (built lazily on first use so
         # it reflects any requires_grad freezing applied in on_fit_start).
         self._interference_blocks: Optional[Dict[str, list]] = None
@@ -412,14 +481,27 @@ class AttentionSelectorForecaster(pl.LightningModule):
             )
             return
 
-        # Concatenate: [S→X part | X→X part] → (L_X, L_S + L_X)
-        combined = torch.cat([cross_mask, self_mask], dim=1)
+        if self.homogeneous_nodes:
+            # Homogeneous mode: the model expects the SQUARE (N, N) GT
+            # adjacency because every node is a child.  Rows 0..L_S-1 are the
+            # S children — sources have no parents in this dataset family, so
+            # those rows are all-zero — and rows L_S..N-1 carry the X children's
+            # parents as [dec_cross | dec_self].
+            combined = torch.zeros(self.N, self.N, dtype=cross_mask.dtype)
+            combined[self.S_seq_len :, : self.S_seq_len] = cross_mask
+            combined[self.S_seq_len :, self.S_seq_len :] = self_mask
+        else:
+            # Split mode: concatenate [S→X part | X→X part] → (L_X, L_S + L_X)
+            combined = torch.cat([cross_mask, self_mask], dim=1)
+
         self.register_buffer("oracle_combined_mask", combined)
         self._hard_masks_loaded = True
         print(
             f"✓ Oracle combined mask built: shape {combined.shape} "
-            f"(cross {cross_mask.shape} ‖ self {self_mask.shape})"
+            f"(cross {cross_mask.shape} ‖ self {self_mask.shape}"
+            f"{', homogeneous square layout' if self.homogeneous_nodes else ''})"
         )
+
 
     # ------------------------------------------------------------------
     # Forward
@@ -439,13 +521,25 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 The value column is blanked internally for the query path.
 
         Returns:
-            pred_x:            (B, L_X, 1) predictions.
-            attention_weights: (B, L_X, L_S + L_X) combined attention matrix.
+            pred_x:            (B, L_X, 1) predictions — (B, N, 1) when
+                               ``homogeneous_nodes=True`` (S nodes are children
+                               too and therefore reconstructed as well).
+            attention_weights: (B, L_X, L_S + L_X) combined attention matrix —
+                               square (B, N, N) when ``homogeneous_nodes=True``.
             entropy:           Attention entropy.
         """
         # Blank value column for the query path
         x_blanked = data_intermediate.clone()
         x_blanked[:, :, self.val_idx] = 0.0
+
+        # Homogeneous mode: the S nodes are queries as well, so they need their
+        # own value-blanked copy.  ``forward_with_actual`` raises ValueError if
+        # this is missing, and ignores it in split mode.
+        s_blanked = None
+        if self.homogeneous_nodes:
+            s_blanked = data_source.clone()
+            s_blanked[:, :, self.val_idx] = 0.0
+
 
         # Retrieve the GT oracle mask when hard masks are loaded and oracle is
         # active. Gating on apply_hard_masks mirrors SingleCausalForecaster:
@@ -464,6 +558,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             x_actual=data_intermediate,
             oracle=oracle,
             oracle_combined_mask=oracle_mask,
+            s_blanked=s_blanked,
         )
         # Note: forward_with_actual returns (pred_x, attention_weights, entropy, l0_penalty).
         # All four values are passed through so that _step can access l0_penalty.
@@ -478,6 +573,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         X = batch[1]
 
         x_val = X[:, :, self.val_idx]           # (B, L_X)  ground truth values
+
+        # Homogeneous mode: the model reconstructs ALL N nodes, so the target
+        # is cat([S_values, X_values]) → (B, N).  Everything downstream that
+        # consumes ``x_target`` / ``pred_x`` (MSE, metrics, HSIC residuals,
+        # ANM diagnostics) then operates on N rows automatically.
+        if self.homogeneous_nodes:
+            x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)   # (B, N)
 
         # Forward — returns (pred_x, attention_weights, aux_dict)
         pred_x, attention_weights, aux = self.forward(S, X)
@@ -523,11 +625,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # ----------------------------------------------------------------
         residuals = x_target.squeeze() - pred_x.squeeze()    # (B, L_X)
 
-        s_values = S[:, :, self.val_idx]          # (B, L_S)
-        x_values = x_target.squeeze()             # (B, L_X)
-
-        # Concatenate all potential parent values: [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
-        combined_source = torch.cat([s_values, x_values], dim=1)   # (B, L_S + L_X)
+        # Candidate-parent values must be paired with the residual of every
+        # child row.  In homogeneous mode ``x_target`` ALREADY is
+        # [S_values | X_values] (all N nodes), so it is the candidate set
+        # itself; in split mode the S values must be prepended.
+        if self.homogeneous_nodes:
+            combined_source = x_target.squeeze()                    # (B, N)
+        else:
+            s_values = S[:, :, self.val_idx]          # (B, L_S)
+            x_values = x_target.squeeze()             # (B, L_X)
+            # Concatenate all potential parent values:
+            # [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
+            combined_source = torch.cat([s_values, x_values], dim=1)  # (B, L_S+L_X)
 
         hsic_value = hsic_cross_per_pair(
             combined_source,
@@ -553,9 +662,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # The score tensor is 2-D (batch-mean, head-averaged) for single-head
         # CausalCrossAttention.  Multi-head tensors (dim != 2) are skipped.
         # ----------------------------------------------------------------
+        # In homogeneous mode the score tensor IS the square (N, N) directed
+        # adjacency over all nodes, so NOTEARS applies to the FULL matrix (the
+        # column slice would be a meaningless sub-block there).
         if self.kappa > 0.0 and score_tensor is not None and score_tensor.dim() == 2:
-            A_xx = score_tensor[:, self.S_seq_len:]   # (L_X, L_X)
-            acyclic_reg = self.kappa * self._notears_acyclicity(A_xx)
+            A_cyc = (
+                score_tensor                      # (N, N)
+                if self.homogeneous_nodes
+                else score_tensor[:, self.S_seq_len:]   # (L_X, L_X)
+            )
+            acyclic_reg = self.kappa * self._notears_acyclicity(A_cyc)
         else:
             acyclic_reg = torch.tensor(0.0, device=X.device)
 
@@ -1082,6 +1198,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """
         Run forward and return split S→X and X→X attention matrices.
 
+        Works in BOTH node topologies: ``AttentionSelectorLayer.split_attention``
+        is shape-aware, so a square homogeneous ``(B, N, N)`` posterior is first
+        row-sliced to the X children before the columns are split.
+
         Returns:
             att_sx: (B, L_X, L_S)  — S→X learned edges
             att_xx: (B, L_X, L_X)  — X→X learned edges (diagonal = 0)
@@ -1089,3 +1209,37 @@ class AttentionSelectorForecaster(pl.LightningModule):
         with torch.no_grad():
             _, attention_weights, _ = self.forward(data_source, data_intermediate)
         return self.model.split_attention(attention_weights)
+
+    # -- Homogeneous-mode diagnostics (thin pass-throughs to the layer) -----
+    # Kept on the forecaster so notebooks/eval code can reach them without
+    # touching ``forecaster.model`` and without re-deriving the L_S / L_X split.
+
+    def split_attention_blocks(self, attention: torch.Tensor) -> Dict[str, Optional[torch.Tensor]]:
+        """All FOUR sub-blocks of the posterior (see the layer's docstring).
+
+        Returns a dict with ``s_to_x`` / ``x_to_x`` always present, plus
+        ``x_to_s`` / ``s_to_s`` which are ``None`` in split mode (there, S nodes
+        are never children, so those rows simply do not exist).
+        """
+        return self.model.split_attention_blocks(attention)
+
+    def source_scores(self, attention: torch.Tensor) -> torch.Tensor:
+        """Per-node incoming-edge mass over the ``N`` nodes (LOW ⇒ likely a source).
+
+        In homogeneous mode this is the quantity that tells us whether the model
+        RE-DISCOVERED the S/X partition it was not given: true exogenous sources
+        should end up with (near-)zero incoming attention.
+        """
+        return self.model.source_scores(attention)
+
+    def get_diagnostic_blocks(
+        self,
+        data_source: torch.Tensor,
+        data_intermediate: torch.Tensor,
+    ):
+        """Convenience: one forward → (all four blocks, per-node source scores)."""
+        with torch.no_grad():
+            _, attention_weights, _ = self.forward(data_source, data_intermediate)
+            blocks = self.model.split_attention_blocks(attention_weights)
+            scores = self.model.source_scores(attention_weights)
+        return blocks, scores

@@ -72,6 +72,9 @@ def _make_atsel(
         comps_embed_S="summation",
         comps_embed_X="summation",
         attention_type="CausalCrossAttention",
+        # MANDATORY since the legacy cross-only variant was removed.
+        self_attention_type="GatedSelfAttention",
+
         n_heads=1,
         dropout_emb=0.0,
         dropout_attn_out=0.0,
@@ -294,7 +297,10 @@ def _make_forecaster_config(
                 "comps_embed_S": "summation",
                 "comps_embed_X": "summation",
                 "attention_type": "CausalCrossAttention",
+                # MANDATORY since the legacy cross-only variant was removed.
+                "self_attention_type": "GatedSelfAttention",
                 "n_heads": 1,
+
                 "dropout_emb": 0.0,
                 "dropout_attn_out": 0.0,
                 "dropout_ff": 0.0,

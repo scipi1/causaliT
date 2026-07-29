@@ -122,15 +122,34 @@ class AttentionSelectorPredictor(SingleCausalPredictor):
             output: ``(pred_x, attention_weights, aux)`` where
                 ``attention_weights`` is the combined ``(B, L_X, L_S + L_X)``
                 posterior (or ``(B, H, L_X, L_S + L_X)`` when
-                ``shared_dag_across_heads=False``).
+                ``shared_dag_across_heads=False``).  With
+                ``homogeneous_nodes=True`` it is the square ``(B, N, N)``
+                posterior over all ``N = L_S + L_X`` nodes — ``split_combined_
+                attention`` in ``eval_dag_query`` classifies that shape, so the
+                attention dict is forwarded unchanged.
 
         Returns:
             Dict with ``pred_x`` and ``attention_weights={"att_combined": ...}``.
+            In homogeneous mode ``pred_x`` is restricted to the X rows so it
+            still aligns with the X ground truth used by every downstream
+            reconstruction metric, and the S rows are additionally exposed as
+            ``pred_s`` for the (new) S-reconstruction diagnostics.
         """
         pred_x = output[0]
         attention_weights = output[1] if len(output) > 1 else None
 
-        return {
-            "pred_x": pred_x,
-            "attention_weights": {"att_combined": attention_weights},
-        }
+        result: Dict[str, Any] = {}
+
+        # Homogeneous mode: the model reconstructs ALL N nodes, so rows
+        # 0..L_S-1 are the S variables and rows L_S..N-1 are the X variables.
+        if getattr(self.model, "homogeneous_nodes", False) and pred_x is not None:
+            L_S = int(getattr(self.model, "S_seq_len", 0))
+            if L_S > 0 and pred_x.shape[1] == int(getattr(self.model, "N", -1)):
+                result["pred_s"] = pred_x[:, :L_S, ...]
+                pred_x = pred_x[:, L_S:, ...]
+
+        result["pred_x"] = pred_x
+        result["attention_weights"] = {"att_combined": attention_weights}
+        return result
+
+

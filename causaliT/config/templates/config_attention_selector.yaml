@@ -156,12 +156,13 @@ experiment:
   # are classified as RECONSTRUCTION parameters by gradient routing.
   value_structure_query_injection: "none"
 
-  # Direction-aware X→X self-attention split.  By default (null) the X→X
-  # interaction is modelled by the SAME combined cross block used for S→X, which
-  # cannot express edge direction (double-edges / two-cycles).  When set, the
-  # X→X sub-block is SPLIT into a dedicated direction-aware self block whose
-  # antisymmetric direction gate suppresses two-cycles.  One of:
-  #   null                       — no split (default, single combined block).
+  # Direction-aware X→X self-attention block.  MANDATORY (the legacy
+  # "one combined cross block also models X→X" variant was removed because it
+  # cannot express edge direction — double-edges / two-cycles): passing null
+  # raises ValueError.  The X→X interaction is always a dedicated
+  # direction-aware self block whose antisymmetric direction gate suppresses
+  # two-cycles.  In homogeneous mode (see homogeneous_nodes below) this type
+  # builds the SINGLE square (N, N) block.  One of:
   #   "GatedSelfAttention"       — SYMMETRIC Hard-Concrete existence gate (on the
   #                                symmetric Toeplitz part) x antisymmetric
   #                                direction gate x reconstruction gain.
@@ -172,7 +173,27 @@ experiment:
   #                                x the same antisymmetric direction gate x gain.
   #                                Prefer this to keep S→X and X→X edge existence
   #                                on ONE gating code path.
-  self_attention_type: null
+  self_attention_type: "GatedSelfAttention"
+
+  # ------------------------------------------------------------------
+  # Node topology: heterogeneous (default) vs homogeneous nodes
+  # ------------------------------------------------------------------
+  # false — SPLIT (default).  The S/X prior is kept: only the L_X variables are
+  #         children.  ``attention`` is the S→X cross block (attention_type) and
+  #         ``self_attention`` the direction-aware X→X block
+  #         (self_attention_type); the posterior is (B, L_X, L_S+L_X).
+  # true  — HOMOGENEOUS.  The S/X prior is DROPPED: [S ; X] is one set of
+  #         N = L_S + L_X nodes, each simultaneously a value-blanked query and
+  #         an actual-value key/value.  ONE square block is built from
+  #         ``self_attention_type`` and the posterior is the full directed
+  #         (B, N, N) adjacency; the S variables are reconstructed too.
+  #
+  # In homogeneous mode:
+  #   * ``attention_type`` is IGNORED (only the self block is built);
+  #   * ``self_attention_type`` is REQUIRED (it is mandatory in both modes);
+  #   * ``shared_query`` / ``shared_key`` MUST be false — a single block shares
+  #     its projections by construction, so setting them raises ValueError.
+  homogeneous_nodes: false
   # Direction-gate Binary-Concrete temperature (GatedSelfAttention /
   # CommutatorSelfAttention only).  Lower = sharper direction commitment.
   dir_tau: 0.6667
@@ -319,6 +340,9 @@ model:
     value_structure_query_injection: ${experiment.value_structure_query_injection}
     # Direction-aware X→X self-attention split; see experiment.self_attention_type.
     self_attention_type: ${experiment.self_attention_type}
+    # Homogeneous node topology (square (N, N) posterior over [S ; X]);
+    # see experiment.homogeneous_nodes.
+    homogeneous_nodes: ${experiment.homogeneous_nodes}
     # Direction-gate temperature (split self attentions); see experiment.dir_tau.
     dir_tau: ${experiment.dir_tau}
     # Shared structural query projection across cross/self blocks (split only);

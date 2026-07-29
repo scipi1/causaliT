@@ -103,6 +103,92 @@ def test_split_combined_attention_without_dims_is_skipped():
 
 
 # ---------------------------------------------------------------------------
+# split_combined_attention -- homogeneous_nodes (square (N, N) posterior)
+#
+# With ``homogeneous_nodes=True`` the AttentionSelector drops the S/X prior:
+# every node is BOTH a query and a key, so the posterior is square
+# ``(N, N)`` with ``N = L_S + L_X`` instead of ``(L_X, L_S + L_X)``.  The X
+# child rows are recovered first (``[L_S:, :]``), then the columns are split, so
+# the canonical ``cross`` / ``self`` blocks (and hence every downstream
+# DAG/SHD/MEC/plot consumer) are unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_split_combined_square_selects_child_rows_then_splits_columns():
+    n = L_S + L_X
+    matrix = np.arange(n * n, dtype=float).reshape(n, n)
+
+    blocks = split_combined_attention(matrix, L_S=L_S, L_X=L_X)
+
+    assert set(blocks) == {CROSS, SELF}
+    assert blocks[CROSS].shape == (L_X, L_S)
+    assert blocks[SELF].shape == (L_X, L_X)
+    # Rows first (drop the S child rows), THEN the S / X parent columns.
+    assert np.allclose(blocks[CROSS], matrix[L_S:, :L_S])
+    assert np.allclose(blocks[SELF], matrix[L_S:, L_S:])
+
+
+def test_split_combined_square_drops_the_s_child_rows():
+    """The S->S / X->S rows have no ground truth, so they must NOT leak in."""
+    n = L_S + L_X
+    matrix = np.zeros((n, n))
+    matrix[:L_S, :] = 9.0          # S child rows: must be discarded
+    matrix[L_S:, :] = 1.0          # X child rows: must survive
+
+    blocks = split_combined_attention(matrix, L_S=L_S, L_X=L_X)
+    assert np.allclose(blocks[CROSS], 1.0)
+    assert np.allclose(blocks[SELF], 1.0)
+
+
+def test_split_combined_square_with_no_s_nodes_is_not_row_sliced():
+    """``L_S == 0`` guard for the ``N == L_X`` ambiguity.
+
+    With no S nodes an (L_X, L_X) matrix is square but NOT a homogeneous
+    posterior, so rule 1 must NOT fire (row-slicing at ``L_S=0`` would be a
+    no-op here, but the block would then be mis-split for L_S > 0 layouts).
+    It falls through to the combined rule, whose cross block is simply empty.
+    """
+    blocks = split_combined_attention(np.ones((L_X, L_X)), L_S=0, L_X=L_X)
+
+    assert SELF in blocks
+    assert blocks[SELF].shape == (L_X, L_X)
+    assert np.allclose(blocks[SELF], 1.0), (
+        "The whole matrix is the X->X block; nothing may be sliced away."
+    )
+    # No S nodes -> a zero-width cross block (or none at all).
+    assert blocks.get(CROSS, np.zeros((L_X, 0))).shape == (L_X, 0)
+
+
+def test_query_dag_blocks_from_square_homogeneous_tensor():
+    """End to end through the batch/head reduction, as eval sees it."""
+    n = L_S + L_X
+    rng = np.random.default_rng(0)
+    att = rng.random((16, n, n))
+
+    blocks = query_dag_blocks({"att_combined": att}, L_S=L_S, L_X=L_X)
+
+    assert set(blocks) == {CROSS, SELF}
+    mean = att.mean(axis=0)
+    assert np.allclose(blocks[CROSS], mean[L_S:, :L_S])
+    assert np.allclose(blocks[SELF], mean[L_S:, L_S:])
+
+
+def test_square_homogeneous_round_trips_through_assemble_full_dag():
+    n = L_S + L_X
+    rng = np.random.default_rng(1)
+    att = rng.random((n, n))
+
+    blocks = query_dag_blocks({"att_combined": att}, L_S=L_S, L_X=L_X)
+    full = assemble_full_dag(blocks, L_S=L_S, L_X=L_X)
+
+    assert full is not None
+    assert full.shape == (n, n)
+    # The X child rows survive verbatim; the S rows are zeroed (no GT for them).
+    assert np.allclose(full[L_S:, :], att[L_S:, :])
+    assert np.allclose(full[:L_S, :], 0.0)
+
+
+# ---------------------------------------------------------------------------
 # query_dag_blocks
 # ---------------------------------------------------------------------------
 

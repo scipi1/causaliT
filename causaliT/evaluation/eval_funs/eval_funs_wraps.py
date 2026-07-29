@@ -72,12 +72,10 @@ def run_evaluations_from_config(
     FUNCTION_REGISTRY = {
         "eval_attention_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
         "eval_interventions": lambda exp: eval_interventions(exp, show_plots=show_plots),
-        "fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
-        "enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
-        # [DEPRECATED ALIAS] AttentionSelectorLayer is handled by
-        # eval_attention_scores, which classifies the attention blocks by shape
-        # (cross only, self only, or both) and assembles the DAG accordingly.
-        "eval_attention_selector_scores": lambda exp: eval_attention_scores(exp, show_plots=show_plots),
+        
+        # [OLD DELETE]
+        #"fix_kfold_summary": lambda exp: fix_kfold_summary(exp),
+        #"enrich_kfold_summary": lambda exp: enrich_kfold_summary(exp),
     }
     
     # Seed sweep evaluation for paper reporting (lazy import)

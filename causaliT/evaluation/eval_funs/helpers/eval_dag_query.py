@@ -166,11 +166,19 @@ def split_combined_attention(
     """
     Classify one 2-D attention matrix into canonical DAG blocks by its shape.
 
-    The observed width decides the layout:
+    The observed shape decides the layout.  Resolution order (first match wins):
 
-    - width ``L_S + L_X`` -> ``{cross, self}`` (split at ``L_S``)
-    - width ``L_S``       -> ``{cross}``
-    - width ``L_X``       -> ``{self}``
+    1. square ``(L_S + L_X, L_S + L_X)`` and ``L_S > 0`` -> ``homogeneous_nodes``
+       mode: every node is a child, so the X child rows ``[L_S:, :]`` are
+       selected first and then split -> ``{cross, self}``
+    2. ``L_X`` rows and width ``L_S + L_X`` -> ``{cross, self}`` (split at ``L_S``)
+    3. ``L_X`` rows and width ``L_S``       -> ``{cross}``
+    4. ``L_X`` rows and width ``L_X``       -> ``{self}``
+
+    The ``L_S > 0`` condition in rule 1 resolves the ``N == L_X`` ambiguity: when
+    ``L_S == 0`` the square matrix IS the plain ``(L_X, L_X)`` self block, so it
+    must fall through to rule 4 instead of being row-sliced to nothing.
+
 
     Args:
         matrix: 2-D attention matrix, rows = query tokens (X).
@@ -194,7 +202,23 @@ def split_combined_attention(
 
     n_rows, n_cols = matrix.shape
 
+    # ------------------------------------------------------------------
+    # Rule 1 — homogeneous_nodes: square (N, N) posterior with N = L_S + L_X.
+    # Every node (S and X alike) is a value-blanked query, so the matrix has
+    # N rows instead of L_X.  Keep the X child rows, then split the columns,
+    # which restores the canonical (L_X, L_S) / (L_X, L_X) blocks and lets all
+    # existing DAG / SHD / MEC / plotting code work unchanged.
+    #
+    # ``L_S > 0`` guards the N == L_X ambiguity (see docstring): with L_S == 0
+    # a square matrix is just the plain self block and falls through below.
+    # ------------------------------------------------------------------
+    N = L_S + L_X
+    if L_S > 0 and n_rows == n_cols == N:
+        child_rows = matrix[L_S:, :]                     # (L_X, N)
+        return {CROSS: child_rows[:, :L_S], SELF: child_rows[:, L_S:]}
+
     if n_rows != L_X:
+
         if verbose:
             print(
                 f"  [dag_query] Attention has {n_rows} query rows but L_X={L_X} "

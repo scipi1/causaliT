@@ -74,6 +74,13 @@ adaptive_training:
   eval_dag: true                   # capture DAG diagnostics + score margin at
                                    # each switch (set false to skip / speed up)
 
+  run_final_evaluations: true      # run the standard post-training evaluation
+                                   # suite on the experiment folder once the fit
+                                   # ends (same dispatcher as ``trainer()``; WHICH
+                                   # functions run is set by ``evaluation.functions``).
+                                   # Set false for long sweeps that evaluate all
+                                   # arms in one separate pass afterwards.
+
   # --- Cross-fitting (DML / DARTS "honest" split) ---------------------------
   # Fraction of the training set assigned to the reconstruct phase; the disjoint
   # remainder is used by the structure phase, so residual-HSIC is measured

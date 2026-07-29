@@ -96,7 +96,13 @@ STRUCTURAL_PATTERNS = [
     # This is the decoupled X *query* identity lookup table; it feeds only the
     # attention Query, so it is a structural parameter driven by HSIC /
     # score-sparsity — NOT the reconstruction loss.
-    "query_embed_X",
+    # Prefix (NOT the full name) so that BOTH tables are matched:
+    #   * ``query_embed_X`` — split mode (X children only)
+    #   * ``query_embed_S`` — homogeneous_nodes=True, where the S variables are
+    #     children too and therefore own a free query table as well.
+    # Verified: no reconstruction parameter name contains "query_embed".
+    "query_embed",
+
     # CommutatorSelfAttention direction generator (direction_mode="skew_query").
     # The bias-free projections ``direction_proj_a`` / ``direction_proj_b`` build
     # the learnable so(d) commutator Ω = W_a W_bᵀ − W_b W_aᵀ that resolves EDGE
