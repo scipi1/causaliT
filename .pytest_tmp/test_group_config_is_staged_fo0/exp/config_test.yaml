@@ -1,0 +1,7 @@
+experiment:
+  name: test
+data:
+  dataset: PLACEHOLDER
+training:
+  seed: 0
+  learning_rate: 0.001

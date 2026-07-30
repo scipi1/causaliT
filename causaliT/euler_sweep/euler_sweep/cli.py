@@ -1111,10 +1111,117 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 # =============================================================================
 # Register commands with CLI
 # =============================================================================
+# =============================================================================
+# DAG SWEEP: optimize once per DAG size, then train every seed
+# =============================================================================
+
+@click.command()
+@click.option(
+    "--exp_id",
+    required=True,
+    help="Experiment folder (relative to experiments/) holding config*.yaml + dagsweep*.yaml",
+)
+@click.option(
+    "--cluster",
+    is_flag=True,
+    default=False,
+    help="Running on a cluster (passed through to the trainers)",
+)
+@click.option(
+    "--keep_data",
+    is_flag=True,
+    default=False,
+    help="Keep every generated ds.npz instead of pruning it after each run (debug; costly)",
+)
+@click.option(
+    "--skip_optuna",
+    is_flag=True,
+    default=False,
+    help="Do not tune; reuse the best_trial.yaml already present in each group",
+)
+@click.option(
+    "--force_optuna",
+    is_flag=True,
+    default=False,
+    help="Re-run the study even when a group already has a best_trial.yaml",
+)
+@click.option(
+    "--dry_run",
+    is_flag=True,
+    default=False,
+    help="Print the group/seed plan and exit without generating or training",
+)
+def dagsweep(exp_id, cluster, keep_data, skip_optuna, force_optuna, dry_run):
+    """
+    Run a grouped DAG sweep: one Optuna study per DAG size, shared by all seeds.
+
+    Hyper-parameters are tuned once per group (e.g. per ``n_nodes``) on a
+    dedicated optimisation DAG, then reused for every evaluation seed of that
+    group. This turns the naive ``sizes x seeds x trials`` explosion into
+    ``sizes studies + sizes x seeds`` runs.
+
+    \b
+    Example:
+        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep \\
+            --exp_id 7_SCALING/atsel_nodes
+    """
+    from causaliT.euler_sweep.euler_sweep.opt_train_sweep import run_dag_sweep
+
+    exp_dir = join(ROOT_DIR, "experiments", exp_id)
+    if not exists(exp_dir):
+        raise click.ClickException(f"Experiment folder not found: {exp_dir}")
+
+    print("=" * 60)
+    print("DAG SWEEP")
+    print("=" * 60)
+    print(f"Experiment: {exp_id}")
+    print(f"Folder:     {exp_dir}")
+    print("=" * 60)
+
+    results = run_dag_sweep(
+        exp_dir=exp_dir,
+        cluster=cluster,
+        keep_data=keep_data,
+        skip_optuna=skip_optuna,
+        force_optuna=force_optuna,
+        dry_run=dry_run,
+    )
+
+    if not dry_run:
+        for group_name, group in results.get("groups", {}).items():
+            statuses = [r["status"] for r in group["seeds"].values()]
+            ok = sum(1 for s in statuses if s == "ok")
+            print(f"  {group_name}: {ok}/{len(statuses)} seed(s) ok, "
+                  f"{len(group['best_params'])} tuned param(s)")
+
+
+@click.command(name="dagsweep-regen")
+@click.option(
+    "--dataset_dir",
+    required=True,
+    help="Path to a dataset folder containing dag_recipe.json",
+)
+def dagsweep_regen(dataset_dir):
+    """
+    Re-materialize a pruned sampled DAG from its ``dag_recipe.json``.
+
+    DAG sweeps delete the heavy ``ds.npz`` after each run to keep disk usage
+    flat. Because the recipe pins the seed and every generator argument, the
+    exact same dataset can be rebuilt on demand - e.g. to re-run an evaluation
+    months later.
+    """
+    from causaliT.euler_sweep.euler_sweep.dag_provider import regenerate_from_recipe
+
+    path = regenerate_from_recipe(dataset_dir)
+    print(f"Re-materialized: {path}")
+
+
 cli.add_command(sweep)
 cli.add_command(calisweep)
 cli.add_command(anmsweep)
 cli.add_command(adaptivesweep)
+cli.add_command(dagsweep)
+cli.add_command(dagsweep_regen)
 
 
 

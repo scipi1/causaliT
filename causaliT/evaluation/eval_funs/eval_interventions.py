@@ -77,7 +77,48 @@ def infer_checkpoint_type(config) -> str:
 # SCM Registry - maps dataset names to SCM objects for MC sampling
 # =============================================================================
 
-def get_scm_for_dataset(dataset_name: str):
+from .helpers.datadir import resolve_datadir
+
+
+def _try_random_scm_dataset(datadir_path: Optional[str], dataset_name: str):
+    """
+    Rebuild a randomly-sampled SCM from its persisted recipe.
+
+    Datasets produced by the DAG sweeper (``euler_sweep.dag_provider``) are not
+    in the static registry below - they are sampled on the fly and their heavy
+    arrays are pruned after training.  They *do* however ship a
+    ``dag_recipe.json`` holding the full ``RandomSCMConfig``, so the SCM can be
+    rebuilt exactly.  This yields a live ``.scm`` for Monte-Carlo intervention
+    sampling **without requiring any stored samples**.
+
+    Returns:
+        The ``SCMDataset``, or ``None`` when this is not a recipe-backed dataset.
+    """
+    if not datadir_path:
+        return None
+
+    recipe_path = join(datadir_path, dataset_name, "dag_recipe.json")
+    if not exists(recipe_path):
+        return None
+
+    try:
+        import dataclasses
+
+        from scm_ds.random_scm import RandomSCMConfig, sample_random_scm_dataset
+
+        with open(recipe_path, "r", encoding="utf-8") as fh:
+            recipe = json.load(fh)
+
+        fields = dict(recipe.get("random_scm_config") or {})
+        known = {f.name for f in dataclasses.fields(RandomSCMConfig)}
+        cfg = RandomSCMConfig(**{k: v for k, v in fields.items() if k in known})
+        return sample_random_scm_dataset(cfg)
+    except Exception as exc:
+        print(f"  Warning: could not rebuild random SCM from {recipe_path}: {exc}")
+        return None
+
+
+def get_scm_for_dataset(dataset_name: str, datadir_path: Optional[str] = None):
     """
     Get the SCM object for a given dataset name.
     
@@ -86,6 +127,9 @@ def get_scm_for_dataset(dataset_name: str):
     
     Args:
         dataset_name: Name of the dataset (e.g., "scm1", "scm2", "scm3")
+        datadir_path: Optional data root. When given, randomly-sampled datasets
+            carrying a ``dag_recipe.json`` are rebuilt from that recipe, which
+            makes arbitrary sampled DAGs work without a registry entry.
         
     Returns:
         SCMDataset object
@@ -116,14 +160,19 @@ def get_scm_for_dataset(dataset_name: str):
         "scm3_continuous": ds_scm3,
     }
     
-    if dataset_name not in SCM_REGISTRY:
-        raise ValueError(
-            f"Dataset '{dataset_name}' not found in SCM registry. "
-            f"Available: {list(SCM_REGISTRY.keys())}. "
-            f"For non-SCM datasets, use the legacy test-split-based evaluation."
-        )
-    
-    return SCM_REGISTRY[dataset_name]
+    if dataset_name in SCM_REGISTRY:
+        return SCM_REGISTRY[dataset_name]
+
+    # Randomly-sampled DAGs (DAG sweeps) are recipe-backed, not registered.
+    random_ds = _try_random_scm_dataset(datadir_path, dataset_name)
+    if random_ds is not None:
+        return random_ds
+
+    raise ValueError(
+        f"Dataset '{dataset_name}' not found in SCM registry and no "
+        f"'dag_recipe.json' was found for it. "
+        f"Available: {list(SCM_REGISTRY.keys())}."
+    )
 
 
 def sample_mc_source_inputs(
@@ -259,8 +308,9 @@ def run_mc_predictions(
             checkpoint_path = find_best_or_last_checkpoint(checkpoints_dir, checkpoint_type)
             print(f"  Processing {kfold_dir}...")
             
-            # Create predictor
-            datadir_path = join(root_path, "data")
+            # Create predictor (data root may live inside the run folder for
+            # DAG-sweep runs, hence the resolver rather than a fixed path)
+            datadir_path = resolve_datadir(config=config_updated)
             predictor = create_predictor(config_updated, checkpoint_path, datadir_path)
             
             # Get device
@@ -604,7 +654,9 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     config = OmegaConf.load(join(experiment, config_files[0]))
     dataset_name = config.get("data", {}).get("dataset")
     
-    datadir_path = join(root_path, "data")
+    # DAG-sweep runs keep their datasets under the run folder; fall back to
+    # <repo>/data for classic experiments.
+    datadir_path = resolve_datadir(experiment=experiment)
     metadata = load_dataset_metadata(datadir_path, dataset_name)
     if not metadata:
         raise ValueError(f"Dataset metadata not found for '{dataset_name}'")
@@ -615,12 +667,15 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     # Load SCM for MC sampling
     # =========================================================================
     try:
-        scm_dataset = get_scm_for_dataset(dataset_name)
+        scm_dataset = get_scm_for_dataset(dataset_name, datadir_path=datadir_path)
         print(f"  Loaded SCM for MC sampling")
     except ValueError as e:
+        # NOTE: do *not* call eval_ate()/eval_ate_mc() here. eval_ate is an
+        # alias for this very function, so re-entering it recursed infinitely
+        # for every dataset outside SCM_REGISTRY (e.g. sampled random DAGs).
         print(f"  Warning: {e}")
-        print(f"  Falling back to test-split-based evaluation...")
-        return eval_ate(experiment)
+        print("  Skipping ATE evaluation (no SCM available for MC sampling).")
+        return pd.DataFrame()
     
     # =========================================================================
     # Load ATE ground truth and normalization

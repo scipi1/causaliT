@@ -1,0 +1,70 @@
+{
+  "computation_method": "monte_carlo",
+  "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] via Monte Carlo sampling",
+  "interventions": {
+    "S1": {
+      "role": "negative_control",
+      "type": "in_distribution",
+      "values": [
+        0.5
+      ]
+    },
+    "S2": {
+      "ood_values": [
+        1.5
+      ],
+      "role": "positive_control",
+      "type": "mixed",
+      "values": [
+        0.5,
+        1.5
+      ]
+    },
+    "S3": {
+      "ood_values": [
+        1.5
+      ],
+      "role": "structure_test",
+      "type": "mixed",
+      "values": [
+        -0.5,
+        1.5
+      ]
+    },
+    "S5": {
+      "ood_values": [
+        1.5
+      ],
+      "role": "confounding_test",
+      "type": "mixed",
+      "values": [
+        -0.5,
+        1.5
+      ]
+    }
+  },
+  "monte_carlo": {
+    "ate": {
+      "S1=0.5": {
+        "X1": 0.418905392492944,
+        "X2": 0.12705780314093232,
+        "X3": 0.48324238795053936
+      }
+    },
+    "baseline": {
+      "S1": {
+        "X1": 0.00010009192979182558,
+        "X2": 0.00029255158360054473,
+        "X3": 0.00014753301117371472
+      }
+    },
+    "treated": {
+      "S1=0.5": {
+        "X1": 0.41900548442273583,
+        "X2": 0.12735035472453285,
+        "X3": 0.48338992096171307
+      }
+    }
+  },
+  "n_samples": 50000
+}

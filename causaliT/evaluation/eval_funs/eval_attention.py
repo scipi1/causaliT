@@ -61,6 +61,7 @@ from .helpers.eval_lib import (
 from .eval_interventions import infer_checkpoint_type
 
 # Architecture-agnostic DAG query + shared metric core
+from .helpers.datadir import resolve_datadir
 from .helpers.eval_dag_query import query_dag_blocks, describe_topology
 from .helpers.eval_dag_scores import compute_dag_metrics, make_json_serializable
 
@@ -381,7 +382,9 @@ def eval_attention_scores(experiment: str, show_plots: bool = True) -> dict:
     if not dataset_name:
         raise ValueError("No dataset specified in experiment config.")
 
-    datadir_path = join(root_path, "data")
+    # DAG-sweep runs keep their datasets inside the experiment folder, so the
+    # data root comes from the run's config (falling back to <repo>/data).
+    datadir_path = resolve_datadir(config=config, experiment=experiment)
     metadata = load_dataset_metadata(datadir_path, dataset_name)
 
     if not metadata:

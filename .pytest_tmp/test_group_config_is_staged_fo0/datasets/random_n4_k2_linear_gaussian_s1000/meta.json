@@ -1,0 +1,31 @@
+{
+  "created": "2026-07-30",
+  "description": "Randomly sampled SCM. n_nodes=4, degree(k)=2 (target edges=8, actual=6), linearity=linear, noise=gaussian, seed=1000.",
+  "n_edges": 6,
+  "name": "random_n4_k2_linear_gaussian_s1000",
+  "random_scm_config": {
+    "degree": 2,
+    "ensure_x_has_parent": true,
+    "exact_edges": true,
+    "linearity": "linear",
+    "n_nodes": 4,
+    "n_sources": null,
+    "name": null,
+    "noise": "gaussian",
+    "noise_scale": 0.1,
+    "nonlinear_fns": [
+      "square",
+      "cube",
+      "sin",
+      "tanh"
+    ],
+    "rescale_by_indegree": true,
+    "s_x_ratio": null,
+    "seed": 1000,
+    "source_noise": "uniform",
+    "weight_range": [
+      0.5,
+      2.0
+    ]
+  }
+}
