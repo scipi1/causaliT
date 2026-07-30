@@ -438,6 +438,56 @@ training:
   hsic_mode: "biased"
   nhsic_epsilon: 0.01
 
+  # --- Descendant-excluding HSIC (self-attention block only) --------------
+  # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is
+  # independent of every NON-descendant of i, but NECESSARILY dependent on
+  #   * its DESCENDANTS  (X_j downstream of i is a function of e_i), and
+  #   * X_i itself       (X_i contains e_i).
+  # Averaging those pairs into the HSIC term means the TRUE DAG is NOT a
+  # minimiser of the structural loss: the only way the optimiser can shrink a
+  # descendant term is to stop having r_i = e_i, i.e. to regress X_i on its own
+  # child — the classic "attends to descendants instead of parents" failure.
+  # Excluding Desc(i) U {i} removes that bias and makes the objective
+  # consistent.  The exclusion set is read off the LEARNED directed posterior
+  # (thresholded + transitive closure) and is always DETACHED, so the model can
+  # never create an edge just to delete its own penalty term.
+  #
+  # Only applies to the SELF-attention columns: cross-attention keys are
+  # exogenous S nodes, which can never be descendants of an X node.
+  # Requires self_attention_type: GatedSelfAttention (a DIRECTED posterior is
+  # needed to tell descendants from ancestors); otherwise it is disabled.
+  #
+  # CAUTION — self-confirmation risk: the mask comes from the adjacency that the
+  # masked HSIC is itself training.  Early on the graph is ~random, so masking
+  # can delete exactly the parent signal you are trying to find and lock in a
+  # wrong orientation.  Use warmup / threshold / weight / hops to temper it.
+  #
+  # Suggested experiment ladder (safest -> strongest):
+  #   hops=1,    weight=0.5, warmup=10   ->  hops=1, weight=0.0
+  #   -> hops=null (full closure), weight=0.0
+  hsic_exclude_descendants: false      # master switch (false = legacy behaviour)
+  hsic_descendant_threshold: 0.5       # p_directed above which an edge is "present"
+  hsic_descendant_hops: null           # null = full transitive closure; 1 = direct children only
+  hsic_descendant_exclude_self: true   # also drop the equally-biased HSIC(X_i, r_i) diagonal
+  hsic_descendant_weight: 0.0          # weight GIVEN TO excluded pairs (0 = drop; >0 = soft down-weight)
+  hsic_descendant_warmup_epochs: 0     # no masking for the first N epochs of STRUCTURE
+                                       # learning (the graph is still ~random, so masking
+                                       # would delete the parent signal itself).  Counted
+                                       # from run start under the plain/staged trainers;
+                                       # under the ADAPTIVE trainer it is counted from the
+                                       # first epoch of the FIRST structure phase and is
+                                       # then served once (never re-paid per cycle).
+
+  hsic_descendant_min_kept_frac: 0.25  # collapse guard: if a dense graph would mask more
+                                       # than this, fall back to unmasked HSIC for the step
+                                       # (otherwise the structural gradient dies silently)
+  hsic_descendant_ema: 0.0             # EMA on the adjacency in [0,1) to stop mask thrashing
+  # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic.
+  # NOTE: with masking ON, {stage}_hsic is a MASKED mean whose normalisation set
+  # drifts across epochs, so it is not comparable epoch-to-epoch.  Prefer
+  # kept_frac for health monitoring, and keep this in mind for
+  # ``adaptive_training.hsic_monitor`` and the lambda calibration search.
+
   # --- Group-L1 (embedding column sparsity) ---
   lambda_group_l1: 0.0
 
@@ -599,6 +649,35 @@ adaptive_training:
                                    # (struct_drop AND struct_hsic_plateau) before N
                                    # epochs — guards against early structure-learning
                                    # latency (the max_epochs cap always takes precedence)
+
+    # --- Descendant-excluding HSIC, PER PHASE (optional) ---
+    # Any of the ``training.hsic_descendant_*`` / ``hsic_exclude_descendants``
+    # keys may be repeated here (and under ``reconstruct:``) to override the
+    # ``training:``-level value while that phase is active.  Keys that are OMITTED
+    # are left untouched, so this block is a pure no-op by default.
+    #
+    # This is the RECOMMENDED curriculum lever for the feature.  The mask is read
+    # off the very adjacency the masked HSIC is training, so enabling it while the
+    # graph is still ~random risks deleting the parent signal and locking in a
+    # wrong orientation.  The adaptive schedule fixes that far better than a raw
+    # epoch count: the first structure phase(s) run unmasked, and the mask is
+    # switched on only once the predictor and adjacency have co-adapted.
+    # ``hsic_descendant_warmup_epochs`` is anchored to the FIRST structure phase:
+    # the controller counts it from that phase's first epoch (NOT from the start
+    # of the run — the reconstruct warmup would otherwise expire it before a
+    # single structural step had run) and marks it served afterwards, so later
+    # structure phases start masked immediately instead of re-paying the delay.
+    # Keep it comfortably below ``min_epochs`` if you want the FIRST phase itself
+    # to train under the mask, since an HSIC-plateau exit can end that phase as
+    # soon as the floor clears.
+
+    #
+    # Example — enable the safest variant during the structure phase only:
+    #   hsic_exclude_descendants: true
+    #   hsic_descendant_hops: 1        # direct children only
+    #   hsic_descendant_weight: 0.5    # soft down-weight rather than a hard drop
+    # The EMA state is reset at every phase switch, so a phase change never
+    # inherits an adjacency smoothed under different settings.
 
 
 

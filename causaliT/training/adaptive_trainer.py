@@ -267,6 +267,8 @@ class PhaseController(Callback):
         self._hsic_plateau_counter: int = 0     # consecutive no-improve epochs (HSIC)
         self._cycle_count: int = 0       # completed structure phases
         self._phase_index: int = 0       # 0-based phase counter across the run
+        self._struct_phase_count: int = 0  # STARTED structure phases (1 = first)
+
 
 
         # Records
@@ -299,6 +301,116 @@ class PhaseController(Callback):
             elif hasattr(pl_module, key):
                 setattr(pl_module, key, fval)
 
+    # Descendant-excluding HSIC knobs that may be overridden PER PHASE.
+    # See causaliT.utils.descendant_mask and
+    # AttentionSelectorForecaster._build_hsic_descendant_mask.
+    #
+    # Why per phase: the mask is derived from the adjacency that the masked HSIC
+    # is itself training, so it carries a self-confirmation risk — turning it on
+    # while the graph is still ~random can delete exactly the parent signal we
+    # are looking for and lock in a wrong orientation.  The adaptive schedule
+    # gives a much better curriculum handle than a raw epoch count: leave it OFF
+    # for the first structure phase(s) and switch it ON once the predictor and
+    # adjacency have co-adapted.  Only keys actually PRESENT in the phase block
+    # are touched, so omitting them keeps the ``training:``-level value.
+    _DESCENDANT_MASK_KEYS = (
+        "hsic_exclude_descendants",
+        "hsic_descendant_threshold",
+        "hsic_descendant_hops",
+        "hsic_descendant_exclude_self",
+        "hsic_descendant_weight",
+        "hsic_descendant_warmup_epochs",
+        "hsic_descendant_min_kept_frac",
+        "hsic_descendant_ema",
+    )
+
+    def _apply_descendant_mask_cfg(
+        self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
+    ) -> None:
+        """Apply per-phase descendant-HSIC overrides (no-op when unspecified).
+
+        ``hsic_descendant_hops`` is intentionally allowed to be ``None`` (=full
+        transitive closure), so it is cast separately from the numeric keys.
+
+        The ``hsic_descendant_warmup_epochs`` value set here is interpreted
+        relative to the anchor installed by
+        :meth:`_apply_descendant_warmup_anchor` — see that method for why a raw
+        global-epoch threshold is meaningless under the adaptive schedule.
+        """
+        if not any(k in phase_cfg for k in self._DESCENDANT_MASK_KEYS):
+            return
+        if not hasattr(pl_module, "hsic_exclude_descendants"):
+            logger.warning(
+                "[adaptive] descendant-HSIC keys present in the phase config but "
+                "the forecaster (%s) does not support them — ignoring.",
+                type(pl_module).__name__,
+            )
+            return
+
+        applied: Dict[str, Any] = {}
+        for key in self._DESCENDANT_MASK_KEYS:
+            if key not in phase_cfg:
+                continue
+            raw = phase_cfg[key]
+            if key == "hsic_descendant_hops":
+                val: Any = None if raw is None else int(raw)
+            elif key in ("hsic_exclude_descendants", "hsic_descendant_exclude_self"):
+                val = bool(raw)
+            else:
+                val = float(raw)
+            setattr(pl_module, key, val)
+            applied[key] = val
+
+        # Changing the mask invalidates any smoothed adjacency accumulated under
+        # the previous phase's settings, so drop the EMA state at the switch.
+        if hasattr(pl_module, "_descendant_ema_score"):
+            setattr(pl_module, "_descendant_ema_score", None)
+
+        logger.info("[adaptive] descendant-HSIC overrides applied: %s", applied)
+
+    def _apply_descendant_warmup_anchor(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        """Charge the descendant-mask warmup to the FIRST structure phase only.
+
+        The forecaster counts ``hsic_descendant_warmup_epochs`` from
+        ``_descendant_warmup_anchor`` (default 0 = start of the run).  Under the
+        adaptive schedule everything runs in ONE ``fit()``, so ``current_epoch``
+        is global and a raw threshold is the wrong quantity twice over:
+
+        * it is typically ALREADY EXPIRED when structure first starts — with a
+          reconstruct warmup of 100–200 epochs, a 50-epoch guard has long
+          elapsed, so the mask goes live on the very first structural step, on a
+          still-random adjacency.  That is exactly the self-confirmation risk the
+          warmup exists to prevent;
+        * and being a one-shot global comparison, it can never re-arm, so it
+          cannot express "delay within each phase" either.
+
+        Anchoring it to the first epoch of the FIRST structure phase makes the
+        warmup count the epochs that actually TRAIN the structure.  Later
+        structure phases set the anchor to ``None`` ("already served"), so the
+        delay is paid once instead of being re-paid every cycle — the adjacency
+        is no longer random by then, which is what the guard protects against.
+        """
+        if not hasattr(pl_module, "_descendant_warmup_anchor"):
+            return
+
+        if self._struct_phase_count <= 1:
+            anchor: Optional[int] = int(trainer.current_epoch)
+            warmup = int(getattr(pl_module, "hsic_descendant_warmup_epochs", 0) or 0)
+            if warmup > 0:
+                logger.info(
+                    "[adaptive] descendant-HSIC warmup anchored to the FIRST "
+                    "structure phase: %d epoch(s) from global_epoch=%d "
+                    "(masking becomes active at global_epoch=%d).",
+                    warmup, anchor, anchor + warmup,
+                )
+        else:
+            # Warmup already served in the first structure phase.
+            anchor = None
+
+        setattr(pl_module, "_descendant_warmup_anchor", anchor)
+
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
@@ -308,6 +420,9 @@ class PhaseController(Callback):
                 p.requires_grad_(False)
             for p in recon_params:
                 p.requires_grad_(True)
+            # Descendant-HSIC overrides are honoured in BOTH phases so a run can
+            # e.g. keep the mask off during reconstruct and on during structure.
+            self._apply_descendant_mask_cfg(pl_module, self.recon_cfg)
         elif phase == "structure":
             for p in recon_params:
                 p.requires_grad_(False)
@@ -315,6 +430,12 @@ class PhaseController(Callback):
                 p.requires_grad_(True)
             # Apply structure-phase loss weights (e.g. lambda_hsic_cross)
             self._apply_lambdas(pl_module, self.struct_cfg)
+            # ...and the structure-phase descendant-exclusion settings.
+            self._struct_phase_count += 1
+            self._apply_descendant_mask_cfg(pl_module, self.struct_cfg)
+            # Anchor AFTER the overrides so the warmup value logged/compared is
+            # the one this phase will actually use.
+            self._apply_descendant_warmup_anchor(trainer, pl_module)
         else:
             raise ValueError(f"Unknown phase {phase!r}")
 

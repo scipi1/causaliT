@@ -29,6 +29,8 @@ Config options:
     nhsic_epsilon: float  (regularization for nHSIC, default: 0.01)
 """
 
+from typing import Optional
+
 import torch
 
 
@@ -325,6 +327,7 @@ def hsic_pair_matrix(
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
     exclude_diagonal: bool = False,
+    pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute pairwise residual-HSIC for all target/source variable pairs.
@@ -348,6 +351,12 @@ def hsic_pair_matrix(
         exclude_diagonal: If True and the matrix is square, diagonal entries
             are set to ``NaN``. Useful for self-attention DAG summaries where
             self-loops are not valid candidate parents.
+        pair_mask: Optional ``(L_target, L_source)`` tensor.  Pairs whose mask
+            entry is exactly ``0`` are SKIPPED entirely (set to ``NaN``) instead
+            of being computed, which saves the kernel work for those pairs.
+            Non-zero entries are computed normally — the *weighting* itself is
+            the caller's job (see :func:`hsic_cross_per_pair`).  Used by the
+            descendant-exclusion mask (``causaliT.utils.descendant_mask``).
 
     Returns:
         Tensor of shape ``(L_target, L_source)`` where entry ``[j, i]`` is
@@ -356,12 +365,22 @@ def hsic_pair_matrix(
     seq_len_source = source_values.shape[1]
     seq_len_target = residuals.shape[1]
 
+    if pair_mask is not None and tuple(pair_mask.shape) != (seq_len_target, seq_len_source):
+        raise ValueError(
+            f"pair_mask shape {tuple(pair_mask.shape)} does not match the HSIC "
+            f"matrix shape {(seq_len_target, seq_len_source)}."
+        )
+
     rows = []
     for j in range(seq_len_target):
         res_j = residuals[:, j]
         vals = []
         for i in range(seq_len_source):
             if exclude_diagonal and seq_len_source == seq_len_target and i == j:
+                vals.append(torch.tensor(float("nan"), device=source_values.device, dtype=source_values.dtype))
+                continue
+            if pair_mask is not None and float(pair_mask[j, i]) == 0.0:
+                # Fully excluded pair: skip the kernel computation entirely.
                 vals.append(torch.tensor(float("nan"), device=source_values.device, dtype=source_values.dtype))
                 continue
             source_i = source_values[:, i]
@@ -391,6 +410,7 @@ def hsic_cross_per_pair(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute HSIC between each S variable and each X residual (per-pair).
@@ -412,9 +432,18 @@ def hsic_cross_per_pair(
         adaptive_bandwidth: If True, use median heuristic per variable pair
         source_kernel: "rbf" (default) or "dirac" (for discrete S variables).
             When "dirac", uses Dirac delta kernel for S and RBF for residuals.
+        pair_mask: Optional ``(seq_len_x, seq_len_s)`` per-pair WEIGHT matrix.
+            When given, the result is the weighted mean
+            ``sum(w * HSIC) / sum(w)`` instead of the plain mean.  Pairs with
+            weight exactly ``0`` are skipped entirely (no kernel work).  The
+            mask must be detached by the caller — see
+            ``causaliT.utils.descendant_mask.build_hsic_pair_mask``, which
+            produces the descendant-exclusion mask.  ``None`` (default)
+            reproduces the plain unweighted mean exactly.
 
     Returns:
-        Mean HSIC across all (S_i, res_j) pairs (scalar)
+        Mean (or ``pair_mask``-weighted mean) HSIC across all (S_i, res_j) pairs
+        (scalar)
 
     Example:
         >>> s_values = torch.randn(100, 5)   # 5 S variables
@@ -433,12 +462,25 @@ def hsic_cross_per_pair(
         nhsic_epsilon=nhsic_epsilon,
         source_kernel=source_kernel,
         exclude_diagonal=False,
+        pair_mask=pair_mask,
     )
 
     if hsic_mat.numel() == 0:
         return torch.tensor(0.0, device=s_values.device, dtype=s_values.dtype)
 
-    return hsic_mat.mean()
+    if pair_mask is None:
+        return hsic_mat.mean()
+
+    # Weighted mean over the pairs that were actually computed.  Skipped pairs
+    # (weight == 0) come back as NaN and are dropped here, so a zero weight and
+    # a skipped computation agree exactly.
+    weights = pair_mask.to(device=hsic_mat.device, dtype=hsic_mat.dtype)
+    valid = ~torch.isnan(hsic_mat)
+    weight_sum = weights[valid].sum()
+    if float(weight_sum) <= 1e-12:
+        # Everything excluded: no structural signal available this step.
+        return torch.zeros((), device=s_values.device, dtype=s_values.dtype)
+    return (weights[valid] * hsic_mat[valid]).sum() / weight_sum
 
 
 def hsic_per_token(

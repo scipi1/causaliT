@@ -114,7 +114,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from os.path import join
 
 
@@ -127,6 +127,7 @@ import torchmetrics as tm
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
+from causaliT.utils.descendant_mask import build_hsic_pair_mask
 from causaliT.utils.query_norm import collect_query_norm_penalty, query_norm_stats
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
@@ -251,6 +252,90 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.hsic_mode = config["training"].get("hsic_mode", "biased")
         self.nhsic_epsilon = config["training"].get("nhsic_epsilon", 0.01)
         self.hsic_kernel_source = config["training"].get("hsic_kernel_source", "rbf")
+
+        # ----------------------------------------------------------------
+        # Descendant-excluding HSIC (see causaliT.utils.descendant_mask)
+        #
+        # Under an ANM the residual r_i = e_i is independent of every
+        # NON-descendant of i, but NECESSARILY dependent on its descendants and
+        # on X_i itself.  Averaging those pairs into the HSIC term means the
+        # TRUE DAG is not a minimiser of the structural loss: the only way to
+        # shrink a descendant term is to stop having r_i = e_i, i.e. to regress
+        # X_i on its own descendants — the documented "attends to descendants"
+        # failure mode.  Excluding them restores consistency.
+        #
+        # The exclusion set is read off the LEARNED adjacency (the directed
+        # posterior of the self-attention block), so it is only meaningful for
+        # attention types that expose a direction-aware posterior.  Defaults
+        # leave the loss byte-identical to the pre-feature behaviour.
+        # ----------------------------------------------------------------
+        self.hsic_exclude_descendants = bool(
+            config["training"].get("hsic_exclude_descendants", False)
+        )
+        self.hsic_descendant_threshold = float(
+            config["training"].get("hsic_descendant_threshold", 0.5)
+        )
+        _hops = config["training"].get("hsic_descendant_hops", None)
+        self.hsic_descendant_hops = None if _hops is None else int(_hops)
+        self.hsic_descendant_exclude_self = bool(
+            config["training"].get("hsic_descendant_exclude_self", True)
+        )
+        self.hsic_descendant_weight = float(
+            config["training"].get("hsic_descendant_weight", 0.0)
+        )
+        self.hsic_descendant_warmup_epochs = int(
+            config["training"].get("hsic_descendant_warmup_epochs", 0)
+        )
+        self.hsic_descendant_min_kept_frac = float(
+            config["training"].get("hsic_descendant_min_kept_frac", 0.25)
+        )
+        self.hsic_descendant_ema = float(
+            config["training"].get("hsic_descendant_ema", 0.0)
+        )
+        if not (0.0 <= self.hsic_descendant_ema < 1.0):
+            raise ValueError(
+                f"hsic_descendant_ema must be in [0, 1), got {self.hsic_descendant_ema}"
+            )
+        # Self-attention block type: only a direction-aware posterior can tell
+        # descendants from ancestors.  In homogeneous mode the single square
+        # block IS the self-attention type; in split mode it drives the X→X
+        # columns.  Anything else disables the feature (with one warning).
+        self._self_attention_type = str(
+            config["model"]["kwargs"].get("self_attention_type", "") or ""
+        )
+        self._descendant_mask_supported = (
+            self._self_attention_type in self._DIRECTED_SELF_ATTENTION_TYPES
+        )
+        if self.hsic_exclude_descendants and not self._descendant_mask_supported:
+            logger.warning(
+                "training.hsic_exclude_descendants=True but self_attention_type=%r "
+                "does not expose a DIRECTED edge posterior (supported: %s). "
+                "Descendant exclusion is DISABLED — without an orientation the "
+                "descendant set is undefined.",
+                self._self_attention_type,
+                ", ".join(self._DIRECTED_SELF_ATTENTION_TYPES),
+            )
+        # Epoch from which ``hsic_descendant_warmup_epochs`` is counted.
+        #
+        #   * ``0`` (default)  -> warmup counted from the START OF THE RUN.  This
+        #     is the right semantics for the plain/staged trainers, where the
+        #     structural loss is active from epoch 0, and it reproduces the
+        #     original global-epoch behaviour exactly.
+        #   * ``k``            -> warmup counted from global epoch ``k``.  The
+        #     adaptive trainer sets this to the first epoch of the FIRST
+        #     structure phase: under adaptive training everything runs in a
+        #     single ``fit()``, so ``current_epoch`` is global and a raw
+        #     threshold would be silently expired by the (long) reconstruct
+        #     warmup phase before a single structural step had run.
+        #   * ``None``         -> warmup already served, never delay again (set
+        #     by the adaptive trainer on the second and later structure phases,
+        #     so the warmup is a one-off and not re-paid every cycle).
+        self._descendant_warmup_anchor: Optional[int] = 0
+        # Running diagnostics (surfaced as logged metrics each step).
+        self._descendant_ema_score: Optional[torch.Tensor] = None
+        self._last_hsic_desc_kept_frac = 1.0
+        self._last_hsic_desc_cyclic = False
+
 
         # ----------------------------------------------------------------
         # Group-L1 regularization (L2,1 norm on embedding columns)
@@ -638,6 +723,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
             combined_source = torch.cat([s_values, x_values], dim=1)  # (B, L_S+L_X)
 
+        # --- Descendant exclusion -------------------------------------------
+        # Under an ANM the residual r_i = e_i is independent of every
+        # NON-descendant of i, but NECESSARILY dependent on its descendants
+        # (and on X_i itself).  Penalising those pairs biases the objective
+        # away from the true DAG and rewards attending to descendants, so we
+        # drop them from the average.  The mask is derived from the learned
+        # adjacency and is always DETACHED (a differentiable mask would let the
+        # model create an edge purely to delete its own penalty term).
+        hsic_pair_mask, hsic_desc_kept_frac, hsic_desc_cyclic = self._build_hsic_descendant_mask(
+            score_tensor
+        )
+
         hsic_value = hsic_cross_per_pair(
             combined_source,
             residuals,
@@ -646,8 +743,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
             mode=self.hsic_mode,
             nhsic_epsilon=self.nhsic_epsilon,
             source_kernel=self.hsic_kernel_source,
+            pair_mask=hsic_pair_mask,
         )
         hsic_reg = self.lambda_hsic * hsic_value
+
+        if hsic_pair_mask is not None:
+            self._last_hsic_desc_kept_frac = hsic_desc_kept_frac
+            self._last_hsic_desc_cyclic = hsic_desc_cyclic
+        else:
+            self._last_hsic_desc_kept_frac = 1.0
+            self._last_hsic_desc_cyclic = False
 
         # ----------------------------------------------------------------
         # Group-L1 regularization (L2,1 norm on embedding columns)
@@ -758,6 +863,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_score_sparse", score_sparse_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
+        # Descendant-exclusion diagnostics.  NOTE: with masking active the
+        # ``{stage}_hsic`` value above is a MASKED mean, so its normalisation
+        # set drifts as the learned graph changes and it is NOT comparable
+        # across epochs.  ``kept_frac`` tells you how much of the pair set is
+        # still contributing (a collapse toward 0 kills the structural signal),
+        # and ``cyclic`` flags a thresholded graph containing a cycle, which
+        # inflates the descendant closure.
+        if self.hsic_exclude_descendants:
+            self.log(
+                f"{stage}_hsic_desc_kept_frac",
+                float(self._last_hsic_desc_kept_frac),
+                on_step=False, on_epoch=True,
+            )
+            self.log(
+                f"{stage}_hsic_desc_cyclic",
+                float(self._last_hsic_desc_cyclic),
+                on_step=False, on_epoch=True,
+            )
         # Structural-pathway reconstruction term (alpha * loss_x).  Non-zero
         # only when lambda_struct_recon > 0; lets eval/monitoring see how much
         # reconstruction signal is shaping the structural parameters.
@@ -908,6 +1031,103 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 detail,
             )
 
+
+    # ------------------------------------------------------------------
+    # Descendant-excluding HSIC mask
+    # ------------------------------------------------------------------
+
+    # Self-attention types whose score tensor is a DIRECTED edge posterior
+    # (existence gate x direction gate), from which "descendant" is well
+    # defined.  Symmetric / undirected scores cannot orient an edge, so the
+    # descendant set would be meaningless there.
+    _DIRECTED_SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
+
+    def _build_hsic_descendant_mask(
+        self,
+        score_tensor: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], float, bool]:
+        """Build the detached HSIC pair mask that excludes ``Desc(i) U {i}``.
+
+        Returns ``(mask, kept_frac, is_cyclic)``.  ``mask is None`` means "no
+        masking this step" — the HSIC term then falls back to the plain mean, so
+        every guard below degrades gracefully to the pre-feature behaviour.
+
+        Guards, in order:
+          1. feature off, or the self-attention block has no directed posterior;
+          2. no score tensor available, or it is not 2-D (multi-head);
+          3. warmup: the learned adjacency is still ~random early on, and
+             masking on a wrong graph would delete exactly the parent signal we
+             are trying to find (self-confirmation risk).  The countdown starts
+             at ``self._descendant_warmup_anchor`` rather than at epoch 0, so
+             the adaptive trainer can anchor it to the first epoch of the FIRST
+             structure phase — the epochs that actually train the structure —
+             instead of having it silently expire during the (long) reconstruct
+             warmup.  ``anchor is None`` means the warmup was already served;
+          4. collapse: if a dense adjacency makes the closure swallow almost
+             every pair, the structural gradient would silently vanish, so we
+             fall back to no masking and log it.
+        """
+        if not (self.hsic_exclude_descendants and self._descendant_mask_supported):
+            return None, 1.0, False
+
+        if score_tensor is None or not isinstance(score_tensor, torch.Tensor):
+            return None, 1.0, False
+        if score_tensor.dim() != 2:
+            # Multi-head posteriors have no single (target, source) adjacency.
+            return None, 1.0, False
+
+        anchor = self._descendant_warmup_anchor
+        if (
+            anchor is not None
+            and (self.current_epoch - anchor) < self.hsic_descendant_warmup_epochs
+        ):
+            return None, 1.0, False
+
+        score = score_tensor.detach()
+
+        # Optional EMA smoothing: stops the mask from thrashing between batches
+        # when edge posteriors sit near the threshold.
+        if self.hsic_descendant_ema > 0.0:
+            beta = self.hsic_descendant_ema
+            prev = self._descendant_ema_score
+            if prev is None or prev.shape != score.shape:
+                self._descendant_ema_score = score.clone()
+            else:
+                self._descendant_ema_score = (
+                    beta * prev.to(score.device) + (1.0 - beta) * score
+                )
+            score = self._descendant_ema_score
+
+        try:
+            mask, kept_frac, is_cyclic = build_hsic_pair_mask(
+                score_tensor=score,
+                s_seq_len=self.S_seq_len,
+                homogeneous_nodes=self.homogeneous_nodes,
+                threshold=self.hsic_descendant_threshold,
+                hops=self.hsic_descendant_hops,
+                exclude_self=self.hsic_descendant_exclude_self,
+                excluded_weight=self.hsic_descendant_weight,
+            )
+        except ValueError as exc:
+            # Shape inconsistency: never break training over a diagnostic mask.
+            logger.warning(
+                "Descendant HSIC mask skipped (%s). Falling back to unmasked HSIC.",
+                exc,
+            )
+            return None, 1.0, False
+
+        if kept_frac < self.hsic_descendant_min_kept_frac:
+            logger.warning(
+                "Descendant HSIC mask would keep only %.1f%% of pairs "
+                "(< min_kept_frac=%.1f%%) — the learned graph is too dense and "
+                "the structural signal would collapse. Falling back to unmasked "
+                "HSIC for this step.",
+                100.0 * kept_frac,
+                100.0 * self.hsic_descendant_min_kept_frac,
+            )
+            return None, kept_frac, is_cyclic
+
+        return mask, kept_frac, is_cyclic
 
     # ------------------------------------------------------------------
     # Acyclicity helper (mirrors SingleCausalForecaster)
