@@ -692,7 +692,11 @@ def get_metrics_for_optuna(train_results):
 
     result = {}
     for col in df.columns:
-        if df[col].dtype.kind in "fc":   # float or complex (numeric)
+        # Integer columns are included ("iu"), not just floats: `trainable_params`
+        # is an int, and it is the model-size signal the DAG sweep selects the
+        # smallest sufficient model on.  Excluding it silently degraded that
+        # selection to a hyper-parameter-product heuristic.
+        if df[col].dtype.kind in "fciu":
             result[f"{col}_mean"] = float(df[col].mean())
             result[f"{col}_std"]  = float(df[col].std())
 

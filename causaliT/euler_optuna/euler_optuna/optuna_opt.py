@@ -159,6 +159,13 @@ def objective_extended(
         )
     except Exception as e:
         print(f"Trial {trial.number} failed: {e}")
+        # Persist the reason on the trial.  Optuna keeps FAILED trials but not
+        # their exception, so without this a study where every trial crashed can
+        # only report "no completed trial" and the real cause is lost.
+        try:
+            trial.set_user_attr("failure", f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
         raise
 
     metrics = get_metrics(train_results)

@@ -89,17 +89,21 @@ def run_evaluations_from_config(
     for idx, func_name in enumerate(functions, start=1):
         print(f"\n--- Step {idx}: Running {func_name} ---")
         
+        # NOTE: ASCII status markers only.  The previous "✓"/"✗" raised
+        # UnicodeEncodeError on Windows consoles (cp1252), and because the marker
+        # was printed inside the except-handler the failure escaped
+        # run_evaluations_from_config and aborted every REMAINING evaluation.
         if func_name not in FUNCTION_REGISTRY:
-            print(f"  ✗ Unknown function: {func_name}")
+            print(f"  [FAIL] Unknown function: {func_name}")
             results["evaluations"][func_name] = f"failed: Unknown function"
             continue
         
         try:
             FUNCTION_REGISTRY[func_name](experiment)
             results["evaluations"][func_name] = "success"
-            print(f"  ✓ {func_name} completed successfully")
+            print(f"  [OK] {func_name} completed successfully")
         except Exception as e:
-            print(f"  ✗ {func_name} failed: {e}")
+            print(f"  [FAIL] {func_name} failed: {e}")
             traceback.print_exc()
             results["evaluations"][func_name] = f"failed: {e}"
     
@@ -111,7 +115,7 @@ def run_evaluations_from_config(
     total_count = len(results["evaluations"])
     print(f"  Completed: {success_count}/{total_count}")
     for name, status in results["evaluations"].items():
-        status_icon = "✓" if status == "success" else "✗"
+        status_icon = "[OK]" if status == "success" else "[FAIL]"
         print(f"    {status_icon} {name}: {status}")
     
     return results
@@ -187,9 +191,10 @@ def run_all_evaluations(
         try:
             func(experiment)
             results["evaluations"][name] = "success"
-            print(f"  ✓ {name} completed successfully")
+            print(f"  [OK] {name} completed successfully")
         except Exception as e:
-            print(f"  ✗ {name} failed: {e}")
+            # ASCII only — see the note in run_evaluations_from_config.
+            print(f"  [FAIL] {name} failed: {e}")
             traceback.print_exc()
             results["evaluations"][name] = f"failed: {e}"
     
@@ -201,7 +206,7 @@ def run_all_evaluations(
     total_count = len(results["evaluations"])
     print(f"  Completed: {success_count}/{total_count}")
     for name, status in results["evaluations"].items():
-        status_icon = "✓" if status == "success" else "✗"
+        status_icon = "[OK]" if status == "success" else "[FAIL]"
         print(f"    {status_icon} {name}: {status}")
     
     return results

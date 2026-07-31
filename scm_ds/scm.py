@@ -1365,13 +1365,26 @@ class SCMDataset:
                 
                 # Package with metadata for evaluation functions
                 # Monte Carlo only - analytical removed due to incorrect E[f(eps)] = f(0) assumption
+                #
+                # The descriptors below mirror PAPER_INTERVENTIONS, whose roles are
+                # defined on the 5-source paper SCMs.  They MUST be filtered to the
+                # sources this SCM actually has: randomly sampled DAGs (DAG sweeps)
+                # may have only S1..S2, and compute_ate_ground_truth() already skips
+                # the missing ones.  Exporting the unfiltered list made downstream
+                # evaluation call do(S3=...) and raise
+                # "Intervention targets unknown node 'S3'".
+                intervention_specs = {
+                    "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
+                    "S2": {"values": [0.5, 1.5], "type": "mixed", "role": "positive_control", "ood_values": [1.5]},
+                    "S3": {"values": [-0.5, 1.5], "type": "mixed", "role": "structure_test", "ood_values": [1.5]},
+                    "S5": {"values": [-0.5, 1.5], "type": "mixed", "role": "confounding_test", "ood_values": [1.5]},
+                }
+                existing_sources = set(self.source_labels) & set(self.scm.specs)
                 ate_export = {
                     "description": "Ground-truth ATE = E[X|do(S=s)] - E[X|do(S=0)] via Monte Carlo sampling",
                     "interventions": {
-                        "S1": {"values": [0.5], "type": "in_distribution", "role": "negative_control"},
-                        "S2": {"values": [0.5, 1.5], "type": "mixed", "role": "positive_control", "ood_values": [1.5]},
-                        "S3": {"values": [-0.5, 1.5], "type": "mixed", "role": "structure_test", "ood_values": [1.5]},
-                        "S5": {"values": [-0.5, 1.5], "type": "mixed", "role": "confounding_test", "ood_values": [1.5]},
+                        node: spec for node, spec in intervention_specs.items()
+                        if node in existing_sources
                     },
                     "computation_method": "monte_carlo",
                     "n_samples": 50000,

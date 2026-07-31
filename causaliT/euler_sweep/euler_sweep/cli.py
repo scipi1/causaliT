@@ -1125,7 +1125,14 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     "--cluster",
     is_flag=True,
     default=False,
-    help="Running on a cluster (passed through to the trainers)",
+    help="Cluster mode: SUBMIT the sweep as a chained SLURM job graph (add "
+         "--sequential to run linearly on a cluster node instead)",
+)
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help="Force the in-process (linear) sweep even with --cluster",
 )
 @click.option(
     "--keep_data",
@@ -1133,6 +1140,7 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     default=False,
     help="Keep every generated ds.npz instead of pruning it after each run (debug; costly)",
 )
+
 @click.option(
     "--skip_optuna",
     is_flag=True,
@@ -1149,9 +1157,46 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     "--dry_run",
     is_flag=True,
     default=False,
-    help="Print the group/seed plan and exit without generating or training",
+    help="Print the plan (and, with --cluster, write the SLURM scripts) without "
+         "generating, training or submitting anything",
 )
-def dagsweep(exp_id, cluster, keep_data, skip_optuna, force_optuna, dry_run):
+@click.option(
+    "--scratch_path",
+    default=None,
+    help="Run the sweep in this folder instead of experiments/<exp_id> "
+         "(cluster only; the spec files are copied there)",
+)
+# SLURM parameters (only used with --cluster)
+@click.option(
+    "--max_concurrent_jobs",
+    default=6,
+    type=int,
+    help="Maximum concurrent array tasks, for BOTH the trial and the train array",
+)
+@click.option(
+    "--walltime",
+    default="4:00:00",
+    help="SLURM walltime, applied to every job of the chain (default: 4:00:00)",
+)
+@click.option(
+    "--gpu_mem",
+    default="11g",
+    help="GPU memory requirement of the trial/train arrays (default: 11g)",
+)
+@click.option(
+    "--mem_per_cpu",
+    default="10g",
+    help="CPU memory requirement (default: 10g)",
+)
+@click.option(
+    "--venv_path",
+    default="$HOME/myenv",
+    help="Python environment the SLURM jobs activate (default: $HOME/myenv)",
+)
+def dagsweep(exp_id, cluster, sequential, keep_data, skip_optuna, force_optuna,
+             dry_run, scratch_path, max_concurrent_jobs, walltime, gpu_mem,
+             mem_per_cpu, venv_path):
+
     """
     Run a grouped DAG sweep: one Optuna study per DAG size, shared by all seeds.
 
@@ -1160,26 +1205,99 @@ def dagsweep(exp_id, cluster, keep_data, skip_optuna, force_optuna, dry_run):
     group. This turns the naive ``sizes x seeds x trials`` explosion into
     ``sizes studies + sizes x seeds`` runs.
 
+    The evaluation phase uses TWO decoupled seeds (``dagsweep.yaml``):
+    ``dag_seeds`` draws the graph and pins the data split
+    (``training.data_seed``), while ``model_seeds`` varies only the weight
+    initialisation (``training.seed``).  Several model seeds on one DAG give the
+    per-edge stability of the learned structure; omit ``model_seeds`` to keep the
+    legacy one-run-per-DAG behaviour (model seed = DAG seed).
+
+    Execution modes:
+
     \b
-    Example:
-        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep \\
-            --exp_id 7_SCALING/atsel_nodes
+      (default)      linear, in-process: every trial then every run, one after
+                     the other.  Use it locally and for smoke tests.
+      --cluster      PARALLEL: submits a chained SLURM job graph
+                     prep -> trials[array] -> select -> train[array] -> cleanup.
+                     Trials and runs are parallelised inside their phase; the
+                     `select` barrier guarantees every run uses the tuned model.
+      --cluster --sequential
+                     linear execution ON a cluster node (single job, no arrays).
+
+    Progress of a submitted sweep: ``cli dagsweep-status --exp_id ...``.
+
+    \b
+    Examples:
+        # local, linear
+        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id 7_SCALING/atsel_nodes
+
+        # cluster, parallel (10 concurrent GPU tasks per phase)
+        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id 7_SCALING/atsel_nodes --cluster --max_concurrent_jobs 10 --walltime 24:00:00
+
+        # inspect the job scripts without submitting
+        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id 7_SCALING/atsel_nodes --cluster --dry_run
+
     """
     from causaliT.euler_sweep.euler_sweep.opt_train_sweep import run_dag_sweep
 
-    exp_dir = join(ROOT_DIR, "experiments", exp_id)
-    if not exists(exp_dir):
-        raise click.ClickException(f"Experiment folder not found: {exp_dir}")
+    home_exp_dir = join(ROOT_DIR, "experiments", exp_id)
+    if not exists(home_exp_dir):
+        raise click.ClickException(f"Experiment folder not found: {home_exp_dir}")
+
+    parallel = cluster and not sequential
+
+    if scratch_path is not None and not parallel:
+        raise click.ClickException(
+            "--scratch_path is only supported for the parallel cluster mode "
+            "(--cluster without --sequential)."
+        )
 
     print("=" * 60)
-    print("DAG SWEEP")
+    print("DAG SWEEP" + ("  [PARALLEL / SLURM]" if parallel else "  [SEQUENTIAL]"))
     print("=" * 60)
     print(f"Experiment: {exp_id}")
-    print(f"Folder:     {exp_dir}")
+    print(f"Folder:     {home_exp_dir}")
     print("=" * 60)
 
+    # -------------------------------------------------------------------------
+    # Parallel: plan + submit the job chain, then return (nothing trains here)
+    # -------------------------------------------------------------------------
+    if parallel:
+        from causaliT.euler_sweep.euler_sweep.dagsweep_parallel import (
+            stage_experiment_to_scratch,
+            submit_parallel_dag_sweep,
+        )
+
+        if scratch_path is not None:
+            # Only the spec files are copied; datasets, results and sweep state
+            # are written straight into scratch, so $HOME stays small.
+            exp_dir = stage_experiment_to_scratch(home_exp_dir, scratch_path)
+            print(f"Staged spec files to scratch: {exp_dir}")
+        else:
+            exp_dir = home_exp_dir
+
+        submit_parallel_dag_sweep(
+            exp_dir=exp_dir,
+            home_exp_dir=home_exp_dir,
+            slurm_params={
+                "max_concurrent_jobs": max_concurrent_jobs,
+                "walltime": walltime,
+                "gpu_mem": gpu_mem,
+                "mem_per_cpu": mem_per_cpu,
+                "venv_path": venv_path,
+            },
+            keep_data=keep_data,
+            skip_optuna=skip_optuna,
+            force_optuna=force_optuna,
+            submit_jobs=not dry_run,
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # Sequential (default): run everything in this process
+    # -------------------------------------------------------------------------
     results = run_dag_sweep(
-        exp_dir=exp_dir,
+        exp_dir=home_exp_dir,
         cluster=cluster,
         keep_data=keep_data,
         skip_optuna=skip_optuna,
@@ -1191,8 +1309,43 @@ def dagsweep(exp_id, cluster, keep_data, skip_optuna, force_optuna, dry_run):
         for group_name, group in results.get("groups", {}).items():
             statuses = [r["status"] for r in group["seeds"].values()]
             ok = sum(1 for s in statuses if s == "ok")
-            print(f"  {group_name}: {ok}/{len(statuses)} seed(s) ok, "
+            n_dags = len({r.get("dag_seed") for r in group["seeds"].values()})
+            print(f"  {group_name}: {ok}/{len(statuses)} run(s) ok "
+                  f"over {n_dags} DAG(s), "
                   f"{len(group['best_params'])} tuned param(s)")
+
+
+@click.command(name="dagsweep-status")
+@click.option(
+    "--exp_id",
+    required=True,
+    help="Experiment folder (relative to experiments/) of a submitted DAG sweep",
+)
+@click.option(
+    "--scratch_path",
+    default=None,
+    help="Read the sweep state from this folder instead (same value used at submit)",
+)
+def dagsweep_status(exp_id, scratch_path):
+    """
+    Report a parallel DAG sweep: PLANNED vs REACHED trials and runs.
+
+    Rebuilt from the per-item files in ``<exp_dir>/dagsweep/progress/``, so it is
+    accurate even when SLURM killed jobs at the walltime: each group shows its
+    completed/failed trials, whether it ended up tuned, and the state of every
+    run (with the error of the failed ones).
+    """
+    from causaliT.euler_sweep.euler_sweep.dagsweep_parallel import (
+        format_progress,
+        rebuild_progress,
+    )
+
+    exp_dir = scratch_path or join(ROOT_DIR, "experiments", exp_id)
+    try:
+        print(format_progress(rebuild_progress(exp_dir)))
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+
 
 
 @click.command(name="dagsweep-regen")
@@ -1216,12 +1369,74 @@ def dagsweep_regen(dataset_dir):
     print(f"Re-materialized: {path}")
 
 
+@click.command(name="calibrate-batch-budget")
+@click.option("--safety", default=None, type=float,
+              help="Fraction of device memory allowed for activations (default 0.35)")
+@click.option("--multiplicity", default=None, type=int,
+              help="Live activation tensors of the dominant shape (default 12)")
+@click.option("--dtype_bytes", default=4, type=int,
+              help="Bytes per activation element (4 = fp32, 2 = fp16/bf16)")
+@click.option("--no_cache", is_flag=True, default=False,
+              help="Only print the measured budget; do not write the cache")
+def calibrate_batch_budget(safety, multiplicity, dtype_bytes, no_cache):
+    """
+    Measure this machine's activation budget C for the size-derived batch size.
+
+    ``dagsweep``'s ``size_derived`` rule ``activation_budget`` solves
+    ``B = C / (N * H * (N + d))`` for the batch size, so C is the one
+    device-specific number in the whole scaling sweep.  Running this once per
+    machine writes it to ``~/.causalit/activation_budget.json`` (or
+    ``$CAUSALIT_CACHE_DIR``), keyed by GPU name, so the same ``dagsweep.yaml``
+    yields a device-appropriate batch on a laptop and on a cluster node.
+
+    After an OOM, re-run with a smaller ``--safety`` (e.g. 0.2): the batch then
+    shrinks at every DAG size at once, which keeps sizes comparable.
+
+    \b
+    Example:
+        python -m causaliT.euler_sweep.euler_sweep.cli calibrate-batch-budget
+    """
+    from causaliT.euler_sweep.euler_sweep.batch_budget import (
+        DEFAULT_MULTIPLICITY,
+        DEFAULT_SAFETY,
+        calibrate_activation_budget,
+    )
+    from causaliT.euler_sweep.euler_sweep.search_space import activation_batch_size
+
+    report = calibrate_activation_budget(
+        dtype_bytes=dtype_bytes,
+        multiplicity=DEFAULT_MULTIPLICITY if multiplicity is None else multiplicity,
+        safety=DEFAULT_SAFETY if safety is None else safety,
+        write_cache=not no_cache,
+    )
+
+    print("=" * 60)
+    print("ACTIVATION BUDGET CALIBRATION")
+    print("=" * 60)
+    for key in ("device", "total_bytes", "dtype_bytes", "multiplicity", "safety"):
+        print(f"{key:>14}: {report[key]}")
+    print(f"{'C':>14}: {report['C']:.4g}")
+    if "cache_path" in report:
+        print(f"{'cached in':>14}: {report['cache_path']}")
+
+    # Show the resulting batch sizes so the number is interpretable.
+    print("-" * 60)
+    print("Derived batch size (d_ref = 2 * n_keys, n_heads = 4):")
+    for n_keys in (10, 50, 100, 200, 400, 800):
+        batch = activation_batch_size(n_keys, 2 * n_keys, 4, budget=report["C"])
+        print(f"  n_keys={n_keys:>4} -> batch_size={batch}")
+    print("=" * 60)
+
+
 cli.add_command(sweep)
 cli.add_command(calisweep)
 cli.add_command(anmsweep)
 cli.add_command(adaptivesweep)
 cli.add_command(dagsweep)
+cli.add_command(dagsweep_status)
 cli.add_command(dagsweep_regen)
+
+cli.add_command(calibrate_batch_budget)
 
 
 

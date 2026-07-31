@@ -856,6 +856,7 @@ def adaptive_trainer(
         create_model_instance,
         train_single_fold,
         _run_post_training_evaluations,
+        resolve_seeds,
     )
     from causaliT.training.config_utils import populate_seq_lengths_from_dataset
 
@@ -873,21 +874,25 @@ def adaptive_trainer(
             "independently. Enable it in the config."
         )
 
-    seed = config["training"].get("seed", 42)
+    # Model seed (weight init) and data seed (splits) are resolved separately;
+    # data_seed defaults to seed, so legacy configs are unaffected.  The DAG
+    # sweep pins data_seed to the DAG seed so the split stays FIXED while the
+    # model seed varies -> per-edge stability across initializations.
+    seed, data_seed = resolve_seeds(config)
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
 
     config = populate_seq_lengths_from_dataset(config, data_dir)
 
     # --- Shared data module and fold splits (single fold) ---
-    dm = get_dataloader(config, data_dir, cluster, seed)
+    dm = get_dataloader(config, data_dir, cluster, data_seed)
     dm.prepare_data()
 
     # Force single-fold behaviour for the adaptive run.
     config = copy.deepcopy(config)
     config["training"]["k_fold"] = 1
     fold_splits, test_idx, train_val_idx = _make_fold_splits(
-        config, dm, seed, data_dir=data_dir
+        config, dm, data_seed, data_dir=data_dir
     )
     train_local_idx, val_local_idx = fold_splits[0]
 
@@ -922,7 +927,7 @@ def adaptive_trainer(
     if data_split_ratio is not None and 0.0 < float(data_split_ratio) < 1.0:
         active_split_ratio = float(data_split_ratio)
         recon_idx, struct_idx = _partition_train_indices(
-            train_local_idx, active_split_ratio, seed
+            train_local_idx, active_split_ratio, data_seed
         )
 
         stage_splits = {"reconstruct": recon_idx, "structure": struct_idx}

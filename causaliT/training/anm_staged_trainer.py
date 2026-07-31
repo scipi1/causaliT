@@ -757,6 +757,7 @@ def anm_alternating_trainer(
         get_dataloader,
         _make_fold_splits,
         create_model_instance,
+        resolve_seeds,
         train_single_fold,
     )
     from causaliT.training.config_utils import populate_seq_lengths_from_dataset
@@ -772,7 +773,9 @@ def anm_alternating_trainer(
             "Define at least one stage spec dict."
         )
 
-    seed = config["training"].get("seed", 42)
+    # Model seed drives weight init; data seed drives the split (see resolve_seeds).
+    # They coincide unless training.data_seed is set explicitly (DAG sweep).
+    seed, data_seed = resolve_seeds(config)
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
 
@@ -782,10 +785,10 @@ def anm_alternating_trainer(
     # -------------------------------------------------------------------------
     # Build shared data module and fold splits (used by all stages)
     # -------------------------------------------------------------------------
-    dm = get_dataloader(config, data_dir, cluster, seed)
+    dm = get_dataloader(config, data_dir, cluster, data_seed)
     dm.prepare_data()
     fold_splits, test_idx, train_val_idx = _make_fold_splits(
-        config, dm, seed, data_dir=data_dir
+        config, dm, data_seed, data_dir=data_dir
     )
     # All stages use fold 0
     train_local_idx, val_local_idx = fold_splits[0]

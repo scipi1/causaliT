@@ -12,6 +12,8 @@ These tests therefore pin the behaviour that makes the claim true:
 * seeds are members of a group, never an axis of the group product;
 * the optimisation seed must be disjoint from the evaluation seeds;
 * every seed of a group receives the *same* best params, on its *own* DAG;
+* ``dag_seeds`` and ``model_seeds`` are decoupled: several initialisations can
+  train on ONE sampled DAG with ONE data split (the basis of edge stability);
 * heavy arrays (``ds.npz``) are pruned after each run but the dataset stays
   regenerable from ``dag_recipe.json``.
 
@@ -43,10 +45,10 @@ DAG_BLOCK = {
 
 
 def _write_experiment(tmp_path, seeds=(0, 1), n_nodes=(4,), optuna_enabled=False,
-                      extra_spec=None):
+                      extra_spec=None, seed_key="seeds"):
     """Create a minimal experiment folder: base config + dagsweep spec."""
     exp_dir = tmp_path / "exp"
-    exp_dir.mkdir()
+    exp_dir.mkdir(parents=True)
 
     OmegaConf.save(
         OmegaConf.create({
@@ -59,7 +61,7 @@ def _write_experiment(tmp_path, seeds=(0, 1), n_nodes=(4,), optuna_enabled=False
 
     spec = {
         "group_axes": {"n_nodes": list(n_nodes)},
-        "seeds": list(seeds),
+        seed_key: list(seeds),
         "dag": dict(DAG_BLOCK),
         "optuna": {"enabled": optuna_enabled, "opt_seed": 1000},
         "training": {"trainer": "standard"},
@@ -86,6 +88,7 @@ def stub_training(monkeypatch):
             "dataset": config["data"]["dataset"],
             "data_root": config["data"]["data_root"],
             "seed": config["training"]["seed"],
+            "data_seed": config["training"].get("data_seed"),
             "config": OmegaConf.to_container(config, resolve=False),
         })
 
@@ -122,6 +125,52 @@ def test_spec_requires_group_axes_and_seeds(tmp_path):
     OmegaConf.save(OmegaConf.create({"seeds": [0]}), exp_dir / "dagsweep.yaml")
     with pytest.raises(ValueError, match="group_axes"):
         ots.load_dagsweep_spec(str(exp_dir))
+
+
+def test_dag_seeds_is_accepted_and_seeds_stays_an_alias(tmp_path):
+    """``dag_seeds`` is the current name; ``seeds`` must keep working."""
+    exp_dir = _write_experiment(tmp_path, seeds=(3, 4), seed_key="dag_seeds")
+    spec = ots.load_dagsweep_spec(str(exp_dir))
+
+    assert ots.dag_seeds_of(spec) == [3, 4]
+    assert ots.model_seeds_of(spec) is None  # unspecified -> follow the DAG seed
+    assert ots.build_groups(spec)[0]["dag_seeds"] == [3, 4]
+
+
+def test_declaring_both_seed_keys_is_rejected(tmp_path):
+    """Two sources of truth for the DAG seeds could silently disagree."""
+    exp_dir = _write_experiment(tmp_path, seeds=(0, 1),
+                                extra_spec={"dag_seeds": [5, 6]})
+    with pytest.raises(ValueError, match="not both"):
+        ots.load_dagsweep_spec(str(exp_dir))
+
+
+def test_empty_model_seeds_is_rejected(tmp_path):
+    """An empty list means "no runs" - almost certainly a mistake."""
+    exp_dir = _write_experiment(tmp_path, seeds=(0,),
+                                extra_spec={"model_seeds": []})
+    with pytest.raises(ValueError, match="model_seeds"):
+        ots.load_dagsweep_spec(str(exp_dir))
+
+
+def test_run_plan_is_the_dag_x_model_product(tmp_path):
+    """2 DAGs x 3 inits = 6 runs, named so the DAG grouping is recoverable."""
+    exp_dir = _write_experiment(tmp_path, seeds=(0, 1),
+                                extra_spec={"model_seeds": [7, 8, 9]})
+    group = ots.build_groups(ots.load_dagsweep_spec(str(exp_dir)))[0]
+    plan = ots.run_plan(group)
+
+    assert len(plan) == 6
+    assert [p[0] for p in plan] == [0, 0, 0, 1, 1, 1]      # grouped by DAG seed
+    assert [p[1] for p in plan[:3]] == [7, 8, 9]           # inits within a DAG
+    assert plan[0][3] == "dag_0_model_7"
+
+    # Without model_seeds the legacy one-run-per-DAG naming is preserved.
+    legacy = ots.run_plan(ots.build_groups(
+        ots.load_dagsweep_spec(str(_write_experiment(tmp_path / "b", seeds=(0, 1))))
+    )[0])
+    assert [p[1] for p in legacy] == [None, None]
+    assert [p[3] for p in legacy] == ["seed_0", "seed_1"]
 
 
 def test_unknown_dag_key_is_rejected():
@@ -213,6 +262,53 @@ def test_each_seed_trains_on_its_own_dag_with_shared_best_params(tmp_path, stub_
         assert exp_block["n_input"] >= 1
         assert exp_block["n_source"] + exp_block["n_input"] == 4
         assert exp_block["n_nodes"] == 4
+
+
+def test_model_seeds_share_one_dag_and_one_data_split(tmp_path, stub_training):
+    """
+    Edge stability needs the graph AND the split held fixed across inits.
+
+    So several ``model_seeds`` on one ``dag_seed`` must produce runs that differ
+    ONLY in ``training.seed``: same dataset folder (generated once) and the same
+    ``training.data_seed`` (= the DAG seed) driving the train/val/test split.
+    """
+    exp_dir = _write_experiment(tmp_path, seeds=(0, 1), n_nodes=(4,),
+                                extra_spec={"model_seeds": [7, 8]})
+
+    results = ots.run_dag_sweep(str(exp_dir), skip_optuna=True)
+
+    assert len(stub_training) == 4  # 2 DAGs x 2 inits
+
+    per_dag = {}
+    for call in stub_training:
+        per_dag.setdefault(call["data_seed"], []).append(call)
+
+    assert sorted(per_dag) == [0, 1], "data_seed must follow the DAG seed"
+    for dag_seed, calls in per_dag.items():
+        # One DAG -> one dataset shared by every initialisation.
+        assert len({c["dataset"] for c in calls}) == 1
+        # ... and only the model seed varies.
+        assert sorted(c["seed"] for c in calls) == [7, 8]
+
+    # Distinct DAG seeds still give distinct datasets.
+    assert len({c["dataset"] for c in stub_training}) == 2
+
+    # Result keys and run folders name both seeds.
+    seeds = results["groups"]["n_nodes_4"]["seeds"]
+    assert set(seeds) == {"dag_0_model_7", "dag_0_model_8",
+                          "dag_1_model_7", "dag_1_model_8"}
+    assert seeds["dag_0_model_7"]["dag_seed"] == 0
+    assert seeds["dag_0_model_7"]["model_seed"] == 7
+    assert all(r["status"] == "ok" for r in seeds.values())
+
+
+def test_legacy_single_seed_run_sets_matching_data_seed(tmp_path, stub_training):
+    """Without model_seeds both seeds coincide, so nothing changes downstream."""
+    exp_dir = _write_experiment(tmp_path, seeds=(0, 1), n_nodes=(4,))
+    ots.run_dag_sweep(str(exp_dir), skip_optuna=True)
+
+    for call in stub_training:
+        assert call["seed"] == call["data_seed"]
 
 
 def test_failing_run_does_not_abort_the_sweep(tmp_path, monkeypatch):

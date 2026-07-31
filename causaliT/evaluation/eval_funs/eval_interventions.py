@@ -394,7 +394,9 @@ def run_mc_predictions(
                     })
             
         except Exception as e:
-            print(f"  ✗ Error processing {kfold_dir}: {e}")
+            # ASCII only: a "✗" here raises UnicodeEncodeError on Windows
+            # consoles (cp1252), which MASKS the real exception `e`.
+            print(f"  [FAIL] Error processing {kfold_dir}: {e}")
             import traceback
             traceback.print_exc()
             continue

@@ -111,18 +111,43 @@ Per group (= one combination of `group_axes`, e.g. `n_nodes=50`):
 
 1. Sample a **dedicated tuning DAG** using `optuna.opt_seed`.
 2. Run **one** Optuna study on it -> `best_trial.yaml`.
-3. For each `seeds` entry: sample that seed's own DAG, train with the group's
-   best params, run the post-training evaluations.
+3. For each `dag_seeds` entry: sample that seed's own DAG, then train it with
+   every `model_seeds` entry using the group's best params, and run the
+   post-training evaluations.
 
-`opt_seed` must not appear in `seeds` (enforced): tuning and evaluation DAGs stay
-disjoint, so no hyper-parameter information leaks into the reported numbers.
+`opt_seed` must not appear in `dag_seeds` (enforced): tuning and evaluation DAGs
+stay disjoint, so no hyper-parameter information leaks into the reported numbers.
+
+### Two decoupled seeds (evaluation phase)
+
+The evaluation phase separates the two things one `seed` used to conflate:
+
+| key | controls | config field |
+|---|---|---|
+| `dag_seeds` | the sampled graph **and** the train/val/test split | `training.data_seed` |
+| `model_seeds` | the weight initialisation only | `training.seed` |
+
+Fixing the DAG and the split while varying the initialisation is what makes
+**edge stability** measurable: repeated runs differ only in the optimisation
+path, so the spread of a learned edge is attributable to the model rather than to
+the graph. Averaging over `dag_seeds` answers the orthogonal question (behaviour
+across graphs). The plan is therefore `dag_seeds x model_seeds` runs per group,
+and each DAG is generated **once** and reused by all of its model seeds
+(identical arrays, identical split).
+
+`model_seeds` is optional: omit it and every DAG is trained once with
+`training.seed == dag_seed` - the previous behaviour. `seeds` is still accepted
+as an alias for `dag_seeds` (declaring both raises).
+
+Run folders and result keys name what varies:
+`..._seed_3` without `model_seeds`, `..._dag_3_model_7` with it.
 
 ### Experiment layout
 
 ```
 experiments/<exp_id>/
 ├── config_atsel.yaml     # base config
-├── optuna_atsel.yaml     # optional: search space (copied into each group)
+├── optuna_settings.yaml  # search space + budget + selection (copied per group)
 └── dagsweep.yaml         # the sweep spec
 ```
 
@@ -132,7 +157,9 @@ experiments/<exp_id>/
 group_axes:                 # Cartesian product -> one group each, one study each
   n_nodes: [10, 50, 100, 500]
 
-seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]   # runs *within* every group
+dag_seeds:   [0, 1, 2, 3, 4]   # one sampled DAG + data split each
+model_seeds: [7, 8, 9]         # initialisations per DAG (omit -> 1 run/DAG)
+                               # -> 5 x 3 = 15 runs per group
 
 dag:                        # RandomSCMConfig fields + generation options
   degree: 2
@@ -143,10 +170,11 @@ dag:                        # RandomSCMConfig fields + generation options
 
 optuna:
   enabled: true
-  opt_seed: 1000            # must NOT be in `seeds`
-  metric: val_loss
+  opt_seed: 1000            # must NOT be in `dag_seeds`
+  metric: val_x_mae_mean
   direction: minimize
   trainer: standard
+  protocol: reconstruction  # zero every structural lambda in trials
 
 training:
   trainer: standard         # standard | staged | anm | adaptive
@@ -154,6 +182,13 @@ training:
 dataset_derived:            # config field <- len(metadata field) of the sampled DAG
   experiment.n_source: variable_info.source_labels
   experiment.n_input:  variable_info.input_labels
+
+size_derived:               # config field <- f(node count), same in both phases
+  experiment.batch_size:
+    rule: activation_budget
+    C: auto                 # from `calibrate-batch-budget`
+  experiment.query_fanin_scale:
+    rule: fanin_saturating  # F = n_keys * x_sat^2
 
 delete_dataset: true        # prune ds.npz after each run (default)
 ```
@@ -167,6 +202,29 @@ Notes:
 * `dataset_derived` is required whenever the config carries variable counts:
   every group trains on a differently-sized DAG, so those fields must be
   refreshed from the sampled `dataset_metadata.json`.
+* `size_derived` covers fields that are FUNCTIONS of the node count rather than
+  hyper-parameters (batch size, fan-in scale). They are applied identically to
+  the trials and to the evaluation runs, so the tuned values stay valid.
+* Before every run the config is checked against the DAG and **repaired** if
+  needed (`d_model >= n_keys`, `d_model % n_heads == 0`, `d_qk` when the Q/K
+  projections are removed, the fan-in scale) - a stale number is fixed and logged
+  instead of killing an hours-long run.
+
+### Model sizing (the Optuna phase)
+
+The study exists to give every DAG size a model of **proportional capacity**, so
+a scaling benchmark measures the method and not accidental over/under-fitting.
+It tunes only `experiment.d_model_set` (from an adaptive range
+`[n_keys, 2*n_keys]`), `experiment.n_heads` and `training.lr`; trials are trained
+reconstruction-only, and the winner is the SMALLEST model within a tolerance of
+the best metric (`selection.mode: parsimonious`).
+
+Search space, budget and selection live in `optuna_settings.yaml` - parameter
+names are dotted config paths, so adding a hyper-parameter (or adapting all of
+this to another benchmark model) is a YAML edit.
+
+Full rationale, formulas and per-device batch-size calibration:
+**`docs/documentation/DAGSWEEP_OPTUNA.md`**.
 
 ### Run
 
@@ -182,11 +240,17 @@ python -m causaliT.euler_sweep.euler_sweep.cli dagsweep \
 | Option | Description |
 |--------|-------------|
 | `--exp_id` | Experiment folder (relative to `experiments/`) |
-| `--dry_run` | Print groups/seeds and exit |
+| `--dry_run` | Print groups / seed plan and exit |
 | `--skip_optuna` | Reuse existing `best_trial.yaml`, never tune |
 | `--force_optuna` | Re-tune even if a study summary exists |
 | `--keep_data` | Keep every `ds.npz` (debugging; expensive) |
 | `--cluster` | Cluster-side settings (worker counts, etc.) |
+
+Once per machine, measure the activation budget used by the derived batch size:
+
+```bash
+python -m causaliT.euler_sweep.euler_sweep.cli calibrate-batch-budget
+```
 
 ### Results layout
 
@@ -199,14 +263,17 @@ experiments/<exp_id>/groups/n_nodes_50/
 │       ├── dataset_metadata.json
 │       ├── dag_recipe.json  # everything needed to rebuild the arrays
 │       └── ...
-└── sweeper/runs/combinations/<exp_id>_n_nodes_50_seed_3/
+└── sweeper/runs/combinations/
+    ├── <exp_id>_n_nodes_50_seed_3/            # no model_seeds
+    └── <exp_id>_n_nodes_50_dag_3_model_7/     # with model_seeds
 ```
 
 ### Disk & reproducibility
 
 Sample arrays dominate disk usage (a 500-node dataset is large, and there are
-`n_sizes x (1 + n_seeds)` of them), so `ds.npz` is **ephemeral**: generated
-before a run, pruned after it. Everything an evaluation needs later
+`n_sizes x (1 + n_dag_seeds)` of them), so `ds.npz` is **ephemeral**: generated
+before a DAG's runs, pruned after the last of them - so adding `model_seeds`
+costs no extra disk. Everything an evaluation needs later
 (`dataset_metadata.json`, masks, ATE ground truth, normalization) is kept.
 
 Each dataset also carries `dag_recipe.json`, which pins the full

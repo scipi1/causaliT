@@ -97,3 +97,17 @@ pytest tests/test_naming_consistency.py -v
 | hard (optional) | `training.use_hard_masks` | hard (default: false) |
 
 **Note:** This test does NOT modify config files - it only reports inconsistencies.
+
+## Windows: `PermissionError` on the pytest temp dir
+
+If collection dies with
+`PermissionError: [WinError 5] ... AppData\Local\Temp\pytest-of-<user>`, the
+shared `tmp_path` root has become unreadable; pytest cannot even scan it to
+number the next run.  Point it somewhere local instead:
+
+```bash
+python -m pytest tests/ -q --basetemp=.pytest_tmp
+```
+
+`.pytest_tmp*/` and `pytest_tmp*/` are git-ignored - those trees are throwaway
+fixtures, so delete them freely (and never commit them).

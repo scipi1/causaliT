@@ -351,6 +351,34 @@ def _make_fold_splits(
     return fold_splits, test_idx, train_val_idx
 
 
+def resolve_seeds(config: dict) -> Tuple[int, int]:
+    """
+    Resolve the (model_seed, data_seed) pair from a training config.
+
+    Two independent sources of randomness are distinguished:
+
+    * ``training.seed``      -> MODEL seed: weight initialization, dropout,
+                                any torch/numpy RNG consumed during fitting.
+    * ``training.data_seed`` -> DATA seed: train/val/test split and the
+                                reconstruct/structure partition.
+
+    ``data_seed`` is OPTIONAL and defaults to ``seed``, so every config written
+    before this split behaves exactly as before.  Setting it explicitly (as the
+    grouped DAG sweep does, where ``data_seed`` follows the DAG seed) keeps the
+    data partition FIXED while the model seed varies - which is what makes
+    per-edge stability across initializations measurable on one sampled DAG.
+
+    Args:
+        config: Configuration dictionary.
+
+    Returns:
+        ``(model_seed, data_seed)``.
+    """
+    model_seed = int(config["training"].get("seed", 42))
+    data_seed = config["training"].get("data_seed", None)
+    return model_seed, (model_seed if data_seed is None else int(data_seed))
+
+
 def _count_trainable_params(config: dict, data_dir: str) -> int:
     """
     Instantiate a temporary model, count trainable parameters, then delete it.
@@ -474,17 +502,22 @@ def trainer(
     """
     logger_info = logging.getLogger("logger_info")
 
-    seed = config["training"]["seed"]
+    # Model seed drives weight init; data seed drives the split (see resolve_seeds).
+    # They coincide unless training.data_seed is set explicitly.
+    seed, data_seed = resolve_seeds(config)
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
+
+    if data_seed != seed:
+        logger_info.info(f"seeds: model={seed}, data={data_seed}")
 
     # Populate sequence lengths from dataset metadata
     config = populate_seq_lengths_from_dataset(config, data_dir)
 
-    # Build data module and index splits
-    dm = get_dataloader(config, data_dir, cluster, seed)
+    # Build data module and index splits (data_seed: fixed across model seeds)
+    dm = get_dataloader(config, data_dir, cluster, data_seed)
     dm.prepare_data()
-    fold_splits, test_idx, train_val_idx = _make_fold_splits(config, dm, seed, data_dir=data_dir)
+    fold_splits, test_idx, train_val_idx = _make_fold_splits(config, dm, data_seed, data_dir=data_dir)
 
     k_folds = len(fold_splits)
     print(
@@ -621,6 +654,33 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return get_model_class(config)(config)
 
 
+def resolve_num_workers(config: dict, cluster: bool) -> int:
+    """
+    Decide how many DataLoader worker processes to use.
+
+    Rules, in order:
+
+    1. ``training.num_workers`` in the config wins (escape hatch, incl. 0).
+    2. Windows -> 0.  Workers are spawned there (no fork), so each one re-imports
+       torch and re-materializes the dataset; with a double-digit worker count
+       this reliably dies with "DataLoader worker exited unexpectedly", which is
+       what used to abort every Optuna trial of a dagsweep run.
+    3. Cluster -> 1 (one CPU is requested per task).
+    4. Otherwise -> min(8, cpu_count // 2), never more than the machine can feed.
+
+    The previous hardcoded ``20`` off-cluster was both unsafe on Windows and
+    wasteful for the small datasets used by the sizing trials.
+    """
+    declared = config.get("training", {}).get("num_workers", None)
+    if declared is not None:
+        return max(0, int(declared))
+    if sys.platform.startswith("win"):
+        return 0
+    if cluster:
+        return 1
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
 def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     """
     Instantiate the appropriate DataModule for the model type.
@@ -660,7 +720,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
             data_dir=join(data_dir, config["data"]["dataset"]),
             input_file=config["data"]["filename_input"],
             batch_size=config["training"]["batch_size"],
-            num_workers=1 if cluster else 20,
+            num_workers=resolve_num_workers(config, cluster),
             data_format="float32",
             max_data_size=config["data"]["max_data_size"],
             seed=seed,
@@ -673,7 +733,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
             input_file=config["data"]["filename_input"],
             target_file=config["data"]["filename_target"],
             batch_size=config["training"]["batch_size"],
-            num_workers=1 if cluster else 20,
+            num_workers=resolve_num_workers(config, cluster),
             data_format="float32",
             max_data_size=config["data"]["max_data_size"],
             seed=seed,

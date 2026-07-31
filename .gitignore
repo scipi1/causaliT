@@ -8,3 +8,9 @@
 .pytest_cache/
 __pycache__/
 *.egg-info/
+
+# pytest tmp_path trees.  The shared %TEMP%\pytest-of-<user> dir is sometimes
+# unreadable on Windows (PermissionError in find_prefixed), so tests are run with
+# --basetemp=<local dir>; those trees are throwaway fixtures, never sources.
+.pytest_tmp*/
+pytest_tmp*/
