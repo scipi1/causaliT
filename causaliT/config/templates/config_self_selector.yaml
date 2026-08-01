@@ -83,9 +83,17 @@ experiment:
   # and use a fixed sqrt(query_fanin_scale) score scale (structure gate only).
   # This makes the query DIRECTION (not its unbounded norm) drive parent
   # selection, removing the "lazy" centroid-alignment block shortcut. Set
-  # query_fanin_scale to the max in-degree you want cleanly representable.
   normalize_query: false
-  query_fanin_scale: 1.0
+  # "auto" derives F = n_keys * (x/M)^2 from the data at load time
+  # (causaliT/utils/query_norm.py::resolve_query_fanin_scale); F SCALES WITH THE
+  # NODE COUNT, so a hard-coded value breaks on a different dataset.  A literal
+  # float pins it instead (legacy runs reproduce exactly).
+  query_fanin_scale: auto
+  # Knob behind the derivation: edge posterior P(z>0) that a CENTROID-initialised
+  # query gives EVERY candidate parent.  A probability, so 1.0 is unreachable;
+  # use 0.5-0.9.
+  query_centroid_max_p: 0.9
+
 
   # Value-structure injection (SVFA only).  By default ("none") the value
   # projection depends on DATA ONLY, so W_V cannot learn a per-node functional.

@@ -3,15 +3,15 @@ Adaptive Trainer: metric-driven alternating Structure/Reconstruct training.
 
 Motivation
 ----------
-``anm_staged_trainer.py`` runs a *rigid* schedule: each stage trains for a fixed
-epoch budget, then a fresh ``pl.Trainer`` is created, a new model is built, and
-the previous stage's checkpoint is reloaded from disk (``resume_ckpt`` restores
-weights + optimizer state + epoch counter).  The data module is shared, but the
-per-stage ``fit()`` / checkpoint serialize–deserialize cycle is pure overhead,
-and — more importantly — a fixed epoch budget is almost never the right place to
-switch phases.  Empirically, structure optimisation continues *past* the point
-where the (frozen) reconstruction is still faithful, so the residuals used for
-structural signals degrade.
+The predecessor (the now-removed ANM staged trainer) ran a *rigid* schedule:
+each stage trained for a fixed epoch budget, then a fresh ``pl.Trainer`` was
+created, a new model built, and the previous stage's checkpoint reloaded from
+disk.  The data module was shared, but the per-stage ``fit()`` / checkpoint
+serialize-deserialize cycle was pure overhead, and — more importantly — a fixed
+epoch budget is almost never the right place to switch phases.  Empirically,
+structure optimisation continues *past* the point where the (frozen)
+reconstruction is still faithful, so the residuals used for structural signals
+degrade.
 
 This module implements an **adaptive, in-memory** alternative:
 
@@ -113,9 +113,9 @@ from pytorch_lightning.callbacks import Callback
 
 from causaliT.training.callbacks import KFoldResultsTracker
 
-# Reuse plain-container coercion, score-margin helper, cross-fit partitioner and
-# JSON serializer from the rigid trainer so the two trainers stay consistent.
-from causaliT.training.anm_staged_trainer import (
+# Plain-container coercion, score-margin helper, cross-fit partitioner and JSON
+# serializer shared with the rest of the staged-training utilities.
+from causaliT.training.staging_utils import (
     _to_plain_container,
     _compute_score_margin,
     _json_default,
@@ -769,8 +769,7 @@ def _save_config_snapshot(config: dict, save_dir: str) -> Optional[str]:
     When nothing is present (e.g. ``save_dir`` is a fresh scratch directory), we
     write the *resolved* config — sequence lengths populated from the dataset,
     ``k_fold=1`` and the adaptive epoch budget applied — so the run is
-    self-describing for offline evaluation.  Mirrors
-    ``anm_staged_trainer._save_stage_config``.
+    self-describing for offline evaluation.
 
     Returns the path written, or ``None`` when a config was already present.
     """

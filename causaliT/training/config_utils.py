@@ -10,6 +10,9 @@ from typing import Dict, Any
 
 from omegaconf import OmegaConf, DictConfig
 
+from causaliT.utils.query_norm import resolve_query_fanin_scale
+
+
 
 class DatasetMetadataError(Exception):
     """Raised when dataset_metadata.json is missing or invalid."""
@@ -172,8 +175,20 @@ def populate_seq_lengths_from_dataset(
     print(f"  num_embeddings_Y: {n_target + 1 if n_target > 0 else 0}")
     print(f"  num_embeddings_shared: {n_source + n_input + n_target + 1} (for shared embedding)")
     print(f"  feature_indices: {feature_indices}")
-    
+
+    # Auto-calibrate the structure-score temperature.  F = n * (x/M)^2 SCALES
+    # WITH THE NODE COUNT, so it is derived here - the first point where the
+    # number of candidate parents (n_source + n_input) is known - rather than
+    # hard-coded per experiment.  An explicit numeric value is left untouched.
+    fanin_info = resolve_query_fanin_scale(config, n_keys=n_source + n_input)
+    if fanin_info is not None:
+        print(f"  query_fanin_scale: {fanin_info['query_fanin_scale']:.4f} (auto, "
+              f"n_keys={fanin_info['n_keys']}, centroid P(edge)="
+              f"{fanin_info['query_centroid_max_p']:.3g}, "
+              f"edge_offset={fanin_info['init_edge_offset']:.4g})")
+
     return config
+
 
 
 def validate_dataset_metadata_for_evaluation(

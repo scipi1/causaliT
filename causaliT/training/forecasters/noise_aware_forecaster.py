@@ -205,8 +205,8 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
         # =====================================================================
         # PARAMETER FREEZING FOR ALTERNATING STAGES (ANM experiments)
         # =====================================================================
-        # Set by anm_staged_trainer._build_stage_config per stage.
-        # Requires use_gradient_routing=True; otherwise _build_stage_config
+        # Set by the training config (config['training']['freeze_*_params']).
+        # Requires use_gradient_routing=True; otherwise the config loader
         # falls back to loss-level gating and leaves these False.
         # requires_grad is not saved in checkpoints, so each new stage starts
         # with all params unfrozen.

@@ -97,11 +97,22 @@ experiment:
   # Normalising the query makes its DIRECTION (not its unbounded norm) drive
   # parent selection, so a flat centroid row no longer wins.  Pair with a
   # positive gate offset (init_gamma < -init_zeta) so an undecided raw≈0 key
-  # defaults OFF.  ``query_fanin_scale`` is the score temperature: set it to the
-  # max in-degree you want cleanly representable (raw_on ≈ sqrt(scale/(m·E))).
+  # defaults OFF.
   # Structure gate only — never touches the value / reconstruction-gain streams.
   normalize_query: false
-  query_fanin_scale: 1.0
+
+  # ``query_fanin_scale`` (F) is the score temperature of the capped path.  Keep
+  # it "auto": F = n_keys * (x/M)^2 is DERIVED from the data at load time
+  # (causaliT/utils/query_norm.py::resolve_query_fanin_scale), because F SCALES
+  # WITH THE NODE COUNT - a value tuned for 10 nodes under-scores a 400-node row
+  # by 40x.  A literal float pins it instead (legacy runs reproduce exactly).
+  query_fanin_scale: auto
+  # The single knob behind the derivation: the edge posterior P(z>0) that a
+  # CENTROID-initialised query gives EVERY candidate parent.  It is a
+  # probability, so 1.0 is unreachable (asymptotic sigmoid); use 0.5-0.9.
+  # Higher = hotter scores = more init mass on every edge.
+  query_centroid_max_p: 0.9
+
 
   # Adaptive learnable per-node query-norm budget (only active when
   # normalize_query=true).  See causaliT/utils/query_norm.py.  Plain

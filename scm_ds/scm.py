@@ -1404,7 +1404,14 @@ class SCMDataset:
         else:
             print("Skipping ATE ground truth export (no source_labels defined)")
 
-        graph.render(str(join(save_dir, 'graph')), format="pdf", cleanup=True)
+        # ---- render DAG pdf (optional: needs the Graphviz 'dot' binary) ----
+        # On some environments (e.g. HPC clusters) the system binary is not
+        # available. The pdf is purely informative, so skip it instead of
+        # failing the whole dataset generation.
+        try:
+            graph.render(str(join(save_dir, 'graph')), format="pdf", cleanup=True)
+        except Exception as e:
+            print(f"Warning: skipping DAG pdf rendering ('dot' unavailable?): {e}")
 
 
 # --------------------------- Example -------------------------------- #

@@ -206,6 +206,26 @@ than a code change.
 4. keep `selection.mode: parsimonious` so all methods are sized by the same
    "smallest sufficient model" rule.
 
+### External baselines (NOTEARS, DAGMA, PC) are not tuned at all
+
+The structure-learning baselines take a different route on purpose: they run with
+fixed paper hyperparameters, so they have no search space and skip Optuna
+entirely.  Point the trainer at them and the sweep fits them on exactly the same
+generated DAGs and datasets as the models:
+
+```yaml
+training:
+  trainer: benchmark      # -> cli.benchmark_function_for_sweep
+benchmark:
+  methods: [notears_linear, dagma_linear, pc]
+  seeds: [0, 1, 2]
+```
+
+Each method writes its own `eval/eval_benchmark_<method>/` folder with the
+standard `dag_metrics.json`, so `eval_seed_sweep` and the analysis notebooks
+aggregate baselines and models with the same code.  Details and the reasoning
+behind the fixed hyperparameters: `BENCHMARKS.md`.
+
 ## Troubleshooting
 
 **`ValueError: No completed trial: cannot select hyper-parameters.`**

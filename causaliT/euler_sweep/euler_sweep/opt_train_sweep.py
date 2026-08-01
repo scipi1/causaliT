@@ -70,12 +70,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from omegaconf import DictConfig, OmegaConf
 
-from causaliT.euler_sweep.euler_sweep.dag_provider import (
-    build_dag_config,
-    dag_dataset_name,
-    materialized_dag,
-    split_dag_block,
+from causaliT.euler_sweep.euler_sweep.data_source import (
+
+    DATASET_AXIS,
+    DataSource,
+    build_data_source,
 )
+
 from causaliT.euler_sweep.euler_sweep.search_space import (
     apply_protocol,
     build_sample_params_fn,
@@ -88,8 +89,13 @@ from causaliT.euler_sweep.euler_sweep.sweeper import run_single_combination
 
 logger = logging.getLogger(__name__)
 
-DAGSWEEP_FILENAME_GLOB = "dagsweep*.yaml"
+#: Spec file names.  ``atesweep*.yaml`` is a pure ALIAS (identical parsing and
+#: execution): a fixed-dataset ATE study reads better in a folder listing when
+#: its spec is not called "dagsweep", but there is only one code path.
+DAGSWEEP_FILENAME_GLOBS = ("dagsweep*.yaml", "atesweep*.yaml")
+DAGSWEEP_FILENAME_GLOB = DAGSWEEP_FILENAME_GLOBS[0]  # backwards compatibility
 DEFAULT_OPT_SEED = 1000
+
 
 
 def _as_dict(node: Any) -> Dict[str, Any]:
@@ -108,21 +114,29 @@ def _as_dict(node: Any) -> Dict[str, Any]:
 
 def dag_seeds_of(spec: Any) -> List[int]:
     """
-    Return the DAG seeds of a spec, accepting the legacy ``seeds`` alias.
+    Return the DAG seeds of a spec, accepting its two aliases.
 
-    ``dag_seeds`` is the current name (it says what the seed actually controls:
-    the sampled graph and the data split).  ``seeds`` is kept as an alias so
-    existing specs keep working; declaring both is rejected because the two would
-    silently disagree.
+    All three names denote the SAME axis - the seed that fixes the data a run
+    trains on (and, through ``training.data_seed``, its train/val/test split):
+
+    * ``dag_seeds``  - current name for a sampled-DAG sweep (the seed IS the graph);
+    * ``data_seeds`` - preferred name for a FIXED-dataset sweep, where the graph
+      never changes and the seed only moves the split;
+    * ``seeds``      - the original name, kept so old specs keep working.
+
+    Declaring more than one is rejected: they would silently disagree.
     """
-    has_dag = "dag_seeds" in spec and spec.get("dag_seeds")
-    has_legacy = "seeds" in spec and spec.get("seeds")
-    if has_dag and has_legacy:
+    present = [k for k in ("dag_seeds", "data_seeds", "seeds")
+               if k in spec and spec.get(k)]
+    if len(present) > 1:
         raise ValueError(
-            "Define either 'dag_seeds' or its legacy alias 'seeds', not both."
+            f"Define only ONE seed list, got {present}. 'dag_seeds' (sampled "
+            "DAGs), 'data_seeds' (fixed datasets) and 'seeds' (legacy) are "
+            "aliases of the same axis."
         )
-    raw = spec.get("dag_seeds") if has_dag else spec.get("seeds")
+    raw = spec.get(present[0]) if present else None
     return [int(s) for s in (raw or [])]
+
 
 
 def model_seeds_of(spec: Any) -> Optional[List[int]]:
@@ -147,25 +161,68 @@ def model_seeds_of(spec: Any) -> Optional[List[int]]:
     return seeds
 
 
-def load_dagsweep_spec(exp_dir: str) -> Any:
-    """Load ``dagsweep*.yaml`` from an experiment folder."""
-    matches = sorted(glob.glob(join(exp_dir, DAGSWEEP_FILENAME_GLOB)))
+def find_dagsweep_spec(exp_dir: str) -> str:
+    """
+    Locate the single sweep spec of an experiment folder.
+
+    ``dagsweep*.yaml`` and ``atesweep*.yaml`` are ALIASES - identical parsing,
+    identical execution - so a fixed-dataset study can be named after what it
+    measures.  Finding several is an error rather than a precedence rule: which
+    file a sweep actually ran would otherwise depend on alphabetical order.
+    """
+    matches: List[str] = []
+    for pattern in DAGSWEEP_FILENAME_GLOBS:
+        matches.extend(glob.glob(join(exp_dir, pattern)))
+    matches = sorted(set(matches))
+
     if not matches:
         raise FileNotFoundError(
-            f"No {DAGSWEEP_FILENAME_GLOB} found in {exp_dir}. "
-            "A DAG sweep needs a spec with at least 'group_axes' and 'dag_seeds'."
+            f"No {' / '.join(DAGSWEEP_FILENAME_GLOBS)} found in {exp_dir}. "
+            "A sweep needs a spec with a data source ('dag' for sampled graphs "
+            "or 'datasets' for fixed SCMs) and 'dag_seeds'/'data_seeds'."
         )
-    spec: Any = OmegaConf.load(matches[0])
-
-    if "group_axes" not in spec:
-        raise ValueError(f"{basename(matches[0])} must define 'group_axes'.")
-    if "dag_seeds" not in spec and "seeds" not in spec:
+    if len(matches) > 1:
         raise ValueError(
-            f"{basename(matches[0])} must define 'dag_seeds' "
-            "(or its legacy alias 'seeds')."
+            f"Several sweep specs in {exp_dir}: {[basename(m) for m in matches]}. "
+            "Keep exactly one ('dagsweep*.yaml' and 'atesweep*.yaml' are "
+            "aliases), so what the sweep ran is unambiguous."
+        )
+    return matches[0]
+
+
+def load_dagsweep_spec(exp_dir: str) -> Any:
+    """
+    Load and validate the sweep spec of an experiment folder.
+
+    Everything that can be checked without touching the disk is checked HERE, so
+    a malformed spec fails in the second it is submitted instead of after hours
+    of queueing: the data source (``dag`` xor ``datasets``, registry keys), the
+    seed aliases, and the tuning/evaluation seed disjointness.
+
+    ``group_axes`` is required only for a SAMPLED-DAG sweep.  A fixed-dataset
+    sweep already has an axis - the dataset itself - so demanding a second one
+    would force a dummy entry into every ATE spec.
+    """
+    path = find_dagsweep_spec(exp_dir)
+    spec: Any = OmegaConf.load(path)
+
+    # Rejects 'dag' + 'datasets', an empty/unknown/duplicated registry key, ...
+    source = build_data_source(spec)
+
+    if "group_axes" not in spec and source.group_axis_values() is None:
+        raise ValueError(
+            f"{basename(path)} must define 'group_axes' (a sampled-DAG sweep "
+            "groups by DAG size/shape). Only a 'datasets' sweep may omit it, "
+            "because the dataset is then the group axis."
+        )
+    if "dag_seeds" not in spec and "data_seeds" not in spec and "seeds" not in spec:
+        raise ValueError(
+            f"{basename(path)} must define 'dag_seeds' (sampled DAGs) or "
+            "'data_seeds' (fixed datasets); 'seeds' is the legacy alias."
         )
 
     dag_seeds = dag_seeds_of(spec)
+
     if not dag_seeds:
         raise ValueError("'dag_seeds' must list at least one evaluation seed.")
     model_seeds_of(spec)  # validate early (raises on an empty list)
@@ -182,21 +239,59 @@ def load_dagsweep_spec(exp_dir: str) -> Any:
     return spec
 
 
-def build_groups(spec: Any) -> List[Dict[str, Any]]:
+def group_name_of(values: Dict[str, Any]) -> str:
     """
-    Expand ``group_axes`` into groups, each carrying the full seed plan.
+    Render a group's folder name from its axis values.
+
+    Axes are tagged (``n_nodes_50``) so a listing is self-describing.  The
+    ``dataset`` axis is the exception: its value is already the alias the user
+    typed, so it is emitted bare (``ds_scm1``, not ``dataset_ds_scm1``).
+    """
+    return "_".join(
+        str(value) if key == DATASET_AXIS else f"{key}_{value}"
+        for key, value in values.items()
+    )
+
+
+def build_groups(spec: Any, source: Optional[DataSource] = None) -> List[Dict[str, Any]]:
+    """
+    Expand the group axes into groups, each carrying the full seed plan.
 
     A group is one Cartesian-product point of the group axes; seeds are *not*
     part of that product - they are members inside each group.  Every group gets
-    the same ``dag_seeds`` (one sampled DAG each) and ``model_seeds``
-    (initialisations trained on each of those DAGs; ``None`` = one run with
-    model seed == DAG seed).  ``seeds`` is kept as a mirror of ``dag_seeds`` for
-    backwards compatibility with existing readers.
+    the same ``dag_seeds`` (one sampled DAG each, or one SHARED dataset for a
+    fixed-SCM sweep) and ``model_seeds`` (initialisations trained on each of
+    those datasets; ``None`` = one run with model seed == DAG seed).  ``seeds``
+    is kept as a mirror of ``dag_seeds`` for backwards compatibility.
+
+    A fixed-dataset source contributes an IMPLICIT, outermost ``dataset`` axis
+    (its aliases), so one group is created per dataset - each with its own study,
+    ``best_trial.yaml`` and folder - without repeating the list in ``group_axes``.
+
+    Args:
+        spec: The loaded sweep spec.
+        source: Data source providing the implicit axis; built from the spec when
+            omitted.
     """
     import itertools
 
-    axes: Dict[str, List[Any]] = {k: list(v) for k, v in _as_dict(spec["group_axes"]).items()}
+    if source is None:
+        source = build_data_source(spec)
+
+    axes: Dict[str, List[Any]] = {}
+    dataset_values = source.group_axis_values()
+    if dataset_values is not None:
+        axes[DATASET_AXIS] = list(dataset_values)
+    for key, values in _as_dict(spec.get("group_axes")).items():
+        if key == DATASET_AXIS:
+            raise ValueError(
+                f"'{DATASET_AXIS}' is a reserved group axis (it selects the "
+                "DATA, not a hyper-parameter). Use 'datasets.names' instead."
+            )
+        axes[key] = list(values)
+
     dag_seeds = dag_seeds_of(spec)
+
     model_seeds = model_seeds_of(spec)
 
     names = list(axes.keys())
@@ -205,7 +300,8 @@ def build_groups(spec: Any) -> List[Dict[str, Any]]:
         values = dict(zip(names, combo))
         groups.append({
             "axes": values,
-            "name": "_".join(f"{k}_{v}" for k, v in values.items()),
+            "name": group_name_of(values),
+
             "dag_seeds": dag_seeds,
             "model_seeds": model_seeds,
             # Legacy alias: the DAG seeds are what used to be called "seeds".
@@ -330,11 +426,27 @@ def apply_dataset_derived(config: Any, spec: Any,
                     len(value) if isinstance(value, (list, tuple)) else value)
 
 
+def _write_axes(config: Any, group: Dict[str, Any]) -> None:
+    """
+    Expose the group axes under ``experiment.*`` so a config can interpolate
+    them (e.g. ``${experiment.n_nodes}``) exactly like in a normal sweep.
+
+    ``dataset`` is skipped: it selects the DATA (already written as
+    ``data.dataset``), not a hyper-parameter.
+    """
+    for key, value in group["axes"].items():
+        if key == DATASET_AXIS:
+            continue
+        _set_dotted(config, f"experiment.{key}", value)
+
+
 def stage_group_config(base_config_path: str, base_optuna_path: Optional[str],
                        group_dir: Path, group: Dict[str, Any], spec: Any,
                        dataset_name: str, datasets_dir: str,
                        n_keys: Optional[int] = None,
-                       search_protocol: Optional[str] = None) -> Any:
+                       search_protocol: Optional[str] = None,
+                       opt_seed: Optional[int] = None) -> Any:
+
     """
     Materialize a group's config directory (as ``OptunaStudy`` expects it).
 
@@ -345,6 +457,12 @@ def stage_group_config(base_config_path: str, base_optuna_path: Optional[str],
     * the size-derived fields (batch size, fan-in scale) for THIS DAG size, and
     * the search protocol (``search_protocol``), i.e. reconstruction-only
       training - so a trial measures capacity and nothing else.
+
+    ``opt_seed`` pins ``training.data_seed`` for the search.  It matters for a
+    FIXED-dataset sweep, where every group shares one dataset and the seeds are
+    split seeds: tuning must then happen on a split that no evaluation run uses.
+    (For sampled DAGs the optimisation graph is already a separate dataset.)
+
 
     Because the file lands next to ``best_trial.yaml`` it is also the audit trail
     of what the search actually trained.  ``d_model`` is deliberately NOT
@@ -358,15 +476,15 @@ def stage_group_config(base_config_path: str, base_optuna_path: Optional[str],
 
     config: Any = OmegaConf.load(base_config_path)
 
-    # Group axes are exposed under `experiment.*` so a config can interpolate
-    # them (e.g. `${experiment.n_nodes}`) exactly like in a normal sweep.
-    for key, value in group["axes"].items():
-        _set_dotted(config, f"experiment.{key}", value)
+    _write_axes(config, group)
 
     _set_dotted(config, "data.dataset", dataset_name)
     # Point the whole stack at the group-local dataset store, so nothing is
     # written to the shared `data/` folder.
     _set_dotted(config, "data.data_root", datasets_dir)
+    if opt_seed is not None:
+        _set_dotted(config, "training.data_seed", int(opt_seed))
+
 
     apply_dataset_derived(config, spec, datasets_dir, dataset_name)
 
@@ -413,9 +531,9 @@ def stage_run_config(base_config_path: str, group: Dict[str, Any], spec: Any,
     """
     config: Any = OmegaConf.load(base_config_path)
 
-    for key, value in group["axes"].items():
-        _set_dotted(config, f"experiment.{key}", value)
+    _write_axes(config, group)
     _set_dotted(config, "data.dataset", dataset_name)
+
     _set_dotted(config, "data.data_root", datasets_dir)
     _set_dotted(config, "training.data_seed", int(dag_seed))
     _set_dotted(config, "training.seed",
@@ -656,6 +774,10 @@ def resolve_trainer(name: str) -> Tuple[Callable, str, str]:
         "staged": "staged_train_function_for_sweep",
         "anm": "anm_train_function_for_sweep",
         "adaptive": "adaptive_train_function_for_sweep",
+        # Not a trainer: fits the external baselines (NOTEARS / DAGMA / PC) on
+        # the generated datasets, so a DAG sweep can produce baseline curves
+        # with exactly the same graphs, splits and reporting as the model runs.
+        "benchmark": "benchmark_function_for_sweep",
     }
     if name not in registry:
         raise ValueError(
@@ -693,13 +815,14 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
         A summary dict with the per-group/per-seed outcome.
     """
     spec = load_dagsweep_spec(exp_dir)
-    groups = build_groups(spec)
+    # One source for the whole sweep: it decides what a group's data IS
+    # (sampled graph vs fixed SCM) and when the heavy arrays may be pruned.
+    source = build_data_source(spec)
+    groups = build_groups(spec, source)
     base_config_path, base_optuna_path = _find_base_files(exp_dir)
 
-    dag_block: Dict[str, Any] = _as_dict(spec.get("dag", {}))
-    _, gen_kwargs = split_dag_block(dag_block)
-
     opt_cfg = spec.get("optuna", {}) or {}
+
     opt_seed = int(opt_cfg.get("opt_seed", DEFAULT_OPT_SEED))
     optuna_enabled = bool(opt_cfg.get("enabled", True)) and not skip_optuna
 
@@ -719,7 +842,12 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
 
     if dry_run:
         for group in groups:
-            print(f"[group] {group['name']}  dag_seeds={group['dag_seeds']}"
+            # A fixed dataset has no DAG to draw, so the same seed list means
+            # "split seed" there; print the label the spec actually used.
+            seed_label = ("data_seeds" if source.group_axis_values() is not None
+                          else "dag_seeds")
+            print(f"[group] {group['name']}  {seed_label}={group['dag_seeds']}"
+
                   f"  model_seeds="
                   f"{group['model_seeds'] if group['model_seeds'] is not None else '= dag_seed'}"
                   f"  runs={len(plans[group['name']])}"
@@ -738,55 +866,57 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
 
         group_result: Dict[str, Any] = {"seeds": {}, "best_params": {}}
 
-        # ---- Phase 1: optimise once, on a dedicated DAG ---------------------
-        best_params: Dict[str, Any] = {}
-        if optuna_enabled:
-            opt_dag_cfg = build_dag_config(dag_block, seed=opt_seed, **group["axes"])
-            with materialized_dag(opt_dag_cfg, datasets_dir, gen_kwargs,
-                                  delete_dataset=delete_dataset) as opt_dataset:
-                # The node count comes from the generated dataset, not from the
-                # group axis: it is what the width range must be built on.
-                n_keys = n_keys_from_metadata(
-                    datasets_dir, opt_dataset,
-                    fallback=group["axes"].get("n_nodes"),
-                )
-                logger.info("  Optimisation DAG %s (n_keys=%d)", opt_dataset, n_keys)
-                stage_group_config(
-                    base_config_path, base_optuna_path, group_dir, group, spec,
-                    opt_dataset, datasets_dir, n_keys=n_keys,
-                    search_protocol=str(opt_cfg.get("protocol", "reconstruction")),
-                )
-                best_params = optimize_group(group_dir, datasets_dir, spec,
-                                             cluster, n_keys=n_keys,
-                                             force=force_optuna)
-        else:
-            best_params = load_best_params(group_dir)
-            if best_params:
-                logger.info("  Using %d cached best param(s)", len(best_params))
+        # The scope owns the group's data: for sampled DAGs it is a thin
+        # per-seed wrapper, for a fixed SCM it generates once here and prunes
+        # once at exit (regenerating per seed would dominate the runtime).
+        with source.group_scope(group, datasets_dir, delete_dataset) as scope:
+
+            # ---- Phase 1: optimise once, on a dedicated dataset -------------
+            best_params: Dict[str, Any] = {}
+            if optuna_enabled:
+                with scope.dataset(opt_seed) as opt_dataset:
+                    # The node count comes from the generated dataset, not from
+                    # the group axis: the width range must be built on it.
+                    n_keys = n_keys_from_metadata(
+                        datasets_dir, opt_dataset,
+                        fallback=group["axes"].get("n_nodes"),
+                    )
+                    logger.info("  Optimisation dataset %s (n_keys=%d)",
+                                opt_dataset, n_keys)
+                    stage_group_config(
+                        base_config_path, base_optuna_path, group_dir, group, spec,
+                        opt_dataset, datasets_dir, n_keys=n_keys,
+                        search_protocol=str(opt_cfg.get("protocol", "reconstruction")),
+                        opt_seed=opt_seed,
+                    )
+                    best_params = optimize_group(group_dir, datasets_dir, spec,
+                                                 cluster, n_keys=n_keys,
+                                                 force=force_optuna)
             else:
-                # Explicit fallback (--skip_optuna / optuna.enabled: false): the
-                # base config is trained AS IS.  Loud, because an untuned run
-                # looks exactly like a tuned one in the output folder.
-                logger.warning(
-                    "  No best_trial.yaml in %s -> training the BASE config "
-                    "UNTUNED for every seed of this group", group_dir,
-                )
+                best_params = load_best_params(group_dir)
+                if best_params:
+                    logger.info("  Using %d cached best param(s)", len(best_params))
+                else:
+                    # Explicit fallback (--skip_optuna / optuna.enabled: false):
+                    # the base config is trained AS IS.  Loud, because an untuned
+                    # run looks exactly like a tuned one in the output folder.
+                    logger.warning(
+                        "  No best_trial.yaml in %s -> training the BASE config "
+                        "UNTUNED for every seed of this group", group_dir,
+                    )
 
+            group_result["best_params"] = best_params
 
-        group_result["best_params"] = best_params
-
-        # ---- Phase 2: train every seed, reusing those params ---------------
-        # Runs are grouped by DAG seed so each dataset is generated ONCE and all
-        # of its model seeds train on the very same arrays (identical graph AND
-        # identical split - the premise of an edge-stability estimate).  Pruning
-        # therefore happens after the last model seed of a DAG.
-        for dag_seed, dag_runs in _group_plan_by_dag(plans[group["name"]]):
-            dag_cfg = build_dag_config(dag_block, seed=dag_seed, **group["axes"])
-
-            try:
-                with materialized_dag(dag_cfg, datasets_dir, gen_kwargs,
-                                      delete_dataset=delete_dataset) as dataset_name:
+            # ---- Phase 2: train every seed, reusing those params ------------
+            # Runs are grouped by data seed so each dataset is materialized ONCE
+            # and all of its model seeds train on the very same arrays (identical
+            # graph AND identical split - the premise of an edge-stability
+            # estimate).
+            for dag_seed, dag_runs in _group_plan_by_dag(plans[group["name"]]):
+              try:
+                with scope.dataset(dag_seed) as dataset_name:
                     for model_seed, run_key, suffix in dag_runs:
+
                         run_name = f"{exp_id}_{group['name']}_{suffix}"
                         save_dir = (group_dir / "sweeper" / "runs"
                                     / "combinations" / run_name)
@@ -829,15 +959,16 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
                                 "error": str(exc),
                                 "dag_seed": int(dag_seed),
                             }
-            except Exception as exc:
-                # Dataset generation / pruning failed: no run of this DAG ran.
-                logger.error("DAG seed %s failed: %s", dag_seed, exc, exc_info=True)
+              except Exception as exc:
+                # Dataset generation / pruning failed: no run of this seed ran.
+                logger.error("Data seed %s failed: %s", dag_seed, exc, exc_info=True)
                 for model_seed, run_key, _suffix in dag_runs:
                     group_result["seeds"].setdefault(run_key, {
                         "status": "failed",
                         "error": str(exc),
                         "dag_seed": int(dag_seed),
                     })
+
 
         results["groups"][group["name"]] = group_result
 

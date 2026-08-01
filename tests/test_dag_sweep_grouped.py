@@ -120,11 +120,24 @@ def test_opt_seed_overlapping_eval_seeds_is_rejected(tmp_path):
 
 
 def test_spec_requires_group_axes_and_seeds(tmp_path):
+    """A sampled-DAG sweep must say how to GROUP; only 'datasets' may omit it."""
     exp_dir = tmp_path / "exp"
     exp_dir.mkdir()
-    OmegaConf.save(OmegaConf.create({"seeds": [0]}), exp_dir / "dagsweep.yaml")
+    OmegaConf.save(OmegaConf.create({"seeds": [0], "dag": {"n_nodes": 4}}),
+                   exp_dir / "dagsweep.yaml")
     with pytest.raises(ValueError, match="group_axes"):
         ots.load_dagsweep_spec(str(exp_dir))
+
+
+def test_spec_without_any_data_source_is_rejected(tmp_path):
+    """Neither 'dag' nor 'datasets' means the sweep has no data to train on."""
+    exp_dir = tmp_path / "exp"
+    exp_dir.mkdir()
+    OmegaConf.save(OmegaConf.create({"group_axes": {"n_nodes": [4]}, "seeds": [0]}),
+                   exp_dir / "dagsweep.yaml")
+    with pytest.raises(ValueError, match="no data source"):
+        ots.load_dagsweep_spec(str(exp_dir))
+
 
 
 def test_dag_seeds_is_accepted_and_seeds_stays_an_alias(tmp_path):
@@ -141,8 +154,9 @@ def test_declaring_both_seed_keys_is_rejected(tmp_path):
     """Two sources of truth for the DAG seeds could silently disagree."""
     exp_dir = _write_experiment(tmp_path, seeds=(0, 1),
                                 extra_spec={"dag_seeds": [5, 6]})
-    with pytest.raises(ValueError, match="not both"):
+    with pytest.raises(ValueError, match="ONE seed list"):
         ots.load_dagsweep_spec(str(exp_dir))
+
 
 
 def test_empty_model_seeds_is_rejected(tmp_path):

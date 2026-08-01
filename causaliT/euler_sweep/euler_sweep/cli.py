@@ -34,7 +34,6 @@ from causaliT.euler_sweep.euler_sweep.sweeper import run_sequential_sweep, run_p
 # Import causaliT training components
 from causaliT.training.trainer import trainer
 from causaliT.training.staged_trainer import staged_trainer
-from causaliT.training.anm_staged_trainer import anm_alternating_trainer
 from causaliT.training.adaptive_trainer import adaptive_trainer
 from causaliT.training.experiment_control import update_config
 
@@ -118,41 +117,6 @@ def staged_train_function_for_sweep(
     )
 
 
-def anm_train_function_for_sweep(
-    config: OmegaConf,
-    save_dir: Path,
-    data_dir: Path,
-    cluster: bool,
-    **kwargs
-):
-    """
-    ANM alternating training function wrapper for parameter sweeps.
-
-    Like ``staged_train_function_for_sweep`` but delegates to
-    ``anm_alternating_trainer`` which runs the Subsequent Structure-Reconstruct
-    schedule defined in ``config['anm_training']['stages']``.
-
-    Args:
-        config: Configuration object (OmegaConf) with all hyperparameters
-        save_dir: Directory to save outputs (checkpoints, logs, results)
-        data_dir: Directory containing training data
-        cluster: Whether running on a cluster (affects num_workers, etc.)
-        **kwargs: Additional arguments passed to anm_alternating_trainer
-
-    Returns:
-        pd.DataFrame: One row per stage with training metrics and DAG diagnostics
-    """
-    config_updated = update_config(config)
-
-    return anm_alternating_trainer(
-        config=config_updated,
-        save_dir=str(save_dir),
-        data_dir=str(data_dir),
-        cluster=cluster,
-        **kwargs
-    )
-
-
 def adaptive_train_function_for_sweep(
     config: OmegaConf,
     save_dir: Path,
@@ -163,7 +127,7 @@ def adaptive_train_function_for_sweep(
     """
     Adaptive alternating training function wrapper for parameter sweeps.
 
-    Like ``anm_train_function_for_sweep`` but delegates to
+    Like ``staged_train_function_for_sweep`` but delegates to
     ``adaptive_trainer`` which runs the metric-driven reconstruct/structure
     schedule defined in ``config['adaptive_training']`` (a single in-memory
     ``pl.Trainer.fit()`` that switches phases automatically on ``val_x_mae``).
@@ -192,6 +156,58 @@ def adaptive_train_function_for_sweep(
         cluster=cluster,
         **kwargs
     )
+
+
+def benchmark_function_for_sweep(
+    config: OmegaConf,
+    save_dir: Path,
+    data_dir: Path,
+    cluster: bool,
+    **kwargs
+):
+    """
+    Benchmark "training" function wrapper for parameter / DAG sweeps.
+
+    Drop-in replacement for ``train_function_for_sweep`` that fits the external
+    structure learners (NOTEARS, DAGMA, PC) instead of a causaliT model.  It
+    keeps the sweep signature so a DAG sweep can run baselines on exactly the
+    same generated datasets by setting ``training.trainer: benchmark``.
+
+    No model is trained: the methods read ``ds.npz`` directly and each writes
+    ``eval/eval_benchmark_<method>/`` inside ``save_dir`` with the standard
+    ``dag_metrics.json`` produced by ``write_dag_report``.  The methods and their
+    settings come from the ``benchmark`` section of the config (see
+    ``causaliT.benchmarks.runner.DEFAULT_BENCHMARK_CONFIG``).
+
+    Args:
+        config: Staged run config; ``data.dataset`` selects the dataset and the
+            optional ``benchmark`` section selects methods/seeds/threshold.
+        save_dir: Run folder that receives the eval subfolders.
+        data_dir: Directory containing the dataset folder (group-local in a DAG
+            sweep), passed explicitly so no data-root resolution is needed.
+        cluster: Ignored; benchmarks are single-process CPU fits.
+        **kwargs: Forwarded as overrides to ``run_benchmarks``.
+
+    Returns:
+        pd.DataFrame: One row per method with the headline DAG metrics.  The same
+        table is written to ``save_dir/benchmark_summary.csv``, because the sweep
+        discards trainer return values - without the file a run folder could only
+        be summarised by walking every eval subfolder.
+    """
+
+    import pandas as pd
+
+    from causaliT.benchmarks.runner import run_benchmarks, summarize_benchmarks
+
+    results = run_benchmarks(
+        experiment=str(save_dir),
+        datadir_path=None if data_dir is None else str(data_dir),
+        overrides=kwargs or None,
+    )
+    summary = pd.DataFrame(summarize_benchmarks(results))
+    summary.to_csv(Path(save_dir) / "benchmark_summary.csv", index=False)
+    return summary
+
 
 
 # =============================================================================
@@ -667,227 +683,7 @@ def calisweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 
 
 # =============================================================================
-# ANMSWEEP COMMAND — mirrors `calisweep` but uses anm_alternating_trainer
-# =============================================================================
-@click.command()
-@click.option(
-    "--exp_id",
-    required=True,
-    help="Experiment ID (folder name containing config.yaml and sweep.yaml)"
-)
-@click.option(
-    "--sweep_mode",
-    required=True,
-    type=click.Choice(['independent', 'combination']),
-    help="Sweep mode: 'independent' (one param at a time) or 'combination' (all combinations)"
-)
-@click.option(
-    "--parallel",
-    default=False,
-    is_flag=True,
-    help="Run in parallel using SLURM job arrays (cluster only)"
-)
-@click.option(
-    "--cluster",
-    default=False,
-    is_flag=True,
-    help="Running on cluster (affects paths and resource usage)"
-)
-@click.option(
-    "--scratch_path",
-    default=None,
-    help="Scratch path for cluster execution (e.g., $SCRATCH/my_exp)"
-)
-# SLURM parameters (only used with --parallel)
-@click.option(
-    "--max_concurrent_jobs",
-    default=6,
-    type=int,
-    help="Maximum concurrent SLURM jobs (default: 6)"
-)
-@click.option(
-    "--walltime",
-    default="4:00:00",
-    help="SLURM walltime limit (default: 4:00:00)"
-)
-@click.option(
-    "--gpu_mem",
-    default="11g",
-    help="GPU memory requirement (default: 11g)"
-)
-@click.option(
-    "--mem_per_cpu",
-    default="10g",
-    help="CPU memory requirement (default: 10g)"
-)
-@click.option(
-    "--submit_jobs",
-    default=True,
-    is_flag=True,
-    help="Actually submit jobs (False for dry run)"
-)
-def anmsweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
-             max_concurrent_jobs, walltime, gpu_mem, mem_per_cpu, submit_jobs):
-    """
-    Run parameter sweeps using the ANM alternating trainer.
-
-    Identical to the ``calisweep`` command but uses ``anm_alternating_trainer``
-    instead of ``staged_trainer``.  The ANM trainer runs the Subsequent
-    Structure-Reconstruct schedule defined in ``config['anm_training']['stages']``:
-    alternating reconstruction-only and structure-only phases with a key-dropout
-    curriculum (H1–H5 from docs/ideas/PARTIAL_ANM_REGRESSION.md).
-
-    Sweep Modes:
-      - independent: Vary one parameter at a time (baseline comparison)
-      - combination: Explore all combinations (Cartesian product)
-
-    Execution Modes:
-      - Sequential (default): Run combinations one after another
-      - Parallel (--parallel): Use SLURM job arrays for cluster parallelization
-
-    Examples::
-
-      # Sequential combination sweep with ANM alternating trainer
-      python cli.py anmsweep --exp_id my_exp --sweep_mode combination
-
-      # Parallel combination sweep on cluster
-      python cli.py anmsweep --exp_id my_exp --sweep_mode combination \\
-          --parallel --cluster --scratch_path $SCRATCH/my_exp \\
-          --max_concurrent_jobs 10
-    """
-    print(f"Starting ANM alternating parameter sweep: exp_id={exp_id}, mode={sweep_mode}, parallel={parallel}")
-
-    # =============================================================================
-    # Validate execution mode
-    # =============================================================================
-    if parallel and not cluster:
-        raise ValueError(
-            "Parallel execution (--parallel) requires cluster mode (--cluster).\n"
-            "Parallel sweeps use SLURM job arrays which are only available on clusters.\n"
-            "For local execution, use sequential mode (omit --parallel flag)."
-        )
-
-    # =============================================================================
-    # Set up directories for causaliT project
-    # =============================================================================
-    if scratch_path is None:
-        exp_dir = join(ROOT_DIR, "experiments", exp_id)
-        home_exp_dir = exp_dir
-    else:
-        exp_dir = scratch_path
-        home_exp_dir = join(ROOT_DIR, "experiments", exp_id)
-
-    # Data directory
-    data_dir = join(ROOT_DIR, "data")
-
-    # Check if experiment directory exists
-    check_dir = home_exp_dir if scratch_path is not None else exp_dir
-    if not exists(check_dir):
-        raise ValueError(f"Experiment directory does not exist: {check_dir}")
-
-    # Check for required config files (supports config*.yaml pattern)
-    import glob
-    config_pattern = join(check_dir, "config*.yaml")
-    config_files = glob.glob(config_pattern)
-    sweeper_dir = join(check_dir, "sweeper")
-    sweep_path = join(sweeper_dir, "sweep.yaml")
-
-    if not config_files:
-        raise ValueError(
-            f"Config file not found in: {check_dir}\n"
-            "Create a config.yaml (or config_*.yaml) file in your experiment directory."
-        )
-
-    if not exists(sweeper_dir):
-        raise ValueError(
-            f"Sweeper directory not found: {sweeper_dir}\n"
-            "Create a 'sweeper' subdirectory in your experiment folder.\n"
-            f"Expected structure: {check_dir}/sweeper/sweep.yaml"
-        )
-
-    if not exists(sweep_path):
-        raise ValueError(
-            f"Sweep file not found: {sweep_path}\n"
-            "Create a sweep.yaml file in the sweeper subdirectory.\n"
-            f"Expected location: {check_dir}/sweeper/sweep.yaml"
-        )
-
-    print(f"Experiment directory: {exp_dir}")
-    print(f"Data directory: {data_dir}")
-    print(f"Config: {config_files[0]}")
-    print(f"Sweep: {sweep_path}")
-    print(f"Training function: anm_train_function_for_sweep (anm_alternating_trainer)")
-
-    # =============================================================================
-    # CausaliT training function — ANM alternating variant
-    # =============================================================================
-    train_fn = anm_train_function_for_sweep
-
-    # =============================================================================
-    # Execute sweep based on mode
-    # =============================================================================
-    if not parallel:
-        # Sequential sweep
-        print(f"\nRunning sequential {sweep_mode} sweep (ANM alternating trainer)...")
-        print("This will run combinations one after another.\n")
-
-        run_sequential_sweep(
-            exp_dir=exp_dir,
-            sweep_mode=sweep_mode,
-            train_fn=train_fn,
-            data_dir=data_dir,
-            cluster=cluster,
-            experiment_id=exp_id
-        )
-
-        print("\n" + "=" * 60)
-        print("Sequential ANM alternating sweep completed!")
-        print("=" * 60)
-
-        if sweep_mode == "independent":
-            print(f"Results: {exp_dir}/sweeps/")
-        else:
-            print(f"Results: {exp_dir}/combinations/")
-        print("=" * 60 + "\n")
-
-    else:
-        # Parallel sweep using SLURM job arrays
-        print(f"\nPreparing parallel {sweep_mode} sweep (ANM alternating trainer)...")
-        print(f"Max concurrent jobs: {max_concurrent_jobs}")
-        print(f"Walltime: {walltime}")
-        print(f"GPU memory: {gpu_mem}")
-        print(f"CPU memory: {mem_per_cpu}\n")
-
-        # Prepare SLURM parameters
-        slurm_params = {
-            'max_concurrent_jobs': max_concurrent_jobs,
-            'walltime': walltime,
-            'gpu_mem': gpu_mem,
-            'mem_per_cpu': mem_per_cpu
-        }
-
-        # For parallel execution, specify the training function by module and name
-        # so it can be imported by worker jobs on cluster nodes
-        train_fn_module = "causaliT.euler_sweep.euler_sweep.cli"
-        train_fn_name = "anm_train_function_for_sweep"
-
-        run_parallel_sweep(
-            exp_dir=exp_dir,
-            home_exp_dir=home_exp_dir,
-            sweep_mode=sweep_mode,
-            train_fn_module=train_fn_module,
-            train_fn_name=train_fn_name,
-            experiment_id=exp_id,
-            data_dir=data_dir,
-            scratch_path=scratch_path,
-            slurm_params=slurm_params,
-            cluster=cluster,
-            submit_jobs=submit_jobs
-        )
-
-
-# =============================================================================
-# ADAPTIVESWEEP COMMAND — mirrors `anmsweep` but uses adaptive_trainer
+# ADAPTIVESWEEP COMMAND — mirrors `calisweep` but uses adaptive_trainer
 # =============================================================================
 @click.command()
 @click.option(
@@ -951,8 +747,8 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     """
     Run parameter sweeps using the adaptive alternating trainer.
 
-    Identical to the ``anmsweep`` command but uses ``adaptive_trainer`` instead
-    of ``anm_alternating_trainer``.  The adaptive trainer runs the metric-driven
+    Identical to the ``calisweep`` command but uses ``adaptive_trainer`` instead
+    of ``staged_trainer``.  The adaptive trainer runs the metric-driven
     reconstruct/structure schedule defined in ``config['adaptive_training']``
     (single in-memory ``pl.Trainer.fit()`` switching phases on ``val_x_mae``).
 
@@ -1430,7 +1226,6 @@ def calibrate_batch_budget(safety, multiplicity, dtype_bytes, no_cache):
 
 cli.add_command(sweep)
 cli.add_command(calisweep)
-cli.add_command(anmsweep)
 cli.add_command(adaptivesweep)
 cli.add_command(dagsweep)
 cli.add_command(dagsweep_status)

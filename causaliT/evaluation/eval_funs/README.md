@@ -159,3 +159,22 @@ tensor **by its shape**, so no architecture registry is involved:
 Every architecture therefore emits the same canonical block names, and
 `dag_metrics.json` / `learned_dag_edges.json` are comparable across models.
 MEC metrics require both blocks and are skipped for cross-only models.
+
+## Shared with the external benchmarks
+
+The model-free half of `eval_attention_scores` lives in
+`helpers/eval_dag_query.py` (metrics/plots/JSON given the blocks) and
+`helpers/eval_dag_report.py` (`resolve_dag_dims`, `write_dag_report`).  The
+NOTEARS / DAGMA / PC baselines in `causaliT/benchmarks/` call `write_dag_report`
+too, so their `eval/eval_benchmark_<method>/files/dag_metrics.json` has exactly
+this schema and `eval_seed_sweep` aggregates baselines and models with the same
+code:
+
+```
+model:     checkpoint -> attention -> query_dag_blocks -\
+                                                         >-- write_dag_report
+benchmark: design matrix -> W -> adjacency_to_blocks ----/
+```
+
+Changing the metric keys or the JSON layout therefore changes the baselines' files
+as well - which is the point.  See `docs/documentation/BENCHMARKS.md`.

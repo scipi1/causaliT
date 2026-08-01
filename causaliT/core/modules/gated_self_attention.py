@@ -95,6 +95,7 @@ import torch.nn.functional as F
 
 from causaliT.utils.query_norm import (
     apply_query_norm,
+    coerce_fanin_scale,
     make_query_norm_log_scale,
     overspend_penalty,
 )
@@ -178,7 +179,8 @@ class GatedSelfAttention(nn.Module):
 
         # Centroid-collapse fix (structure score only); see __init__ doc.
         self.normalize_query = bool(normalize_query)
-        self.query_fanin_scale = float(query_fanin_scale)
+        self.query_fanin_scale = coerce_fanin_scale(query_fanin_scale)
+
 
         # Learnable per-node query-norm multiplier (only active with
         # normalize_query=True).  ``M_i = exp(log_scale_i)`` init at

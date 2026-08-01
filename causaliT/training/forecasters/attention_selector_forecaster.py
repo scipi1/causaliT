@@ -414,9 +414,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self._reconstruction_params = reconstruction_params
 
         # ----------------------------------------------------------------
-        # Parameter freezing for ANM alternating stages
-        # Set by anm_staged_trainer._build_stage_config per stage.
-        # Requires use_gradient_routing=True; otherwise _build_stage_config
+        # Parameter freezing for alternating structure/reconstruct phases
+        # Set by the training config (config['training']['freeze_*_params']).
+        # Requires use_gradient_routing=True; otherwise the config loader
         # falls back to loss-level gating and leaves these False.
         # Applied in on_fit_start so that warm-started weights can be loaded
         # first and frozen second (requires_grad is not saved in checkpoints).
@@ -1293,7 +1293,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """
         Strip BKD state-dict keys that don't exist in the current model.
 
-        When warm-starting across ANM stages whose ``batch_key_dropout``
+        When warm-starting across phases whose ``batch_key_dropout``
         configuration differs (e.g. stage 1 has BKD enabled, stage 2 has
         ``batch_key_dropout=null``), the saved checkpoint may contain keys
         such as::
@@ -1378,15 +1378,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     def on_fit_start(self):
         """
-        ANM stage-level parameter freezing.
+        Phase-level parameter freezing.
 
         Called by Lightning at the start of each ``trainer.fit()`` call.
         Freezes structural or reconstruction parameters when the corresponding
-        flag is set by ``anm_staged_trainer._build_stage_config``.
+        flag is set in ``config['training']``.
 
         Only active when ``use_gradient_routing=True`` (param groups exist).
-        When gradient routing is off, ``_build_stage_config`` already falls
-        back to loss-level gating and leaves both flags ``False``.
+        When gradient routing is off there are no parameter groups to freeze,
+        so both flags are expected to stay ``False`` and the loss weights do
+        the gating instead.
 
         ``requires_grad`` is **not** persisted in checkpoints, so each new
         stage's warm-started model starts fully unfrozen and this hook re-
@@ -1395,11 +1396,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self.freeze_structural_params and self.use_gradient_routing:
             for p in self._structural_params:
                 p.requires_grad_(False)
-            print("  [ANM stage] Structural parameters frozen (requires_grad=False).")
+            print("  [phase] Structural parameters frozen (requires_grad=False).")
         if self.freeze_reconstruction_params and self.use_gradient_routing:
             for p in self._reconstruction_params:
                 p.requires_grad_(False)
-            print("  [ANM stage] Reconstruction parameters frozen (requires_grad=False).")
+            print("  [phase] Reconstruction parameters frozen (requires_grad=False).")
 
         # Rebuild the interference block mapping so it reflects the current
         # requires_grad state for this stage.

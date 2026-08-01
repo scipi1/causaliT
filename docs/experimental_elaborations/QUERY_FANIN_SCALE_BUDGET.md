@@ -151,3 +151,42 @@ vanishing-gradient trade-off in this direction.
    matched offset — not a smaller F.
 3. **`M_i` should relax toward 1.0.** With enough F, nodes no longer need to
    over-spend; `M_i` staying above ~1.2 would mean F is still too small.
+
+## 8. `query_fanin_scale: auto` (implemented)
+
+Because `F = n * x^2` scales with the node count, hard-coding it per experiment
+is a latent bug: the same YAML on a 400-node dataset would under-score every row
+by 40x. F is therefore **derived from the data**, and the config exposes the
+*intent* instead — target (b) of Section 6, the centroid edge posterior:
+
+```yaml
+experiment:
+  query_fanin_scale: auto      # or a literal float to pin it (legacy runs)
+  query_centroid_max_p: 0.9    # P(z>0) given to EVERY parent at the centroid
+```
+
+`causaliT/utils/query_norm.py::resolve_query_fanin_scale` inverts the same gate
+algebra used above,
+
+```
+x = logit(max_p) + T + beta*ln(-gamma/zeta)      F = n_keys * (x / M)^2
+```
+
+with `T = init_edge_offset` (dropped in `homogeneous_nodes` mode — there is no
+S->X cross gate to offset) and `M = query_norm_init_scale`. The stretch term
+`beta*ln(-gamma/zeta)` is 0 for the symmetric `gamma=-1.1, zeta=1.1` arm and is
+otherwise absorbed automatically, so the Hard-Concrete parameters can be swept
+without invalidating F.
+
+Resolution happens **once**, in `populate_seq_lengths_from_dataset` — the first
+point where `n_keys = n_source + n_input` is known — so every entry point
+(train, sweep, adaptive, eval) gets the same value, and the resolved number is
+printed with the other derived dimensions. The dagsweep's `fanin_saturating`
+size-derived rule (target (a), gate saturation `z = 1`) remains available and
+`validate_dimensions` treats `auto` as valid rather than stale.
+
+Why a *probability* and not "1.0 for maximum": `max_p` targets the sigmoid
+posterior `P(z>0)`, which reaches 1 only asymptotically, so `1.0` is rejected.
+Target (a) — gate value `z = 1`, reachable because of the hard clamp — is the
+`fanin_saturating` rule; at the reference arm it corresponds to `max_p ~ 0.82`.
+

@@ -11,6 +11,9 @@ building blocks the entry points (``eval_attention``, ``eval_interventions``,
     eval_dag_query:  model-free, shape-based extraction of the canonical
                      DAG blocks (``cross`` = S->X, ``self`` = X->X)
     eval_dag_scores: the shared metric core built on the above
+    eval_dag_report: model-free metric computation + artefact writing
+                     (``write_dag_report``), shared by ``eval_attention``
+                     and the external benchmarks in ``causaliT.benchmarks``
 
 This module deliberately re-exports nothing: import the submodule you need
 explicitly, e.g. ``from .helpers.eval_utils import _load_true_dag_mask``.

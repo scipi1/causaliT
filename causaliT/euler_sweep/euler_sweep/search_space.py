@@ -53,6 +53,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from omegaconf import OmegaConf
 
+from causaliT.utils.query_norm import is_auto_fanin
+
 logger = logging.getLogger(__name__)
 
 # Default alignment / range of the adaptive width list.
@@ -366,6 +368,10 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
     so ``F = n_keys * x_sat^2``.  F therefore SCALES WITH THE NODE COUNT: a value
     derived for 10 nodes under-scores a 400-node row by a factor of 40.
     See docs/experimental_elaborations/QUERY_FANIN_SCALE_BUDGET.md.
+
+    This PINS F to gate saturation (z = 1).  Leaving ``query_fanin_scale: auto``
+    in the config is the general alternative: it targets an explicit centroid
+    posterior ``query_centroid_max_p`` instead (query_norm.py).
     """
     exp = config.get("experiment", {}) if config is not None else {}
     tau = float(exp.get("init_tau", 0.5) or 0.5)
@@ -522,9 +528,13 @@ def validate_dimensions(config: Any, n_keys: int, repair: bool = True,
             )
 
     # 4. Fan-in scale (F = n * x_sat^2).
+    # ``auto`` (or null) is NOT a violation: F is then derived from n_keys at
+    # data-load time by causaliT.utils.query_norm.resolve_query_fanin_scale,
+    # which is exactly what this check enforces for pinned values.
     fanin = exp.get("query_fanin_scale", None)
-    if fanin is not None:
+    if fanin is not None and not is_auto_fanin(fanin):
         recommended = saturating_query_fanin(config, n_keys)
+
         if recommended > 0 and abs(float(fanin) - recommended) / recommended > fanin_tolerance:
             _fail_or_fix(
                 "experiment.query_fanin_scale", recommended,

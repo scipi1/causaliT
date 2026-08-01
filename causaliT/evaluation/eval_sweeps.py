@@ -21,6 +21,11 @@ import torch
 import re
 
 from causaliT.paths import DATA_DIR
+from causaliT.training.training_summary import (
+    TRAINED_RUN_MARKERS,
+    load_training_summary,
+)
+
 
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
@@ -54,35 +59,51 @@ def has_logs_subfolder(directory: str, s3: bool = False, bucket: str = None) -> 
         return any(subdir.name == target_folder for subdir in directory_path.iterdir() if subdir.is_dir())
 
 
-def has_kfold_summary(directory: str, s3: bool = False, bucket: str = None) -> bool:
+def is_trained_run(directory: str, s3: bool = False, bucket: str = None) -> bool:
     """
-    Check if the given directory contains kfold_summary.json file.
-    This indicates we've reached a trained model directory (bottom level).
-    
+    Check whether the directory is a completed run (the recursion bottom).
+
+    Accepts either marker:
+      - ``training_summary.json`` (current, written by models AND benchmarks)
+      - ``kfold_summary.json``    (legacy, previously finished experiments)
+
+    Both must be accepted: ``get_df_recursive`` keeps descending while this
+    returns False, so a run written in only one of the two formats would be
+    walked straight past and yield an EMPTY DataFrame with no error at all.
+
     Args:
         directory: Directory path to check
         s3: Whether to check on S3
         bucket: S3 bucket name (required if s3=True)
-        
-    Returns:
-        bool: True if kfold_summary.json exists in directory
-    """
-    target_file = "kfold_summary.json"
 
+    Returns:
+        bool: True if the directory holds a training summary in either format
+    """
     if s3:
         s3_client = get_s3_client()
-        # Ensure directory ends with /
         prefix = directory.rstrip('/') + '/'
-        file_key = prefix + target_file
-        
-        try:
-            s3_client.head_object(Bucket=bucket, Key=file_key)
-            return True
-        except:
-            return False
+        for target_file in TRAINED_RUN_MARKERS:
+            try:
+                s3_client.head_object(Bucket=bucket, Key=prefix + target_file)
+                return True
+            except Exception:
+                continue
+        return False
     else:
         directory_path = Path(directory)
-        return (directory_path / target_file).exists()
+        return any((directory_path / name).exists() for name in TRAINED_RUN_MARKERS)
+
+
+def has_kfold_summary(directory: str, s3: bool = False, bucket: str = None) -> bool:
+    """
+    Deprecated alias of :func:`is_trained_run`, kept for external callers.
+
+    Note this is NOT the old semantics: it now also matches runs that carry
+    only ``training_summary.json``.  That is deliberate - the old semantics
+    would silently skip every new run.
+    """
+    return is_trained_run(directory, s3=s3, bucket=bucket)
+
 
 
 def is_gradients_folder(directory: str, s3: bool = False, bucket: str = None) -> bool:
@@ -376,33 +397,44 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
         else:
             # Local paths
             folder_path = join(filepath, folder)
-            kfold_summary_path = join(folder_path, "kfold_summary.json")
-            
+
             # Find config file using helper
             try:
                 config_path = find_config_file(folder_path)
             except (FileNotFoundError, ValueError) as e:
                 print(f"Warning: {e}, skipping...")
                 continue
-                
-            if not exists(kfold_summary_path):
-                print(f"Warning: No kfold_summary.json in {folder_path}, skipping...")
+
+            summary = load_training_summary(folder_path)
+            if summary is None:
+                print(f"Warning: No training summary in {folder_path}, skipping...")
                 continue
-            
+
+            # Benchmark runs are trained runs, but there is no model to load:
+            # the estimate is a matrix, not a checkpoint.  Skip explicitly
+            # rather than letting the checkpoint lookup fail further down.
+            run_kind = (summary.get("run") or {}).get("kind")
+            if run_kind == "benchmark":
+                print(f"Skipping {folder}: benchmark run has no checkpoint to predict from")
+                continue
+
             try:
-                # Load config and kfold summary
+                # Load config and resolve the best fit's checkpoint
                 config = OmegaConf.load(config_path)
-                kfold_summary = OmegaConf.load(kfold_summary_path)
-                best_fold_number = kfold_summary.best_fold.fold_number
-                
-                # Build checkpoint path
-                checkpoint_path = join(
-                    folder_path,
-                    f'k_{best_fold_number}',
-                    'checkpoints',
-                    'best_checkpoint.ckpt'
-                )
-                
+                best_fit = summary.get("best_fit") or {}
+
+                checkpoint_path = best_fit.get("checkpoint")
+                if not checkpoint_path:
+                    # Fall back to the conventional location for the best fit.
+                    fit_id = best_fit.get("id", "k_0")
+                    checkpoint_path = join(
+                        folder_path,
+                        str(fit_id),
+                        'checkpoints',
+                        'best_checkpoint.ckpt'
+                    )
+
+
                 if not exists(checkpoint_path):
                     print(f"Warning: Checkpoint not found: {checkpoint_path}, skipping...")
                     continue
@@ -593,7 +625,7 @@ def eval_sweeps(filepath: str, outpath: str = None, s3: bool = False, datadir_pa
     df = get_df_recursive(
         filepath=filepath, 
         bottom_action=bottom_action_with_datadir, 
-        is_bottom=has_kfold_summary, 
+        is_bottom=is_trained_run, 
         s3=s3, 
         bucket="scipi1-public"
     )
@@ -936,7 +968,7 @@ def predict_nested_all_checkpoints(filepath: str, outpath: str = None, s3: bool 
     df = get_df_recursive(
         filepath=filepath, 
         bottom_action=bottom_action_with_params, 
-        is_bottom=has_kfold_summary, 
+        is_bottom=is_trained_run, 
         s3=s3, 
         bucket="scipi1-public"
     )

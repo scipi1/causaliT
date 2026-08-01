@@ -98,6 +98,42 @@ pytest tests/test_naming_consistency.py -v
 
 **Note:** This test does NOT modify config files - it only reports inconsistencies.
 
+---
+
+## 3. Benchmark Tests (`test_benchmarks.py`)
+
+Covers the external structure learners (NOTEARS, DAGMA, PC) in
+`causaliT/benchmarks/` - see `docs/documentation/BENCHMARKS.md`.
+
+```bash
+pytest tests/test_benchmarks.py -q
+```
+
+The two MLP variants take minutes per fit, so their end-to-end test is opt-in:
+
+```bash
+# Windows
+set CAUSALIT_RUN_SLOW_BENCHMARKS=1 && pytest tests/test_benchmarks.py -q
+# Linux/macOS
+CAUSALIT_RUN_SLOW_BENCHMARKS=1 pytest tests/test_benchmarks.py -q
+```
+
+What matters most in this file:
+
+- **orientation** - the papers use `W[parent, child]`, causaliT uses
+  `A[child, parent]`; a missing transpose scores the *reverse* graph with
+  perfectly plausible numbers, so the true `W` is pushed through the pipeline and
+  must reproduce the true masks exactly;
+- **standardisation** - the runner z-scores by default so the methods cannot read
+  the topological order off the marginal variances (varsortability); one test
+  pins raw-exact vs standardised-degraded so nobody "fixes" a weak benchmark
+  score by dropping it;
+- **plumbing** - the runner writes the same `dag_metrics.json` keys as the model
+  evaluation (`standard_shd_*`), and the sweep trainer `benchmark` is registered.
+
+A method whose optional dependency (`dagma`, `causal-learn`, `torch`) is missing
+is skipped, not failed.
+
 ## Windows: `PermissionError` on the pytest temp dir
 
 If collection dies with

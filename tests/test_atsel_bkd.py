@@ -8,8 +8,6 @@ Verifies:
 3. BKD is None when batch_key_dropout=None (default / disabled).
 4. A forward pass with BKD enabled completes without error and produces the
    correct output shape.
-5. _build_stage_config in anm_staged_trainer now applies batch_key_dropout_p
-   to AttentionSelectorLayer kwargs (regression test for the previous skip).
 6. BKD stage-transition state_dict compatibility:
    - BatchConsistentKeyDropout._step_count is only in state_dict when annealing
      is active (Fix 1).
@@ -207,65 +205,6 @@ class TestAttentionSelectorLayerBKD:
         bkd = inner.batch_key_dropout
         assert bkd is not None
         assert abs(float(bkd.p_init) - 0.0) < 1e-6
-
-
-class TestBuildStageConfigBKDForAtsel:
-    """
-    Regression tests: _build_stage_config must now apply batch_key_dropout_p
-    to AttentionSelectorLayer (previously it was silently skipped).
-    """
-
-    def _make_base_config(self):
-        return {
-            "model": {
-                "model_object": "AttentionSelectorLayer",
-                "kwargs": {
-                    "batch_key_dropout": None,
-                    "batch_key_dropout_p_final": None,
-                    "batch_key_dropout_annealing_batches": None,
-                },
-            },
-            "training": {
-                "max_epochs": 10,
-                "k_fold": 1,
-            },
-        }
-
-    def test_bkd_p_applied_to_atsel(self):
-        """batch_key_dropout_p in stage_spec is now forwarded to model kwargs."""
-        from causaliT.training.anm_staged_trainer import _build_stage_config
-
-        base = self._make_base_config()
-        stage_spec = {"name": "test_stage", "batch_key_dropout_p": 0.6}
-
-        result = _build_stage_config(base, stage_spec, stage_idx=0)
-
-        mk = result["model"]["kwargs"]
-        assert mk["batch_key_dropout"] == pytest.approx(0.6), (
-            f"Expected batch_key_dropout=0.6, got {mk['batch_key_dropout']}"
-        )
-        assert mk["batch_key_dropout_p_final"] == pytest.approx(0.6), (
-            f"Expected batch_key_dropout_p_final=0.6 (no intra-stage annealing), "
-            f"got {mk['batch_key_dropout_p_final']}"
-        )
-        assert mk["batch_key_dropout_annealing_batches"] is None, (
-            "Expected batch_key_dropout_annealing_batches=None (step annealing "
-            f"disabled), got {mk['batch_key_dropout_annealing_batches']}"
-        )
-
-    def test_bkd_p_not_set_leaves_kwargs_unchanged(self):
-        """If stage_spec has no batch_key_dropout_p, model kwargs are untouched."""
-        from causaliT.training.anm_staged_trainer import _build_stage_config
-
-        base = self._make_base_config()
-        stage_spec = {"name": "test_stage"}
-
-        result = _build_stage_config(base, stage_spec, stage_idx=0)
-
-        mk = result["model"]["kwargs"]
-        assert mk["batch_key_dropout"] is None
-        assert mk["batch_key_dropout_p_final"] is None
-        assert mk["batch_key_dropout_annealing_batches"] is None
 
 
 # ---------------------------------------------------------------------------

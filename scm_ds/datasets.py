@@ -740,8 +740,67 @@ ds_scm8 = SCMDataset(
 
 
 # =============================================================================
+# DATASET REGISTRY
+# =============================================================================
+# Maps a stable STRING KEY to an SCMDataset object.
+#
+# Why a registry: a fixed-dataset sweep (ATE studies) must name its datasets in
+# a YAML spec, and a YAML file cannot hold a Python object.  The key is also what
+# ends up in `data.dataset` and in `scm_recipe.json`, so an experiment folder
+# records exactly which SCM produced its data - and any researcher can rebuild it
+# from this repository alone, without shipping the heavy arrays.
+#
+# Keys are STABLE PUBLIC NAMES: renaming one invalidates existing specs and
+# recipes, so add a new key instead.
+# =============================================================================
+
+DATASET_REGISTRY: dict = {
+    # Paper datasets - discrete S sampling (defaults; holdout-friendly)
+    "ds_scm1": ds_scm1_discrete_sampling,
+    "ds_scm2": ds_scm2_discrete_sampling,
+    "ds_scm3": ds_scm3_discrete_sampling,
+    # Same SCMs with continuous (uniform) S sampling
+    "ds_scm1_continuous": ds_scm1,
+    "ds_scm2_continuous": ds_scm2,
+    "ds_scm3_continuous": ds_scm3,
+    # Control SCM: exchangeable multi-parent children (see the block above)
+    "ds_scm_equal": ds_scm_equal,
+    # Legacy / auxiliary SCMs
+    "ds_scm4": ds_scm4,
+    "ds_scm5": ds_scm5,
+    "ds_scm6": ds_scm6,
+    "ds_scm7": ds_scm7,
+    "ds_scm8": ds_scm8,
+    "ds_scm_1_to_1_ct": ds_scm_1_to_1_ct,
+    "ds_scm_1_to_1_ct_2": ds_scm_1_to_1_ct_2,
+}
+
+
+def get_dataset(name: str) -> SCMDataset:
+    """
+    Resolve a registry key to its ``SCMDataset``.
+
+    Args:
+        name: A key of :data:`DATASET_REGISTRY` (e.g. ``"ds_scm1"``).
+
+    Returns:
+        The registered ``SCMDataset``.
+
+    Raises:
+        KeyError: with the sorted list of valid keys - a typo in a sweep spec
+            must fail immediately, not silently train on the wrong SCM.
+    """
+    if name not in DATASET_REGISTRY:
+        raise KeyError(
+            f"Unknown dataset '{name}'. Available: {sorted(DATASET_REGISTRY)}."
+        )
+    return DATASET_REGISTRY[name]
+
+
+# =============================================================================
 # DATASET GENERATION (uncomment to generate)
 # =============================================================================
+
 
 if __name__ == "__main__":
     # =========================================================================

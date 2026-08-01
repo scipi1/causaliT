@@ -29,14 +29,48 @@ so *whenever* saturation actually bites — no epoch window to tune.
 
 ``log_scale`` is a STRUCTURAL parameter (matched by ``gradient_routing`` via the
 ``query_norm_log_scale`` name) so it is updated on the structural stream only.
+
+Automatic ``query_fanin_scale``
+-------------------------------
+F is not a free hyper-parameter: it is the only temperature left in the capped
+path, and it SCALES WITH THE NODE COUNT, so a hard-coded value silently breaks
+on a new dataset.  ``resolve_query_fanin_scale`` derives it from one intent -
+"a CENTROID-initialised query should give each candidate parent an edge
+posterior of ``query_centroid_max_p``" - see the derivation on
+``query_fanin_scale_from_centroid_p`` and
+docs/experimental_elaborations/QUERY_FANIN_SCALE_BUDGET.md.
 """
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+#: Default centroid edge posterior used when the config does not set one.
+DEFAULT_CENTROID_MAX_P = 0.9
+
+
+def coerce_fanin_scale(value: Any) -> float:
+    """Cast a ``query_fanin_scale`` to float, rejecting an UNRESOLVED sentinel.
+
+    ``auto`` must be turned into a number by ``resolve_query_fanin_scale`` at
+    data-load time (it needs ``n_keys``).  If it reaches a module the config
+    never went through that hook, so fail with the fix instead of the cryptic
+    ``could not convert string to float: 'auto'``.
+    """
+    if is_auto_fanin(value):
+        raise ValueError(
+            f"query_fanin_scale={value!r} was never resolved to a number. "
+            "It is derived from the node count by "
+            "causaliT.utils.query_norm.resolve_query_fanin_scale, which runs in "
+            "populate_seq_lengths_from_dataset; build the model from a config "
+            "passed through that hook, or set an explicit float."
+        )
+    return float(value)
+
+
 
 
 def make_query_norm_log_scale(num_nodes: int, init_scale: float = 1.0) -> nn.Parameter:
@@ -145,3 +179,102 @@ def query_norm_stats(model: torch.nn.Module):
         return None, None
     allm = torch.cat(scales)
     return allm.mean(), allm.max()
+
+
+# =============================================================================
+# Automatic query_fanin_scale
+# =============================================================================
+
+def query_fanin_scale_from_centroid_p(
+    n_keys: int,
+    max_p: float = DEFAULT_CENTROID_MAX_P,
+    init_tau: float = 0.5,
+    init_gamma: float = -1.1,
+    init_zeta: float = 1.1,
+    init_edge_offset: float = 0.0,
+    query_norm_init_scale: float = 1.0,
+) -> float:
+    """Fan-in scale F whose CENTROID init gives every parent posterior ``max_p``.
+
+    At the centroid every cosine is ``1/sqrt(n)``, so the score is
+    ``x = M * sqrt(F/n)`` (M = ``query_norm_init_scale``).  The Hard-Concrete
+    edge posterior is ``P(z>0) = sigmoid(x - T - c)`` with ``T =
+    init_edge_offset`` and the stretch term ``c = beta * ln(-gamma/zeta)``
+    (beta = ``init_tau``).  Inverting for ``P = max_p``::
+
+        x = logit(max_p) + T + c        ->      F = n * (x / M)^2
+
+    ``max_p`` is a PROBABILITY (the sigmoid never reaches 1); useful values are
+    in [0.5, 0.9].  F scales with ``n``, which is why it must be derived per
+    dataset instead of hard-coded.
+    """
+    if not 0.0 < float(max_p) < 1.0:
+        raise ValueError(
+            f"query_centroid_max_p must be in (0, 1), got {max_p!r}: it is an "
+            "edge POSTERIOR, so 1.0 is unreachable (use ~0.5-0.9)."
+        )
+    if int(n_keys) < 1:
+        raise ValueError(f"n_keys must be >= 1, got {n_keys!r}.")
+    if float(init_tau) <= 0.0 or float(init_gamma) >= 0.0 or float(init_zeta) <= 1.0:
+        raise ValueError(
+            "Hard-Concrete needs init_tau > 0, init_gamma < 0, init_zeta > 1; got "
+            f"{init_tau!r}, {init_gamma!r}, {init_zeta!r}."
+        )
+    if float(query_norm_init_scale) <= 0.0:
+        raise ValueError(
+            f"query_norm_init_scale must be > 0, got {query_norm_init_scale!r}."
+        )
+
+    stretch = float(init_tau) * math.log(-float(init_gamma) / float(init_zeta))
+    x = math.log(max_p / (1.0 - max_p)) + float(init_edge_offset) + stretch
+    if x <= 0.0:
+        raise ValueError(
+            f"query_centroid_max_p={max_p} needs a non-positive score (x={x:.4g}) "
+            f"given init_edge_offset={init_edge_offset} and stretch={stretch:.4g}; "
+            "raise query_centroid_max_p."
+        )
+    return float(n_keys) * (x / float(query_norm_init_scale)) ** 2
+
+
+def is_auto_fanin(value: Any) -> bool:
+    """True when ``query_fanin_scale`` asks to be derived (``auto`` / ``null``)."""
+    if value is None:
+        return True
+    return isinstance(value, str) and value.strip().lower() in ("auto", "derive", "null")
+
+
+def resolve_query_fanin_scale(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
+    """Fill ``experiment.query_fanin_scale`` IN PLACE when it is ``auto``.
+
+    ``init_edge_offset`` lives ONLY on the S->X ``GatedCrossAttention`` gate, so
+    it is dropped in ``homogeneous_nodes`` mode (one square block, no cross
+    block).  An explicit numeric ``query_fanin_scale`` is always honoured (old
+    configs reproduce exactly) and returns ``None``.
+    """
+    exp = config.get("experiment", None) if hasattr(config, "get") else None
+    if exp is None or "query_fanin_scale" not in exp:
+        return None
+    if not is_auto_fanin(exp.get("query_fanin_scale", None)):
+        return None
+
+    def _get(key, default):
+        value = exp.get(key, default)
+        return default if value is None else value
+
+    offset = 0.0 if bool(_get("homogeneous_nodes", False)) else float(
+        _get("init_edge_offset", 0.0))
+    max_p = float(_get("query_centroid_max_p", DEFAULT_CENTROID_MAX_P))
+    fanin = query_fanin_scale_from_centroid_p(
+        n_keys=n_keys,
+        max_p=max_p,
+        init_tau=float(_get("init_tau", 0.5)),
+        init_gamma=float(_get("init_gamma", -1.1)),
+        init_zeta=float(_get("init_zeta", 1.1)),
+        init_edge_offset=offset,
+        query_norm_init_scale=float(_get("query_norm_init_scale", 1.0)),
+    )
+    exp["query_fanin_scale"] = fanin
+    return {"query_fanin_scale": fanin, "n_keys": int(n_keys),
+            "query_centroid_max_p": max_p, "init_edge_offset": offset}
+
+
