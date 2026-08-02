@@ -856,18 +856,33 @@ truth, graph) works unchanged.
 | `seed` | Master seed. Same config + seed => identical DAG, equations, weights and noise. |
 | `linearity` | `"linear"`, `"nonlinear"`, or `"mixed"` (per node). |
 | `noise` | `"gaussian"`, `"nongaussian"`, or `"mixed"` for the X-node noise. |
-| `n_sources` / `s_x_ratio` | Number (or fraction) of source `S` nodes. Defaults to ~30%. |
 | `weight_range` | Magnitude range for structural weights (sign is random). |
 | `rescale_by_indegree` | If `True`, bakes `w / sqrt(in_degree)` for variance stability. |
-| `exact_edges` | If `True`, samples exactly `m` edges; else Bernoulli(p). |
+| `permute_labels` | If `True` (default), node numbering is shuffled so the index does not leak the topological order. |
+
+> **There is no `n_sources` knob.** The number of sources is *emergent*: it is whatever
+> the sampled ER-k graph produces (see below).
+
 
 ### Structure and guarantees
 
-- **S/X paradigm**: the first `n_sources` nodes are sources `S` (no incoming edges);
-  the rest are inputs `X`. Only `S->X` and `X->X` edges are produced, matching the
-  cross-/self-attention masks. `target_labels` is empty (no `Y` stage).
-- **Acyclicity by construction**: edges only go from an earlier to a later position in
-  a fixed topological layout, so the DAG is always valid.
+- **S/X paradigm, emergent**: a single ER-k DAG is drawn over all `n_nodes`, then the
+  partition is *read off* the graph - nodes with in-degree 0 are the sources `S`, all
+  others are inputs `X`. Consequently only `S->X` and `X->X` edges exist (an `S` node
+  has no parents by definition), which is exactly the cross-/self-attention mask
+  structure the model expects. `target_labels` is empty (no `Y` stage).
+- **Source count scales with the graph**, matching the standard ER benchmark. For
+  `p = 2k/(n-1)` the expected number of roots is `(1 - (1-p)^n) / p`, i.e. roughly
+  `43%` of the nodes at ER1, `24%` at ER2 and `12%` at ER4 - a *fraction* of `n`, not a
+  constant. This is what NOTEARS/DAGMA/GraN-DAG-style generators produce implicitly:
+  they never parameterise the root count, they simply sample the graph. The realised
+  count and the analytic expectation are both recorded in
+  `dataset.meta["graph_stats"]`.
+- **Acyclicity by construction**: nodes are laid out in a random topological order and
+  edges only go forward in that order, so the DAG is always valid.
+- **No topological-order leak**: with `permute_labels=True` the `S`/`X` indices are a
+  random permutation, so a model cannot infer "parent" from "lower index".
+
 - **Reproducibility**: a single `seed` drives DAG sampling, equation-family choices,
   weight sampling and per-node noise-type choices. The full config is stored in
   `dataset.meta["random_scm_config"]`, so a generated dataset is exactly regenerable
@@ -884,9 +899,14 @@ cfg = RandomSCMConfig(
     seed=42,
     linearity="mixed",
     noise="mixed",
-    s_x_ratio=0.3,
 )
 ds = sample_random_scm_dataset(cfg)   # a standard SCMDataset
+
+# The S/X split is emergent - inspect it, do not configure it:
+print(ds.meta["graph_stats"])
+# {'n_nodes': 30, 'n_edges': 60, 'n_sources': 7, 'n_inputs': 23,
+#  'source_fraction': 0.233, 'expected_er_roots': 7.1, ...}
+
 
 ds.generate_ds(
     mode="flat",

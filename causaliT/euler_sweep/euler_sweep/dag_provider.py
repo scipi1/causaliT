@@ -90,7 +90,8 @@ def split_dag_block(dag_block: Dict[str, Any]) -> tuple:
             silently ignored ``n_node`` would invalidate a whole sweep).
     """
     scm_names = _random_scm_field_names()
-    gen_names = {"n_samples", "normalize_method", "mode", "normalize"}
+    gen_names = {"n_samples", "normalize_method", "mode", "normalize", "compute_ate"}
+
 
     scm_fields: Dict[str, Any] = {}
     gen_kwargs: Dict[str, Any] = {}
@@ -248,6 +249,10 @@ def generate_dag_dataset(cfg: RandomSCMConfig, data_root: Union[str, Path],
     n_samples = int(gen_kwargs.pop("n_samples", DEFAULT_N_SAMPLES))
     mode = gen_kwargs.pop("mode", DEFAULT_MODE)
     gen_kwargs.setdefault("normalize_method", DEFAULT_NORMALIZE_METHOD)
+    # Sampled DAGs are scored on structure recovery (SHD), not on ATE: skip the two
+    # 50k-sample Monte Carlo passes unless explicitly requested from the config.
+    gen_kwargs.setdefault("compute_ate", False)
+
     # Reuse the DAG seed for sampling so the whole dataset is a pure function
     # of (dag_cfg, seed) - no hidden state, fully regenerable.
     gen_kwargs.setdefault("seed", int(cfg.seed))

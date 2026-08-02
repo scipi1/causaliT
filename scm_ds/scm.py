@@ -1088,10 +1088,12 @@ class SCMDataset:
             return input_np, (iv_map, if_map, iv_order), target_np , (tv_map, tf_map, tv_order), shared_vars_map
 
             
-    def generate_ds(self, mode, n, save_dir: Union[str, Path]=None, meta_dict: dict=None, 
+    def generate_ds(self, mode, n, save_dir: Union[str, Path]=None, meta_dict: dict=None,
                     normalize: bool = True, normalize_method: str = "standardize", seed=42,
                     shared_embedding: bool = False,
-                    test_split_method: Optional[Dict[str, Any]] = None):
+                    test_split_method: Optional[Dict[str, Any]] = None,
+                    compute_ate: bool = True):
+
         
         # get numpy array - handle both cases (with and without source_labels)
         get_numpy_result = self.get_numpy(mode, n, seed, shared_embedding=shared_embedding)
@@ -1350,9 +1352,15 @@ class SCMDataset:
             json.dump(dataset_metadata, file, indent=2, sort_keys=True, ensure_ascii=False)
         print(f"Exported dataset_metadata.json with causal structure and variable info")
 
-        # Export ATE ground truth for intervention evaluation (Monte Carlo only)
-        if self.source_labels:
+        # Export ATE ground truth for intervention evaluation (Monte Carlo only).
+        # ``compute_ate=False`` skips it entirely: randomly sampled DAGs (DAG sweeps)
+        # are only scored on structure recovery (SHD), so the two 50k-sample Monte
+        # Carlo passes would be pure overhead.
+        if not compute_ate:
+            print("Skipping ATE ground truth export (compute_ate=False)")
+        elif self.source_labels:
             try:
+
                 # Uses default PAPER_INTERVENTIONS from compute_ate_ground_truth()
                 # Unified scheme: ID=±0.5, OOD=1.5 (see PAPER_INTERVENTIONS)
                 
