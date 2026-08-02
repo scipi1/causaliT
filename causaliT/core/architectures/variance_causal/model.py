@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from causaliT.core.modules import (
-    ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention,
+    ScaledDotSoftmax, CausalCrossAttention, SigmoidCrossAttention,
     AttentionLayer, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask,
@@ -253,11 +253,11 @@ class VarianceCausalLayer(nn.Module):
     ):
         """Build an AttentionLayer.  Always dual_value=True for dual-residual decoder."""
         assert attention_type in [
-            "ScaledDotProduct", "CausalCrossAttention",
+            "ScaledDotSoftmax", "CausalCrossAttention",
             "SigmoidCrossAttention", "ToeplitzAttention",
         ]
         attn_cls = {
-            "ScaledDotProduct": ScaledDotAttention,
+            "ScaledDotSoftmax": ScaledDotSoftmax,
             "CausalCrossAttention": CausalCrossAttention,
             "SigmoidCrossAttention": SigmoidCrossAttention,
             "ToeplitzAttention": ToeplitzAttention,

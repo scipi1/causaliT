@@ -129,7 +129,7 @@ def _make_model(
         ds_embed_X=_summation_embed_cfg(VOCAB_X),
         comps_embed_S="summation",
         comps_embed_X="summation",
-        attention_type="ScaledDotProduct",
+        attention_type="ScaledDotSoftmax",
         # MANDATORY since the legacy cross-only variant was removed.
         self_attention_type="GatedSelfAttention",
 

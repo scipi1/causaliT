@@ -88,7 +88,7 @@ class StageCausalForecaster(pl.LightningModule):
         # Logging for sparsity
         self.log_sparsity = config["training"].get("log_sparsity", False)
         
-        # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotAttention)
+        # L1 regularization on attention SCORES (works for ANY attention type, including ScaledDotSoftmax)
         # These are independent parameters for fine-grained control over sparsity
         self.lambda_l1_self_scores = config["training"].get("lambda_l1_self_scores", 0.0)
         self.lambda_l1_cross_scores = config["training"].get("lambda_l1_cross_scores", 0.0)
@@ -350,14 +350,14 @@ class StageCausalForecaster(pl.LightningModule):
         sparsity_regularizer = 0.0
         
         # L1 regularization on attention SCORES
-        # NOTE: This is INEFFECTIVE for ScaledDotProduct attention because post-softmax
+        # NOTE: This is INEFFECTIVE for ScaledDotSoftmax attention because post-softmax
         # weights always sum to 1, making the mean approximately constant (1/seq_len).
-        # For ScaledDotProduct, use lambda_entropy_* instead for sparsity.
+        # For ScaledDotSoftmax, use lambda_entropy_* instead for sparsity.
         # This regularizer is kept for attention types with learnable phi parameters.
         def _get_att_scores_l1(att_weights_list):
             """L1 penalty on attention weights (post-softmax/activation).
             
-            NOTE: Ineffective for ScaledDotProduct attention - use entropy regularization instead.
+            NOTE: Ineffective for ScaledDotSoftmax attention - use entropy regularization instead.
             
             Args:
                 att_weights_list: List of attention weight tensors from each layer

@@ -850,7 +850,7 @@ class ToeplitzAttention(nn.Module):
         return getattr(self, 'P_edge_for_reg', None)
 
 
-class ScaledDotAttention(nn.Module):
+class ScaledDotSoftmax(nn.Module):
     """
     Simplified Scaled Dot-Product Attention.
 
@@ -868,7 +868,7 @@ class ScaledDotAttention(nn.Module):
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
-        super(ScaledDotAttention, self).__init__()
+        super(ScaledDotSoftmax, self).__init__()
 
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
@@ -911,7 +911,7 @@ class ScaledDotAttention(nn.Module):
     ):
         if oracle:
             raise NotImplementedError(
-                "Oracle attention mode is not implemented for ScaledDotAttention. "
+                "Oracle attention mode is not implemented for ScaledDotSoftmax. "
                 "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
             )
 
@@ -994,7 +994,7 @@ class ScaledDotAttention(nn.Module):
         return None
 
 
-class ScaledDotAttentionNAIM(nn.Module):
+class ScaledDotSoftmaxNAIM(nn.Module):
     """
     Scaled Dot-Product Attention with NAIM (Not All Is Missing) handling.
 
@@ -1003,7 +1003,7 @@ class ScaledDotAttentionNAIM(nn.Module):
     Reference: https://arxiv.org/abs/2407.11540
 
     NOTE: The hard_mask in this version is applied AFTER softmax, which can cause
-    information leakage. Use ScaledDotAttention for proper causal masking.
+    information leakage. Use ScaledDotSoftmax for proper causal masking.
 
     Returns ``(V, A, aux_dict)`` where ``aux_dict = {"entropy": ..., "l0_penalty": None}``.
     """
@@ -1016,7 +1016,7 @@ class ScaledDotAttentionNAIM(nn.Module):
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
-        super(ScaledDotAttentionNAIM, self).__init__()
+        super(ScaledDotSoftmaxNAIM, self).__init__()
 
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
@@ -1052,7 +1052,7 @@ class ScaledDotAttentionNAIM(nn.Module):
     ):
         if oracle:
             raise NotImplementedError(
-                "Oracle attention mode is not implemented for ScaledDotAttentionNAIM. "
+                "Oracle attention mode is not implemented for ScaledDotSoftmaxNAIM. "
                 "Use ToeplitzAttention (self) or CausalCrossAttention (cross) instead."
             )
 
@@ -1260,8 +1260,8 @@ class AttentionLayer(nn.Module):
     Multi-head attention layer.
 
     Supports the following attention mechanisms:
-        - ScaledDotAttention
-        - ScaledDotAttentionNAIM
+        - ScaledDotSoftmax
+        - ScaledDotSoftmaxNAIM
         - CausalCrossAttention    (ReLU(Tanh) activation, constant tau)
         - SigmoidCrossAttention   (Sigmoid activation, constant tau)
         - ToeplitzAttention       (Toeplitz decomposition, constant tau + learnable gate bias)
@@ -1442,7 +1442,7 @@ class AttentionLayer(nn.Module):
         # ``value_structure_query_dim`` to the value output width; the caller
         # passes a per-QUERY ``value_structure_query`` tensor of that trailing
         # width to ``forward``.  Only the gated (GatedCrossAttention /
-        # GatedSelfAttention) and ScaledDotAttention inner modules support the
+        # GatedSelfAttention) and ScaledDotSoftmax inner modules support the
         # additive query term.  0 (default) disables it.
         value_structure_query_dim: int = 0,
     ):
@@ -1760,14 +1760,14 @@ class AttentionLayer(nn.Module):
             GatedCrossAttention,
             GatedSelfAttention,
             CommutatorSelfAttention,
-            ScaledDotAttention,
+            ScaledDotSoftmax,
         )
         if self.value_structure_query_dim > 0:
             if not self._value_query_capable:
                 raise ValueError(
                     "value_structure_query_dim > 0 requires an inner attention "
                     "that supports the additive query term "
-                    "(GatedCrossAttention, GatedSelfAttention, ScaledDotAttention); "
+                    "(GatedCrossAttention, GatedSelfAttention, ScaledDotSoftmax); "
                     f"got {attention.__name__}."
                 )
             self.value_query_proj = nn.Linear(
@@ -1996,7 +1996,7 @@ def main():
 
     print("Testing single-head attention (n_heads=1):")
     attention_single = AttentionLayer(
-        attention=ScaledDotAttention,
+        attention=ScaledDotSoftmax,
         d_model_queries=d_model,
         d_model_keys=d_model,
         d_model_values=d_model,
@@ -2021,7 +2021,7 @@ def main():
 
     print("\nTesting multi-head attention (n_heads=4):")
     attention_multi = AttentionLayer(
-        attention=ScaledDotAttention,
+        attention=ScaledDotSoftmax,
         d_model_queries=d_model,
         d_model_keys=d_model,
         d_model_values=d_model,

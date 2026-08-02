@@ -147,7 +147,7 @@ def test_svfa_multihead_forward():
 
 def test_rejects_non_gated_self_attention():
     with pytest.raises(ValueError):
-        SelfSelectorLayer(**_model_kwargs(attention_type="ScaledDotProduct"))
+        SelfSelectorLayer(**_model_kwargs(attention_type="ScaledDotSoftmax"))
 
 
 def test_rejects_per_head_structure():

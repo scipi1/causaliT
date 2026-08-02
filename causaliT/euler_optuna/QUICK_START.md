@@ -223,11 +223,11 @@ from where it left off.  To increase the trial budget, either:
 
 ## Known issues / notes
 
-### Multi-head attention with SVFA (ScaledDotAttention)
+### Multi-head attention with SVFA (ScaledDotSoftmax)
 
 The SVFA architecture uses **separate head counts** for Q/K (structure) and V (value).
 When `n_heads_struct = 1` and `n_heads_value > 1`, the Q/K tensors are 3-D while V is
-4-D. `ScaledDotAttention` handles this correctly via the mixed-head einsum path
+4-D. `ScaledDotSoftmax` handles this correctly via the mixed-head einsum path
 (`"bls,bshd->blhd"`), added in `causaliT/core/modules/attention.py`. The same fix
 also applies to `CausalCrossAttention`, `SigmoidCrossAttention`, and
 `ToeplitzAttention`.

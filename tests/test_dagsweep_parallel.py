@@ -28,7 +28,9 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from causaliT.euler_sweep.euler_sweep import data_source as dsrc
 from causaliT.euler_sweep.euler_sweep import dagsweep_parallel as dsp
+
 
 
 # ---------------------------------------------------------------------------
@@ -99,8 +101,8 @@ def fake_datasets(monkeypatch):
     """
     Replace DAG generation with a deterministic naming stub.
 
-    The prepare stage is the only place that touches the generator; stubbing it
-    keeps these tests about the plan/state machine and fast.
+    Generation is reached through the DataSource, so the stub is installed on
+    ``data_source`` (the prepare stage no longer calls the provider itself).
     """
     generated = []
 
@@ -110,10 +112,98 @@ def fake_datasets(monkeypatch):
         generated.append(name)
         return name
 
-    monkeypatch.setattr(dsp, "ensure_dag_dataset", fake_ensure)
+    monkeypatch.setattr(dsrc, "ensure_dag_dataset", fake_ensure)
     monkeypatch.setattr(dsp, "n_keys_from_metadata",
                         lambda datasets_dir, name, fallback=None: int(fallback or 4))
     return generated
+
+
+# ---------------------------------------------------------------------------
+# Fixed-dataset (ATE) fixtures - same scheme, data from scm_ds.datasets
+# ---------------------------------------------------------------------------
+
+FIXED_NAMES = ("ds_fake_a", "ds_fake_b")
+
+
+def _write_fixed_experiment(tmp_path, name="ate", names=FIXED_NAMES,
+                            data_seeds=(0,), model_seeds=(1, 2),
+                            optuna_enabled=True, n_trials=2):
+    """Experiment folder whose spec declares FIXED SCMs (an 'atesweep.yaml')."""
+    exp_dir = tmp_path / name
+    exp_dir.mkdir(parents=True)
+
+    OmegaConf.save(
+        OmegaConf.create({
+            "experiment": {"name": "test"},
+            "data": {"dataset": "PLACEHOLDER"},
+            "training": {"seed": 0, "data_seed": 0, "lr": 0.001},
+        }),
+        exp_dir / "config_test.yaml",
+    )
+    if optuna_enabled:
+        OmegaConf.save(
+            OmegaConf.create({
+                "n_trials": n_trials,
+                "sampler": {"name": "sobol"},
+                "pruner": "none",
+                "search_space": {"training.lr": {"type": "float", "low": 1e-4,
+                                                 "high": 1e-2, "log": True}},
+            }),
+            exp_dir / "optuna_settings.yaml",
+        )
+
+    OmegaConf.save(
+        OmegaConf.create({
+            "datasets": {"names": list(names), "generate": {"n": 100}},
+            "data_seeds": list(data_seeds),
+            "model_seeds": list(model_seeds),
+            "optuna": {"enabled": optuna_enabled, "opt_seed": 1000,
+                       "metric": "val_x_mae_mean", "direction": "minimize"},
+            "training": {"trainer": "standard"},
+        }),
+        exp_dir / "atesweep.yaml",
+    )
+    return exp_dir
+
+
+@pytest.fixture
+def fake_registry(monkeypatch):
+    """
+    Register fake fixed datasets and stub their (expensive) generation.
+
+    A real ATE dataset is 50k samples plus a Monte-Carlo ground truth; the
+    orchestration only cares about the folder NAME, so the stub only writes the
+    metadata the config staging reads back.
+
+    Like the real generator it is IDEMPOTENT (an existing folder is reused), so
+    ``calls`` counts actual materializations - which is what tells "generated
+    once and shared" from "regenerated per seed".
+    """
+    import scm_ds.datasets as datasets_mod
+
+    registry = {n: object() for n in FIXED_NAMES}
+    monkeypatch.setattr(datasets_mod, "DATASET_REGISTRY", registry)
+
+    calls = []
+
+    def fake_generate(registry_name, data_root, generation=None, folder_name=None,
+                      force=False, verbose=True):
+        name = folder_name or registry_name
+        folder = Path(data_root, name)
+        if folder.exists() and not force:
+            return name
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "dataset_metadata.json").write_text(json.dumps(
+            {"variable_info": {"source_labels": ["x0", "x1"],
+                               "input_labels": ["x2", "x3"]}}
+        ))
+        calls.append((name, dict(generation or {})))
+        return name
+
+    monkeypatch.setattr(dsrc, "generate_fixed_dataset", fake_generate)
+    return calls
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -618,3 +708,154 @@ def test_scratch_staging_copies_only_spec_files(tmp_path):
 
     names = sorted(p.name for p in scratch.iterdir())
     assert names == ["config_test.yaml", "dagsweep.yaml", "optuna_settings.yaml"]
+
+
+def test_scratch_staging_copies_the_atesweep_alias(tmp_path, fake_registry):
+    """
+    ``atesweep.yaml`` is an ALIAS of ``dagsweep.yaml``; if staging forgets it the
+    prep job starts in a folder with no spec at all.
+    """
+    exp_dir = _write_fixed_experiment(tmp_path)
+
+    scratch = tmp_path / "scratch_ate"
+    dsp.stage_experiment_to_scratch(str(exp_dir), str(scratch))
+
+    names = sorted(p.name for p in scratch.iterdir())
+    assert names == ["atesweep.yaml", "config_test.yaml", "optuna_settings.yaml"]
+
+
+# ---------------------------------------------------------------------------
+# Fixed-dataset (ATE) sweeps in parallel
+#
+# The same five-stage chain must drive a spec whose data does NOT come from a
+# sampled DAG.  The failure this pins: forwarding the implicit 'dataset' group
+# axis into the random-SCM config (TypeError in the prep job).
+# ---------------------------------------------------------------------------
+
+def _prepared_fixed_experiment(tmp_path, monkeypatch, best_params=None, **kwargs):
+    """Plan + prepare a fixed-dataset experiment, optionally tuned."""
+    monkeypatch.setattr(dsp, "build_group_study",
+                        lambda *a, **k: (_FakeStudy(tmp_path), "m", "minimize", {}))
+
+    exp_dir = _write_fixed_experiment(tmp_path, **kwargs)
+    plan = dsp.build_static_plan(str(exp_dir), str(exp_dir),
+                                 slurm_params={"max_concurrent_jobs": 4})
+    dsp.prepare_stage(str(exp_dir))
+
+    if best_params is not None:
+        for group in plan["groups"]:
+            OmegaConf.save(OmegaConf.create({"params": best_params}),
+                           Path(group["group_dir"]) / "best_trial.yaml")
+    return exp_dir, plan
+
+
+def test_fixed_dataset_plan_groups_by_dataset(tmp_path, fake_registry):
+    """
+    One group per registry key, exactly as one group per node count:
+    2 datasets x 2 trials = 4 trial tasks; 2 x 1 split x 2 inits = 4 runs.
+    """
+    exp_dir = _write_fixed_experiment(tmp_path, data_seeds=(0,),
+                                      model_seeds=(1, 2), n_trials=2)
+    plan = dsp.build_static_plan(str(exp_dir), str(exp_dir))
+
+    assert plan["data_source"] == "fixed_dataset"
+    assert [g["name"] for g in plan["groups"]] == list(FIXED_NAMES)
+    assert plan["n_trial_tasks"] == 4
+    assert plan["n_train_tasks"] == 4
+    # Planning stays dataset-free (the array sizes are needed before prep runs).
+    assert fake_registry == []
+
+
+def test_fixed_dataset_prepare_materializes_each_scm_once(tmp_path, monkeypatch,
+                                                          fake_registry):
+    """
+    All seeds of a fixed group share ONE dataset: generating per seed would
+    re-run a 50k-sample SCM (and its MC ground truth) for nothing.
+    """
+    monkeypatch.setattr(dsp, "build_group_study",
+                        lambda *a, **k: (_FakeStudy(tmp_path), "m", "minimize", {}))
+
+    exp_dir = _write_fixed_experiment(tmp_path, data_seeds=(0, 1),
+                                      model_seeds=(1, 2))
+    dsp.build_static_plan(str(exp_dir), str(exp_dir))
+    prepared = dsp.prepare_stage(str(exp_dir))
+
+    assert prepared["source"] == "fixed_dataset"
+    entry = prepared["groups"]["ds_fake_a"]
+    # Both data seeds AND the search point at the same folder ...
+    assert entry["datasets"] == {"0": "ds_fake_a", "1": "ds_fake_a"}
+    assert entry["opt_dataset"] == "ds_fake_a"
+    # ... which was written exactly once per dataset (idempotent generator).
+    assert sorted(name for name, _gen in fake_registry) == ["ds_fake_a",
+                                                            "ds_fake_b"]
+    assert fake_registry[0][1] == {"n": 100}    # generation options forwarded
+
+
+def test_fixed_dataset_search_split_is_disjoint_from_the_runs(tmp_path,
+                                                              monkeypatch,
+                                                              fake_registry):
+    """
+    With one shared dataset the SPLIT is the only separation left between tuning
+    and evaluation, so the staged group config must carry ``opt_seed`` as
+    ``training.data_seed``.  Without it the search would select on an evaluation
+    split.
+    """
+    staged = {}
+
+    def spy_stage_group_config(base_config_path, base_optuna_path, group_dir,
+                               group, spec, dataset_name, datasets_dir, **kwargs):
+        staged[Path(group_dir).name] = kwargs
+        return OmegaConf.create({})
+
+    monkeypatch.setattr(dsp, "stage_group_config", spy_stage_group_config)
+    monkeypatch.setattr(dsp, "build_group_study",
+                        lambda *a, **k: (_FakeStudy(tmp_path), "m", "minimize", {}))
+
+    exp_dir = _write_fixed_experiment(tmp_path, data_seeds=(0,))
+    dsp.build_static_plan(str(exp_dir), str(exp_dir))
+    dsp.prepare_stage(str(exp_dir))
+
+    assert staged["ds_fake_a"]["opt_seed"] == 1000      # not the run's seed 0
+
+
+def test_fixed_dataset_runs_share_data_and_vary_only_the_init(tmp_path,
+                                                              monkeypatch,
+                                                              fake_registry,
+                                                              stub_train):
+    """An ATE arm: same SCM, same split, different model seeds."""
+    exp_dir, plan = _prepared_fixed_experiment(
+        tmp_path, monkeypatch, best_params={"training.lr": 0.02},
+        data_seeds=(0,), model_seeds=(1, 2))
+
+    for task_id in range(plan["n_train_tasks"]):
+        dsp.train_task(str(exp_dir), task_id)
+
+    per_dataset = {}
+    for call in stub_train:
+        per_dataset.setdefault(call["dataset"], []).append(call)
+
+    assert sorted(per_dataset) == list(FIXED_NAMES)
+    for calls in per_dataset.values():
+        assert {c["data_seed"] for c in calls} == {0}     # same split
+        assert sorted(c["seed"] for c in calls) == [1, 2]  # different inits
+        assert {c["lr"] for c in calls} == {0.02}          # tuned per group
+
+
+def test_fixed_dataset_cleanup_prunes_the_shared_folder_once(tmp_path, monkeypatch,
+                                                             fake_registry):
+    """
+    Every seed of a fixed group maps to one folder, so a naive loop would prune
+    it N+1 times and over-report the reclaimed size.
+    """
+    pruned = []
+    monkeypatch.setattr(dsp, "prune_dag_arrays",
+                        lambda path: pruned.append(Path(path).name) or 1000)
+
+    exp_dir, _plan_obj = _prepared_fixed_experiment(
+        tmp_path, monkeypatch, data_seeds=(0, 1), model_seeds=(1, 2))
+
+    dsp.cleanup_stage(str(exp_dir))
+
+    assert sorted(pruned) == list(FIXED_NAMES)
+
+

@@ -65,13 +65,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from omegaconf import OmegaConf
 
-from causaliT.euler_sweep.euler_sweep.dag_provider import (
-    build_dag_config,
-    ensure_dag_dataset,
-    prune_dag_arrays,
-    split_dag_block,
-)
+from causaliT.euler_sweep.euler_sweep.dag_provider import prune_dag_arrays
+from causaliT.euler_sweep.euler_sweep.data_source import build_data_source
 from causaliT.euler_sweep.euler_sweep.opt_train_sweep import (
+    DAGSWEEP_FILENAME_GLOBS,
     DEFAULT_OPT_SEED,
     _as_dict,
     _find_base_files,
@@ -85,6 +82,7 @@ from causaliT.euler_sweep.euler_sweep.opt_train_sweep import (
     stage_group_config,
     stage_run_config,
 )
+
 from causaliT.euler_sweep.euler_sweep.search_space import n_keys_from_metadata
 from causaliT.euler_sweep.euler_sweep.sweeper import run_single_combination
 
@@ -208,12 +206,21 @@ def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
     known before any DAG exists, so groups, runs and trial slots are expanded
     here, while ``prepare`` only resolves dataset names and ``n_keys``.
 
+    Both spec families are planned identically: a fixed-dataset (``datasets:``)
+    sweep contributes its registry keys as an implicit ``dataset`` group axis, so
+    ``R = n_datasets * |data_seeds| * |model_seeds|`` falls out of the same
+    expansion as ``R = n_sizes * |dag_seeds| * |model_seeds|``.
+
     Returns:
         The plan dict (also written to ``<exp_dir>/dagsweep/plan.json``).
     """
     spec = load_dagsweep_spec(exp_dir)
-    groups = build_groups(spec)
+    # ONE source for planning and (later) generation: it owns the implicit
+    # 'dataset' group axis a fixed-SCM sweep is grouped by.
+    source = build_data_source(spec)
+    groups = build_groups(spec, source)
     base_config_path, base_optuna_path = _find_base_files(exp_dir)
+
 
     opt_cfg = _as_dict(spec.get("optuna", {}))
     optuna_enabled = bool(opt_cfg.get("enabled", True)) and not skip_optuna
@@ -279,6 +286,8 @@ def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
         # share datasets, so nothing may be pruned while the array is alive).
         "delete_dataset": bool(spec.get("delete_dataset", True)) and not keep_data,
         "trainer": trainer_name,
+        "data_source": source.kind,
+
         "optuna": {
             "enabled": optuna_enabled,
             "declared_enabled": bool(opt_cfg.get("enabled", True)),
@@ -416,12 +425,20 @@ def format_progress(rollup: Dict[str, Any]) -> str:
 
 def prepare_stage(exp_dir: str) -> Dict[str, Any]:
     """
-    Generate every DAG of the sweep, stage the group configs, create the studies.
+    Generate every dataset of the sweep, stage the group configs, create the studies.
 
     Centralising generation is what removes the races: no array task ever creates
-    a dataset, so several trials (one DAG) or several model seeds (one DAG) can
-    read the same folder concurrently.  ``ensure_dag_dataset`` is idempotent, so
+    a dataset, so several trials (one dataset) or several model seeds (one
+    dataset) can read the same folder concurrently.  Generation is idempotent, so
     re-running this stage after a walltime kill only fills in what is missing.
+
+    The data itself comes from the spec's :class:`DataSource`, exactly as in the
+    sequential path: a ``dag:`` block samples ONE graph per seed, a ``datasets:``
+    block resolves EVERY seed of a group to the SAME fixed SCM (an ATE study
+    varies only the split and the initialisation).  Going through the source is
+    what makes both spec families work here - talking to ``dag_provider``
+    directly would feed the implicit ``dataset`` group axis into
+    ``RandomSCMConfig``.
     """
     plan = load_plan(exp_dir)
     record_progress(exp_dir, "stage_prep", {"state": "running"})
@@ -429,25 +446,26 @@ def prepare_stage(exp_dir: str) -> Dict[str, Any]:
     try:
         spec = load_dagsweep_spec(exp_dir)
         base_config_path, base_optuna_path = _find_base_files(exp_dir)
-        dag_block = _as_dict(spec.get("dag", {}))
-        _, gen_kwargs = split_dag_block(dag_block)
+        source = build_data_source(spec)
         optuna_enabled = bool(plan["optuna"]["enabled"])
         opt_seed = int(plan["optuna"]["opt_seed"])
 
-        prepared: Dict[str, Any] = {"groups": {}}
+        prepared: Dict[str, Any] = {"source": source.kind, "groups": {}}
 
         for group in plan["groups"]:
             group_dir = Path(group["group_dir"])
             datasets_dir = group["datasets_dir"]
             Path(datasets_dir).mkdir(parents=True, exist_ok=True)
-            logger.info("[prep] group %s", group["name"])
+            logger.info("[prep] group %s (%s)", group["name"], source.kind)
 
+            # ``ensure`` takes the group dict the source understands; only the
+            # axes select the data (the seed plan lives in the plan file).
+            group_spec = {"axes": group["axes"]}
             entry: Dict[str, Any] = {"datasets": {}, "opt_dataset": None}
 
-            # --- optimisation DAG + staged search config + study DB -----------
+            # --- optimisation dataset + staged search config + study DB -------
             if optuna_enabled:
-                opt_cfg = build_dag_config(dag_block, seed=opt_seed, **group["axes"])
-                opt_dataset = ensure_dag_dataset(opt_cfg, datasets_dir, gen_kwargs)
+                opt_dataset = source.ensure(group_spec, datasets_dir, opt_seed)
                 n_keys = n_keys_from_metadata(
                     datasets_dir, opt_dataset,
                     fallback=group["axes"].get("n_nodes"),
@@ -457,8 +475,12 @@ def prepare_stage(exp_dir: str) -> Dict[str, Any]:
 
                 stage_group_config(
                     base_config_path, base_optuna_path, group_dir,
-                    {"axes": group["axes"]}, spec, opt_dataset, datasets_dir,
+                    group_spec, spec, opt_dataset, datasets_dir,
                     n_keys=n_keys, search_protocol=plan["optuna"]["protocol"],
+                    # Pins training.data_seed for the search.  Load-bearing for a
+                    # FIXED dataset, where every seed shares the data and only the
+                    # split differs: tuning must not see an evaluation split.
+                    opt_seed=opt_seed,
                 )
 
                 study, _m, _d, _s = build_group_study(
@@ -475,15 +497,17 @@ def prepare_stage(exp_dir: str) -> Dict[str, Any]:
                         best.unlink()
                 study.create()  # no-op message when it already exists
 
-            # --- evaluation DAGs (one per dag_seed, shared by model seeds) -----
+            # --- evaluation datasets (one per data seed, shared by model seeds)
+            # For a fixed SCM every seed resolves to the same folder, which the
+            # idempotent generator materializes once and then reuses.
             for dag_seed in group["dag_seeds"]:
-                cfg = build_dag_config(dag_block, seed=int(dag_seed), **group["axes"])
-                name = ensure_dag_dataset(cfg, datasets_dir, gen_kwargs)
+                name = source.ensure(group_spec, datasets_dir, int(dag_seed))
                 entry["datasets"][str(dag_seed)] = name
                 entry.setdefault("n_keys", int(n_keys_from_metadata(
                     datasets_dir, name, fallback=group["axes"].get("n_nodes"))))
 
             prepared["groups"][group["name"]] = entry
+
 
         _write_json(prepared_path(exp_dir), prepared)
         record_progress(exp_dir, "stage_prep", {"state": "ok"})
@@ -668,7 +692,19 @@ def train_task(exp_dir: str, task_id: int, force: bool = False) -> None:
         raise RuntimeError(message)
 
     prepared = load_prepared(exp_dir)["groups"][group["name"]]
-    dataset_name = prepared["datasets"][str(run["dag_seed"])]
+    datasets = prepared.get("datasets", {})
+    if str(run["dag_seed"]) not in datasets:
+        # A bare KeyError inside an array task says nothing about what to do.
+        message = (
+            f"group {group['name']}: the prepare stage resolved no dataset for "
+            f"data seed {run['dag_seed']} (known: {sorted(datasets)}). Re-run the "
+            "prepare stage - the plan and prepared.json are out of sync."
+        )
+        record_progress(exp_dir, item, {"state": "failed", "group": group["name"],
+                                        "error": message})
+        raise RuntimeError(message)
+    dataset_name = datasets[str(run["dag_seed"])]
+
 
     spec = load_dagsweep_spec(exp_dir)
     train_fn = resolve_trainer(plan["trainer"])[0]
@@ -723,8 +759,8 @@ def cleanup_stage(exp_dir: str) -> Dict[str, Any]:
     Prune the heavy arrays and write the final planned-vs-reached report.
 
     Pruning cannot happen inside a run (concurrent tasks share a dataset), so it
-    is deferred to here.  Only ``ds*.npz`` goes: ``dag_recipe.json`` stays, so any
-    dataset remains exactly regenerable with ``cli dagsweep-regen``.
+    is deferred to here.  Only ``ds*.npz`` goes: the recipe (``dag_recipe.json``
+    or ``scm_recipe.json``) stays, so any dataset remains exactly regenerable.
     """
     plan = load_plan(exp_dir)
     record_progress(exp_dir, "stage_cleanup", {"state": "running"})
@@ -740,7 +776,10 @@ def cleanup_stage(exp_dir: str) -> Dict[str, Any]:
             names = list(entry.get("datasets", {}).values())
             if entry.get("opt_dataset"):
                 names.append(entry["opt_dataset"])
-            for name in names:
+            # A fixed-SCM group maps every seed (and the search) to ONE folder;
+            # deduplicate so it is pruned once and the reclaimed size is honest.
+            for name in dict.fromkeys(names):
+
                 try:
                     freed += prune_dag_arrays(join(group["datasets_dir"], name))
                 except Exception as exc:  # pruning must never fail the sweep
@@ -984,9 +1023,14 @@ def stage_experiment_to_scratch(home_exp_dir: str, scratch_path: str) -> str:
     Only the light spec files are copied: results, datasets and state are written
     directly into the scratch folder by the jobs, which is exactly why heavy
     output never touches ``$HOME``.
+
+    The spec patterns come from ``DAGSWEEP_FILENAME_GLOBS``, so both spec names
+    (``dagsweep*.yaml`` and its ``atesweep*.yaml`` alias) always travel together:
+    staging a fixed-dataset study without its spec would fail in the prep job.
     """
     Path(scratch_path).mkdir(parents=True, exist_ok=True)
-    for pattern in ("config*.yaml", "optuna*.yaml", "dagsweep*.yaml"):
+    for pattern in ("config*.yaml", "optuna*.yaml") + tuple(DAGSWEEP_FILENAME_GLOBS):
+
         for src in glob(join(home_exp_dir, pattern)):
             shutil.copy2(src, join(scratch_path, basename(src)))
     return scratch_path

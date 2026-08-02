@@ -82,7 +82,7 @@ reproducibility.
 Running Optuna with `n_heads > 1` revealed a pre-existing bug in
 `causaliT/core/modules/attention.py`: the SVFA architecture uses separate head counts
 for Q/K (structure) and V (value). When `n_heads_struct=1` (3-D Q/K) but
-`n_heads_value > 1` (4-D V), `ScaledDotAttention` would fail with a shape mismatch.
+`n_heads_value > 1` (4-D V), `ScaledDotSoftmax` would fail with a shape mismatch.
 
 Fixed by adding a mixed-head einsum branch:
 ```python

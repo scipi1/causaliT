@@ -143,7 +143,7 @@ def _extract_learned_dag(model: pl.LightningModule) -> Dict[str, Optional[np.nda
     This is a lightweight operation — it reads sigmoid(phi) directly from
     the model parameters. No forward pass or data loading required.
 
-    For models without phi (e.g. pure ScaledDotProduct), returns None
+    For models without phi (e.g. pure ScaledDotSoftmax), returns None
     for those blocks.
 
     Returns:

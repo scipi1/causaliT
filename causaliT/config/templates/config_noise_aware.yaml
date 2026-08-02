@@ -15,7 +15,7 @@ experiment:
   max_epochs: 100
 
   dec_self_attention_type: "ToeplitzAttention"
-  dec_cross_attention_type: "ScaledDotProduct"
+  dec_cross_attention_type: "ScaledDotSoftmax"
 
 
 model:

@@ -127,18 +127,18 @@ def _make_atsel(
     value_structure_injection: str = "none",
     comps_embed_X: str = "svfa",
     value_structure_query_injection: str = "none",
-    attention_type: str = "ScaledDotProduct",
+    attention_type: str = "ScaledDotSoftmax",
 ):
     ds_embed_X = (
         _svfa_embed_cfg(VOCAB_X)
         if comps_embed_X == "svfa"
         else _summation_embed_cfg(VOCAB_X)
     )
-    # ``ScaledDotAttention`` does not implement the additive query term, so
+    # ``ScaledDotSoftmax`` does not implement the additive query term, so
     # EFFECT-dependent checks build the layer with ``GatedCrossAttention``
     # (which genuinely applies ``(sum_j A_ij) * W_V^q(e_i)``).  The structural
     # wiring checks (projection presence/width, tables, routing) are inner-
-    # attention agnostic and use the default ScaledDotProduct.
+    # attention agnostic and use the default ScaledDotSoftmax.
     extra = {}
     if attention_type == "GatedCrossAttention":
         extra["gain_stream_source"] = "separate"

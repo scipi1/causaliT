@@ -58,14 +58,14 @@ model:
           label: "value_missing"
           kwargs: {}
 
-    dec1_cross_attention_type: "ScaledDotProduct"
+    dec1_cross_attention_type: "ScaledDotSoftmax"
     dec1_cross_mask_type: "Uniform"
-    dec1_self_attention_type: "ScaledDotProduct"
+    dec1_self_attention_type: "ScaledDotSoftmax"
     dec1_self_mask_type: "Uniform"
 
-    dec2_cross_attention_type: "ScaledDotProduct"
+    dec2_cross_attention_type: "ScaledDotSoftmax"
     dec2_cross_mask_type: "Uniform"
-    dec2_self_attention_type: "ScaledDotProduct"
+    dec2_self_attention_type: "ScaledDotSoftmax"
     dec2_self_mask_type: "Uniform"
 
     n_heads: ${experiment.n_heads}

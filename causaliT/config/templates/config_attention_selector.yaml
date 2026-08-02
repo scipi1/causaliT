@@ -14,7 +14,7 @@
 # Attention type recommendation:
 #   CausalCrossAttention (ReLU-Tanh):  non-normalized, can be zero → sparse
 #   SigmoidCrossAttention:             bounded [0,1], can be near-zero → sparse
-#   ScaledDotProduct:                  softmax, always dense → use only as baseline
+#   ScaledDotSoftmax:                  softmax, always dense → use only as baseline
 #
 # Suggested workflow:
 #   1. Run with lambda_hsic=0, lambda_score_sparse=0 to verify reconstruction works.

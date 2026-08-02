@@ -23,7 +23,7 @@ sys.path.insert(0, str(project_root))
 from causaliT.core.modules.embedding import ModularEmbedding
 from causaliT.core.modules.encoder import EncoderLayer, Encoder
 from causaliT.core.modules.decoder import DecoderLayer, Decoder
-from causaliT.core.modules.attention import AttentionLayer, ScaledDotAttention
+from causaliT.core.modules.attention import AttentionLayer, ScaledDotSoftmax
 from causaliT.core.modules.extra_layers import Normalization, UniformAttentionMask
 
 
@@ -120,7 +120,7 @@ def sample_input(batch_size, seq_len, vocab_size):
 def attention_layer(d_model, d_qk):
     """Create a standard attention layer"""
     return AttentionLayer(
-        attention=ScaledDotAttention,
+        attention=ScaledDotSoftmax,
         d_model_queries=d_model,
         d_model_keys=d_model,
         d_model_values=d_model,
@@ -330,13 +330,13 @@ class TestDecoderSVFA:
         dec_seq_len = 4
         
         self_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
         )
         cross_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
@@ -379,13 +379,13 @@ class TestDecoderSVFA:
         dec_seq_len = 4
         
         self_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
         )
         cross_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
@@ -438,13 +438,13 @@ class TestReversedDecoderSVFA:
         ext_seq_len = 8
         
         cross_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
         )
         self_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
@@ -488,13 +488,13 @@ class TestReversedDecoderSVFA:
         ext_seq_len = 8
         
         cross_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
         )
         self_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
@@ -537,13 +537,13 @@ class TestReversedDecoderSVFA:
         ext_seq_len = 8
         
         cross_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0
         )
         self_attention = AttentionLayer(
-            attention=ScaledDotAttention,
+            attention=ScaledDotSoftmax,
             d_model_queries=d_model, d_model_keys=d_model, d_model_values=d_model,
             d_queries_keys=d_qk, n_heads=1, mask_layer=UniformAttentionMask(),
             attention_dropout=0.0, dropout_qkv=0.0

@@ -11,9 +11,9 @@ Format: <architecture>_<SelfAttn>_<CrossAttn>_<dataset>_[modifiers]_<ID>
 
 Components:
   architecture : single, na_single, stage
-  SelfAttn     : SM (ScaledDotProduct), Lie (LieAttention), 
+  SelfAttn     : SM (ScaledDotSoftmax), Lie (LieAttention), 
                  PhiSM (PhiSoftMax), Toeplitz (ToeplitzLieAttention)
-  CrossAttn    : SM (ScaledDotProduct), CC (CausalCrossAttention), PhiSM (PhiSoftMax)
+  CrossAttn    : SM (ScaledDotSoftmax), CC (CausalCrossAttention), PhiSM (PhiSoftMax)
   dataset      : scm1, scm2, scm3, scm6, scm7, etc.
   modifiers    : (optional) SVFA, antisym, gated, indep, hard, orthS
   ID           : Euler job ID or random hash
@@ -82,7 +82,7 @@ NAMING_RULES = {
         "options": {
             "Lie": "LieAttention",
             "PhiSM": "PhiSoftMax",
-            "SM": "ScaledDotProduct",
+            "SM": "ScaledDotSoftmax",
             "Toeplitz": "ToeplitzLieAttention",
         }
     },
@@ -92,7 +92,7 @@ NAMING_RULES = {
         "options": {
             "CC": "CausalCrossAttention",
             "PhiSM": "PhiSoftMax",
-            "SM": "ScaledDotProduct",
+            "SM": "ScaledDotSoftmax",
         }
     },
     "dataset": {
@@ -184,7 +184,7 @@ STANDARD_VALUES = {
     "training.lambda_tau": 0.0,
     
     # Cross-attention consistency - for isolating self-attention effects
-    "model.kwargs.dec_cross_attention_type": "ScaledDotProduct",
+    "model.kwargs.dec_cross_attention_type": "ScaledDotSoftmax",
 }
 
 

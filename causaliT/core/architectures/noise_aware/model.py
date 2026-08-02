@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer, ToeplitzAttention,
+    ScaledDotSoftmax, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer, ToeplitzAttention,
     ModularEmbedding, OrthogonalMaskEmbedding,
     Normalization, UniformAttentionMask,
     MLPHead
@@ -641,10 +641,10 @@ class NoiseAwareSingleCausalLayer(nn.Module):
                 Default ``False`` preserves legacy behavior.
         """
         
-        assert attention_type in ["ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention"]
+        assert attention_type in ["ScaledDotSoftmax", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention"]
 
-        if attention_type == "ScaledDotProduct":
-            attention_module = ScaledDotAttention
+        if attention_type == "ScaledDotSoftmax":
+            attention_module = ScaledDotSoftmax
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
         elif attention_type == "SigmoidCrossAttention":

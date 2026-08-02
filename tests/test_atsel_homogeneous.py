@@ -347,11 +347,15 @@ class TestValidation:
             _make_model(shared_key=True)
 
     def test_self_attention_type_is_mandatory(self):
-        """The legacy cross-only variant is gone: ``None`` must raise in BOTH modes."""
+        """``None`` is illegal in HOMOGENEOUS mode (the square block IS the self
+        attention), but legal in split mode, where it selects the cross-only
+        vanilla-transformer benchmark arm."""
         with pytest.raises(ValueError, match="self_attention_type"):
             _make_model(self_attention_type=None)
-        with pytest.raises(ValueError, match="self_attention_type"):
-            _make_model(homogeneous_nodes=False, self_attention_type=None)
+
+        model = _make_model(homogeneous_nodes=False, self_attention_type=None)
+        assert model.cross_only
+        assert model.self_attention is None
 
     def test_split_mode_ignores_s_blanked(self):
         """``s_blanked`` is accepted but unused in split mode (harmless)."""

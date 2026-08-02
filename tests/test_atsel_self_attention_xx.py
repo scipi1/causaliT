@@ -4,11 +4,10 @@ Run with:  pytest tests/test_atsel_self_attention_xx.py -v
 
 Motivation
 ----------
-The legacy single combined cross-attention parametrised the X→X interaction with
-the SAME (undirected) mechanism used for S→X, so it could not express edge
-direction and produced two-cycles / double edges.  That variant has been
-REMOVED: ``self_attention_type`` is now MANDATORY and always SPLITS the layer
-into:
+The combined cross-attention parametrises the X→X interaction with the SAME
+(undirected) mechanism used for S→X, so it cannot express edge direction and
+produces two-cycles / double edges.  Setting ``self_attention_type`` SPLITS the
+layer into:
 
 
   * S→X  via the cross ``attention_type`` block  (keys/values = S only)
@@ -20,8 +19,8 @@ unified representation of X (reconstructed from both S and X) is preserved.
 
 These tests verify:
 
-1. Construction wiring (``self_attention`` is always built; a missing/invalid
-   ``self_attention_type`` raises ``ValueError``).
+1. Construction wiring (``self_attention`` is built when ``self_attention_type``
+   is set, ``None`` selects the cross-only vanilla arm, invalid values raise).
 
 2. Forward shapes + combined-attention round-trip equals ``cat(attn_sx, attn_xx)``.
 3. Two-cycle suppression on the X→X directed posterior (``p_ij + p_ji <= 1``).
@@ -159,10 +158,13 @@ class TestConstruction:
         m_on = _make_model(self_attention_type="GatedSelfAttention")
         assert m_on.self_attention is not None
 
-    def test_self_attention_type_is_mandatory(self):
-        """The legacy cross-only variant is gone: ``None`` must raise."""
-        with pytest.raises(ValueError, match="self_attention_type"):
-            _make_model(self_attention_type=None)
+    def test_none_selects_cross_only(self):
+        """``None`` selects the combined cross-only block (vanilla arm)."""
+        m = _make_model(self_attention_type=None)
+        assert m.cross_only is True
+        assert m.split_xx is False
+        assert m.self_attention is None
+        assert m.combined_mask.shape == (X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
 
 
     def test_cross_block_keys_are_S_only_in_split(self):

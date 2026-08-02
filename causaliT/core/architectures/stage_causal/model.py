@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from causaliT.core.modules import (
-    ScaledDotAttention, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer,
+    ScaledDotSoftmax, CausalCrossAttention, SigmoidCrossAttention, AttentionLayer,
     ModularEmbedding,
     Normalization, UniformAttentionMask
 )
@@ -452,7 +452,7 @@ class StageCausaliT(nn.Module):
             d_model_values: Dimension of value projections
             n_heads: Number of attention heads
             d_queries_keys: Dimension of queries and keys per head
-            attention_type: Type of attention mechanism ("ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention")
+            attention_type: Type of attention mechanism ("ScaledDotSoftmax", "CausalCrossAttention", "SigmoidCrossAttention", "ToeplitzAttention")
             mask_type: Type of masking ("Uniform" or None)
             dropout_qkv: Dropout rate for query/key/value projections
             attention_dropout: Dropout rate for attention weights
@@ -466,10 +466,10 @@ class StageCausaliT(nn.Module):
         """
         
         # Choose attention type
-        assert attention_type in ["ScaledDotProduct", "CausalCrossAttention", "SigmoidCrossAttention"]
+        assert attention_type in ["ScaledDotSoftmax", "CausalCrossAttention", "SigmoidCrossAttention"]
         
-        if attention_type == "ScaledDotProduct":
-            attention_module = ScaledDotAttention
+        if attention_type == "ScaledDotSoftmax":
+            attention_module = ScaledDotSoftmax
         elif attention_type == "CausalCrossAttention":
             attention_module = CausalCrossAttention
         elif attention_type == "SigmoidCrossAttention":

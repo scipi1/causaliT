@@ -9,7 +9,7 @@ This package contains the building blocks of the transformer architecture:
 """
 
 from .attention import (
-    ScaledDotAttention,
+    ScaledDotSoftmax,
     CausalCrossAttention,
     SigmoidCrossAttention,
     HardConcreteCrossAttention,
@@ -32,7 +32,7 @@ from .variance_layers import IntrinsicNoiseLayer, AnalyticalVarianceHead, Residu
 from .mlp_head import MLPHead
 
 __all__ = [
-    'ScaledDotAttention',
+    'ScaledDotSoftmax',
     'CausalCrossAttention',
     'SigmoidCrossAttention',
     'HardConcreteCrossAttention',

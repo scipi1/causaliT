@@ -26,7 +26,7 @@ import torch
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from causaliT.core.modules.attention import AttentionLayer, ScaledDotAttention
+from causaliT.core.modules.attention import AttentionLayer, ScaledDotSoftmax
 from causaliT.core.modules.extra_layers import UniformAttentionMask
 from causaliT.core.architectures.single_causal_res.decoder import (
     DualResidualDecoder,
@@ -76,7 +76,7 @@ def ext_seq_len():
 def _make_attention(d_model, d_qk, n_heads=1, dual_value=False):
     """Helper: build a fresh AttentionLayer with our defaults."""
     return AttentionLayer(
-        attention=ScaledDotAttention,
+        attention=ScaledDotSoftmax,
         d_model_queries=d_model,
         d_model_keys=d_model,
         d_model_values=d_model,

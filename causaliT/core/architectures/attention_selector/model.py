@@ -9,19 +9,28 @@ The model answers one focused question:
      of each X variable from observational data, when given the actual values of
      all candidate parents (S and X) as keys?"
 
-Two modes (``homogeneous_nodes``)
+Three modes
 
-**Split mode** (``homogeneous_nodes=False``, default) — the S -> X direction is
-ASSUMED: S nodes appear only as keys, never as queries.  Two attention blocks:
+**Split mode** (``homogeneous_nodes=False`` + ``self_attention_type`` set,
+the default for the causal method) — the S -> X direction is ASSUMED: S nodes
+appear only as keys, never as queries.  Two attention blocks:
 
     * ``attention``      — S -> X cross block  (``attention_type``, keys/values = S)
     * ``self_attention`` — X -> X self  block  (``self_attention_type``, keys/values = X)
 
 Their outputs are summed into one value residual stream and their posteriors are
-re-concatenated into the canonical ``(B, L_X, L_S + L_X)`` layout.  Both blocks
-are MANDATORY: the historical cross-only variant (a single combined block whose
-right-hand columns modelled X -> X without direction) has been REMOVED, so
-``self_attention_type`` must always be set.
+re-concatenated into the canonical ``(B, L_X, L_S + L_X)`` layout.
+
+**Cross-only mode** (``self_attention_type=None``) — ONE combined block whose
+keys/values are ``[S_actual ; X_actual]``, so a SINGLE softmax normalises over
+the S and X parents JOINTLY (they compete on one simplex) and the X -> X columns
+carry no direction gate.  This is the VANILLA-TRANSFORMER benchmark arm: paired
+with ``attention_type="ScaledDotSoftmax"`` and ``comps_embed_X="summation"`` it
+is a standard single-layer encoder block (softmax attention + residual + FFN),
+with the only causal-discovery-specific ingredient being the zero diagonal that
+forbids a node from copying itself.  It carries no sparsity/acyclicity score and
+no value-structure injection, so the structure it reports is whatever plain
+attention learns from the reconstruction loss alone.
 
 **Homogeneous mode** (``homogeneous_nodes=True``) — the S/X prior is IGNORED.
 The data stream is treated as a single homogeneous set of ``N = L_S + L_X``
@@ -54,8 +63,8 @@ Forward pass
 
 4. Residual + LayerNorm → FFN → LayerNorm → MLP head.
 
-No self-attention block is included.  The single combined cross-attention IS
-the causal structure.  The resulting attention matrix
+In cross-only mode the single combined attention IS the causal structure.  The
+resulting attention matrix
     A  ∈  ℝ^{B × L_X × (L_S + L_X)}
 contains the learned edge weights; splitting it gives
     A[:, :, :L_S]      → S→X adjacency
@@ -85,7 +94,7 @@ from typing import Optional
 from causaliT.core.modules import (
     CausalCrossAttention,
     SigmoidCrossAttention,
-    ScaledDotAttention,
+    ScaledDotSoftmax,
     HardConcreteCrossAttention,
     GatedCrossAttention,
     GatedSelfAttention,
@@ -122,7 +131,7 @@ class AttentionSelectorLayer(nn.Module):
         comps_embed_S: Composition mode for S embedding ("summation", etc.).
         comps_embed_X: Composition mode for X embedding ("summation", etc.).
         attention_type: One of "CausalCrossAttention", "SigmoidCrossAttention",
-            "ScaledDotProduct". CausalCrossAttention (ReLU-Tanh) is recommended:
+            "ScaledDotSoftmax". CausalCrossAttention (ReLU-Tanh) is recommended:
             it produces non-negative, non-normalized (can be zero) attention weights
             suitable for sparse causal structure recovery.
         n_heads: Number of attention heads (1 recommended for interpretability).
@@ -539,17 +548,27 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
         SELF_ATTENTION_TYPES = ("GatedSelfAttention", "CommutatorSelfAttention")
         self.self_attention_type = self_attention_type
-        if self_attention_type not in SELF_ATTENTION_TYPES:
+        if self_attention_type is not None and self_attention_type not in SELF_ATTENTION_TYPES:
             raise ValueError(
                 f"self_attention_type='{self_attention_type}' is invalid. "
-                f"It is now MANDATORY: the legacy cross-only variant (a single "
-                f"combined cross block whose right-hand columns modelled X→X "
-                f"without direction) has been REMOVED. "
-                f"Must be one of: {list(SELF_ATTENTION_TYPES)}."
+                f"Must be None (combined cross-only block) or one of: "
+                f"{list(SELF_ATTENTION_TYPES)}."
             )
+        if self_attention_type is None and self.homogeneous_nodes:
+            raise ValueError(
+                "homogeneous_nodes=True requires self_attention_type: the single "
+                "square (N, N) block IS the self attention."
+            )
+        # ``self_attention_type=None`` restores the COMBINED CROSS-ONLY variant:
+        # ONE attention block whose keys/values are [S_actual ; X_actual], so a
+        # single softmax normalises over S and X parents jointly and the X→X
+        # columns carry no explicit direction gate.  This is the configuration
+        # used by the vanilla-transformer benchmark; the direction-aware split
+        # (cross + self) remains the default for the causal method.
+        self.cross_only = self_attention_type is None
         # In homogeneous mode the ONE square (N, N) block IS the self attention
         # (stored in ``self.attention``), so there is no separate split block.
-        self.split_xx = not self.homogeneous_nodes
+        self.split_xx = not self.homogeneous_nodes and not self.cross_only
         self.dir_tau = dir_tau
 
         # Shared structural query projection (W_q) across the cross (S→X) and
@@ -638,12 +657,8 @@ class AttentionSelectorLayer(nn.Module):
         att_cls_map = {
             "CausalCrossAttention": CausalCrossAttention,
             "SigmoidCrossAttention": SigmoidCrossAttention,
-            "ScaledDotProduct": ScaledDotAttention,
-            # Backward-compat alias: configs and checkpoint hparams saved before the
-            # "ScaledDotProduct" rename still store attention_type="ScaledDotAttention".
-            # load_from_checkpoint reconstructs the model from stored hparams, so
-            # without this alias those checkpoints raise a ValueError at eval time.
-            "ScaledDotAttention": ScaledDotAttention,
+            # Vanilla softmax attention (Vaswani et al., 2017).
+            "ScaledDotSoftmax": ScaledDotSoftmax,
             # Hard Concrete L0 gates (Louizos et al., ICLR 2018).
             "HardConcreteCrossAttention": HardConcreteCrossAttention,
             # Disentangled structure-gate x reconstruction-gain (anti-run_0).
@@ -671,10 +686,13 @@ class AttentionSelectorLayer(nn.Module):
                     f"AttentionSelectorLayer.  Choose from: {list(att_cls_map)}"
                 )
             att_cls = att_cls_map[attention_type]
+            query_seq_len = X_seq_len
             # SPLIT: the cross block attends to S ONLY (keys/values = S); the
             # X→X interaction is handled by the self-attention block below.
-            query_seq_len = X_seq_len
-            cross_key_seq_len = S_seq_len
+            # CROSS-ONLY: the single block attends to [S ; X] jointly.
+            cross_key_seq_len = (
+                S_seq_len if self.split_xx else S_seq_len + X_seq_len
+            )
 
         self.attention = AttentionLayer(
             attention=att_cls,
@@ -849,6 +867,16 @@ class AttentionSelectorLayer(nn.Module):
         if self.homogeneous_nodes:
             self.register_buffer(
                 "homogeneous_mask", 1.0 - torch.eye(self.N)
+            )
+        elif self.cross_only:
+            # ONE (L_X, L_S + L_X) mask: the S block is fully connected and the
+            # X block is off-diagonal (no self-loops).
+            self.register_buffer(
+                "combined_mask",
+                torch.cat(
+                    [torch.ones(X_seq_len, S_seq_len), 1.0 - torch.eye(X_seq_len)],
+                    dim=1,
+                ),
             )
         else:
             self.register_buffer(
@@ -1247,12 +1275,18 @@ class AttentionSelectorLayer(nn.Module):
             oracle: If True, bypass QK^T and use the hard mask directly as
                 attention weights (inherited from CausalCrossAttention oracle mode).
             oracle_combined_mask: Optional (L_X, L_S+L_X) GT DAG combined mask.
-                When oracle=True and this is provided, it is used as the hard_mask
-                (i.e. the GT adjacency is the oracle attention).  When oracle=True
-                but this is None, falls back to self.combined_mask (structural
-                constraint — all-ones S block + off-diagonal X block), which gives
-                uniform oracle attention and is useful only as a sanity baseline.
-                When oracle=False this argument is ignored entirely.
+                It is INDEPENDENT of ``oracle``: whenever it is provided it is
+                intersected with the structural mask and passed as the block's
+                ``hard_mask``, so forbidden keys are set to -inf BEFORE the
+                softmax.  The three reachable regimes are:
+
+                  mask=None, oracle=False -> learned QK^T, structural mask only.
+                  mask=GT,   oracle=False -> learned QK^T renormalised over the
+                      TRUE parents ("cheater": the support is given, the weights
+                      are still learned).
+                  mask=GT,   oracle=True  -> QK^T bypassed entirely; the GT
+                      adjacency itself becomes the attention (uniform average
+                      over the true parents).
 
         Returns:
             pred_x:           (B, L_X, out_dim)
@@ -1417,10 +1451,10 @@ class AttentionSelectorLayer(nn.Module):
             # reconstructs the S variables too — no S→X direction is assumed.
             # ==============================================================
             all_q_emb = torch.cat([sq_struct, x_q_emb], dim=1)   # (B, N, d)
-            if oracle and oracle_combined_mask is not None:
-                hard_mask = oracle_combined_mask                  # (N, N) GT DAG
-            else:
-                hard_mask = self.homogeneous_mask
+            hard_mask = self.homogeneous_mask
+            if oracle_combined_mask is not None:
+                # (N, N) GT DAG intersected with the architectural constraints.
+                hard_mask = oracle_combined_mask * hard_mask
             attn_out, attention_weights, _aux = self.attention(
                 query=all_q_emb,
                 key=sx_keys,
@@ -1436,19 +1470,48 @@ class AttentionSelectorLayer(nn.Module):
                 value_structure=vsi_SX,
                 value_structure_query=vsq_all,
             )
+        elif self.cross_only:
+            # ==============================================================
+            # CROSS-ONLY MODE — ONE combined block (vanilla transformer).
+            # Q: X_blanked struct                (B, L_X, d)
+            # K: [S_actual ; X_actual] struct    (B, L_S+L_X, d)
+            # V: [S_actual ; X_actual] val       (B, L_S+L_X, d)  (= K in summation)
+            # A single softmax normalises over the S and X parents JOINTLY, so
+            # the two parent families compete on one simplex — no direction gate
+            # and no re-fusion of two separately normalised posteriors.
+            # ==============================================================
+            hard_mask = self.combined_mask
+            if oracle_combined_mask is not None:
+                # (L_X, L_S+L_X) GT DAG intersected with the architectural
+                # constraints (zero diagonal on the X block).
+                hard_mask = oracle_combined_mask * hard_mask
+            attn_out, attention_weights, _aux = self.attention(
+                query=x_q_emb,
+                key=sx_keys,
+                value=sx_vals,
+                mask_miss_k=None,
+                mask_miss_q=None,
+                pos=None,
+                causal_mask=False,
+                hard_mask=hard_mask,
+                oracle=oracle,
+                gain_query=gain_query,
+                gain_key=gain_key,
+                value_structure=vsi_SX,
+                value_structure_query=vsq_X,
+            )
         else:
 
             # ==============================================================
             # SPLIT MODE — S→X cross block + direction-aware X→X self block.
             # ==============================================================
-            # Oracle: slice the GT (L_X, L_S+L_X) combined mask into the two
-            # per-block hard masks so each block receives its own GT adjacency.
-            if oracle and oracle_combined_mask is not None:
-                cross_hard = oracle_combined_mask[:, : self.S_seq_len]
-                self_hard = oracle_combined_mask[:, self.S_seq_len :]
-            else:
-                cross_hard = self.cross_mask
-                self_hard = self.self_mask
+            # Slice the GT (L_X, L_S+L_X) combined mask into the two per-block
+            # hard masks so each block receives its own GT adjacency.
+            cross_hard = self.cross_mask
+            self_hard = self.self_mask
+            if oracle_combined_mask is not None:
+                cross_hard = oracle_combined_mask[:, : self.S_seq_len] * cross_hard
+                self_hard = oracle_combined_mask[:, self.S_seq_len :] * self_hard
 
             # ---- S→X cross block (keys/values = S only) -----------------
             out_sx, attn_sx, aux_sx = self.attention(
