@@ -121,6 +121,7 @@ For homogeneous-mode diagnostics the forecaster also forwards:
         homogeneous mode no longer assumes.
 """
 
+import inspect
 import json
 import logging
 import math
@@ -516,9 +517,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         #              be predicted from its own descendants, so a high value
         #              means the posterior is being used ANTI-CAUSALLY.
         self.r2_x_endo = tm.R2Score()
-        self.r2_x_macro = tm.R2Score(
-            num_outputs=self.X_seq_len, multioutput="uniform_average"
-        )
+        # torchmetrics compatibility: ``num_outputs`` was deprecated in 1.5.0
+        # and REMOVED in 1.6.0, where R2Score infers the output count from the
+        # input shape instead.  Passing it to >= 1.6 raises
+        # "Unexpected keyword arguments: num_outputs" (it falls through to
+        # Metric.__init__).  requirements.txt pins 1.0.3, but cluster envs
+        # routinely carry a newer build, so probe the signature rather than the
+        # version string and stay correct on both.
+        _r2_macro_kwargs: Dict[str, Any] = {"multioutput": "uniform_average"}
+        if "num_outputs" in inspect.signature(tm.R2Score.__init__).parameters:
+            _r2_macro_kwargs["num_outputs"] = self.X_seq_len   # torchmetrics < 1.6
+        self.r2_x_macro = tm.R2Score(**_r2_macro_kwargs)
         self.r2_x_src = (
             tm.R2Score() if self.homogeneous_nodes else None
         )
