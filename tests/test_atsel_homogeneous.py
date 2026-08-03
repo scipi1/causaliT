@@ -858,7 +858,104 @@ class TestForecasterEndToEnd:
         assert pred.shape == (BATCH, X_SEQ_LEN, 1)
 
 
+# ===========================================================================
+# 10. Interpretable fit metrics (x_r2_endo / x_r2_macro / x_r2_src)
+# ===========================================================================
+
+
+class TestR2Variants:
+    """``x_r2`` is pooled over ALL rows -- in homogeneous mode that includes the
+    exogenous S rows, whose causally-correct R2 is ~0, so the metric has a
+    ceiling far below 1 and is NOT a fit quality.  The three additive keys must
+    fix scope (``endo``), pooling (``macro``) and expose anti-causal leakage
+    (``src``)."""
+
+    @staticmethod
+    def _forecaster(homogeneous_nodes: bool = True):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+
+        fc = AttentionSelectorForecaster(
+            _make_forecaster_config(homogeneous_nodes=homogeneous_nodes)
+        )
+        logged: Dict[str, float] = {}
+        fc.log = lambda name, value, **kw: logged.__setitem__(  # type: ignore[assignment]
+            name, float(value)
+        )
+        return fc, logged
+
+    def test_split_mode_endo_equals_pooled(self):
+        """With no S rows in the target, ``x_r2_endo`` must reproduce ``x_r2``
+        exactly -- the new key changes nothing in split mode."""
+        torch.manual_seed(0)
+        fc, logged = self._forecaster(homogeneous_nodes=False)
+        fc.train()
+        source, x_actual, _, _ = _make_inputs(seed=0)
+        fc._step((source, x_actual), stage="train")
+        assert "train_x_r2_endo" in logged
+        assert logged["train_x_r2_endo"] == pytest.approx(
+            logged["train_x_r2"], abs=1e-6
+        )
+        # S rows do not exist as children here, so there is nothing to diagnose.
+        assert "train_x_r2_src" not in logged
+
+    def test_endo_ignores_source_rows(self):
+        """Perfect X rows + garbage S rows: ``x_r2_endo`` ~ 1 while the pooled
+        ``x_r2`` is dragged down by rows the model SHOULD not predict."""
+        torch.manual_seed(0)
+        fc, logged = self._forecaster()
+        target = torch.randn(BATCH, N_NODES)
+        pred = target.clone()
+        pred[:, :S_SEQ_LEN] = 0.0            # sources not predicted (correct)
+        fc._log_r2_variants(pred, target, "val")
+
+        assert logged["val_x_r2_endo"] == pytest.approx(1.0, abs=1e-5)
+        assert logged["val_x_r2_macro"] == pytest.approx(1.0, abs=1e-5)
+        # Pooled-over-everything R2 on the same tensors is strictly worse.
+        pooled = 1.0 - ((pred - target) ** 2).sum() / (
+            (target - target.mean()) ** 2
+        ).sum()
+        assert float(pooled) < 0.9
+
+    def test_src_r2_flags_anticausal_leakage(self):
+        """``x_r2_src`` is a DIAGNOSTIC: a source can only be predicted from its
+        own descendants, so predicting it well means the posterior is used
+        anti-causally."""
+        torch.manual_seed(0)
+        fc, logged = self._forecaster()
+        target = torch.randn(BATCH, N_NODES)
+        pred = torch.zeros_like(target)
+        pred[:, :S_SEQ_LEN] = target[:, :S_SEQ_LEN]   # sources reproduced (leak)
+        fc._log_r2_variants(pred, target, "val")
+        assert logged["val_x_r2_src"] == pytest.approx(1.0, abs=1e-5)
+        assert logged["val_x_r2_endo"] < 0.5
+
+    def test_macro_is_invariant_to_per_node_rescaling(self):
+        """Per-node R2 is normalised by each node's own variance, so blowing up
+        one node's scale must not move ``x_r2_macro`` -- while the pooled
+        ``x_r2_endo`` (one global variance) does move.  This is the pooling
+        defect that makes ``x_r2`` incomparable across datasets."""
+        torch.manual_seed(0)
+        fc, logged = self._forecaster()
+        target = torch.randn(BATCH, N_NODES)
+        pred = target + 0.3 * torch.randn_like(target)
+
+        fc._log_r2_variants(pred, target, "val")
+        macro_before, endo_before = logged["val_x_r2_macro"], logged["val_x_r2_endo"]
+
+        scaled_t, scaled_p = target.clone(), pred.clone()
+        scaled_t[:, -1] *= 100.0
+        scaled_p[:, -1] *= 100.0              # same relative error on that node
+        fc._log_r2_variants(scaled_p, scaled_t, "val")
+
+        assert logged["val_x_r2_macro"] == pytest.approx(macro_before, abs=1e-4)
+        assert abs(logged["val_x_r2_endo"] - endo_before) > 1e-3
+
+
 if __name__ == "__main__":
     import pytest as _pytest
 
     _pytest.main([__file__, "-v"])
+
+

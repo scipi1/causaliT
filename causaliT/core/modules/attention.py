@@ -12,6 +12,7 @@ from causaliT.core.modules.gated_self_attention import GatedSelfAttention
 from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
+from causaliT.utils.query_geometry import assert_orthonormal_frame, transitive_weights
 from typing import List, Optional
 
 
@@ -1451,6 +1452,12 @@ class AttentionLayer(nn.Module):
 
 
 
+        # Transitive-correction state: the Gram check runs once (the frame is
+        # fixed by construction), and ``last_transitive_W`` is a diagnostics
+        # handle read by the forecaster / notebooks.
+        self._transitive_frame_checked = False
+        self.last_transitive_W: Optional[torch.Tensor] = None
+
         self._uses_shared_structure = shared_qk_inner is not None
         self._query_external = bool(query_external)
         if self._query_external and self._uses_shared_structure:
@@ -1841,6 +1848,14 @@ class AttentionLayer(nn.Module):
         gain_key: torch.Tensor = None,
         value_structure: torch.Tensor = None,
         value_structure_query: torch.Tensor = None,
+        # Geometric TRANSITIVE correction (grandparent suppression), opt-in.
+        # Dict from AttentionSelectorLayer: {"alpha", "delta", "tnorm",
+        # "margin", "symmetric", "symmetric_span"}.  Orchestrated HERE because
+        # this is the only place that owns the PROJECTED q/k the correction
+        # operates on.  Requires an inner attention exposing
+        # ``structure_posterior`` (the gated blocks) — see
+        # causaliT/utils/query_geometry.py.
+        transitive_cfg: Optional[dict] = None,
     ):
         B, L, _ = query.shape
         _, S, _ = key.shape
@@ -1900,6 +1915,50 @@ class AttentionLayer(nn.Module):
         # attention types do not accept the kwarg.
         vq_kwargs = {"value_query": value_query} if self._value_query_capable else {}
 
+        # ---- Transitive correction: PASS 1 (probe) + weights -------------
+        # Pass 1 reads the block's own DETERMINISTIC posterior from the SAME
+        # projected q/k that pass 2 will score, so the trigger is exact (no
+        # Hard-Concrete noise, no gain) and identical in train and eval mode.
+        tw_kwargs = {}
+        if transitive_cfg is not None and not oracle:
+            inner = self.inner_attention
+            if not hasattr(inner, "structure_posterior"):
+                raise NotImplementedError(
+                    "transitive_correction requires an inner attention exposing "
+                    "structure_posterior() (GatedSelfAttention / "
+                    f"GatedCrossAttention), got {type(inner).__name__}."
+                )
+            if q.dim() != 3 or k.dim() != 3:
+                raise NotImplementedError(
+                    "transitive_correction requires a single structural head "
+                    "(shared_dag_across_heads=True)."
+                )
+            if not self._transitive_frame_checked:
+                # The component removal is only exact on an orthonormal key
+                # frame; fail loud rather than silently computing something else.
+                # ``layer_name`` lives on the INNER attention, not this wrapper.
+                _name = getattr(self.inner_attention, "layer_name", "attention")
+                assert_orthonormal_frame(
+                    k[0], context=f"layer '{_name}' projected keys"
+                )
+                self._transitive_frame_checked = True
+            pi = inner.structure_posterior(q, k, hard_mask)      # (L, S), detached
+            W = transitive_weights(
+                pi,
+                alpha=transitive_cfg.get("alpha", 0.5),
+                tnorm=transitive_cfg.get("tnorm", "min"),
+                margin=transitive_cfg.get("margin", True),
+                symmetric=transitive_cfg.get("symmetric", True),
+                symmetric_span=transitive_cfg.get("symmetric_span"),
+            )
+            if hard_mask is not None:
+                W = W * hard_mask.to(W.dtype)
+            self.last_transitive_W = W
+            tw_kwargs = {
+                "transitive_W": W,
+                "transitive_delta": transitive_cfg.get("delta", 0.5),
+            }
+
         if self._gated_gain:
 
             # Reconstruction-gain stream (GatedCrossAttention).  gain_query /
@@ -1922,6 +1981,7 @@ class AttentionLayer(nn.Module):
                 gain_query=gq,
                 gain_key=gk,
                 **vq_kwargs,
+                **tw_kwargs,
             )
         else:
             out, attn, aux = self.inner_attention(
@@ -1935,6 +1995,7 @@ class AttentionLayer(nn.Module):
                 hard_mask=hard_mask,
                 oracle=oracle,
                 **vq_kwargs,
+                **tw_kwargs,
             )
 
 

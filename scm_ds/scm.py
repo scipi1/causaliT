@@ -777,6 +777,192 @@ class SCMDataset:
             "baseline": baseline_expectations,
             "treated": treated_expectations,
         }
+
+    # ------------------------------------------------------------------
+    # Edge-level ground-truth causal effect
+    # ------------------------------------------------------------------
+    def compute_edge_effect_ground_truth(
+        self,
+        n_grid: int = 9,
+        n_samples: int = 20000,
+        seed: int = 42,
+        quantile: Tuple[float, float] = (0.05, 0.95),
+        negligible_effect: float = 0.02,
+        modifier_ratio: float = 5.0,
+        include_ancestor_pairs: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Ground-truth causal effect of EVERY edge of the true DAG, including X -> X
+        edges (which `compute_ate_ground_truth` does not cover, as it only
+        intervenes on `source_labels`).
+
+        Motivation
+        ----------
+        A structural metric that counts every edge equally is misleading when the
+        edges differ in causal strength by orders of magnitude. On `scm3` the edge
+        `S5 -> X4` has an ATE 24x smaller than `S4 -> X4`, because S5 enters only
+        through the product `e*S5*X2` with `E[X2] ~ 0`. Not recovering it is the
+        correct answer for any additive aggregator, not a failure. This method
+        quantifies that instead of assuming it.
+
+        Estimands (all by Monte Carlo `do()`, common random numbers)
+        -----------------------------------------------------------
+        For an edge `j -> i`, with `lo_j`/`hi_j` the observational quantiles of j:
+
+        - `ate_total`   : E[i | do(j=hi)] - E[i | do(j=lo)], all directed paths.
+        - `ate_direct`  : the same with the OTHER parents of i held at their
+                          observational mean, i.e. the controlled direct effect.
+                          This is what the single edge j -> i actually claims.
+        - `effect_std`  : std of E[i | do(j=v)] over the grid, divided by sd(i).
+                          Scale-free strength that does not depend on lo/hi.
+        - `modifier`    : how much j changes the effect OF THE CO-PARENTS on i.
+                          For each co-parent k, the spread over s of
+                          E[i|do(k=hi,j=s)] - E[i|do(k=lo,j=s)], divided by sd(i);
+                          the maximum over k is reported. Large `modifier` with
+                          ~zero `ate_total` is a pure effect modifier (interaction).
+
+        Labels
+        ------
+        - `strong`        : `effect_std >= negligible_effect`.
+        - `modifier_only` : negligible average effect, but
+                            `modifier > modifier_ratio * effect_std`.
+        - `weak`          : negligible average effect and no modification.
+
+        Returns
+        -------
+        Dict with `edges` (list of per-edge records), `nodes` (the observational
+        lo/mean/hi/sd used), `ancestor_pairs` (non-edge ancestor pairs, whose total
+        effect explains why a "spurious" edge can look attractive) and `params`.
+        """
+        scm = self.scm
+        specs = scm.specs
+        df = scm.sample(n=n_samples, seed=seed)
+
+        # Observational reference points for every node.
+        nodes: Dict[str, Dict[str, float]] = {}
+        for name in df.columns:
+            col = df[name].to_numpy()
+            lo, hi = np.quantile(col, quantile[0]), np.quantile(col, quantile[1])
+            nodes[name] = {
+                "lo": float(lo),
+                "hi": float(hi),
+                "mean": float(col.mean()),
+                "sd": float(col.std()),
+            }
+
+        def expect(intervention: Dict[str, float], target: str) -> float:
+            return self.compute_interventional_expectation(
+                intervention=intervention, target_vars=[target],
+                n_samples=n_samples, seed=seed,
+            )[target]
+
+        records: List[Dict[str, Any]] = []
+        for parent, child in scm.edges():
+            if parent not in nodes or child not in nodes:
+                continue
+            p, c = nodes[parent], nodes[child]
+            sd_c = c["sd"] if c["sd"] > 1e-12 else 1.0
+            grid = np.linspace(p["lo"], p["hi"], n_grid)
+
+            # --- total effect along all paths
+            tot = [expect({parent: float(v)}, child) for v in grid]
+            ate_total = float(tot[-1] - tot[0])
+            effect_std = float(np.std(tot) / sd_c)
+
+            # --- controlled direct effect: freeze the other parents of `child`
+            co_parents = [q for q in specs[child].parents if q != parent and q in nodes]
+            frozen = {q: nodes[q]["mean"] for q in co_parents}
+            dir_lo = expect({parent: float(grid[0]), **frozen}, child)
+            dir_hi = expect({parent: float(grid[-1]), **frozen}, child)
+            ate_direct = float(dir_hi - dir_lo)
+
+            # --- effect modification: does `parent` change a co-parent's effect?
+            modifier = 0.0
+            per_co: Dict[str, float] = {}
+            for q in co_parents:
+                slopes = []
+                for s in (grid[0], grid[len(grid) // 2], grid[-1]):
+                    e_hi = expect({q: nodes[q]["hi"], parent: float(s)}, child)
+                    e_lo = expect({q: nodes[q]["lo"], parent: float(s)}, child)
+                    slopes.append(e_hi - e_lo)
+                spread = float((max(slopes) - min(slopes)) / sd_c)
+                per_co[q] = spread
+                modifier = max(modifier, spread)
+
+            if effect_std >= negligible_effect:
+                label = "strong"
+            elif modifier > modifier_ratio * max(effect_std, 1e-12):
+                label = "modifier_only"
+            else:
+                label = "weak"
+
+            records.append({
+                "edge": f"{parent}->{child}",
+                "parent": parent,
+                "child": child,
+                "ate_total": ate_total,
+                "ate_direct": ate_direct,
+                "effect_std": effect_std,
+                "modifier": modifier,
+                "modifier_per_coparent": per_co,
+                "do_lo": float(grid[0]),
+                "do_hi": float(grid[-1]),
+                "label": label,
+            })
+
+        # Non-edge ancestor pairs: a "spurious" edge from an ancestor can carry a
+        # real total effect, which is why the selector may prefer it.
+        ancestor_pairs: List[Dict[str, Any]] = []
+        if include_ancestor_pairs:
+            # Full closure over ALL nodes (`_compute_transitive_closure` only keys
+            # `source_labels`, so it would miss X -> X ancestor pairs such as
+            # X1 -> X5 routed through another X).
+            children_of: Dict[str, List[str]] = defaultdict(list)
+            for parent, child in scm.edges():
+                children_of[parent].append(child)
+            closure: Dict[str, List[str]] = {}
+            for start in nodes:
+                reachable, queue = set(), deque([start])
+                while queue:
+                    cur = queue.popleft()
+                    for ch in children_of.get(cur, []):
+                        if ch not in reachable:
+                            reachable.add(ch)
+                            queue.append(ch)
+                closure[start] = sorted(reachable)
+
+            true_edges = set(scm.edges())
+            for anc, descs in closure.items():
+
+                for desc in descs:
+                    if (anc, desc) in true_edges:
+                        continue
+                    if anc not in nodes or desc not in nodes:
+                        continue
+                    a, d = nodes[anc], nodes[desc]
+                    sd_d = d["sd"] if d["sd"] > 1e-12 else 1.0
+                    grid = np.linspace(a["lo"], a["hi"], n_grid)
+                    vals = [expect({anc: float(v)}, desc) for v in grid]
+                    ancestor_pairs.append({
+                        "pair": f"{anc}->{desc}",
+                        "ate_total": float(vals[-1] - vals[0]),
+                        "effect_std": float(np.std(vals) / sd_d),
+                    })
+
+        return {
+            "edges": records,
+            "nodes": nodes,
+            "ancestor_pairs": ancestor_pairs,
+            "params": {
+                "n_grid": n_grid,
+                "n_samples": n_samples,
+                "seed": seed,
+                "quantile": list(quantile),
+                "negligible_effect": negligible_effect,
+                "modifier_ratio": modifier_ratio,
+            },
+        }
+
     
     def _generate_dataset_metadata(self, shared_vars_map: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
         """

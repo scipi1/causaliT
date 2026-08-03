@@ -93,6 +93,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from causaliT.utils.query_geometry import correct_query
 from causaliT.utils.query_norm import (
     apply_query_norm,
     coerce_fanin_scale,
@@ -276,6 +277,76 @@ class GatedSelfAttention(nn.Module):
         return triu - triu.transpose(-1, -2)        # antisymmetric, zero diagonal
 
     # ------------------------------------------------------------------
+    # Structural score (shared by forward and the cheap posterior probe)
+    # ------------------------------------------------------------------
+    def _structural_raw(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        transitive_W: Optional[torch.Tensor] = None,
+        transitive_delta: float = 0.0,
+    ) -> torch.Tensor:
+        """``raw[b, n, m]`` — the asymmetric structural score before the Toeplitz split.
+
+        The optional TRANSITIVE CORRECTION is applied here, on the unit query and
+        BEFORE the per-node norm budget ``M_i``, so the coordinate taken away from
+        a mediated (grandparent) edge is handed back to the surviving parents by
+        the subsequent re-normalisation.  ``transitive_W`` is detached, so the
+        correction biases the geometry without giving the loss a shortcut.
+        """
+        E_s = query.shape[-1]
+        q_s = query
+        if transitive_W is not None:
+            # u <- u - (W * (c + delta)) khat   (exact on an orthonormal frame)
+            q_s = correct_query(q_s, key, transitive_W, delta=transitive_delta)
+        if self.normalize_query:
+            if self.query_norm_learnable:
+                # q̂ * M_i (per-node learnable budget); scale = sqrt(fanin).
+                q_s, scale_s = apply_query_norm(
+                    q_s, self.query_norm_log_scale, self.query_fanin_scale
+                )
+            else:
+                # Plain unit-norm cap (M == 1).
+                q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
+                scale_s = math.sqrt(self.query_fanin_scale)
+        else:
+            scale_s = 1.0 / math.sqrt(E_s)
+
+        raw = torch.einsum("bne,bme->bnm", q_s, key) * scale_s   # (B, N, N)
+        return torch.nan_to_num(raw, nan=0.0)
+
+    @torch.no_grad()
+    def structure_posterior(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        hard_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """DETERMINISTIC directed posterior ``P(z_edge>0) * d``, batch-averaged.
+
+        A cheap probe of the structure only: no Hard-Concrete / direction noise,
+        no gain, no value aggregation and no ``last_*`` diagnostics write.  Used
+        as pass 1 of the transitive correction, where the trigger must be
+        identical in train and eval mode (a noisy trigger would make the
+        correction depend on the sampled gate).
+
+        Returns:
+            ``(N, N)`` posterior with ``[i, j] = P(j -> i)``, zero diagonal.
+        """
+        raw = self._structural_raw(query, key)
+        S_sym = 0.5 * (raw + raw.transpose(-1, -2))
+        A_anti = 0.5 * (raw - raw.transpose(-1, -2))
+        pi = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(A_anti / self.dir_beta)
+        n = pi.shape[-1]
+        pi = pi.masked_fill(
+            torch.eye(n, device=pi.device, dtype=torch.bool).unsqueeze(0), 0.0
+        )
+        if hard_mask is not None:
+            hm = hard_mask if hard_mask.dim() == 3 else hard_mask.unsqueeze(0)
+            pi = pi * hm.to(pi.dtype)
+        return pi.mean(dim=0)
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
     def forward(
@@ -296,6 +367,11 @@ class GatedSelfAttention(nn.Module):
         # ``(sum_j A_ij) * value_query`` — the exact, memory-cheap decomposition
         # of concatenating the query identity into a (linear, bias-free) W_V^q.
         value_query: Optional[torch.Tensor] = None,
+        # Geometric TRANSITIVE correction (grandparent suppression).  ``(N, N)``
+        # or ``(B, N, N)`` DETACHED weights computed by the LAYER from the square
+        # posterior (see causaliT/utils/query_geometry.py); None = disabled.
+        transitive_W: Optional[torch.Tensor] = None,
+        transitive_delta: float = 0.0,
     ):
         if causal_mask:
             raise NotImplementedError(
@@ -324,26 +400,12 @@ class GatedSelfAttention(nn.Module):
         N = L
 
         # ---- Structural score, Toeplitz-decomposed ----------------------
-        # Centroid-collapse fix: unit-normalise the query so its DIRECTION (not
-        # its norm) drives selection, with a fixed sqrt(query_fanin_scale) score
-        # scale replacing 1/sqrt(E) (see GatedCrossAttention for the rationale).
-        q_s = query
-        if self.normalize_query:
-            if self.query_norm_learnable:
-                # q̂ * M_i (per-node learnable budget); scale = sqrt(fanin).
-                q_s, scale_s = apply_query_norm(
-                    q_s, self.query_norm_log_scale, self.query_fanin_scale
-                )
-            else:
-                # Plain unit-norm cap (M == 1).
-                q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
-                scale_s = math.sqrt(self.query_fanin_scale)
-
-        else:
-            scale_s = 1.0 / math.sqrt(E_s)
-
-        raw = torch.einsum("bne,bme->bnm", q_s, key) * scale_s   # (B, N, N)
-        raw = torch.nan_to_num(raw, nan=0.0)
+        # Centroid-collapse fix (unit-normalised query + sqrt(fanin) scale) and
+        # the optional transitive correction both live in ``_structural_raw``,
+        # shared with the deterministic ``structure_posterior`` probe.
+        raw = self._structural_raw(
+            query, key, transitive_W=transitive_W, transitive_delta=transitive_delta
+        )
         S_sym = 0.5 * (raw + raw.transpose(-1, -2))                # symmetric
         A_anti = 0.5 * (raw - raw.transpose(-1, -2))               # antisymmetric
 

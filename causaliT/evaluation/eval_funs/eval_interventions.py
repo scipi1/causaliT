@@ -118,6 +118,41 @@ def _try_random_scm_dataset(datadir_path: Optional[str], dataset_name: str):
         return None
 
 
+def _try_fixed_scm_dataset(datadir_path: Optional[str], dataset_name: str):
+    """
+    Rebuild a fixed (registry) SCM from its persisted ``scm_recipe.json``.
+
+    Fixed-dataset sweeps (``euler_sweep.data_source.FixedDatasetSource``, used by
+    the ATE studies) materialize a registry SCM INSIDE the experiment folder and
+    leave an ``scm_recipe.json`` next to it holding the registry key.  Reading
+    that key is the only robust way to recover the SCM when the folder name is
+    not itself a registry key (renamed / aliased folders).
+
+    Returns:
+        The ``SCMDataset``, or ``None`` when this is not a recipe-backed dataset.
+    """
+    if not datadir_path:
+        return None
+
+    recipe_path = join(str(datadir_path), dataset_name, "scm_recipe.json")
+    if not exists(recipe_path):
+        return None
+
+    try:
+        from scm_ds.datasets import get_dataset
+
+        with open(recipe_path, "r", encoding="utf-8") as fh:
+            recipe = json.load(fh)
+
+        registry_name = recipe.get("registry_name")
+        if not registry_name:
+            return None
+        return get_dataset(str(registry_name))
+    except Exception as exc:
+        print(f"  Warning: could not rebuild SCM from {recipe_path}: {exc}")
+        return None
+
+
 def get_scm_for_dataset(dataset_name: str, datadir_path: Optional[str] = None):
     """
     Get the SCM object for a given dataset name.
@@ -126,7 +161,9 @@ def get_scm_for_dataset(dataset_name: str, datadir_path: Optional[str] = None):
     used to generate the ground truth.
     
     Args:
-        dataset_name: Name of the dataset (e.g., "scm1", "scm2", "scm3")
+        dataset_name: Dataset folder name / registry key. Resolution order:
+            registry key ("ds_scm3_continuous"), legacy un-prefixed alias
+            ("scm3_continuous"), "scm_recipe.json", "dag_recipe.json".
         datadir_path: Optional data root. When given, randomly-sampled datasets
             carrying a ``dag_recipe.json`` are rebuilt from that recipe, which
             makes arbitrary sampled DAGs work without a registry entry.
@@ -137,31 +174,24 @@ def get_scm_for_dataset(dataset_name: str, datadir_path: Optional[str] = None):
     Raises:
         ValueError: If dataset name is not recognized
     """
-    # Import SCM definitions (lazy import to avoid circular dependencies)
-    from scm_ds.datasets import (
-        ds_scm1_discrete_sampling,
-        ds_scm2_discrete_sampling,
-        ds_scm3_discrete_sampling,
-        ds_scm1,
-        ds_scm2,
-        ds_scm3,
-    )
+    # Lazy import to avoid circular dependencies.
+    from scm_ds.datasets import DATASET_REGISTRY
     
-    # Registry mapping dataset names to SCM objects
-    # Discrete variants use rng.choice() for S; continuous use rng.uniform()
-    SCM_REGISTRY = {
-        # Discrete S (paper defaults)
-        "scm1": ds_scm1_discrete_sampling,
-        "scm2": ds_scm2_discrete_sampling,
-        "scm3": ds_scm3_discrete_sampling,
-        # Continuous S (uniform) — for HSIC kernel analysis
-        "scm1_continuous": ds_scm1,
-        "scm2_continuous": ds_scm2,
-        "scm3_continuous": ds_scm3,
-    }
+    # DATASET_REGISTRY is the single source of truth. This used to be a
+    # hardcoded copy holding the OLD un-prefixed names, which silently stopped
+    # resolving the "ds_*" folder names produced by the sweepers.
+    if dataset_name in DATASET_REGISTRY:
+        return DATASET_REGISTRY[dataset_name]
+
+    # Legacy un-prefixed alias: "scm3_continuous" -> "ds_scm3_continuous".
+    legacy_key = f"ds_{dataset_name}"
+    if legacy_key in DATASET_REGISTRY:
+        return DATASET_REGISTRY[legacy_key]
     
-    if dataset_name in SCM_REGISTRY:
-        return SCM_REGISTRY[dataset_name]
+    # Fixed SCMs generated inside an experiment folder (ATE sweeps).
+    fixed_ds = _try_fixed_scm_dataset(datadir_path, dataset_name)
+    if fixed_ds is not None:
+        return fixed_ds
 
     # Randomly-sampled DAGs (DAG sweeps) are recipe-backed, not registered.
     random_ds = _try_random_scm_dataset(datadir_path, dataset_name)
@@ -170,8 +200,9 @@ def get_scm_for_dataset(dataset_name: str, datadir_path: Optional[str] = None):
 
     raise ValueError(
         f"Dataset '{dataset_name}' not found in SCM registry and no "
-        f"'dag_recipe.json' was found for it. "
-        f"Available: {list(SCM_REGISTRY.keys())}."
+        f"'scm_recipe.json' / 'dag_recipe.json' was found for it "
+        f"(searched under datadir '{datadir_path}'). "
+        f"Available: {sorted(DATASET_REGISTRY)}."
     )
 
 
@@ -297,6 +328,7 @@ def run_mc_predictions(
     
     n_inputs = len(input_labels)
     all_records = []
+    failed_folds = []
     
     # Process each k-fold
     for kfold_dir in kfold_dirs:
@@ -399,8 +431,19 @@ def run_mc_predictions(
             print(f"  [FAIL] Error processing {kfold_dir}: {e}")
             import traceback
             traceback.print_exc()
+            failed_folds.append(kfold_dir)
             continue
-    
+
+    # A swallowed per-fold error used to leave an incomplete (or empty) frame
+    # behind, which surfaced downstream as an opaque KeyError - or, worse, as a
+    # reported SUCCESS. Failures are terminal.
+    if failed_folds:
+        raise RuntimeError(
+            f"MC predictions failed for {len(failed_folds)}/{len(kfold_dirs)} "
+            f"folds in {experiment_path}: {failed_folds}. "
+            f"See the traceback(s) above."
+        )
+
     return pd.DataFrame(all_records)
 
 
@@ -668,16 +711,14 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     # =========================================================================
     # Load SCM for MC sampling
     # =========================================================================
-    try:
-        scm_dataset = get_scm_for_dataset(dataset_name, datadir_path=datadir_path)
-        print(f"  Loaded SCM for MC sampling")
-    except ValueError as e:
-        # NOTE: do *not* call eval_ate()/eval_ate_mc() here. eval_ate is an
-        # alias for this very function, so re-entering it recursed infinitely
-        # for every dataset outside SCM_REGISTRY (e.g. sampled random DAGs).
-        print(f"  Warning: {e}")
-        print("  Skipping ATE evaluation (no SCM available for MC sampling).")
-        return pd.DataFrame()
+    # An unresolvable SCM is a hard error: without it there is no ground-truth
+    # sampler, so there is no ATE. Returning an empty frame here used to make
+    # run_evaluations_from_config report the evaluation as a SUCCESS while
+    # nothing had been computed.
+    # NOTE: do *not* call eval_ate()/eval_ate_mc() in a handler here - eval_ate
+    # is an alias for this very function, so re-entering it recurses forever.
+    scm_dataset = get_scm_for_dataset(dataset_name, datadir_path=datadir_path)
+    print(f"  Loaded SCM for MC sampling")
     
     # =========================================================================
     # Load ATE ground truth and normalization
@@ -789,6 +830,15 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
         )
         df.to_csv(predictions_file, index=False)
         print(f"  Saved MC predictions to {predictions_file}")
+
+    # Guard the contract of the frame the metrics below rely on.
+    missing_cols = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if len(df) == 0 or missing_cols:
+        raise RuntimeError(
+            f"MC predictions are unusable for '{experiment}' "
+            f"(rows={len(df)}, missing columns={missing_cols}). "
+            f"No ATE can be computed."
+        )
     
     # =========================================================================
     # Compute ATE metrics

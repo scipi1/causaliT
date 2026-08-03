@@ -71,7 +71,19 @@ Design differences from SingleCausalForecaster
 Logged metrics
 ==============
 - train/val_loss_x         : MSE reconstruction loss
-- train/val_x_mae/rmse/r2  : Reconstruction metrics
+- train/val_x_mae/rmse/r2  : Reconstruction metrics.  NOTE ``x_r2`` is POOLED
+                             over every node (and, in homogeneous mode, over the
+                             exogenous S rows whose correct R2 is ~0), so it is
+                             NOT a fit quality.  Read ``x_r2_macro`` instead.
+- train/val_x_r2_endo      : pooled R2 on the ENDOGENOUS rows only (== x_r2 in
+                             split mode)
+- train/val_x_r2_macro     : mean PER-NODE R2 over the endogenous rows --
+                             pooling-free, this is the fit-quality number
+- train/val_x_r2_src       : pooled R2 on the S rows (homogeneous mode only).
+                             A source is only predictable from its descendants,
+                             so a HIGH value flags ANTI-CAUSAL use of the
+                             posterior.
+
 - train/val_score_sparse   : L1 sparsity on attention weights
 - train/val_hsic           : HSIC regularization value
 - train/val_hsic_reg       : Weighted HSIC regularization term
@@ -486,6 +498,32 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.rmse_x = tm.MeanSquaredError(squared=False)
         self.r2_x = tm.R2Score()
 
+        # --- Fit metrics that are actually interpretable -------------------
+        # ``r2_x`` is POOLED over every node and sample (``reshape(-1)``), so
+        # (a) in homogeneous mode it includes the exogenous S rows, whose
+        # causally-correct R2 is ~0, and (b) between-node variance leaks into
+        # SStot, making the value depend on the relative variances of the
+        # variables rather than on fit quality alone.  ``r2_x`` is kept
+        # UNCHANGED (it is in every historical metrics.csv) and the three keys
+        # below are added next to it:
+        #   x_r2_endo  pooled R2 over the ENDOGENOUS rows only (== x_r2 in
+        #              split mode, where the target already excludes S)
+        #   x_r2_macro mean of PER-NODE R2 over the endogenous rows; each node
+        #              is normalised by its own variance, so the value is
+        #              pooling-free and invariant to per-node rescaling
+        #   x_r2_src   pooled R2 over the S rows (homogeneous mode only).  This
+        #              is a DIAGNOSTIC, not noise: an exogenous source can only
+        #              be predicted from its own descendants, so a high value
+        #              means the posterior is being used ANTI-CAUSALLY.
+        self.r2_x_endo = tm.R2Score()
+        self.r2_x_macro = tm.R2Score(
+            num_outputs=self.X_seq_len, multioutput="uniform_average"
+        )
+        self.r2_x_src = (
+            tm.R2Score() if self.homogeneous_nodes else None
+        )
+
+
     # ------------------------------------------------------------------
     # Hard mask loading
     # ------------------------------------------------------------------
@@ -899,6 +937,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log(f"{stage}_x_{name}", metric_eval, on_step=False, on_epoch=True,
                      prog_bar=(stage == "val" and name == "mae"))
 
+        self._log_r2_variants(pred_x, x_target, stage)
+
+
         if effective_dims is not None:
             self.log(f"{stage}_effective_dims", effective_dims, on_step=False, on_epoch=True)
 
@@ -916,8 +957,72 @@ class AttentionSelectorForecaster(pl.LightningModule):
         return total_loss, pred_x, X
 
     # ------------------------------------------------------------------
+    # Interpretable fit metrics
+    # ------------------------------------------------------------------
+
+    def _log_r2_variants(
+        self,
+        pred_x: torch.Tensor,
+        x_target: torch.Tensor,
+        stage: str,
+    ) -> None:
+        """Log ``x_r2_endo`` / ``x_r2_macro`` / ``x_r2_src`` next to ``x_r2``.
+
+        ``x_r2`` (logged by the caller) is pooled over EVERY node and sample, so
+        in homogeneous mode it averages the endogenous rows with the exogenous S
+        rows, whose causally-correct R2 is ~0 -- the metric then has a ceiling
+        far below 1 and cannot be read as a fit quality.  Pooling also mixes
+        between-node variance into SStot, so the value depends on the relative
+        variances of the variables.  Hence:
+
+        * ``x_r2_endo``  pooled R2 on the endogenous rows only (identical to
+          ``x_r2`` in split mode, where the target has no S rows);
+        * ``x_r2_macro`` mean of the PER-NODE R2 over the endogenous rows -- each
+          node normalised by its own variance, so pooling-free and invariant to
+          per-node rescaling.  This is the number to read as "fit quality";
+        * ``x_r2_src``   pooled R2 on the S rows (homogeneous mode only).  A
+          source can only be predicted from its own descendants, so a HIGH value
+          is a positive diagnostic of ANTI-CAUSAL use of the posterior.
+
+        ``x_r2`` itself is never redefined: it appears in every historical
+        ``metrics.csv`` and in the sweep/Optuna plumbing.
+        """
+        # (B, n_rows) view of predictions and targets.
+        pred = pred_x.reshape(x_target.shape[0], -1)
+        targ = x_target.reshape(x_target.shape[0], -1)
+
+        if self.homogeneous_nodes:
+            pred_endo, targ_endo = pred[:, self.S_seq_len:], targ[:, self.S_seq_len:]
+            pred_src, targ_src = pred[:, : self.S_seq_len], targ[:, : self.S_seq_len]
+        else:
+            pred_endo, targ_endo = pred, targ
+            pred_src, targ_src = None, None
+
+        self.log(
+            f"{stage}_x_r2_endo",
+            self.r2_x_endo(pred_endo.reshape(-1), targ_endo.reshape(-1)),
+            on_step=False, on_epoch=True,
+        )
+        # R2Score(num_outputs>1) needs a (B, n_outputs) 2-D input and at least
+        # two samples per output; a degenerate batch would raise, so guard it.
+        if pred_endo.shape[0] > 1 and pred_endo.shape[1] == self.X_seq_len:
+            self.log(
+                f"{stage}_x_r2_macro",
+                self.r2_x_macro(pred_endo, targ_endo),
+                on_step=False, on_epoch=True,
+            )
+        if self.r2_x_src is not None and pred_src is not None and targ_src is not None:
+            self.log(
+                f"{stage}_x_r2_src",
+                self.r2_x_src(pred_src.reshape(-1), targ_src.reshape(-1)),
+                on_step=False, on_epoch=True,
+            )
+
+
+    # ------------------------------------------------------------------
     # L0 ↔ HSIC gradient-interference diagnostic
     # ------------------------------------------------------------------
+
 
     # Attention types that expose a differentiable L0 penalty on the structure
     # gate (aux["l0_penalty"]), for which the L0 ↔ HSIC interference probe is

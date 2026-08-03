@@ -340,6 +340,21 @@ class AttentionSelectorLayer(nn.Module):
         # ``self_attention_type``; forbids ``shared_query`` / ``shared_key``
         # (there is a single block, so sharing is intrinsic).  Default False.
         homogeneous_nodes: bool = False,
+        # ---- Geometric TRANSITIVE correction (grandparent suppression) ----
+        # Opt-in.  Pass 1 probes the block's own DETACHED posterior; every edge
+        # j -> i that is already explained by a mediator (j -> k -> i) has its
+        # key component removed from the query in pass 2, and the freed
+        # query-norm budget is handed back to the surviving parents by
+        # ``normalize_query``.  See causaliT/utils/query_geometry.py and
+        # experiments/6_INVESTIGATIONS/HOMOGENEOUS/TRANSITIVE_CORRECTION.md.
+        # Requires an ORTHONORMAL key frame (orthogonal_fixed +
+        # remove_key_projection) — enforced loudly on the first forward.
+        transitive_correction: bool = False,
+        transitive_alpha: float = 0.5,      # strength; 1.0 starts eating true edges
+        transitive_delta: float = 0.5,      # target COSINE on the negative side
+        transitive_tnorm: str = "min",      # Goedel; "prod" deflates and barely fires
+        transitive_margin: bool = True,     # relu(m - Pi): silent at the all-on init
+        transitive_symmetric: bool = True,  # existence part is symmetric
         # Direction-gate Binary-Concrete temperature (GatedSelfAttention only).
         dir_tau: float = 2.0 / 3.0,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
@@ -456,6 +471,40 @@ class AttentionSelectorLayer(nn.Module):
 
         # Homogeneous N-node mode (no S/X prior); N = L_S + L_X.
         self.homogeneous_nodes = bool(homogeneous_nodes)
+
+        # ---- Transitive correction (see the ctor docstring above) ---------
+        self.transitive_correction = bool(transitive_correction)
+        self.transitive_alpha = float(transitive_alpha)
+        self.transitive_delta = float(transitive_delta)
+        self.transitive_tnorm = str(transitive_tnorm)
+        self.transitive_margin = bool(transitive_margin)
+        self.transitive_symmetric = bool(transitive_symmetric)
+        # Config bundle handed to the block on every forward (None = disabled).
+        self._transitive_cfg = (
+            {
+                "alpha": self.transitive_alpha,
+                "delta": self.transitive_delta,
+                "tnorm": self.transitive_tnorm,
+                "margin": self.transitive_margin,
+                "symmetric": self.transitive_symmetric,
+            }
+            if self.transitive_correction
+            else None
+        )
+        if self.transitive_correction and not self.homogeneous_nodes:
+            # The trigger needs a SQUARE posterior: the mediator k ranges over
+            # the same node set as the parents j.  In split mode each block sees
+            # only a slice (the S->X block is (L_X, L_S) — S nodes are never
+            # children there), so no mediated path is even representable inside
+            # one block.  Supporting it would require probing the RE-FUSED
+            # (L_X, L_S+L_X) posterior and scattering the weights back per
+            # block; not done, so refuse rather than silently under-correct.
+            raise ValueError(
+                "transitive_correction=True currently requires "
+                "homogeneous_nodes=True (ONE square (N, N) block).  In split "
+                "mode the per-block posteriors are not square, so the mediator "
+                "axis does not exist inside a block."
+            )
         self.N = S_seq_len + X_seq_len
 
         # ------------------------------------------------------------------
@@ -1469,6 +1518,7 @@ class AttentionSelectorLayer(nn.Module):
                 gain_key=gain_key,
                 value_structure=vsi_SX,
                 value_structure_query=vsq_all,
+                transitive_cfg=self._transitive_cfg,
             )
         elif self.cross_only:
             # ==============================================================

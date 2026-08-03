@@ -109,6 +109,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from causaliT.utils.query_geometry import correct_query
 from causaliT.utils.query_norm import (
     apply_query_norm,
     coerce_fanin_scale,
@@ -284,6 +285,46 @@ class GatedCrossAttention(nn.Module):
 
 
     # ------------------------------------------------------------------
+    # Deterministic structure probe (pass 1 of the transitive correction)
+    # ------------------------------------------------------------------
+    @property
+    def l0_offset(self) -> float:
+        """``beta * log(-gamma/zeta)`` — the Hard-Concrete stretch offset."""
+        return float(self.beta * math.log(-self.gamma / self.zeta))
+
+    @torch.no_grad()
+    def structure_posterior(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        hard_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """DETERMINISTIC gate posterior ``P(z>0)``, batch-averaged, ``(L, S)``.
+
+        Structure only: no Hard-Concrete noise, no gain, no value aggregation and
+        no ``last_*`` diagnostics write, so the transitive-correction trigger is
+        identical in train and eval mode.
+        """
+        E_s = query.shape[-1]
+        q_s = query
+        if self.normalize_query:
+            if self.query_norm_learnable:
+                q_s, scale_s = apply_query_norm(
+                    q_s, self.query_norm_log_scale, self.query_fanin_scale
+                )
+            else:
+                q_s = F.normalize(q_s, p=2.0, dim=-1, eps=1e-8)
+                scale_s = math.sqrt(self.query_fanin_scale)
+        else:
+            scale_s = 1.0 / math.sqrt(E_s)
+        log_alpha = torch.einsum("ble,bse->bls", q_s, key) * scale_s
+        p = torch.sigmoid(log_alpha - self.edge_offset - self.l0_offset)
+        if hard_mask is not None:
+            hm = hard_mask if hard_mask.dim() == 3 else hard_mask.unsqueeze(0)
+            p = p * hm.to(p.dtype)
+        return p.mean(dim=0)
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
     def forward(
@@ -304,6 +345,11 @@ class GatedCrossAttention(nn.Module):
         # ``(sum_j A_ij) * value_query`` — the exact, memory-cheap decomposition
         # of concatenating the query identity into a (linear, bias-free) W_V^q.
         value_query: Optional[torch.Tensor] = None,
+        # Geometric TRANSITIVE correction (grandparent suppression).  ``(L, S)``
+        # or ``(B, L, S)`` DETACHED weights computed by the LAYER from the square
+        # posterior (see causaliT/utils/query_geometry.py); None = disabled.
+        transitive_W: Optional[torch.Tensor] = None,
+        transitive_delta: float = 0.0,
     ):
         if causal_mask:
 
@@ -336,6 +382,11 @@ class GatedCrossAttention(nn.Module):
         #      sqrt(fanin/m) per edge (blocks get sqrt(m)-cheaper per edge and
         #      pay a growing L0 cost while true parents stay ON).
         q_s = query
+        if transitive_W is not None:
+            # Transitive correction: drop the key components already explained by
+            # a mediator, BEFORE the norm budget, so the freed budget is handed
+            # back to the surviving parents by the re-normalisation below.
+            q_s = correct_query(q_s, key, transitive_W, delta=transitive_delta)
         if self.normalize_query:
             if self.query_norm_learnable:
                 # q̂ * M_i (per-node learnable budget); scale = sqrt(fanin).
