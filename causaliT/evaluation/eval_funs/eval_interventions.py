@@ -271,6 +271,66 @@ def sample_mc_source_inputs(
     return torch.from_numpy(source_tensor)
 
 
+def _find_train_npz(datadir_path: str, dataset_name: str) -> Optional[str]:
+    """Locate the training npz (``ds_train.npz`` preferred, else ``ds.npz``)."""
+    ds_dir = join(str(datadir_path), dataset_name)
+    for fname in ("ds_train.npz", "ds.npz"):
+        path = join(ds_dir, fname)
+        if exists(path):
+            return path
+    return None
+
+
+@torch.no_grad()
+def _build_residual_pool(
+    model,
+    npz_path: str,
+    source_vars_map: dict,
+    input_vars_map: dict,
+    source_labels: List[str],
+    input_labels: List[str],
+    device,
+    batch_size: int = 8192,
+) -> torch.Tensor:
+    """
+    Teacher-forced residual pool for the variant-B interventional roll-out.
+
+    One ordinary (teacher-forced) forward pass over the stored training data -
+    real S, real X as keys/values, exactly as in training - collecting the
+    per-node residual ``e_i = x_i - f_i(pa(i))`` in NORMALIZED space (the npz
+    is already normalized).  The pool is the model's empirical estimate of the
+    ANM noise distribution; ``causal_predict`` resamples one row per Monte
+    Carlo draw and re-adds it every round so mediator noise propagates into
+    downstream nonlinear mechanisms.
+
+    Validity rests on the ANM assumptions (additive noise, residuals
+    independent of the parents); check with ``eval_anm_residual_hsic``.
+
+    Returns:
+        Tensor of shape (n_train, n_inputs), dtype float32.
+    """
+    data = np.load(npz_path)
+    s_np = np.asarray(data["s"])            # (n, L_S, 2) [value, var_idx]
+    x_np = np.asarray(data["x"])            # (n, L_X, 2)
+    n = x_np.shape[0]
+    n_inputs = len(input_labels)
+
+    residuals = np.empty((n, n_inputs), dtype=np.float32)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        s_batch = torch.from_numpy(s_np[start:end].astype(np.float32)).to(device)
+        x_batch = torch.from_numpy(x_np[start:end].astype(np.float32)).to(device)
+        pred = model.forward(data_source=s_batch, data_intermediate=x_batch)[0]
+        if getattr(model, "homogeneous_nodes", False):
+            pred = pred[:, s_batch.shape[1]:, :]      # keep the X rows
+        pred = pred.squeeze(-1)                        # (B, L_X)
+        residuals[start:end] = (
+            x_batch[:, :, 0] - pred
+        ).cpu().numpy().astype(np.float32)
+
+    return torch.from_numpy(residuals)
+
+
 def run_mc_predictions(
     experiment_path: str,
     scm_dataset,
@@ -283,12 +343,24 @@ def run_mc_predictions(
     n_samples: int = 50000,
     seed: int = 42,
     checkpoint_type: str = "best_causal",
-    batch_size: int = 64,
+    batch_size: int = 4096,
+    propagation: str = "rollout",
+    noise: str = "residual",
+    datadir_path: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Run model predictions using Monte Carlo sampled S values.
     
     This ensures model ATE evaluation uses the same S distribution as ground truth.
+
+    For ``AttentionSelectorForecaster`` the prediction is the model's GENERATIVE
+    forward pass (``causal_predict``): X is predicted by iterating the model to
+    a fixed point (the model's own predictions are fed back as keys/values)
+    instead of teacher-forcing observed X - see
+    docs/documentation/ATE_INTERVENTIONAL_ROLLOUT.md.  With ``noise="residual"``
+    (default) each node's teacher-forced residual is re-added every round
+    (variant B: the mediator noise propagates into nonlinear children); with
+    ``noise="none"`` only conditional means propagate (variant A).
     
     Args:
         experiment_path: Path to experiment folder
@@ -341,15 +413,63 @@ def run_mc_predictions(
             print(f"  Processing {kfold_dir}...")
             
             # Create predictor (data root may live inside the run folder for
-            # DAG-sweep runs, hence the resolver rather than a fixed path)
-            datadir_path = resolve_datadir(config=config_updated)
+            # DAG-sweep runs, hence the resolver rather than a fixed path).
+            # An explicit datadir_path (e.g. the run-local datasets/ folder of a
+            # relocated run) wins over the config's data_root, which may be a
+            # stale cluster path.
+            if datadir_path is None:
+                datadir_path = resolve_datadir(config=config_updated)
             predictor = create_predictor(config_updated, checkpoint_path, datadir_path)
             
             # Get device
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             predictor.model.to(device)
             predictor.model.eval()
-            
+
+            # ---------------------------------------------------------
+            # Interventional roll-out dispatch (AttentionSelector only)
+            # ---------------------------------------------------------
+            # The roll-out is the model's generative forward pass: X is
+            # predicted by iterating the model to a fixed point rather than
+            # teacher-forcing observed X values (which would block every
+            # mediated effect at the conditioning node).  See
+            # docs/documentation/ATE_INTERVENTIONAL_ROLLOUT.md.
+            from causaliT.training.forecasters.attention_selector_forecaster import (
+                AttentionSelectorForecaster,
+            )
+            use_rollout = (
+                propagation == "rollout"
+                and isinstance(predictor.model, AttentionSelectorForecaster)
+            )
+            if propagation == "rollout" and not use_rollout:
+                print(
+                    "  [warn] propagation='rollout' requested but the model is "
+                    f"not an AttentionSelectorForecaster ({type(predictor.model).__name__}); "
+                    "falling back to the one-shot pass."
+                )
+
+            # Variant-B residual pool: teacher-forced residuals on the stored
+            # training data, one per node, in normalized space.
+            residual_pool = None
+            if use_rollout and noise == "residual":
+                npz_path = _find_train_npz(datadir_path, config_updated["data"]["dataset"])
+                if npz_path is None:
+                    print(
+                        "  [warn] no training npz found "
+                        f"({datadir_path}/{config_updated['data']['dataset']}); "
+                        "falling back to noise='none'."
+                    )
+                else:
+                    residual_pool = _build_residual_pool(
+                        predictor.model, npz_path,
+                        source_vars_map, input_vars_map,
+                        source_labels, input_labels, device,
+                    )
+                    print(
+                        f"  Residual pool built from {npz_path}: "
+                        f"{tuple(residual_pool.shape)}"
+                    )
+
             # Build list of interventions to evaluate
             interventions_to_run = [({}, "baseline")]  # Baseline: no intervention
             
@@ -376,10 +496,12 @@ def run_mc_predictions(
                     seed=seed,
                 )
                 
-                # Create dummy X tensor (will be blanked by the model)
+                # Initial X state (zero values; only the variable-index column is
+                # set).  In roll-out mode this is the FIXED-POINT INITIALISATION
+                # X^(0): the value column is overwritten by the iteration, so
+                # the zeros never act as (stale) parent values.  In one-shot
+                # fallback mode it is the legacy dummy input.
                 # Shape: (n_samples, n_inputs, 2) where 2 = [value, var_idx]
-                # Variable indices must be integers within embedding vocabulary range
-                # Using input_vars_map for X embedding indices
                 x_dummy = torch.zeros((n_samples, n_inputs, 2), dtype=torch.float32)
                 for i, var_name in enumerate(input_labels):
                     # Use the actual variable index from the INPUT mapping
@@ -387,34 +509,50 @@ def run_mc_predictions(
                     if var_idx is None:
                         raise ValueError(f"Variable '{var_name}' not found in input_vars_map: {input_vars_map}")
                     x_dummy[:, i, 1] = float(var_idx)  # Set variable indices as floats (will be converted to int by model)
-                
-                # Run model forward pass in batches
+
+                # Run model predictions in batches
                 all_preds = []
-                for start_idx in range(0, n_samples, batch_size):
+                max_delta = 0.0
+                max_iters = 0
+                for chunk_i, start_idx in enumerate(range(0, n_samples, batch_size)):
                     end_idx = min(start_idx + batch_size, n_samples)
                     s_batch = source_tensor[start_idx:end_idx].to(device)
                     x_batch = x_dummy[start_idx:end_idx].to(device)
-                    
+
                     with torch.no_grad():
-                        # SingleCausalForecaster.forward expects (S, X) and returns (pred_x, attn, masks, entropy)
-                        # The model internally blanks X values
-                        output = predictor.model.forward(
-                            data_source=s_batch,
-                            data_intermediate=x_batch,
-                        )
-                        pred_x = output[0]  # First element is pred_x
-                        all_preds.append(pred_x.cpu())
-                
+                        if use_rollout:
+                            # Generative forward: iterate the model to a fixed
+                            # point.  The per-chunk generator is seeded
+                            # identically for every intervention, so the same
+                            # residual draws are reused (common random numbers).
+                            gen = torch.Generator().manual_seed(seed + chunk_i)
+                            x_final, n_it, delta = predictor.model.causal_predict(
+                                data_source=s_batch,
+                                x_init=x_batch,
+                                residual_pool=residual_pool,
+                                generator=gen,
+                            )
+                            max_delta = max(max_delta, delta)
+                            max_iters = max(max_iters, n_it)
+                            all_preds.append(x_final.cpu())
+                        else:
+                            output = predictor.model.forward(
+                                data_source=s_batch,
+                                data_intermediate=x_batch,
+                            )
+                            pred_x = output[0]  # First element is pred_x
+                            all_preds.append(pred_x.cpu())
+
                 # Concatenate all batch predictions
                 pred_tensor = torch.cat(all_preds, dim=0)  # Shape: (n_samples, n_inputs, n_features)
-                
+
                 # Extract value predictions (feature 0)
                 pred_values = pred_tensor[:, :, 0].numpy()  # Shape: (n_samples, n_inputs)
-                
+
                 # Record predictions per variable
                 for pos_idx, var_name in enumerate(input_labels):
                     var_preds = pred_values[:, pos_idx]
-                    
+
                     all_records.append({
                         "intervention": label,
                         "pos_idx": pos_idx,
@@ -423,6 +561,8 @@ def run_mc_predictions(
                         "pred_feat_0": float(var_preds.mean()),  # Mean prediction (normalized)
                         "pred_std": float(var_preds.std()),  # Std of predictions
                         "n_samples": n_samples,
+                        "rollout_delta": max_delta,
+                        "rollout_iters": max_iters,
                     })
             
         except Exception as e:
@@ -666,7 +806,14 @@ def compute_ate_metrics(
 # Main Evaluation Function - Monte Carlo Version
 # =============================================================================
 
-def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.DataFrame:
+def eval_ate_mc(
+    experiment: str,
+    n_samples: int = 50000,
+    seed: int = 42,
+    propagation: str = "rollout",
+    noise: str = "residual",
+    datadir_path: Optional[str] = None,
+) -> pd.DataFrame:
     """
     Evaluate ATE using Monte Carlo sampled S values.
     
@@ -675,14 +822,21 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     
     For each intervention do(S_j=s):
     1. Sample fresh S from noise model with S_j clamped to s
-    2. Run model forward pass: S → X predictions
+    2. Predict X with the model's GENERATIVE forward pass (causal_predict):
+       iterate the model to a fixed point, re-adding teacher-forced residuals
+       (noise="residual", variant B) so mediated effects propagate
     3. Compute mean prediction = E[X | do(S_j=s)]
     4. Compare with ground truth
-    
+
     Args:
         experiment: Path to the experiment folder
         n_samples: Number of MC samples (default 50000, matching ground truth)
         seed: Random seed for MC sampling
+        propagation: "rollout" (default, generative fixed-point) or "one_shot"
+            (legacy teacher-forced single pass; only for non-AttentionSelector
+            models or ablation)
+        noise: "residual" (default, variant B: propagate mediator noise) or
+            "none" (variant A: propagate conditional means only)
         
     Returns:
         DataFrame with ATE metrics per intervention × variable × fold
@@ -700,8 +854,11 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     dataset_name = config.get("data", {}).get("dataset")
     
     # DAG-sweep runs keep their datasets under the run folder; fall back to
-    # <repo>/data for classic experiments.
-    datadir_path = resolve_datadir(experiment=experiment)
+    # <repo>/data for classic experiments.  An explicit datadir_path (e.g. the
+    # run-local datasets/ of a relocated run) wins over the resolver, whose
+    # config data_root may be a stale cluster path.
+    if datadir_path is None:
+        datadir_path = resolve_datadir(experiment=experiment)
     metadata = load_dataset_metadata(datadir_path, dataset_name)
     if not metadata:
         raise ValueError(f"Dataset metadata not found for '{dataset_name}'")
@@ -788,6 +945,11 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
     # =========================================================================
     # Required columns in the predictions DataFrame
     REQUIRED_COLUMNS = ["intervention", "pos_idx", "variable", "kfold", "pred_feat_0"]
+    # Roll-out predictions carry a convergence diagnostic; a cache lacking it is
+    # a stale ONE-SHOT prediction file (pre-roll-out) and must be regenerated,
+    # otherwise the old zero-mediator numbers would silently be reused.
+    if propagation == "rollout":
+        REQUIRED_COLUMNS = REQUIRED_COLUMNS + ["rollout_delta"]
     
     # Check if cached file exists AND has valid content
     cache_valid = False
@@ -827,6 +989,9 @@ def eval_ate_mc(experiment: str, n_samples: int = 50000, seed: int = 42) -> pd.D
             n_samples=n_samples,
             seed=seed,
             checkpoint_type=ckpt_type,
+            propagation=propagation,
+            noise=noise,
+            datadir_path=datadir_path,
         )
         df.to_csv(predictions_file, index=False)
         print(f"  Saved MC predictions to {predictions_file}")

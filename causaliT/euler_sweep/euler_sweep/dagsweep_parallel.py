@@ -16,16 +16,18 @@ correct option: every trial of every group is done before any training starts)::
     prep (CPU)                      generate all DAGs, stage group configs,
       |                             create the study DBs, write the plan
       v
-    trials[0..T-1%C] (1 GPU each)   one array task = ONE Optuna trial
+    trials[0..T-1%C] (1 GPU each*)  one array task = ONE Optuna trial
       |            (afterany)
       v
     select (CPU)                    per group: select_best -> best_trial.yaml
       |            (afterok)
       v
-    train[0..R-1%C] (1 GPU each)    one array task = ONE (dag_seed, model_seed) run
+    train[0..R-1%C] (1 GPU each*)   one array task = ONE (dag_seed, model_seed) run
       |            (afterany)
       v
     cleanup (CPU)                   prune ds*.npz, roll up the progress report
+
+    (*or CPU-only when ``gpu_mem`` is null, e.g. for the CPU-only benchmarks)
 
 Design decisions that make this safe
 ------------------------------------
@@ -84,7 +86,10 @@ from causaliT.euler_sweep.euler_sweep.opt_train_sweep import (
 )
 
 from causaliT.euler_sweep.euler_sweep.search_space import n_keys_from_metadata
-from causaliT.euler_sweep.euler_sweep.sweeper import run_single_combination
+from causaliT.euler_sweep.euler_sweep.sweeper import (
+    normalize_gpu_mem,
+    run_single_combination,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +200,32 @@ def _n_trials_of(exp_dir: str, base_optuna_path: Optional[str]) -> int:
     return int(settings.get("n_trials", 0))
 
 
+def _check_trainer_supported(base_config_path: Optional[str], phase: str,
+                             trainer_name: str) -> None:
+    """
+    Reject a trainer the base config cannot run, at PLAN time.
+
+    ``adaptive_trainer`` needs the structural/reconstruction parameter groups to
+    freeze them per phase, so it raises when ``training.use_gradient_routing`` is
+    false.  Without this check the contradiction only surfaces inside the train
+    array, i.e. after prep + trials + select have already run for hours.
+    """
+    if base_config_path is None or trainer_name != "adaptive":
+        return
+    config = _as_dict(OmegaConf.load(base_config_path))
+    if bool(_as_dict(config.get("training", {})).get("use_gradient_routing", False)):
+        return
+    raise ValueError(
+        f"{phase} declares trainer 'adaptive' but {basename(base_config_path)} "
+        f"has training.use_gradient_routing=false; adaptive_trainer requires the "
+        f"gradient-routing parameter groups. Use trainer 'standard' for this arm "
+        f"or enable use_gradient_routing."
+    )
+
+
 def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
                       keep_data: bool = False, skip_optuna: bool = False,
+
                       force_optuna: bool = False,
                       slurm_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -233,6 +262,13 @@ def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
 
     trainer_name = str(_as_dict(spec.get("training", {})).get("trainer", "standard"))
     resolve_trainer(trainer_name)  # fail now, not inside 40 array tasks
+    _check_trainer_supported(base_config_path, "training.trainer", trainer_name)
+    if optuna_enabled:
+        _check_trainer_supported(
+            base_config_path, "optuna.trainer",
+            str(opt_cfg.get("trainer", "standard")),
+        )
+
 
     exp_id = basename(str(home_exp_dir).rstrip("/\\"))
 
@@ -864,6 +900,9 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     Dependencies are patched in at submission time, so the scripts themselves are
     reusable: any stage can be re-run by hand with ``sbatch`` after a partial
     failure (e.g. re-submit only ``train.sh``).
+
+    A null ``gpu_mem`` (None / "null") yields CPU-only trial/train arrays:
+    no ``--gpus`` / ``--gres=gpumem`` request is emitted.
     """
     scripts_dir = state_dir(exp_dir) / "scripts"
     log_dir = str(state_dir(exp_dir) / "slurm_logs")
@@ -872,7 +911,9 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     exp_id = plan["experiment"]
     walltime = slurm_params.get("walltime", "4:00:00")
     mem = slurm_params.get("mem_per_cpu", "10g")
-    gpu_mem = slurm_params.get("gpu_mem", "11g")
+    # A null gpu_mem (None / "null") means CPU-only: the trial/train arrays
+    # then emit no --gpus / --gres=gpumem request at all.
+    gpu_mem = normalize_gpu_mem(slurm_params.get("gpu_mem", "11g"))
     concurrent = int(slurm_params.get("max_concurrent_jobs", 6))
     venv = slurm_params.get("venv_path", "$HOME/myenv")
     env = _ENV_BLOCK.format(venv_path=venv)
@@ -973,6 +1014,8 @@ def submit_parallel_dag_sweep(exp_dir: str, home_exp_dir: str,
     print(f"Training runs   : {plan['n_train_tasks']} (trainer={plan['trainer']})")
     print(f"Max concurrent  : {slurm_params.get('max_concurrent_jobs')}")
     print(f"Walltime        : {slurm_params.get('walltime')}")
+    gpu_mem = normalize_gpu_mem(slurm_params.get("gpu_mem"))
+    print(f"GPU memory      : {gpu_mem if gpu_mem else 'none (CPU-only)'}")
     print(f"State folder    : {state_dir(exp_dir)}")
     print("=" * 60)
 

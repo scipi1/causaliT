@@ -59,7 +59,6 @@ CausaliT supports various regularization techniques to encourage:
 | Parameter | Description |
 |-----------|-------------|
 | `lambda_kl` | KL divergence from running average prior |
-| `lambda_tau` | Penalizes high Gumbel-Softmax temperature |
 | `lambda_embed_l1` | L1 on embedding parameters (for ANS experiments) |
 | `lambda_noise_prior` | Prior on noise parameters (noise-aware only) |
 | `lambda_group_l1` | Group L1 (L2,1) on embedding columns (staged training) |
@@ -77,7 +76,6 @@ CausaliT supports various regularization techniques to encourage:
 | `lambda_hsic` | ✅ | ✅ | ❌ |
 | `lambda_kl` | ✅ | ✅ | ❌ |
 | `lambda_decisive[_cross]` | ✅ | ✅ | ❌ |
-| `lambda_tau` | ✅ | ✅ | ❌ |
 | `lambda_embed_l1` | ✅ | ❌ | ❌ |
 | `lambda_noise_prior` | ❌ | ✅ | ❌ |
 | All annealing schedules | ✅ | ✅ | ❌ |
@@ -119,33 +117,15 @@ sparse edge existence. This is recommended because:
 
 ## Annealing Schedules
 
-### Gumbel-Softmax Temperature (`tau_gs`)
-
-```yaml
-training:
-  use_tau_gs_annealing: true
-  tau_gs_start: 2.0          # High = exploration (soft masks)
-  tau_gs_end: 0.2            # Low = exploitation (hard masks)
-  tau_gs_anneal_epochs: 80
-```
-
-Schedule: Exponential τ(t) = τ_start × (τ_end/τ_start)^(t/T). Recommended for ToeplitzLieAttention.
-
-### Activation Temperature (`tau_gate`, `tau_dir`)
-
-For ToeplitzLieAttention only:
-
-```yaml
-training:
-  use_tau_act_annealing: true
-  tau_gate_start: 1.0
-  tau_gate_end: 0.2
-  tau_dir_start: 0.5
-  tau_dir_end: 0.1
-  tau_act_anneal_epochs: 80
-```
+> **Removed (temperature annealing).** The Gumbel-Softmax (`tau_gs`),
+> activation-temperature (`use_tau_act_annealing`, `tau_gate`/`tau_dir`) and
+> unified-tau (`use_tau_annealing`) schedules no longer exist: the attention
+> temperatures are FIXED, calculated constants, not annealed.  See
+> `docs/documentation/ATTENTION_TEMPERATURES.md` for the three temperatures
+> and the derivation of their defaults.
 
 ### HSIC Annealing
+
 
 ```yaml
 training:
@@ -161,7 +141,6 @@ Schedule: Linear annealing.
 
 | Mechanism A | Mechanism B | Conflict |
 |-------------|-------------|----------|
-| `lambda_tau` | `use_tau_gs_annealing` | Both control τ_gs |
 | `lambda_hsic` (fixed) | `use_hsic_annealing` | Both control HSIC strength |
 
 ---
@@ -194,7 +173,6 @@ training:
   lambda_hsic_cross: 0.0
   lambda_hsic_self: 0.0
   lambda_decisive: 0.0
-  lambda_tau: 0.0
   lambda_kl: 0.0
 ```
 
@@ -205,11 +183,6 @@ experiment:
   dec_self_attention_type: "ToeplitzLieAttention"
 
 training:
-  use_tau_gs_annealing: true
-  tau_gs_start: 2.0
-  tau_gs_end: 0.2
-  tau_gs_anneal_epochs: 80
-
   lambda_l1_self_scores: 0.1
   lambda_decisive: 0.05
   kappa: 0.1
@@ -234,7 +207,7 @@ training:
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| DAG values stuck at ~0.5 | Insufficient decisiveness | `lambda_decisive: 0.1`, lower `tau_gs_end` |
+| DAG values stuck at ~0.5 | Insufficient decisiveness | `lambda_decisive: 0.1` |
 | DAG too sparse (all edges pruned) | Over-regularization | Reduce `lambda_sparse`, `lambda_l1_self_scores` |
 | HSIC too high throughout | Model not learning causal structure | Use HSIC annealing: start at 0, ramp up |
 
@@ -334,7 +307,6 @@ training:
   log_hsic: true             # HSIC value
   log_decisiveness: true     # Decisiveness metrics
   log_embed_l1: true         # Embedding L1 norm
-  log_tau_annealing: true    # Annealed temperature values
   log_hsic_annealing: true   # Annealed HSIC coefficient
   log_noise_params: true     # σ_A, σ_R (noise-aware only)
 ```

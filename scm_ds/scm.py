@@ -1183,7 +1183,17 @@ class SCMDataset:
         return train_data, test_data, split_info
     
     def _normalize(self, data: np.ndarray, method: str = "standardize"):
-        """Normalize only the value features (feature index 0) using sklearn scalers."""
+        """
+        Normalize only the value features (feature index 0) using sklearn scalers.
+
+        Raises:
+            ValueError: if the sampled values contain NaN/inf. Diverging structural
+                mechanisms are the usual cause, so the message names the worst
+                offenders instead of letting sklearn report an opaque
+                "Input X contains infinity".
+        """
+        self._check_finite_values(data)
+
         normalized_data = data.copy()
         values = data[:, :, 0].reshape(-1, 1)  # Flatten to (batch*seq, 1)
         
@@ -1203,7 +1213,54 @@ class SCMDataset:
                  "max": float(scaler.data_max_[0]) if hasattr(scaler, 'data_max_') else None}
         
         return normalized_data, {k: v for k, v in stats.items() if v is not None}
-    
+
+    def _check_finite_values(self, data: np.ndarray, max_report: int = 5) -> None:
+        """
+        Fail fast (with variable names) when sampled values are not finite.
+
+        Args:
+            data: Array shaped (batch, seq, feat); feature 0 holds the values.
+            max_report: How many offending variables to list in the message.
+
+        Raises:
+            ValueError: if any value is NaN or +-inf.
+        """
+        values = data[:, :, 0]
+        bad = ~np.isfinite(values)
+        if not bad.any():
+            return
+
+        # Column index -> variable name, using the same order get_numpy emits.
+        labels: List[str] = []
+        if self.source_labels:
+            labels.extend(self.source_labels)
+        labels.extend(self.input_labels)
+        if self.target_labels:
+            labels.extend(self.target_labels)
+
+        counts = bad.sum(axis=0)
+        worst = np.argsort(-counts)[:max_report]
+        finite_only = np.where(bad, np.nan, values)
+        details = []
+        for col in worst:
+            if counts[col] == 0:
+                continue
+            name = labels[col] if col < len(labels) else f"col{col}"
+            finite_max = np.nanmax(np.abs(finite_only[:, col]))
+            details.append(
+                f"{name}: {int(counts[col])}/{values.shape[0]} non-finite, "
+                f"max finite |value|={finite_max:.3e}"
+            )
+
+        raise ValueError(
+            f"Dataset '{self.name}' contains {int(bad.sum())} non-finite values; "
+            f"cannot normalize. Worst variables -> " + "; ".join(details) + ". "
+            "This normally means the structural mechanisms diverge: unbounded link "
+            "functions get re-applied at every layer of the DAG, so values grow "
+            "geometrically with depth. Use bounded nonlinearities (sin/tanh) or "
+            "reduce the DAG depth/degree."
+        )
+
     def get_numpy(self, mode, n, seed=42, shared_embedding=False):
         # reshape the dataset into B x L x D, where
                 # - B: batch/sample size

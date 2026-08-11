@@ -234,3 +234,69 @@ def test_oracle_requires_hard_masks(data_dir):
     """use_oracle_attention=True without hard masks is a configuration error."""
     with pytest.raises(ValueError, match="use_hard_masks"):
         AttentionSelectorForecaster(_config(False, True), data_dir=data_dir)
+
+
+def test_eval_load_without_data_dir_keeps_mask(data_dir):
+    """Eval-time ``load_from_checkpoint`` (no data_dir) must keep the GT mask.
+
+    Regression guard for the published cheater arm: training registers the
+    ``oracle_combined_mask`` buffer (data_dir available), so the checkpoint
+    carries it.  ``AttentionSelectorPredictor._load_model`` calls
+    ``load_from_checkpoint`` WITHOUT ``data_dir``, so __init__ never registers
+    the buffer and PL's strict load_state_dict used to raise
+    ``RuntimeError: Unexpected key(s) in state_dict: "oracle_combined_mask"``
+    -- killing eval_interventions / eval_attention_scores for every cheater
+    run.  ``on_load_checkpoint`` now registers the buffer straight from the
+    checkpoint tensor, so strict loading succeeds AND the mask stays applied
+    (stripping the key instead would silently evaluate the cheater as a
+    plain vanilla model).
+    """
+    cfg = _config(True, False)
+    # Training-time model: data_dir available -> buffer registered + saved.
+    trained = AttentionSelectorForecaster(cfg, data_dir=data_dir)
+    gt_mask = trained.oracle_combined_mask.detach().clone()
+    checkpoint = {"state_dict": dict(trained.state_dict())}
+    assert "oracle_combined_mask" in checkpoint["state_dict"]
+
+    # Eval-time model: no data_dir -> buffer missing before the fix.
+    fresh = AttentionSelectorForecaster(cfg, data_dir=None)
+    assert getattr(fresh, "oracle_combined_mask", None) is None
+    assert not fresh._hard_masks_loaded
+
+    # The PL hook runs before strict load_state_dict.
+    fresh.on_load_checkpoint(checkpoint)
+    assert hasattr(fresh, "oracle_combined_mask")
+    assert fresh._hard_masks_loaded, "mask must stay active, else no cheating"
+
+    # Strict load now succeeds and writes the checkpoint values.
+    fresh.load_state_dict(checkpoint["state_dict"], strict=True)
+    assert torch.equal(fresh.oracle_combined_mask, gt_mask)
+
+    # Forward must apply the mask: non-parents receive exactly zero mass.
+    # The predictor passes no explicit mask; forward picks the buffer itself.
+    S, X = _batch()
+    fresh.eval()
+    with torch.no_grad():
+        _, attn_fwd, _ = fresh.forward(S, X)
+    forbidden = gt_mask.unsqueeze(0).expand(attn_fwd.shape[0], -1, -1) == 0
+    assert torch.all(attn_fwd[forbidden] == 0.0), "eval forward lost the mask"
+
+
+def test_on_load_checkpoint_fills_missing_oracle_mask(data_dir):
+    """Symmetric case: model has the buffer, checkpoint predates it -> fill."""
+    cfg = _config(True, False)
+    current = AttentionSelectorForecaster(cfg, data_dir=data_dir)
+    ckpt_sd = {
+        k: v for k, v in current.state_dict().items()
+        if k != "oracle_combined_mask"
+    }
+    checkpoint = {"state_dict": ckpt_sd}
+
+    current.on_load_checkpoint(checkpoint)
+    assert "oracle_combined_mask" in checkpoint["state_dict"]
+    assert torch.equal(
+        checkpoint["state_dict"]["oracle_combined_mask"],
+        current.oracle_combined_mask,
+    )
+    # Strict load must not raise on the formerly-missing key.
+    current.load_state_dict(checkpoint["state_dict"], strict=True)

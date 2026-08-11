@@ -7,7 +7,7 @@ from os.path import dirname, abspath
 import sys
 # root_path = dirname(dirname(dirname(abspath(__file__))))
 # sys.path.append(root_path)
-from causaliT.core.modules.embedding_layers import Time2Vec, SinusoidalPosition, identity_emb, nn_embedding, linear_emb
+from causaliT.core.modules.embedding_layers import Time2Vec, SinusoidalPosition, identity_emb, nn_embedding, linear_emb, mlp_emb
 
 
 class EmbeddingMap(nn.Module):
@@ -59,7 +59,7 @@ class ModularEmbedding(nn.Module):
     ]
 
     Options
-    - embed: "mask", "nn_embedding", "time2vec", "identity", "pass"
+    - embed: "mask", "nn_embedding", "time2vec", "identity", "linear", "mlp", "pass"
     - role (for SVFA mode): "structure" (used for Q, K) or "value" (used for V)
     
     SVFA (Structure-Value Factorized Attention) mode:
@@ -113,7 +113,7 @@ class ModularEmbedding(nn.Module):
                 assert role_ in ["structure", "value"], f"Invalid role '{role_}' for SVFA mode. Must be 'structure' or 'value'."
             
             # assign embedding layers
-            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value"], AssertionError("Invalid embedding selected!")
+            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","mlp","pass","value"], AssertionError("Invalid embedding selected!")
             
             if embed_ == "mask":
                 self.mask_idx = idx_
@@ -137,6 +137,9 @@ class ModularEmbedding(nn.Module):
                 
             if embed_ == "linear":
                 emb_module = linear_emb
+            
+            if embed_ == "mlp":
+                emb_module = mlp_emb
             
             # store value index
             if embed_ == "value":

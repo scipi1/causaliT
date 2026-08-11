@@ -10,7 +10,12 @@ from typing import Dict, Any
 
 from omegaconf import OmegaConf, DictConfig
 
-from causaliT.utils.query_norm import resolve_query_fanin_scale
+from causaliT.utils.query_norm import (
+    format_query_norm_log,
+    resolve_query_fanin_scale,
+    resolve_query_norm,
+)
+
 
 
 
@@ -176,11 +181,22 @@ def populate_seq_lengths_from_dataset(
     print(f"  num_embeddings_shared: {n_source + n_input + n_target + 1} (for shared embedding)")
     print(f"  feature_indices: {feature_indices}")
 
+    # Expand the two front-door keys of the capacity design, experiment.
+    # query_norm and experiment.fanin_prior, into the individual knobs.  This
+    # runs BEFORE resolve_query_fanin_scale because it owns query_fanin_scale
+    # when it is active (and leaves an explicit numeric value alone), which then
+    # makes the call below a no-op.
+    n_keys = n_source + n_input
+    qn_info = resolve_query_norm(config, n_keys=n_keys)
+    if qn_info is not None:
+        print(format_query_norm_log(qn_info))
+
     # Auto-calibrate the structure-score temperature.  F = n * (x/M)^2 SCALES
     # WITH THE NODE COUNT, so it is derived here - the first point where the
     # number of candidate parents (n_source + n_input) is known - rather than
     # hard-coded per experiment.  An explicit numeric value is left untouched.
-    fanin_info = resolve_query_fanin_scale(config, n_keys=n_source + n_input)
+    fanin_info = resolve_query_fanin_scale(config, n_keys=n_keys)
+
     if fanin_info is not None:
         print(f"  query_fanin_scale: {fanin_info['query_fanin_scale']:.4f} (auto, "
               f"n_keys={fanin_info['n_keys']}, centroid P(edge)="

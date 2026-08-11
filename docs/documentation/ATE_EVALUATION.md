@@ -1,5 +1,12 @@
 # ATE (Average Treatment Effect) Evaluation
 
+> **Estimator note (current).** For the AttentionSelector family the ATE is
+> computed by the **interventional roll-out** (the model's generative forward
+> pass), not by a single teacher-forced forward pass. See
+> **`ATE_INTERVENTIONAL_ROLLOUT.md`** - it is the authoritative description of
+> the estimator. This document remains correct on the ATE definition, the
+> baseline convention `do(S=0)`, normalization, and file formats.
+
 ## Definition
 
 The **Average Treatment Effect (ATE)** measures the causal effect of an intervention:

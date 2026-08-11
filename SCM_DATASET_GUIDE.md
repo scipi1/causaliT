@@ -855,6 +855,7 @@ truth, graph) works unchanged.
 | `degree` | ER-k expected edges **per node**; target total edges `m = round(degree * n_nodes)`. |
 | `seed` | Master seed. Same config + seed => identical DAG, equations, weights and noise. |
 | `linearity` | `"linear"`, `"nonlinear"`, or `"mixed"` (per node). |
+| `nonlinear_fns` | Pool of nonlinear link functions. Only the **bounded** `"sin"` / `"tanh"` are supported (see below). |
 | `noise` | `"gaussian"`, `"nongaussian"`, or `"mixed"` for the X-node noise. |
 | `weight_range` | Magnitude range for structural weights (sign is random). |
 | `rescale_by_indegree` | If `True`, bakes `w / sqrt(in_degree)` for variance stability. |
@@ -887,6 +888,32 @@ truth, graph) works unchanged.
   weight sampling and per-node noise-type choices. The full config is stored in
   `dataset.meta["random_scm_config"]`, so a generated dataset is exactly regenerable
   from its `meta.json`.
+
+### Nonlinear links must be bounded
+
+`nonlinear_fns` only accepts `"sin"` and `"tanh"`. Both are bounded by 1 in magnitude,
+so a node value is bounded by `sum_p |w_p| + |eps|` no matter how deep the DAG is.
+Asking for the previously available `"square"` / `"cube"` now raises a `ValueError`.
+
+The reason is a real failure, not a stylistic preference. Unbounded monomials are
+re-applied at *every layer* of the DAG, so any value above 1 diverges geometrically
+with depth. On an ER-4 graph over 50 nodes (~13 layers deep) the sampled data reached
+`max |x| = 1e18 .. 1e305` depending on the seed, and some seeds overflowed to `inf`,
+which killed dataset generation inside normalization with
+`Input X contains infinity or a value too large for dtype('float64')`. Even the seeds
+that stayed finite were unusable: with one variable at `1e59`, min-max scaling
+collapses every other variable to a constant.
+
+Note that `rescale_by_indegree` does **not** protect against this - dividing `w` by
+`sqrt(in_degree)` controls *linear* variance only, and cannot tame `x**3`. Bounded
+links remove the failure mode structurally, and match what the nonlinear causal
+discovery benchmarks actually do (GraN-DAG, NOTEARS-MLP and DAGMA-MLP all generate
+their data with bounded activations or GP draws, never with raw monomials cascaded
+over depth).
+
+If a dataset ever does go non-finite, `generate_ds` now fails immediately with the
+offending variable names and their magnitudes, instead of an opaque sklearn error.
+
 
 ### Quick start
 

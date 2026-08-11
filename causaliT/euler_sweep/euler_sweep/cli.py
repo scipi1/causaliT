@@ -29,7 +29,11 @@ ROOT_DIR = Path(__file__).parent.parent.parent.parent.resolve()
 sys.path.insert(0, str(ROOT_DIR))
 
 # Import the sweep framework
-from causaliT.euler_sweep.euler_sweep.sweeper import run_sequential_sweep, run_parallel_sweep
+from causaliT.euler_sweep.euler_sweep.sweeper import (
+    normalize_gpu_mem,
+    run_parallel_sweep,
+    run_sequential_sweep,
+)
 
 # Import causaliT training components
 from causaliT.training.trainer import trainer
@@ -267,7 +271,7 @@ def cli():
 @click.option(
     "--gpu_mem",
     default="11g",
-    help="GPU memory requirement (default: 11g)"
+    help="GPU memory requirement (default: 11g; 'null' = CPU-only, no GPU requested)"
 )
 @click.option(
     "--mem_per_cpu",
@@ -429,7 +433,8 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
         print(f"\nPreparing parallel {sweep_mode} sweep...")
         print(f"Max concurrent jobs: {max_concurrent_jobs}")
         print(f"Walltime: {walltime}")
-        print(f"GPU memory: {gpu_mem}")
+        gpu_mem = normalize_gpu_mem(gpu_mem)  # 'null' -> None: CPU-only jobs
+        print(f"GPU memory: {gpu_mem if gpu_mem else 'none (CPU-only)'}")
         print(f"CPU memory: {mem_per_cpu}\n")
         
         # Prepare SLURM parameters
@@ -507,7 +512,7 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 @click.option(
     "--gpu_mem",
     default="11g",
-    help="GPU memory requirement (default: 11g)"
+    help="GPU memory requirement (default: 11g; 'null' = CPU-only, no GPU requested)"
 )
 @click.option(
     "--mem_per_cpu",
@@ -651,7 +656,8 @@ def calisweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
         print(f"\nPreparing parallel {sweep_mode} sweep (staged trainer)...")
         print(f"Max concurrent jobs: {max_concurrent_jobs}")
         print(f"Walltime: {walltime}")
-        print(f"GPU memory: {gpu_mem}")
+        gpu_mem = normalize_gpu_mem(gpu_mem)  # 'null' -> None: CPU-only jobs
+        print(f"GPU memory: {gpu_mem if gpu_mem else 'none (CPU-only)'}")
         print(f"CPU memory: {mem_per_cpu}\n")
 
         # Prepare SLURM parameters
@@ -729,7 +735,7 @@ def calisweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 @click.option(
     "--gpu_mem",
     default="11g",
-    help="GPU memory requirement (default: 11g)"
+    help="GPU memory requirement (default: 11g; 'null' = CPU-only, no GPU requested)"
 )
 @click.option(
     "--mem_per_cpu",
@@ -873,7 +879,8 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
         print(f"\nPreparing parallel {sweep_mode} sweep (adaptive trainer)...")
         print(f"Max concurrent jobs: {max_concurrent_jobs}")
         print(f"Walltime: {walltime}")
-        print(f"GPU memory: {gpu_mem}")
+        gpu_mem = normalize_gpu_mem(gpu_mem)  # 'null' -> None: CPU-only jobs
+        print(f"GPU memory: {gpu_mem if gpu_mem else 'none (CPU-only)'}")
         print(f"CPU memory: {mem_per_cpu}\n")
 
         # Prepare SLURM parameters
@@ -977,7 +984,8 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 @click.option(
     "--gpu_mem",
     default="11g",
-    help="GPU memory requirement of the trial/train arrays (default: 11g)",
+    help="GPU memory requirement of the trial/train arrays (default: 11g; "
+         "'null' = CPU-only, no GPU requested)",
 )
 @click.option(
     "--mem_per_cpu",
@@ -1033,6 +1041,9 @@ def dagsweep(exp_id, cluster, sequential, keep_data, skip_optuna, force_optuna,
         # inspect the job scripts without submitting
         python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id 7_SCALING/atsel_nodes --cluster --dry_run
 
+        # cluster, CPU nodes (e.g. for the CPU-only benchmark trainers)
+        python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id 7_SCALING/atsel_nodes --cluster --gpu_mem null
+
     """
     from causaliT.euler_sweep.euler_sweep.opt_train_sweep import run_dag_sweep
 
@@ -1078,7 +1089,8 @@ def dagsweep(exp_id, cluster, sequential, keep_data, skip_optuna, force_optuna,
             slurm_params={
                 "max_concurrent_jobs": max_concurrent_jobs,
                 "walltime": walltime,
-                "gpu_mem": gpu_mem,
+                # 'null' -> None: CPU-only trial/train arrays (benchmarks)
+                "gpu_mem": normalize_gpu_mem(gpu_mem),
                 "mem_per_cpu": mem_per_cpu,
                 "venv_path": venv_path,
             },

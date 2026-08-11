@@ -1,0 +1,1019 @@
+RUN cheater_ds_scm1_continuous_dag_0_model_2 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm1_continuous\sweeper\runs\combinations\cheater_ds_scm1_continuous_dag_0_model_2\k_0\checkpoints\epoch=479-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.140
+    self: shape=(5, 5) range=[0.000, 0.623] mean=0.060
+Experiment ID: cheater_ds_scm1_continuous_dag_0_model_2
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm1_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0602  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.699 mean_nonedge=0.000 min_edge=0.206
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0598  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.501 mean_nonedge=0.000 min_edge=0.377
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4029  in_mec=False  mec_thresh=0.2062  skel_recall=0.625  vstr_recall=0.270
+  MEC distance: mean=0.4029  std=0.0000  best=0.4029
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm1_continuous_dag_0_model_2 (82s)
+RUN cheater_ds_scm1_continuous_dag_0_model_3 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm1_continuous\sweeper\runs\combinations\cheater_ds_scm1_continuous_dag_0_model_3\k_0\checkpoints\epoch=549-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.137
+    self: shape=(5, 5) range=[0.000, 0.620] mean=0.063
+Experiment ID: cheater_ds_scm1_continuous_dag_0_model_3
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm1_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0630  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.685 mean_nonedge=0.000 min_edge=0.177
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0570  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.525 mean_nonedge=0.000 min_edge=0.380
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4181  in_mec=False  mec_thresh=0.1769  skel_recall=0.625  vstr_recall=0.246
+  MEC distance: mean=0.4181  std=0.0000  best=0.4181
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm1_continuous_dag_0_model_3 (96s)
+RUN cheater_ds_scm1_continuous_dag_0_model_4 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm1_continuous\sweeper\runs\combinations\cheater_ds_scm1_continuous_dag_0_model_4\k_0\checkpoints\epoch=489-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.138
+    self: shape=(5, 5) range=[0.000, 0.626] mean=0.062
+Experiment ID: cheater_ds_scm1_continuous_dag_0_model_4
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm1_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0624  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.688 mean_nonedge=0.000 min_edge=0.184
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0576  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.520 mean_nonedge=0.000 min_edge=0.374
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4154  in_mec=False  mec_thresh=0.1844  skel_recall=0.625  vstr_recall=0.250
+  MEC distance: mean=0.4154  std=0.0000  best=0.4154
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm1_continuous_dag_0_model_4 (108s)
+RUN cheater_ds_scm1_continuous_dag_0_model_5 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm1_continuous\sweeper\runs\combinations\cheater_ds_scm1_continuous_dag_0_model_5\k_0\checkpoints\epoch=649-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.139
+    self: shape=(5, 5) range=[0.000, 0.623] mean=0.061
+Experiment ID: cheater_ds_scm1_continuous_dag_0_model_5
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm1_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0608  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.696 mean_nonedge=0.000 min_edge=0.200
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0592  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.507 mean_nonedge=0.000 min_edge=0.377
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4065  in_mec=False  mec_thresh=0.1999  skel_recall=0.625  vstr_recall=0.264
+  MEC distance: mean=0.4065  std=0.0000  best=0.4065
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm1_continuous_dag_0_model_5 (109s)
+RUN cheater_ds_scm2_continuous_dag_0_model_1 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_1\k_0\checkpoints\epoch=769-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.139
+    self: shape=(5, 5) range=[0.000, 0.675] mean=0.061
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_1
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0613  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.693 mean_nonedge=0.000 min_edge=0.011
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0587  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.511 mean_nonedge=0.000 min_edge=0.325
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4484  in_mec=False  mec_thresh=0.0106  skel_recall=0.625  vstr_recall=0.200
+  MEC distance: mean=0.4484  std=0.0000  best=0.4484
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm2_continuous_dag_0_model_1 (243s)
+RUN cheater_ds_scm2_continuous_dag_0_model_2 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_2\k_0\checkpoints\epoch=1009-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.128
+    self: shape=(5, 5) range=[0.000, 0.802] mean=0.072
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_2
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0719  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.641 mean_nonedge=0.000 min_edge=0.013
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0481  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.599 mean_nonedge=0.000 min_edge=0.198
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.5216  in_mec=False  mec_thresh=0.0133  skel_recall=0.625  vstr_recall=0.103
+  MEC distance: mean=0.5216  std=0.0000  best=0.5216
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm2_continuous_dag_0_model_2 (110s)
+RUN cheater_ds_scm2_continuous_dag_0_model_3 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_3\k_0\checkpoints\epoch=819-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.141
+    self: shape=(5, 5) range=[0.000, 0.540] mean=0.059
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_3
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0589  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=80.0% FDR=0.0%  | contrast=0.706 mean_nonedge=0.000 min_edge=0.019
+    Standard SHD [cross]: mean=1.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0611  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=33.3% FDR=0.0%  | contrast=0.491 mean_nonedge=0.000 min_edge=0.460
+    Standard SHD [self]: mean=2.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4203  in_mec=False  mec_thresh=0.0186  skel_recall=0.625  vstr_recall=0.242
+  MEC distance: mean=0.4203  std=0.0000  best=0.4203
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm2_continuous_dag_0_model_3 (89s)
+RUN cheater_ds_scm2_continuous_dag_0_model_4 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4\k_0\checkpoints\epoch=1299-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.143
+    self: shape=(5, 5) range=[0.000, 0.723] mean=0.057
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_4
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0574  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.713 mean_nonedge=0.000 min_edge=0.205
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0626  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=33.3% FDR=0.0%  | contrast=0.478 mean_nonedge=0.000 min_edge=0.277
+    Standard SHD [self]: mean=2.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4078  in_mec=False  mec_thresh=0.2048  skel_recall=0.625  vstr_recall=0.262
+  MEC distance: mean=0.4078  std=0.0000  best=0.4078
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm2_continuous_dag_0_model_4 (79s)
+RUN cheater_ds_scm2_continuous_dag_0_model_5 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5\k_0\checkpoints\epoch=1159-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.144
+    self: shape=(5, 5) range=[0.000, 0.625] mean=0.056
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_5
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0556  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.722 mean_nonedge=0.000 min_edge=0.218
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0644  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=33.3% FDR=0.0%  | contrast=0.463 mean_nonedge=0.000 min_edge=0.375
+    Standard SHD [self]: mean=2.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.3843  in_mec=False  mec_thresh=0.2181  skel_recall=0.625  vstr_recall=0.300
+  MEC distance: mean=0.3843  std=0.0000  best=0.3843
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm2_continuous_dag_0_model_5 (72s)
+RUN cheater_ds_scm3_continuous_dag_0_model_1 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1\k_0\checkpoints\epoch=869-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.135
+    self: shape=(5, 5) range=[0.000, 0.689] mean=0.065
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_1
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0650  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.675 mean_nonedge=0.000 min_edge=0.019
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0550  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.542 mean_nonedge=0.000 min_edge=0.311
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4657  in_mec=False  mec_thresh=0.0190  skel_recall=0.625  vstr_recall=0.176
+  MEC distance: mean=0.4657  std=0.0000  best=0.4657
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm3_continuous_dag_0_model_1 (71s)
+RUN cheater_ds_scm3_continuous_dag_0_model_2 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2\k_0\checkpoints\epoch=1119-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.135
+    self: shape=(5, 5) range=[0.000, 0.629] mean=0.065
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_2
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0652  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.674 mean_nonedge=0.000 min_edge=0.142
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0548  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.543 mean_nonedge=0.000 min_edge=0.439
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4233  in_mec=False  mec_thresh=0.1420  skel_recall=0.625  vstr_recall=0.238
+  MEC distance: mean=0.4233  std=0.0000  best=0.4233
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm3_continuous_dag_0_model_2 (73s)
+RUN cheater_ds_scm3_continuous_dag_0_model_3 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3\k_0\checkpoints\epoch=719-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    blocks=['cross', 'self'] L_S=5 L_X=5
+    cross: shape=(5, 5) range=[0.000, 1.000] mean=0.138
+    self: shape=(5, 5) range=[0.000, 0.749] mean=0.062
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_3
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: ['cross', 'self']
+  Evaluating block 'cross'...
+    k_0 [cross]: SoftHamming=0.0615  | SHD=2 (miss=2, extra=0, rev=0)  | TPR=60.0% FDR=0.0%  | contrast=0.692 mean_nonedge=0.000 min_edge=0.013
+    Standard SHD [cross]: mean=2.0 +/- 0.0
+  Evaluating block 'self'...
+    k_0 [self]: SoftHamming=0.0585  | SHD=1 (miss=1, extra=0, rev=0)  | TPR=66.7% FDR=0.0%  | contrast=0.513 mean_nonedge=0.000 min_edge=0.251
+    Standard SHD [self]: mean=1.0 +/- 0.0
+
+--- Computing MEC Metrics ---
+  True DAG: 8 edges, 4 v-structures
+    k_0: mec_dist=0.4618  in_mec=False  mec_thresh=0.0130  skel_recall=0.625  vstr_recall=0.181
+  MEC distance: mean=0.4618  std=0.0000  best=0.4618
+  MEC membership rate: 0.0000
+
+  Saved: dag_metrics.json
+  Saved: learned_dag_edges.json
+
+[OK] eval_attention_scores complete!
+DONE cheater_ds_scm3_continuous_dag_0_model_3 (71s)
+RUN cheater_ds_scm3_continuous_dag_0_model_4 (ate=False, dag=True)
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4\k_0\checkpoints\epoch=639-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+d: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_3\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (79s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm2_continuous_dag_0_model_4
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4\k_0\checkpoints\epoch=1299-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_4
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4
+  Dataset: ds_scm2_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2868 ± 0.5269
+  Mean Relative Error: 6124.35%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_4\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (77s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm2_continuous_dag_0_model_5
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5\k_0\checkpoints\epoch=1159-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm2_continuous_dag_0_model_5
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm2_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5
+  Dataset: ds_scm2_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2749 ± 0.5017
+  Mean Relative Error: 5964.10%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm2_continuous\sweeper\runs\combinations\cheater_ds_scm2_continuous_dag_0_model_5\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (69s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm3_continuous_dag_0_model_1
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1\k_0\checkpoints\epoch=869-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_1
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1
+  Dataset: ds_scm3_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2852 ± 0.5251
+  Mean Relative Error: 5177.27%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_1\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (68s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm3_continuous_dag_0_model_2
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2\k_0\checkpoints\epoch=1119-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_2
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2
+  Dataset: ds_scm3_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2720 ± 0.4976
+  Mean Relative Error: 4875.59%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_2\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (69s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm3_continuous_dag_0_model_3
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3\k_0\checkpoints\epoch=719-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_3
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3
+  Dataset: ds_scm3_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.3080 ± 0.5724
+  Mean Relative Error: 5386.81%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_3\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (72s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm3_continuous_dag_0_model_4
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4\k_0\checkpoints\epoch=639-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_4
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4
+  Dataset: ds_scm3_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2789 ± 0.5174
+  Mean Relative Error: 5074.07%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_4\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (76s)
+
+config.yaml files restored to cluster data_root
+evaluating 1 cheater run(s)
+
+[1/1] cheater_ds_scm3_continuous_dag_0_model_5
+  Checkpoint type: last
+  Found 1 fold(s): ['k_0']
+
+  --- k_0 ---
+    Checkpoint: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_5\k_0\checkpoints\epoch=449-train_loss=0.00.ckpt
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Loading single data file (S, X, [Y] format).
+Data shapes - S: (50000, 5, 2), X: (50000, 5, 2) (no Y)
+Test dataset selected.
+Predicting...
+    [FAIL] k_0: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+Experiment ID: cheater_ds_scm3_continuous_dag_0_model_5
+  Architecture: AttentionSelectorForecaster
+  Dataset: ds_scm3_continuous
+  DAG threshold: 0.5
+  Dimensions: L_S=5, L_X=5 (dataset metadata)
+
+--- Computing DAG Recovery Metrics ---
+  Blocks found: <none>
+
+  MEC metrics skipped: model provides no cross (S->X) block, so no full DAG can be assembled.
+
+  Saved: dag_metrics.json
+
+[OK] eval_attention_scores complete!
+Evaluating ATE (Monte Carlo) for: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_5
+  Dataset: ds_scm3_continuous
+  Loaded SCM for MC sampling
+  Using separate source/input variable mappings (shared_embedding=False)
+    Source: {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'S5': 5}
+    Input: {'X1': 1, 'X2': 2, 'X3': 3, 'X4': 4, 'X5': 5}
+  Interventions (from dataset): ['S1', 'S2', 'S3', 'S5']
+  MC samples: 50000
+  Checkpoint type: last
+  Running MC predictions...
+  Found 1 k-fold directories
+  MC samples: 50000
+  Processing k_0...
+Warning: training.use_hard_masks=True but data_dir was not provided to AttentionSelectorForecaster.  Hard masks will not be loaded.  Pass data_dir via create_model_instance.
+  Saved MC predictions to experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_5\eval\eval_ate_mc\files\predictions_mc.csv
+
+  === ATE Results (Monte Carlo) ===
+  Mean Absolute Error: 0.2570 ± 0.4786
+  Mean Relative Error: 4331.61%
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_5\eval\eval_ate_mc\files\ate_metrics_mc.csv
+  Saved: experiments\7_PUBLISH\ATE\results\cheater_9427393\groups\ds_scm3_continuous\sweeper\runs\combinations\cheater_ds_scm3_continuous_dag_0_model_5\eval\eval_ate_mc\files\ate_metrics_mc.json
+  ate_csv=True dag_json=True (84s)
+
+config.yaml files restored to cluster data_root
+ALL DONE

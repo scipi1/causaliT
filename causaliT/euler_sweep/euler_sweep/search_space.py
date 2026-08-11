@@ -53,7 +53,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from omegaconf import OmegaConf
 
-from causaliT.utils.query_norm import is_auto_fanin
+from causaliT.utils.query_norm import (
+    DEFAULT_GATE_GAMMA,
+    DEFAULT_GATE_ZETA,
+    gate_tau_from_experiment,
+    is_auto_fanin,
+    kappa_1,
+)
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -372,14 +380,24 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
     This PINS F to gate saturation (z = 1).  Leaving ``query_fanin_scale: auto``
     in the config is the general alternative: it targets an explicit centroid
     posterior ``query_centroid_max_p`` instead (query_norm.py).
+
+    ``x_sat = kappa_1 + T`` is eq (2e) of
+    docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md; the
+    constant is imported from ``query_norm`` so it has ONE definition.
     """
     exp = config.get("experiment", {}) if config is not None else {}
-    tau = float(exp.get("init_tau", 0.5) or 0.5)
-    gamma = float(exp.get("init_gamma", -1.1))
-    zeta = float(exp.get("init_zeta", 1.1))
-    offset = float(exp.get("init_edge_offset", 0.0) or 0.0)
-    x_sat = tau * math.log((1.0 - gamma) / (zeta - 1.0)) + offset
+    homogeneous = bool(exp.get("homogeneous_nodes", False))
+    # The split keys (init_tau_cross / init_tau_self) win over the legacy
+    # shared init_tau via gate_tau_from_experiment; in homogeneous mode the
+    # single block IS the self gate and carries no edge offset.
+    tau = gate_tau_from_experiment(exp, homogeneous)
+    gamma = float(exp.get("init_gamma", None) or DEFAULT_GATE_GAMMA)
+    zeta = float(exp.get("init_zeta", None) or DEFAULT_GATE_ZETA)
+    offset = 0.0 if homogeneous else float(exp.get("init_edge_offset", 0.0) or 0.0)
+    x_sat = kappa_1(tau, gamma, zeta) + offset
     return float(n_keys) * x_sat ** 2
+
+
 
 
 #: Recipes usable in ``dagsweep.yaml``'s ``size_derived`` block.
@@ -531,8 +549,22 @@ def validate_dimensions(config: Any, n_keys: int, repair: bool = True,
     # ``auto`` (or null) is NOT a violation: F is then derived from n_keys at
     # data-load time by causaliT.utils.query_norm.resolve_query_fanin_scale,
     # which is exactly what this check enforces for pinned values.
+    #
+    # ``query_norm: true`` OWNS the scale: resolve_query_norm derives
+    # F = x(p*) sqrt(N) from the target posterior (which is NOT the saturation
+    # point x_sat unless p* happens to equal sigmoid(kappa_1)), and a declared
+    # ``fanin_prior`` is priced on the penalty target mu, not on F.  "Repairing"
+    # F here would silently overwrite a deliberate capacity with the saturating
+    # value and delete the feature, so the rule is skipped entirely.
     fanin = exp.get("query_fanin_scale", None)
-    if fanin is not None and not is_auto_fanin(fanin):
+    if bool(exp.get("query_norm", False)):
+        logger.info(
+            "  [validate_dimensions] query_norm=true: query_fanin_scale is owned "
+            "by resolve_query_norm (F = x(p*)*sqrt(n_keys)); skipping the "
+            "saturating-F check."
+        )
+    elif fanin is not None and not is_auto_fanin(fanin):
+
         recommended = saturating_query_fanin(config, n_keys)
 
         if recommended > 0 and abs(float(fanin) - recommended) / recommended > fanin_tolerance:

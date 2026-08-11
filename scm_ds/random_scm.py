@@ -59,6 +59,25 @@ Key properties
   seed => identical SCM.
 - Variance control: with `rescale_by_indegree=True` each parent weight is baked as
   `w / sqrt(in_degree)`, keeping per-node signal variance roughly stable as DAGs grow.
+- Bounded mechanisms: the nonlinear link functions are restricted to `sin` and `tanh`,
+  both bounded by 1 in magnitude, so a node value is bounded by
+  `sum_p |w_p| + |eps|` regardless of how deep the DAG is.
+
+Why only bounded nonlinearities?
+--------------------------------
+Unbounded monomials (`x**2`, `x**3`) used to be part of the pool and made the sampler
+numerically unusable on realistic graphs. An ER-4 DAG over 50 nodes is ~13 layers
+deep, and a cubic link cubes its input at *every* layer, so any value above 1 diverges
+geometrically: measured max |x| reached 1e18..1e305 across seeds, overflowing to `inf`
+and crashing normalization. `rescale_by_indegree` cannot prevent this - dividing `w`
+by `sqrt(in_degree)` controls *linear* variance only. Even the seeds that stayed
+finite were unusable, since a single variable at 1e59 collapses every other variable
+to a constant once the data is min-max scaled.
+
+Bounded links avoid the failure mode structurally and match what the nonlinear causal
+discovery benchmarks actually do (GraN-DAG, NOTEARS-MLP, DAGMA-MLP all generate their
+data with bounded activations or GP draws, never with raw monomials cascaded over
+depth).
 
 The full `RandomSCMConfig` is stored in the dataset's `meta` so any generated dataset
 is exactly regenerable from its `meta.json`.
@@ -105,8 +124,8 @@ class RandomSCMConfig:
         Exogenous noise for the S sources. "uniform" gives bounded support so that
         do(S=.) interventions stay in-distribution (matches existing datasets).
     nonlinear_fns : Tuple[str, ...]
-        Pool of nonlinear link functions to draw from. Supported:
-        "square", "cube", "sin", "tanh".
+        Pool of nonlinear link functions to draw from. Supported: "sin", "tanh".
+        Only *bounded* functions are offered on purpose - see the note below.
     rescale_by_indegree : bool
         If True, bake ``w / sqrt(in_degree)`` into weights (variance control).
     permute_labels : bool
@@ -128,7 +147,7 @@ class RandomSCMConfig:
     weight_range: Tuple[float, float] = (0.5, 2.0)
     noise_scale: float = 0.1
     source_noise: str = "uniform"
-    nonlinear_fns: Tuple[str, ...] = ("square", "cube", "sin", "tanh")
+    nonlinear_fns: Tuple[str, ...] = ("sin", "tanh")
     rescale_by_indegree: bool = True
     permute_labels: bool = True
     name: Optional[str] = None
@@ -256,13 +275,60 @@ def _sample_dag(
 # Structural-equation builder
 # --------------------------------------------------------------------------- #
 
+#: Link-function templates. Every nonlinear entry MUST be bounded in its argument
+#: (see the "Why only bounded nonlinearities?" note in the module docstring):
+#: unbounded links compound over DAG depth and overflow to inf.
 _NONLINEAR_TEMPLATES = {
-    "square": "{w}*{p}**2",
-    "cube": "{w}*{p}**3",
     "sin": "{w}*sin({p})",
     "tanh": "{w}*tanh({p})",
     "linear": "{w}*{p}",
 }
+
+#: Nonlinear link functions a user may request via ``nonlinear_fns``.
+SUPPORTED_NONLINEAR_FNS: Tuple[str, ...] = ("sin", "tanh")
+
+#: Removed because they are unbounded and blow up over DAG depth. Kept here only to
+#: give an actionable error to configs written before the change.
+_REMOVED_NONLINEAR_FNS: Tuple[str, ...] = ("square", "cube")
+
+
+def _validate_nonlinear_fns(cfg: RandomSCMConfig) -> None:
+    """
+    Reject unknown / removed link functions before any sampling happens.
+
+    Only enforced when the pool is actually drawn from (``linearity`` is
+    "nonlinear" or "mixed"). Purely linear datasets ignore ``nonlinear_fns``
+    entirely, and their pre-existing ``dag_recipe.json`` files still carry the old
+    default pool - rejecting those would break restoring perfectly valid data.
+
+    Raises:
+        ValueError: if ``nonlinear_fns`` is empty, or names a function that is not
+            supported. Removed unbounded monomials get a dedicated message.
+    """
+    if cfg.linearity == "linear":
+        return
+
+    requested = tuple(cfg.nonlinear_fns or ())
+    if not requested:
+        raise ValueError(
+            f"nonlinear_fns must not be empty. Supported: {list(SUPPORTED_NONLINEAR_FNS)}."
+        )
+
+    removed = [fn for fn in requested if fn in _REMOVED_NONLINEAR_FNS]
+    if removed:
+        raise ValueError(
+            f"Unbounded link function(s) {removed} are no longer supported: they are "
+            f"applied at every layer of the DAG, so values diverge geometrically with "
+            f"depth and overflow to inf (see the module docstring). "
+            f"Use {list(SUPPORTED_NONLINEAR_FNS)} instead."
+        )
+
+    unknown = [fn for fn in requested if fn not in SUPPORTED_NONLINEAR_FNS]
+    if unknown:
+        raise ValueError(
+            f"Unknown nonlinear link function(s) {unknown}. "
+            f"Supported: {list(SUPPORTED_NONLINEAR_FNS)}."
+        )
 
 
 def _sample_weight(cfg: RandomSCMConfig, rng: np.random.Generator, in_degree: int) -> float:
@@ -444,6 +510,7 @@ def sample_random_scm_dataset(cfg: RandomSCMConfig) -> SCMDataset:
     Returns:
         An :class:`SCMDataset` whose SCM was sampled according to *cfg*.
     """
+    _validate_nonlinear_fns(cfg)
     rng = np.random.default_rng(int(cfg.seed))
 
     # 1) DAG structure; the S/X roles fall out of the sampled roots.
@@ -498,4 +565,9 @@ def sample_random_scm_dataset(cfg: RandomSCMConfig) -> SCMDataset:
     return dataset
 
 
-__all__ = ["RandomSCMConfig", "sample_random_scm_dataset", "expected_er_roots"]
+__all__ = [
+    "RandomSCMConfig",
+    "sample_random_scm_dataset",
+    "expected_er_roots",
+    "SUPPORTED_NONLINEAR_FNS",
+]

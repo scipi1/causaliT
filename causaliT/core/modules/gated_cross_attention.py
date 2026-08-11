@@ -111,11 +111,15 @@ import torch.nn.functional as F
 
 from causaliT.utils.query_geometry import correct_query
 from causaliT.utils.query_norm import (
+    DEFAULT_GATE_GAMMA,
+    DEFAULT_GATE_TAU,
+    DEFAULT_GATE_ZETA,
     apply_query_norm,
     coerce_fanin_scale,
     make_query_norm_log_scale,
     overspend_penalty,
 )
+
 
 
 
@@ -129,9 +133,14 @@ class GatedCrossAttention(nn.Module):
         register_entropy: bool = False,
         layer_name: Optional[str] = None,
         # Hard-Concrete gate hyper-parameters (Louizos et al., ICLR 2018).
-        init_tau: float = 2.0 / 3.0,   # beta: gate temperature
-        gamma: float = -0.1,           # stretch lower bound (< 0)
-        zeta: float = 1.1,             # stretch upper bound (> 1)
+        # Defaults are the CALCULATED operating point documented in
+        # docs/documentation/ATTENTION_TEMPERATURES.md: tau = 0.5 with the
+        # symmetric stretch [-1.1, 1.1] gives kappa = 0 (the gate opens exactly
+        # at logit 0) and kappa_1 = 0.5*ln(21) ~ 1.5223 (saturation).
+        init_tau: float = DEFAULT_GATE_TAU,      # beta: gate temperature
+        gamma: float = DEFAULT_GATE_GAMMA,       # stretch lower bound (< 0)
+        zeta: float = DEFAULT_GATE_ZETA,         # stretch upper bound (> 1)
+
         # Additive logit offset on the STRUCTURE gate (init-balancing).  The
         # effective alignment logit becomes ``log_alpha - init_edge_offset`` in
         # BOTH the Hard-Concrete sample and the P(z>0) posterior, so at init
@@ -281,7 +290,12 @@ class GatedCrossAttention(nn.Module):
         """Per-node over-spend penalty ``sum_i relu(M_i - target)^2`` (or None)."""
         if not self.query_norm_learnable or self.query_norm_log_scale is None:
             return None
-        return overspend_penalty(self.query_norm_log_scale, self.query_norm_target)
+        return overspend_penalty(
+            self.query_norm_log_scale,
+            self.query_norm_target,
+            getattr(self, "query_norm_penalty_form", "absolute"),
+        )
+
 
 
     # ------------------------------------------------------------------

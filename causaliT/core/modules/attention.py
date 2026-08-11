@@ -13,7 +13,14 @@ from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttent
 
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from causaliT.utils.query_geometry import assert_orthonormal_frame, transitive_weights
-from typing import List, Optional
+from causaliT.utils.query_norm import (
+    DEFAULT_DIR_TAU,
+    DEFAULT_GATE_GAMMA,
+    DEFAULT_GATE_TAU,
+    DEFAULT_GATE_ZETA,
+)
+from typing import List, Optional, Tuple
+
 
 
 # ---------------------------------------------------------------------------
@@ -439,11 +446,15 @@ class HardConcreteCrossAttention(nn.Module):
         attention_dropout: Dropout rate applied to z after sampling.
         register_entropy: Whether to compute and return attention entropy.
         layer_name: Name for logging purposes.
-        init_tau: Binary Concrete temperature β (default 2/3 as in paper).
+        init_tau: Binary Concrete temperature β (default 0.5, the calculated
+            operating point of the gated attentions — see
+            docs/documentation/ATTENTION_TEMPERATURES.md).
             Passed as ``init_tau`` for compatibility with AttentionLayer which
             uses that kwarg for all temperature-bearing attention classes.
-        gamma: Stretch lower bound, must be < 0 (default −0.1 as in paper).
+        gamma: Stretch lower bound, must be < 0 (default −1.1; symmetric with
+            zeta so the gate opens exactly at logit 0).
         zeta: Stretch upper bound, must be > 1 (default 1.1 as in paper).
+
         batch_key_dropout: Optional batch-consistent key dropout probability.
         batch_key_dropout_p_final: Final dropout probability after annealing.
         batch_key_dropout_annealing_batches: Batches over which to anneal dropout.
@@ -454,14 +465,15 @@ class HardConcreteCrossAttention(nn.Module):
         attention_dropout: float,
         register_entropy: bool,
         layer_name: str,
-        init_tau: float = 2.0 / 3.0,
-        gamma: float = -0.1,
-        zeta: float = 1.1,
+        init_tau: float = DEFAULT_GATE_TAU,
+        gamma: float = DEFAULT_GATE_GAMMA,
+        zeta: float = DEFAULT_GATE_ZETA,
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
     ):
         super(HardConcreteCrossAttention, self).__init__()
+
 
         if gamma >= 0.0:
             raise ValueError(
@@ -1296,15 +1308,20 @@ class AttentionLayer(nn.Module):
         orthogonal_init_scale: Initial scale value for orthogonal projection
         init_tau: Constant temperature for CausalCrossAttention / SigmoidCrossAttention
                   / ToeplitzAttention / HardConcreteCrossAttention (non-learnable).
-                  Default 3.0; for HardConcreteCrossAttention the paper default is 2/3.
+                  Default 3.0 (the non-gated activation temperature); the
+                  Hard-Concrete gated attentions receive the CALCULATED gate
+                  temperature 0.5 from the architecture (see
+                  docs/documentation/ATTENTION_TEMPERATURES.md).
         init_gate_bias: Initial value of the gate bias in ToeplitzAttention (default: -15.0).
             Ignored for other attention types.
         gate_bias_trainable: If True (default), the gate bias is updated during training.
             If False, it is frozen at init_gate_bias. Only applies to ToeplitzAttention.
-        init_gamma: Stretch lower bound for HardConcreteCrossAttention (default: -0.1).
+        init_gamma: Stretch lower bound for the Hard-Concrete gates (default: -1.1,
+            symmetric with zeta so the gate opens exactly at logit 0).
             Ignored for other attention types.
-        init_zeta: Stretch upper bound for HardConcreteCrossAttention (default: 1.1).
+        init_zeta: Stretch upper bound for the Hard-Concrete gates (default: 1.1).
             Ignored for other attention types.
+
         shared_qk_inner: Optional dict with shared Q/K/inner_attention components.
         shared_dag_across_heads: When True (default), a single score (B,L,S) is
             shared across n_heads value channels. When False, legacy per-head scores.
@@ -1331,15 +1348,17 @@ class AttentionLayer(nn.Module):
         init_tau: float = 3.0,
         init_gate_bias: float = -15.0,
         gate_bias_trainable: bool = True,
-        init_gamma: float = -0.1,
-        init_zeta: float = 1.1,
+        init_gamma: float = DEFAULT_GATE_GAMMA,
+        init_zeta: float = DEFAULT_GATE_ZETA,
+
         # Additive init-balancing logit offset on the GatedCrossAttention
         # structure gate only (ignored by all other inner attentions).  See
         # GatedCrossAttention.init_edge_offset; ln 3 (~1.0986) lands the cross
         # S->X init edge probability at 0.25 to match a directed self edge.
         init_edge_offset: float = 0.0,
         gain_tau: float = 1.0,
-        dir_tau: float = 2.0 / 3.0,
+        dir_tau: float = DEFAULT_DIR_TAU,
+
 
         # CommutatorSelfAttention direction-gate parametrisation (see that
         # module).  "qk" (default) keeps the antisymmetric-of-raw direction;
@@ -1832,6 +1851,87 @@ class AttentionLayer(nn.Module):
             "inner_attention": self.inner_attention,
         }
 
+    def _project_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        apply_dropout: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project the structural query/key into the inner-attention layout.
+
+        External mode: the tensor is ALREADY projected by a W_q / W_K owned by
+        the parent module (shape (B, L, d_queries_keys * H_struct)); it is fed
+        straight through, bypassing this layer's (absent) projection and its
+        dropout — the parent is responsible for any query/key dropout.
+
+        ``apply_dropout=False`` is used by ``transitive_probe`` so the
+        transitive-correction trigger stays deterministic and consumes no RNG
+        (the scored forward then draws the only dropout mask).
+        """
+        B, L, _ = query.shape
+        _, S, _ = key.shape
+        H_struct = self._n_heads_struct
+        drop = self.dropout_qkv if apply_dropout else (lambda t: t)
+        if H_struct > 1:
+            if self._query_external:
+                q = query.view(B, L, H_struct, -1)
+            else:
+                q = drop(self.query_projection(query)).view(B, L, H_struct, -1)
+            if self._key_external:
+                k = key.view(B, S, H_struct, -1)
+            else:
+                k = drop(self.key_projection(key)).view(B, S, H_struct, -1)
+        else:
+            if self._query_external:
+                q = query.view(B, L, -1)
+            else:
+                q = drop(self.query_projection(query)).view(B, L, -1)
+            if self._key_external:
+                k = key.view(B, S, -1)
+            else:
+                k = drop(self.key_projection(key)).view(B, S, -1)
+        return q, k
+
+    @torch.no_grad()
+    def transitive_probe(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        hard_mask: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """PASS 1 of the SPLIT-mode transitive correction: this block's
+        DETERMINISTIC structural posterior plus its projected keys.
+
+        Neither split block alone sees a square posterior (the mediator k of a
+        path ``j -> k -> i`` ranges over the X nodes, the parents j span
+        ``[S ; X]``), so the LAYER probes BOTH blocks, fuses the posteriors and
+        computes the shrink weights once (see
+        ``AttentionSelectorLayer.forward``).  The projection here is
+        dropout-free so the trigger is identical in train and eval mode and
+        consumes no RNG; under the customary ``dropout_qkv=0`` the probed q/k
+        are bit-identical to the scored ones.
+
+        Returns:
+            pi: ``(L, S)`` detached, batch-averaged posterior.
+            k:  this block's projected keys ``(B, S, E)`` (detached), so the
+                layer can check the COMBINED ``[S ; X]`` key frame (per-block
+                checks would miss mutually rotated frames).
+        """
+        inner = self.inner_attention
+        if not hasattr(inner, "structure_posterior"):
+            raise NotImplementedError(
+                "transitive_correction requires an inner attention exposing "
+                "structure_posterior() (GatedSelfAttention / "
+                f"GatedCrossAttention), got {type(inner).__name__}."
+            )
+        q, k = self._project_qk(query, key, apply_dropout=False)
+        if q.dim() != 3 or k.dim() != 3:
+            raise NotImplementedError(
+                "transitive_correction requires a single structural head "
+                "(shared_dag_across_heads=True)."
+            )
+        return inner.structure_posterior(q, k, hard_mask), k
+
     def forward(
         self,
         query: torch.Tensor,
@@ -1850,43 +1950,23 @@ class AttentionLayer(nn.Module):
         value_structure_query: torch.Tensor = None,
         # Geometric TRANSITIVE correction (grandparent suppression), opt-in.
         # Dict from AttentionSelectorLayer: {"alpha", "delta", "tnorm",
-        # "margin", "symmetric", "symmetric_span"}.  Orchestrated HERE because
-        # this is the only place that owns the PROJECTED q/k the correction
-        # operates on.  Requires an inner attention exposing
-        # ``structure_posterior`` (the gated blocks) — see
-        # causaliT/utils/query_geometry.py.
+        # "margin", "symmetric", "symmetric_span", "W"}.  Two regimes:
+        #   * HOMOGENEOUS (no "W" key): ONE square (N, N) block — the mediator
+        #     axis exists inside THIS block, so it probes its own posterior
+        #     here (pass 1) and derives W inline.
+        #   * SPLIT ("W" set): the LAYER probed BOTH blocks via
+        #     ``transitive_probe``, fused the (L_X, L_S+L_X) posterior, padded
+        #     it square, computed the weights once and handed this block its
+        #     slice; the COMBINED key-frame Gram was checked by the layer.
+        # Requires an inner attention exposing ``structure_posterior`` (the
+        # gated blocks) — see causaliT/utils/query_geometry.py.
         transitive_cfg: Optional[dict] = None,
     ):
         B, L, _ = query.shape
         _, S, _ = key.shape
         H = self.n_heads
-        H_struct = self._n_heads_struct
 
-
-        # External-query mode: ``query`` is ALREADY projected by a W_q owned by
-        # the parent module (shape (B, L, d_queries_keys * H_struct)).  Feed it
-        # straight through, bypassing this layer's (absent) query_projection and
-        # its dropout — the parent is responsible for any query dropout.
-        if H_struct > 1:
-            if self._query_external:
-                q = query.view(B, L, H_struct, -1)
-            else:
-                q = self.dropout_qkv(self.query_projection(query)).view(B, L, H_struct, -1)
-            if self._key_external:
-                k = key.view(B, S, H_struct, -1)
-            else:
-                k = self.dropout_qkv(self.key_projection(key)).view(B, S, H_struct, -1)
-        else:
-            if self._query_external:
-                q = query.view(B, L, -1)
-            else:
-                q = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
-            if self._key_external:
-                k = key.view(B, S, -1)
-            else:
-                k = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
-
-
+        q, k = self._project_qk(query, key)
 
         # Value-structure injection: concatenate the per-source-node identity
         # code onto the data value BEFORE the (widened) reconstruction W_V, so
@@ -1916,41 +1996,50 @@ class AttentionLayer(nn.Module):
         vq_kwargs = {"value_query": value_query} if self._value_query_capable else {}
 
         # ---- Transitive correction: PASS 1 (probe) + weights -------------
-        # Pass 1 reads the block's own DETERMINISTIC posterior from the SAME
-        # projected q/k that pass 2 will score, so the trigger is exact (no
-        # Hard-Concrete noise, no gain) and identical in train and eval mode.
         tw_kwargs = {}
         if transitive_cfg is not None and not oracle:
-            inner = self.inner_attention
-            if not hasattr(inner, "structure_posterior"):
-                raise NotImplementedError(
-                    "transitive_correction requires an inner attention exposing "
-                    "structure_posterior() (GatedSelfAttention / "
-                    f"GatedCrossAttention), got {type(inner).__name__}."
+            W = transitive_cfg.get("W")
+            if W is None:
+                # HOMOGENEOUS mode: ONE square (N, N) block — the mediator axis
+                # exists inside THIS block, so pass 1 probes its own
+                # DETERMINISTIC posterior from the SAME projected q/k that
+                # pass 2 will score; the trigger is exact (no Hard-Concrete
+                # noise, no gain) and identical in train and eval mode.
+                inner = self.inner_attention
+                if not hasattr(inner, "structure_posterior"):
+                    raise NotImplementedError(
+                        "transitive_correction requires an inner attention exposing "
+                        "structure_posterior() (GatedSelfAttention / "
+                        f"GatedCrossAttention), got {type(inner).__name__}."
+                    )
+                if q.dim() != 3 or k.dim() != 3:
+                    raise NotImplementedError(
+                        "transitive_correction requires a single structural head "
+                        "(shared_dag_across_heads=True)."
+                    )
+                if not self._transitive_frame_checked:
+                    # The component removal is only exact on an orthonormal key
+                    # frame; fail loud rather than silently computing something
+                    # else.  ``layer_name`` lives on the INNER attention.
+                    _name = getattr(self.inner_attention, "layer_name", "attention")
+                    assert_orthonormal_frame(
+                        k[0], context=f"layer '{_name}' projected keys"
+                    )
+                    self._transitive_frame_checked = True
+                pi = inner.structure_posterior(q, k, hard_mask)  # (L, S), detached
+                W = transitive_weights(
+                    pi,
+                    alpha=transitive_cfg.get("alpha", 0.5),
+                    tnorm=transitive_cfg.get("tnorm", "min"),
+                    margin=transitive_cfg.get("margin", True),
+                    symmetric=transitive_cfg.get("symmetric", True),
+                    symmetric_span=transitive_cfg.get("symmetric_span"),
                 )
-            if q.dim() != 3 or k.dim() != 3:
-                raise NotImplementedError(
-                    "transitive_correction requires a single structural head "
-                    "(shared_dag_across_heads=True)."
-                )
-            if not self._transitive_frame_checked:
-                # The component removal is only exact on an orthonormal key
-                # frame; fail loud rather than silently computing something else.
-                # ``layer_name`` lives on the INNER attention, not this wrapper.
-                _name = getattr(self.inner_attention, "layer_name", "attention")
-                assert_orthonormal_frame(
-                    k[0], context=f"layer '{_name}' projected keys"
-                )
-                self._transitive_frame_checked = True
-            pi = inner.structure_posterior(q, k, hard_mask)      # (L, S), detached
-            W = transitive_weights(
-                pi,
-                alpha=transitive_cfg.get("alpha", 0.5),
-                tnorm=transitive_cfg.get("tnorm", "min"),
-                margin=transitive_cfg.get("margin", True),
-                symmetric=transitive_cfg.get("symmetric", True),
-                symmetric_span=transitive_cfg.get("symmetric_span"),
-            )
+            # else: SPLIT mode — the LAYER probed the re-fused (L_X, L_S+L_X)
+            # posterior, padded it square, computed the weights once and handed
+            # this block its slice; the COMBINED [S ; X] key-frame Gram was
+            # already checked by the layer (per-block checks would miss
+            # mutually rotated frames).  Only the hard-mask gate remains local.
             if hard_mask is not None:
                 W = W * hard_mask.to(W.dtype)
             self.last_transitive_W = W

@@ -411,9 +411,27 @@ class PhaseController(Callback):
 
         setattr(pl_module, "_descendant_warmup_anchor", anchor)
 
+    @staticmethod
+    def _apply_fanin_phase(pl_module: pl.LightningModule, phase: str) -> None:
+        """Tell the fan-in squeeze whether this phase counts as structural time.
+
+        ``query_norm_log_scale`` is a STRUCTURAL parameter, so the squeeze must
+        be clocked in structure epochs: a reconstruct phase freezes it, and
+        letting the global epoch drive the schedule would spend the whole
+        anneal window while nothing structural moves (same failure as the
+        descendant-HSIC warmup above).  No-op when the forecaster predates the
+        feature or the prior is off.
+        """
+        schedule = getattr(pl_module, "fanin_schedule", None)
+        if schedule is None:
+            return
+        schedule.in_structure_phase = (phase == "structure")
+
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
+        self._apply_fanin_phase(pl_module, phase)
+
 
         if phase == "reconstruct":
             for p in struct_params:

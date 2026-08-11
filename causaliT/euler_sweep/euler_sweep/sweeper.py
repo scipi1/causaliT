@@ -43,6 +43,24 @@ from omegaconf import OmegaConf
 # Local imports (deferred to avoid circular imports - see functions that need it)
 # from causaliT.training.config_utils import populate_seq_lengths_from_dataset
 
+
+def normalize_gpu_mem(value: Optional[str]) -> Optional[str]:
+    """
+    Map a ``--gpu_mem`` value to the SLURM GPU request, or None for CPU-only.
+
+    ``None``, ``""``, ``"null"`` and ``"none"`` (any case) mean "request no
+    GPU": the generated sbatch scripts then omit ``--gpus``/``--gres=gpumem``
+    entirely, so the jobs can be scheduled on CPU nodes (e.g. for CPU-only
+    benchmark models).  Any other value is returned unchanged (e.g. ``"11g"``).
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() in ("", "null", "none"):
+        return None
+    return text
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 1. COMBINATION GENERATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -713,7 +731,13 @@ def generate_slurm_job_array_script(
     slurm_logs_dir = join(exp_dir, "sweeper", "slurm_logs")
     if not exists(slurm_logs_dir):
         makedirs(slurm_logs_dir)
-    
+
+    # A null gpu_mem means CPU-only: emit no GPU request at all, so the array
+    # can be scheduled on CPU nodes.
+    gpu_mem = normalize_gpu_mem(slurm_params.get('gpu_mem'))
+    gpu_directives = f"#SBATCH --gpus=1\n#SBATCH --gres=gpumem:{gpu_mem}\n" \
+        if gpu_mem else ""
+
     # Generate script content
     script_content = f"""#!/bin/bash
 #SBATCH --job-name=sweep_{experiment_id}
@@ -722,10 +746,8 @@ def generate_slurm_job_array_script(
 #SBATCH --array=0-{total_jobs-1}%{max_concurrent}
 #SBATCH --ntasks=1
 #SBATCH --time={slurm_params['walltime']}
-#SBATCH --gpus=1
 #SBATCH --mem-per-cpu={slurm_params['mem_per_cpu']}
-#SBATCH --gres=gpumem:{slurm_params['gpu_mem']}
-
+{gpu_directives}
 set -euo pipefail
 
 echo "[$(date)] Job started on $(hostname)"

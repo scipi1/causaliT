@@ -36,7 +36,31 @@ experiment:
   max_epochs: 2
 
   attention_type: "CausalCrossAttention"
+  # --- Harmonized attention temperatures ------------------------------------
+  # See docs/documentation/ATTENTION_TEMPERATURES.md for the full derivation.
+  #
+  # init_tau        — activation temperature of the NON-gated attentions
+  #                   (CausalCrossAttention / SigmoidCrossAttention, default
+  #                   3.0); also the shared FALLBACK for the two Hard-Concrete
+  #                   existence gates when the split keys below are null.
+  # init_tau_cross  — Hard-Concrete existence-gate temperature of the S->X
+  #                   cross block (GatedCrossAttention /
+  #                   HardConcreteCrossAttention).  Calculated default 0.5:
+  #                   with the symmetric stretch gamma=-1.1, zeta=1.1 the gate
+  #                   opens exactly at logit 0 (kappa = 0.5*ln(1) = 0) and
+  #                   saturates at kappa_1 = 0.5*ln(21) ~= 1.5223.
+  # init_tau_self   — same, for the X->X self block (GatedSelfAttention /
+  #                   CommutatorSelfAttention; also the single square block in
+  #                   homogeneous mode).
+  # init_gamma / init_zeta — Hard-Concrete stretch bounds (gamma < 0 < 1 <
+  #                   zeta).  The default pair (-1.1, 1.1) is SYMMETRIC, which
+  #                   is what makes kappa = 0 independent of the temperature.
   init_tau: 3.0
+  init_tau_cross: 0.5
+  init_tau_self: 0.5
+  init_gamma: -1.1
+  init_zeta: 1.1
+
   # SVFA: when True a single (L_X, L_S+L_X) DAG score is shared across all
   # value heads (Sparse Value-Function Attention).  Set False to give each
   # head its own independent score (no sharing).
@@ -112,6 +136,34 @@ experiment:
   # probability, so 1.0 is unreachable (asymptotic sigmoid); use 0.5-0.9.
   # Higher = hotter scores = more init mass on every edge.
   query_centroid_max_p: 0.9
+
+  # --- The two front-door keys: query_norm and fanin_prior ---------------
+  # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
+  # Everything else on the normalised-query path is DERIVED from these two and
+  # from the node count N, by query_norm.resolve_query_norm at data-load time.
+  #
+  # ``query_norm: true`` is a MASTER SWITCH.  It overwrites normalize_query,
+  # query_centroid_init (following free_query_embedding), query_norm_learnable,
+  # query_norm_init_scale and query_fanin_scale with the consistent set, so the
+  # five keys below it no longer have to be kept in sync by hand.  The scale is
+  # F^2 = N*x(p*)^2, i.e. the centroid init gives EVERY candidate parent the
+  # posterior query_centroid_max_p whatever N is.  An explicit numeric
+  # query_fanin_scale still wins (legacy runs reproduce exactly).
+  query_norm: false
+  #
+  # ``fanin_prior: K*`` declares a PRIOR on the in-degree, in EDGES.  By Lemma 1
+  # a row with budget M_i holds at most (M_i*F/x(p*))^2 parents at p*, so at
+  # M_i = 1 the capacity is N: no cap at all.  The prior is priced by lowering
+  # the over-spend TARGET to mu = sqrt(K*/N) - NOT by shrinking F, which would
+  # decay the init signal like sqrt(K*/N) and can close the gate outright.
+  # null = disabled.  Requires query_norm: true and lambda_query_norm > 0
+  # (a prior with a zero weight is silently inert, so it raises instead).
+  # For the random ER-k DAGs use er_indegree_quantile(n, degree, 0.95) - about
+  # 10 for ER-4 - NOT ``degree`` itself: the mean in-degree is k, but the last
+  # topological node already expects 2k parents and the max is larger still.
+  fanin_prior: null
+
+
 
 
   # Adaptive learnable per-node query-norm budget (only active when
@@ -205,9 +257,16 @@ experiment:
   #   * ``shared_query`` / ``shared_key`` MUST be false — a single block shares
   #     its projections by construction, so setting them raises ValueError.
   homogeneous_nodes: false
-  # Direction-gate Binary-Concrete temperature (GatedSelfAttention /
-  # CommutatorSelfAttention only).  Lower = sharper direction commitment.
-  dir_tau: 0.6667
+  # Direction-gate Binary-Concrete temperature of the self block's
+  # antisymmetric term (GatedSelfAttention / CommutatorSelfAttention only).
+  # Lower = sharper direction commitment.  The default 2/3 (Louizos et al.,
+  # ICLR 2018) places the 0.9-posterior point at ln(9)*2/3 ~= 1.465, just below
+  # the existence-gate saturation logit kappa_1 ~= 1.5223, so an edge's
+  # DIRECTION commits slightly before its EXISTENCE saturates (see
+  # docs/documentation/ATTENTION_TEMPERATURES.md).  The legacy key ``dir_tau``
+  # remains accepted as a fallback when dir_tau_self is unset.
+  dir_tau_self: 0.6666666667
+
 
   # Shared structural query projection (W_q) across the S→X cross block and the
   # X→X self block.  SPLIT MODE ONLY (requires ``self_attention_type`` set).
@@ -326,8 +385,14 @@ model:
     # Attention
     attention_type: ${experiment.attention_type}
     n_heads: ${experiment.n_heads}
+    # Harmonized temperatures; see the experiment block for the derivation.
     init_tau: ${experiment.init_tau}
+    init_tau_cross: ${experiment.init_tau_cross}
+    init_tau_self: ${experiment.init_tau_self}
+    init_gamma: ${experiment.init_gamma}
+    init_zeta: ${experiment.init_zeta}
     shared_dag_across_heads: ${experiment.shared_dag_across_heads}
+
 
     # Structural embedding variant (Q/K stream); see experiment.struct_embedding_type.
     struct_embedding_type: ${experiment.struct_embedding_type}
@@ -354,8 +419,10 @@ model:
     # Homogeneous node topology (square (N, N) posterior over [S ; X]);
     # see experiment.homogeneous_nodes.
     homogeneous_nodes: ${experiment.homogeneous_nodes}
-    # Direction-gate temperature (split self attentions); see experiment.dir_tau.
-    dir_tau: ${experiment.dir_tau}
+    # Direction-gate temperature of the self block's antisymmetric term;
+    # see experiment.dir_tau_self.
+    dir_tau_self: ${experiment.dir_tau_self}
+
     # Shared structural query projection across cross/self blocks (split only);
     # see experiment.shared_query.
     shared_query: ${experiment.shared_query}
@@ -513,7 +580,22 @@ training:
   # on the STRUCTURAL loss only.  0.0 lets each budget grow unpenalised; a small
   # positive value keeps M_i near the target unless the structural signal pays
   # for over-spending.  Ignored when query_norm_learnable=false.
+  #
+  # With ``experiment.fanin_prior`` set, this is the PRICE OF THE PRIOR and must
+  # be positive (a zero weight makes the prior inert, so the resolver raises).
+  # It is NOT derivable and does NOT transfer across n_keys unless the capacity
+  # penalty form is used - keep it an explicit axis of every experiment.
   lambda_query_norm: 0.0
+  # STRUCTURE epochs over which the fan-in squeeze walks K(t): n_keys -> K*
+  # (linear in EDGES, so the schedule is interpretable).  Counted from the first
+  # structure phase, never from the global epoch - under adaptive training the
+  # long reconstruct phases would otherwise consume the whole window.
+  #   auto (default) - n_keys - K*, i.e. one edge per structure epoch
+  #   0              - immediate squeeze (the ablation: expect DEFLATED rows,
+  #                    since re-concentrating the budget needs gradient steps)
+  # Ignored when fanin_prior is null.
+  fanin_anneal_epochs: auto
+
 
   # --- L0 <-> HSIC gradient-interference diagnostic ---
   # When True AND attention_type == "HardConcreteCrossAttention" AND

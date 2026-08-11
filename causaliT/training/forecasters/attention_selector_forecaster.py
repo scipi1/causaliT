@@ -141,7 +141,13 @@ from causaliT.core.architectures.attention_selector import AttentionSelectorLaye
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
 from causaliT.utils.descendant_mask import build_hsic_pair_mask
-from causaliT.utils.query_norm import collect_query_norm_penalty, query_norm_stats
+from causaliT.utils.query_norm import (
+    FaninPriorSchedule,
+    collect_query_norm_penalty,
+    query_norm_stats,
+)
+
+
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -368,7 +374,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.lambda_query_norm = float(config["training"].get("lambda_query_norm", 0.0))
 
         # ----------------------------------------------------------------
+        # Fan-in prior (experiment.fanin_prior, in EDGES).  Anneals the
+        # over-spend target from mu=1 down to mu=sqrt(K*/N) over STRUCTURE
+        # epochs, which by Lemma 1 caps how many parents a row can hold at the
+        # target posterior.  Inert unless fanin_prior is set, so the default is
+        # bit-identical to the pre-feature behaviour.  See
+        # docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
+        # ----------------------------------------------------------------
+        self.fanin_schedule = FaninPriorSchedule(config, n_keys=self.N)
+
+        # ----------------------------------------------------------------
         # L0 ↔ HSIC gradient-interference logging (diagnostic).
+
         # When enabled AND the attention is HardConcreteCrossAttention AND
         # both lambda_l0 > 0 and lambda_hsic > 0, we log the per-block cosine
         # similarity between the L0 gradient and the HSIC gradient.  Negative
@@ -694,6 +711,110 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         # Note: forward_with_actual returns (pred_x, attention_weights, entropy, l0_penalty).
         # All four values are passed through so that _step can access l0_penalty.
+
+    # ------------------------------------------------------------------
+    # Generative forward (interventional roll-out)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def causal_predict(
+        self,
+        data_source: torch.Tensor,
+        x_init: torch.Tensor,
+        clamp: Optional[Dict[int, float]] = None,
+        residual_pool: Optional[torch.Tensor] = None,
+        n_iter: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, int, float]:
+        """
+        Generative forward pass: predict X by iterating the model to a fixed
+        point instead of teacher-forcing it with observed X values.
+
+        One forward pass computes ``f_i(pa(i))`` with the CURRENT X values as
+        keys/values; the predictions become the X values of the next round::
+
+            X^(k)_i = f_i(S, X^(k-1)) + 1[i not in D] * e_i      (i = 1..L_X)
+            X^(k)_j = d_j                                          (j in D)
+
+        where ``D`` is the clamped do-set (``clamp``) and ``e`` is a residual
+        vector drawn ONCE per batch row from ``residual_pool`` and re-added
+        every round (variant B of docs/documentation/ATE_INTERVENTIONAL_ROLLOUT.md;
+        ``residual_pool=None`` gives the deterministic variant A).
+
+        For an acyclic learned graph each round propagates final values one
+        topological layer further, so the iterate stops EXACTLY after at most
+        ``L_X`` rounds; a non-zero final ``rollout_delta`` flags a cyclic
+        learned graph, whose interventional semantics are undefined.
+
+        Clamping a slot every round IS the graph mutilation: the clamped node
+        no longer depends on its parents, while downstream nodes keep seeing
+        its intervened value as key/value.
+
+        Args:
+            data_source:   S tensor (B, L_S, F), normalized; already intervened
+                           by the caller for S-side interventions.
+            x_init:        Initial X state (B, L_X, F); its value column is
+                           overwritten by the iteration, its index column is
+                           preserved (the model needs the variable indices).
+            clamp:         {x_position: normalized_value} applied every round.
+                           ``None`` or ``{}`` = observational (generative) run.
+            residual_pool: (N_pool, L_X) normalized residuals
+                           ``x_i - f_i(pa(i))`` collected teacher-forced on
+                           held-out data.  One row-index vector is drawn per
+                           call (from ``generator``), so the SAME noise is
+                           re-added each round and the fixed point converges.
+            n_iter:        Max rounds; default ``L_X`` (sufficient for any DAG).
+            generator:     torch.Generator for the residual draws.  Pass
+                           identically-seeded generators across treated and
+                           baseline runs for common random numbers.
+
+        Returns:
+            x_final:       (B, L_X, F) converged X state (value + index cols).
+            n_iter_used:   Rounds actually run (early stop on convergence).
+            rollout_delta: max |X^(K) - X^(K-1)| over the value column; ~0 for
+                           an acyclic learned graph.
+        """
+        clamp = clamp or {}
+        B, L_X, F = x_init.shape
+        if n_iter is None:
+            n_iter = L_X
+
+        device = x_init.device
+        val = self.val_idx
+
+        # Draw one residual vector per batch row (constant across rounds).
+        e = None
+        if residual_pool is not None:
+            pool = residual_pool.to(device=device, dtype=x_init.dtype)
+            idx = torch.randint(pool.shape[0], (B,), generator=generator, device="cpu")
+            e = pool[idx.to(pool.device)].to(device)          # (B, L_X)
+            if clamp:
+                # Clamped nodes are mutilated: no noise on the do-set.
+                keep = torch.ones(L_X, device=device, dtype=e.dtype)
+                for pos in clamp:
+                    keep[pos] = 0.0
+                e = e * keep.unsqueeze(0)
+
+        x = x_init.clone()
+        delta = float("inf")
+        rounds = 0
+        for k in range(n_iter):
+            pred = self.forward(data_source, x)[0]            # (B, L_X, 1) or (B, N, 1)
+            if self.homogeneous_nodes:
+                pred = pred[:, self.S_seq_len :, :]           # keep the X rows
+            x_new = x.clone()
+            x_new[:, :, val] = pred.squeeze(-1)
+            if e is not None:
+                x_new[:, :, val] = x_new[:, :, val] + e
+            for pos, value in clamp.items():
+                x_new[:, pos, val] = float(value)
+            delta = float((x_new[:, :, val] - x[:, :, val]).abs().max())
+            x = x_new
+            rounds = k + 1
+            if delta == 0.0:
+                break
+
+        return x, rounds, delta
 
     # ------------------------------------------------------------------
     # Common step
@@ -1310,9 +1431,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
             "(query_centroid_init=True; all queries start from the same point)."
         )
 
+    def on_train_epoch_start(self):
+        """Advance the fan-in squeeze and write ``mu(t)`` onto every module.
+
+        No-op unless ``experiment.fanin_prior`` is set.  The write precedes the
+        clock increment, so the first epoch always sees ``mu(0) = 1`` and the
+        centroid initialisation is untouched.
+        """
+        self.fanin_schedule.on_epoch_start(self.model)
+        for name, value in self.fanin_schedule.metrics(self.model).items():
+            self.log(name, value, on_step=False, on_epoch=True)
+
     def training_step(self, batch, batch_idx):
         # One-off: place every X query at the key centroid before the first step.
         self._maybe_init_query_centroid(batch)
+
         if self.use_gradient_routing:
 
             # --- Manual optimization with dual backward ---
@@ -1446,6 +1579,33 @@ class AttentionSelectorForecaster(pl.LightningModule):
         ):
             self._query_centroid_init_done = True
 
+        # ----------------------------------------------------------------
+        # Oracle combined mask (hard-mask / cheater runs).
+        #
+        # At training time ``data_dir`` is available and __init__ registers
+        # the ``oracle_combined_mask`` buffer (GT DAG mask, optionally
+        # corrupted), so it is saved in the checkpoint.  At evaluation time
+        # ``load_from_checkpoint`` constructs the model WITHOUT ``data_dir``
+        # and the buffer is never registered, so PL's strict load_state_dict
+        # raises "Unexpected key(s) in state_dict: oracle_combined_mask"
+        # before any predictor-side fallback can rebuild the mask.
+        #
+        # Register the buffer straight from the checkpoint tensor: the values
+        # ARE the training-time mask, and setting ``_hard_masks_loaded``
+        # keeps the mask APPLIED in forward -- a hard-masked run must be
+        # evaluated WITH its mask, otherwise it silently stops cheating.
+        # ----------------------------------------------------------------
+        _om_key = "oracle_combined_mask"
+        if _om_key in checkpoint["state_dict"] and not hasattr(self, _om_key):
+            self.register_buffer(_om_key, checkpoint["state_dict"][_om_key])
+            self._hard_masks_loaded = True
+            logger.info(
+                "on_load_checkpoint: registered '%s' buffer from checkpoint "
+                "(shape %s); hard masks remain active.",
+                _om_key,
+                tuple(checkpoint["state_dict"][_om_key].shape),
+            )
+
         current_keys = set(self.state_dict().keys())
 
         ckpt_keys = set(checkpoint["state_dict"].keys())
@@ -1488,6 +1648,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "present in current stage): %s",
                 len(missing_bkd),
                 sorted(missing_bkd),
+            )
+
+        # Symmetric oracle-mask case: the current model carries the buffer
+        # (constructed WITH data_dir) but the checkpoint predates it.  Fill
+        # from the current model so strict loading succeeds and the freshly
+        # rebuilt mask values are kept.
+        missing_om = {
+            k for k in (current_keys - ckpt_keys) if k == _om_key
+        }
+        if missing_om:
+            current_sd = self.state_dict()
+            for key in missing_om:
+                checkpoint["state_dict"][key] = current_sd[key]
+            logger.warning(
+                "on_load_checkpoint: filled missing '%s' key from the "
+                "current model (checkpoint predates the oracle mask buffer).",
+                _om_key,
             )
 
     def on_fit_start(self):

@@ -30,6 +30,7 @@ from omegaconf import OmegaConf
 
 from causaliT.euler_sweep.euler_sweep import data_source as dsrc
 from causaliT.euler_sweep.euler_sweep import dagsweep_parallel as dsp
+from causaliT.euler_sweep.euler_sweep.sweeper import normalize_gpu_mem
 
 
 
@@ -617,6 +618,38 @@ def test_no_trial_script_when_search_is_disabled(tmp_path):
                                          {"max_concurrent_jobs": 2})
 
     assert set(scripts) == {"prep", "train", "cleanup"}
+
+
+def test_null_gpu_mem_yields_cpu_only_scripts(tmp_path):
+    """
+    CPU-only runs (e.g. the benchmark trainers) need NO GPU request at all:
+    a null gpu_mem must remove --gpus/--gres from the trial and train arrays,
+    otherwise SLURM keeps them pending on GPU nodes (or rejects gpumem:null).
+    """
+    exp_dir, plan = _plan(tmp_path, dag_seeds=(0, 1), model_seeds=(7, 8),
+                          n_trials=3)
+    for null_value in (None, "null", ""):
+        scripts = dsp.generate_stage_scripts(
+            str(exp_dir), plan,
+            {"max_concurrent_jobs": 2, "walltime": "1:00:00",
+             "gpu_mem": null_value, "mem_per_cpu": "8g", "venv_path": "/env"},
+        )
+        for name in ("trials", "train"):
+            content = Path(scripts[name]).read_text()
+            assert "--gpus" not in content
+            assert "gpumem" not in content
+        # The array spec and the CPU memory request stay untouched.
+        train = Path(scripts["train"]).read_text()
+        assert "#SBATCH --array=0-3%2" in train
+        assert "--mem-per-cpu=8g" in train
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, None), ("", None), ("null", None), ("NULL", None), ("None", None),
+    (" none ", None), ("11g", "11g"), ("24G", "24G"),
+])
+def test_normalize_gpu_mem(value, expected):
+    assert normalize_gpu_mem(value) == expected
 
 
 def test_submission_chain_dependencies(tmp_path, monkeypatch):

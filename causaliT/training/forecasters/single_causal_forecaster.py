@@ -159,17 +159,16 @@ class SingleCausalForecaster(pl.LightningModule):
         # =====================================================================
         # ANNEALING CONFIGURATION
         # =====================================================================
-        
-        # 1. Toeplitz Activation Temperature Annealing (tau_gate, tau_dir)
-        #    Applied to ALL decoder layers
-        self.use_tau_act_annealing = config["training"].get("use_tau_act_annealing", False)
-        self.tau_gate_start = config["training"].get("tau_gate_start", 1.0)
-        self.tau_gate_end = config["training"].get("tau_gate_end", 0.2)
-        self.tau_dir_start = config["training"].get("tau_dir_start", 0.5)
-        self.tau_dir_end = config["training"].get("tau_dir_end", 0.1)
-        self.tau_act_anneal_epochs = config["training"].get("tau_act_anneal_epochs", None)
-        
-        # 2. HSIC Annealing - independent annealing for cross and self
+        # NOTE (temperatures): the tau annealers were REMOVED.  The Hard-
+        # Concrete gate temperatures (beta / dir_beta) are fixed, calculated
+        # constants (see docs/documentation/ATTENTION_TEMPERATURES.md) and were
+        # never touched by the legacy annealers anyway; the learnable
+        # ``log_tau_gate`` / ``log_tau_dir`` parameters the
+        # ``use_tau_act_annealing`` schedule targeted no longer exist, and the
+        # ``use_tau_annealing`` schedule only rewrote the constant ``tau``
+        # float of the legacy non-gated attentions.
+
+        # 1. HSIC Annealing - independent annealing for cross and self
         self.use_hsic_annealing = config["training"].get("use_hsic_annealing", False)
         self.hsic_anneal_epochs = config["training"].get("hsic_anneal_epochs", None)
         self.hsic_lambda_cross_start = config["training"].get("hsic_lambda_cross_start", self.lambda_hsic_cross)
@@ -177,34 +176,7 @@ class SingleCausalForecaster(pl.LightningModule):
         self.hsic_lambda_self_start = config["training"].get("hsic_lambda_self_start", self.lambda_hsic_self)
         self.hsic_lambda_self_end = config["training"].get("hsic_lambda_self_end", 0.0)
         
-        # 2b. Unified attention temperature annealing (self + cross attentions)
-        #     Mirrors the group-L1 anneal pattern.
-        #     Schedule:
-        #       [0, idle)                 -> tau = tau_start  (frozen)
-        #       [idle, idle+transient)    -> tau linearly decays start -> end (frozen)
-        #       [idle+transient, end)     -> tau is unfrozen and learnable from `end`
-        #     Targets the following parameters when present on each attention module:
-        #       - (legacy) log_tau_gate / log_tau_dir — no-op for current attention types
-        #     Note (iter_10+): ``ToeplitzAttention.tau`` and the cross-attentions'
-        #     ``tau`` are non-learnable Python floats (``init_tau``), so they
-        #     are NOT touched by this annealer.
-
-        #     freeze_tau_during_anneal=True: requires_grad disabled during idle+transient,
-        #     re-enabled exactly once at the boundary.
-        self.use_tau_annealing = config["training"].get("use_tau_annealing", False)
-        self.tau_anneal_start = float(config["training"].get("tau_anneal_start", 1.0))
-        self.tau_anneal_end = float(config["training"].get("tau_anneal_end", 0.2))
-        self.tau_anneal_idle_epochs = int(config["training"].get("tau_anneal_idle_epochs", 0))
-        self.tau_anneal_transient_epochs = int(
-            config["training"].get("tau_anneal_transient_epochs", 0)
-        )
-        self.freeze_tau_during_anneal = bool(
-            config["training"].get("freeze_tau_during_anneal", True)
-        )
-        # Tracks whether log_tau* params have been re-enabled (avoid repeated work)
-        self._tau_unfrozen = False
-        
-        # 3. Group L1 Annealing — start high, decay to lambda_group_l1
+        # 2. Group L1 Annealing — start high, decay to lambda_group_l1
 
         #    Schedule: [0, idle) = start_value; [idle, idle+transient) = linear decay; rest = lambda_group_l1
         self._group_l1_anneal_start = config["training"].get("lambda_group_l1_anneal_start_value", None)
@@ -1049,30 +1021,8 @@ class SingleCausalForecaster(pl.LightningModule):
         """Apply annealing schedules at the start of each training epoch."""
         epoch = self.current_epoch
         max_epochs = self.trainer.max_epochs if self.trainer else 100
-        
-        # 1. Toeplitz activation temperature annealing (ALL layers)
-        if self.use_tau_act_annealing:
-            anneal_epochs = self.tau_act_anneal_epochs or max_epochs
-            new_tau_gate = self._linear_anneal(self.tau_gate_start, self.tau_gate_end, epoch, anneal_epochs)
-            new_tau_dir = self._linear_anneal(self.tau_dir_start, self.tau_dir_end, epoch, anneal_epochs)
-            
-            for layer in self.model.decoder.layers:
-                dec_self_inner = layer.global_self_attention.inner_attention
-                
-                log_tau_gate = getattr(dec_self_inner, 'log_tau_gate', None)
-                log_tau_dir = getattr(dec_self_inner, 'log_tau_dir', None)
-                
-                if log_tau_gate is not None:
-                    with torch.no_grad():
-                        log_tau_gate.copy_(torch.log(torch.tensor(new_tau_gate)))
-                if log_tau_dir is not None:
-                    with torch.no_grad():
-                        log_tau_dir.copy_(torch.log(torch.tensor(new_tau_dir)))
-            
-            self.log("annealed_tau_gate", new_tau_gate, on_step=False, on_epoch=True)
-            self.log("annealed_tau_dir", new_tau_dir, on_step=False, on_epoch=True)
-        
-        # 2. HSIC annealing - independent for cross and self
+
+        # 1. HSIC annealing - independent for cross and self
         if self.use_hsic_annealing:
             anneal_epochs = self.hsic_anneal_epochs or max_epochs
             self.lambda_hsic_cross = self._linear_anneal(
@@ -1085,8 +1035,9 @@ class SingleCausalForecaster(pl.LightningModule):
             self.log("annealed_lambda_hsic_cross", self.lambda_hsic_cross, on_step=False, on_epoch=True)
             self.log("annealed_lambda_hsic_self", self.lambda_hsic_self, on_step=False, on_epoch=True)
         
-        # 3. Group L1 annealing — start high, decay to final value
+        # 2. Group L1 annealing — start high, decay to final value
         if self._use_group_l1_annealing:
+
             idle = self._group_l1_anneal_idle
             transient = self._group_l1_anneal_transient
             start_val = float(self._group_l1_anneal_start)
@@ -1102,78 +1053,8 @@ class SingleCausalForecaster(pl.LightningModule):
                 self.lambda_group_l1 = final_val
             
             self.log("annealed_lambda_group_l1", self.lambda_group_l1, on_step=False, on_epoch=True)
-        
-        # 4. Unified attention temperature annealing (self + cross)
-        #    Schedule overrides log_tau* params during [0, idle+transient).
-        #    After the schedule ends: requires_grad is re-enabled (Option A).
-        if self.use_tau_annealing:
-            idle = self.tau_anneal_idle_epochs
-            transient = self.tau_anneal_transient_epochs
-            tau_start = self.tau_anneal_start
-            tau_end = self.tau_anneal_end
-            schedule_end = idle + transient
-            
-            in_schedule = epoch < schedule_end
-            
-            if in_schedule:
-                if epoch < idle:
-                    new_tau = tau_start
-                else:
-                    new_tau = self._linear_anneal(
-                        tau_start, tau_end, epoch - idle, transient
-                    )
-                
-                # Walk all decoder layers, set tau on self + cross attention.
-                # Two paths, applied side-by-side:
-                #   (a) Legacy learnable log_tau parameters
-                #       (``log_tau_gate`` / ``log_tau_dir``) — fill with the
-                #       log of the new tau.
-                #   (b) Constant Python-float ``tau`` attributes of
-                #       ToeplitzAttention / CausalCrossAttention /
-                #       SigmoidCrossAttention (introduced in iter_10) —
-                #       overwrite the float in place. No autograd, no
-                #       requires_grad games. iter_11+ uses this path to
-                #       anneal the constant taus from beginning to end.
-                tau_param_names = ("log_tau_gate", "log_tau_dir")
-                log_new_tau = float(torch.log(torch.tensor(new_tau)))
 
-                for layer in self.model.decoder.layers:
-                    for inner in (layer.global_self_attention.inner_attention,
-                                  layer.global_cross_attention.inner_attention):
-                        # (a) learnable log_tau* Parameters
-                        for pname in tau_param_names:
-                            p = getattr(inner, pname, None)
-                            if p is None:
-                                continue
-                            with torch.no_grad():
-                                p.fill_(log_new_tau)
-                            if self.freeze_tau_during_anneal:
-                                p.requires_grad = False
-                        # (b) constant float ``tau`` (iter_10+ attentions)
-                        tau_attr = getattr(inner, "tau", None)
-                        if tau_attr is not None and not isinstance(tau_attr, torch.Tensor):
-                            inner.tau = float(new_tau)
-
-                self.log("annealed_tau", new_tau, on_step=False, on_epoch=True)
-
-            elif self.freeze_tau_during_anneal and not self._tau_unfrozen:
-                # One-shot unfreeze at boundary (iter_10+ list — see above)
-                tau_param_names = ("log_tau_gate", "log_tau_dir")
-
-                for layer in self.model.decoder.layers:
-                    for inner in (layer.global_self_attention.inner_attention,
-                                  layer.global_cross_attention.inner_attention):
-                        for pname in tau_param_names:
-                            p = getattr(inner, pname, None)
-                            if p is None:
-                                continue
-                            p.requires_grad = True
-                self._tau_unfrozen = True
-                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
-            else:
-                self.log("annealed_tau", tau_end, on_step=False, on_epoch=True)
-
-        # 5. Gate bias annealing (H5: Dense-to-Sparse Attention Bias)
+        # 3. Gate bias annealing (H5: Dense-to-Sparse Attention Bias)
         #    Drifts gate_bias from gate_bias_start to gate_bias_end across all layers.
         #    ToeplitzAttention.gate_bias is an nn.Parameter → use .fill_().
         #    SigmoidCrossAttention.gate_bias is a plain float → direct assignment.

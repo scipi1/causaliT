@@ -94,6 +94,25 @@ experiment:
   # use 0.5-0.9.
   query_centroid_max_p: 0.9
 
+  # --- The two front-door keys: query_norm and fanin_prior ---------------
+  # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md
+  # and the fuller commentary in config_attention_selector.yaml.
+  #
+  # ``query_norm: true`` is a MASTER SWITCH: it derives normalize_query,
+  # query_centroid_init, query_norm_learnable, query_norm_init_scale and
+  # query_fanin_scale = F^2 = N*x(p*)^2 as one consistent set, so the centroid
+  # init gives every candidate parent the posterior query_centroid_max_p at any
+  # node count N.  An explicit numeric query_fanin_scale still wins.
+  query_norm: false
+  # ``fanin_prior: K*`` - prior in-degree, in EDGES.  Priced by lowering the
+  # over-spend target to mu = sqrt(K*/N) (never by shrinking F, which would
+  # decay the init signal).  null = disabled; requires query_norm: true and
+  # training.lambda_query_norm > 0.
+  # NOTE homogeneous mode: N = L_S + L_X, and the S nodes are sources with no
+  # parents, so K* covers the X rows and is generous for the S ones.
+  fanin_prior: null
+
+
 
   # Value-structure injection (SVFA only).  By default ("none") the value
   # projection depends on DATA ONLY, so W_V cannot learn a per-node functional.
@@ -262,7 +281,16 @@ training:
   # Weight on ``sum_i relu(M_i - target)^2`` charged on the STRUCTURAL loss only
   # (see causaliT/utils/query_norm.py).  Active only when the attention modules
   # expose a learnable query-norm multiplier; 0.0 is a no-op otherwise.
+  # With ``experiment.fanin_prior`` set it is the PRICE OF THE PRIOR and must be
+  # positive (a zero weight would make the prior inert, so the resolver raises).
   lambda_query_norm: 0.0
+  # STRUCTURE epochs over which the fan-in squeeze walks K(t): n_keys -> K*.
+  # Counted from the first structure phase, never from the global epoch.
+  #   auto (default) - n_keys - K*, one edge per structure epoch
+  #   0              - immediate squeeze (ablation)
+  # Ignored when fanin_prior is null.
+  fanin_anneal_epochs: auto
+
 
   # --- NOTEARS acyclicity on the FULL (N, N) score ---
   # h(A) = tr(exp(A ⊙ A)) - N; zero iff A is a DAG.  Set >0 to enforce acyclicity.

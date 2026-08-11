@@ -74,7 +74,12 @@ import torchmetrics as tm
 from causaliT.core.architectures.self_selector import SelfSelectorLayer
 from causaliT.core.utils import load_dag_masks
 from causaliT.utils.hsic_utils import hsic_cross_per_pair
-from causaliT.utils.query_norm import collect_query_norm_penalty, query_norm_stats
+from causaliT.utils.query_norm import (
+    FaninPriorSchedule,
+    collect_query_norm_penalty,
+    query_norm_stats,
+)
+
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.interference_utils import (
     build_interference_blocks,
@@ -157,7 +162,13 @@ class SelfSelectorForecaster(pl.LightningModule):
         # relu(M_i - target)^2 on the STRUCTURAL loss only (query_norm.py).
         self.lambda_query_norm = float(config["training"].get("lambda_query_norm", 0.0))
 
+        # Fan-in prior (experiment.fanin_prior, in EDGES): anneals the
+        # over-spend target down to mu = sqrt(K*/N) over STRUCTURE epochs.
+        # Inert unless fanin_prior is set.  See query_norm.FaninPriorSchedule.
+        self.fanin_schedule = FaninPriorSchedule(config, n_keys=self.N)
+
         # L0 <-> HSIC interference diagnostic
+
         self.log_l0_hsic_interference = bool(
             config["training"].get("log_l0_hsic_interference", False)
         )
@@ -497,8 +508,19 @@ class SelfSelectorForecaster(pl.LightningModule):
     # Lightning hooks
     # ------------------------------------------------------------------
 
+    def on_train_epoch_start(self):
+        """Advance the fan-in squeeze and write ``mu(t)`` onto every module.
+
+        No-op unless ``experiment.fanin_prior`` is set; the write precedes the
+        clock increment so epoch 0 sees ``mu(0) = 1`` exactly.
+        """
+        self.fanin_schedule.on_epoch_start(self.model)
+        for name, value in self.fanin_schedule.metrics(self.model).items():
+            self.log(name, value, on_step=False, on_epoch=True)
+
     def training_step(self, batch, batch_idx):
         if self.use_gradient_routing:
+
             opt_recon, opt_struct = self.optimizers()
             total_loss, _, _ = self._step(batch=batch, stage="train")
             loss_recon = self._last_loss_components["loss_recon"]

@@ -110,6 +110,18 @@ from causaliT.core.modules import (
 # Imported directly from the submodule so the layer does not depend on the
 # package ``__init__`` re-export being present.
 from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
+from causaliT.utils.query_geometry import (
+    assert_orthonormal_frame,
+    correct_query,
+    transitive_weights,
+)
+from causaliT.utils.query_norm import (
+    DEFAULT_DIR_TAU,
+    DEFAULT_GATE_GAMMA,
+    DEFAULT_GATE_TAU,
+    DEFAULT_GATE_ZETA,
+)
+
 
 
 # Allowed values for ``struct_embedding_type`` (structural Q/K embedding scheme).
@@ -150,7 +162,21 @@ class AttentionSelectorLayer(nn.Module):
         d_qk: Q/K projection dimension per head.
         S_seq_len: Number of S variables.
         X_seq_len: Number of X variables.
-        init_tau: Temperature for CausalCrossAttention / SigmoidCrossAttention (default 3.0).
+        init_tau: LEGACY shared temperature key.  Still the activation
+            temperature of the non-gated attentions (CausalCrossAttention /
+            SigmoidCrossAttention, default 3.0) and the shared fallback for the
+            two Hard-Concrete existence gates.  Prefer the explicit split keys
+            below (see docs/documentation/ATTENTION_TEMPERATURES.md).
+        init_tau_cross: Hard-Concrete existence-gate temperature of the S->X
+            cross block (GatedCrossAttention / HardConcreteCrossAttention).
+            None -> ``init_tau`` -> the calculated default 0.5.
+        init_tau_self: Hard-Concrete existence-gate temperature of the X->X
+            self block (GatedSelfAttention / CommutatorSelfAttention; also the
+            single square block in homogeneous mode).  None -> ``init_tau``
+            -> 0.5.
+        dir_tau_self: Antisymmetric direction-gate temperature of the self
+            block.  None -> ``dir_tau`` (legacy name) -> 2/3 (Louizos et al.,
+            ICLR 2018).
         output_mlp_layers: Number of layers in the output MLP head (1 = linear).
         output_mlp_hidden: Hidden dimension of the MLP head (None → d_ff).
         output_mlp_activation: Activation in the MLP head.
@@ -264,8 +290,12 @@ class AttentionSelectorLayer(nn.Module):
         # Sequence lengths
         S_seq_len: int,
         X_seq_len: int,
-        # Attention temperature
-        init_tau: float = 3.0,
+        # Attention temperatures (harmonized; the legacy shared ``init_tau``
+        # doubles as the non-gated activation temperature AND as the shared
+        # fallback for the two Hard-Concrete existence gates).
+        init_tau: Optional[float] = None,
+        init_tau_cross: Optional[float] = None,
+        init_tau_self: Optional[float] = None,
         # MLP output head
         output_mlp_layers: int = 1,
         output_mlp_hidden: Optional[int] = None,
@@ -309,8 +339,8 @@ class AttentionSelectorLayer(nn.Module):
         # When False, bypass the learnable reconstruction gain in the gated
         # attentions: the structure gate becomes the final attention weight.
         use_gain: bool = True,
-        init_gamma: float = -0.1,
-        init_zeta: float = 1.1,
+        init_gamma: float = DEFAULT_GATE_GAMMA,
+        init_zeta: float = DEFAULT_GATE_ZETA,
         # Additive logit offset on the S→X cross existence gate ONLY, to balance
         # its initialization against the directed X→X self edge.  The cross
         # existence posterior is P = sigmoid(logα − init_edge_offset); with the
@@ -341,12 +371,23 @@ class AttentionSelectorLayer(nn.Module):
         # (there is a single block, so sharing is intrinsic).  Default False.
         homogeneous_nodes: bool = False,
         # ---- Geometric TRANSITIVE correction (grandparent suppression) ----
-        # Opt-in.  Pass 1 probes the block's own DETACHED posterior; every edge
-        # j -> i that is already explained by a mediator (j -> k -> i) has its
-        # key component removed from the query in pass 2, and the freed
-        # query-norm budget is handed back to the surviving parents by
-        # ``normalize_query``.  See causaliT/utils/query_geometry.py and
+        # Opt-in.  Pass 1 probes the DETACHED posterior; every edge j -> i that
+        # is already explained by a mediator (j -> k -> i) has its key component
+        # removed from the query in pass 2, and the freed query-norm budget is
+        # handed back to the surviving parents by ``normalize_query``.  See
+        # causaliT/utils/query_geometry.py and
         # experiments/6_INVESTIGATIONS/HOMOGENEOUS/TRANSITIVE_CORRECTION.md.
+        # Works in BOTH node topologies:
+        #   * homogeneous: the single square (N, N) block probes its own
+        #     posterior inside AttentionLayer.forward (the mediator axis exists
+        #     inside the block);
+        #   * split: the LAYER probes BOTH blocks (AttentionLayer.
+        #     transitive_probe), fuses the (L_X, L_S+L_X) posterior, pads it to
+        #     the square (N, N) graph with zero S-rows (the descendant_mask
+        #     convention — every mediator is an X node there), computes the
+        #     weights once and scatters the per-block slices; symmetrisation is
+        #     limited to the square X-X self block (symmetric_span) and the
+        #     ORTHONORMALITY check runs on the COMBINED [S ; X] key frame.
         # Requires an ORTHONORMAL key frame (orthogonal_fixed +
         # remove_key_projection) — enforced loudly on the first forward.
         transitive_correction: bool = False,
@@ -355,8 +396,11 @@ class AttentionSelectorLayer(nn.Module):
         transitive_tnorm: str = "min",      # Goedel; "prod" deflates and barely fires
         transitive_margin: bool = True,     # relu(m - Pi): silent at the all-on init
         transitive_symmetric: bool = True,  # existence part is symmetric
-        # Direction-gate Binary-Concrete temperature (GatedSelfAttention only).
-        dir_tau: float = 2.0 / 3.0,
+        # Direction-gate Binary-Concrete temperature of the self-attention
+        # antisymmetric term.  ``dir_tau`` is the LEGACY name (fallback);
+        # ``dir_tau_self`` wins when set; both None -> DEFAULT_DIR_TAU (2/3).
+        dir_tau: Optional[float] = None,
+        dir_tau_self: Optional[float] = None,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
         # L2-normalise the STRUCTURAL query before scoring and replace the
         # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  This makes
@@ -491,20 +535,49 @@ class AttentionSelectorLayer(nn.Module):
             if self.transitive_correction
             else None
         )
-        if self.transitive_correction and not self.homogeneous_nodes:
-            # The trigger needs a SQUARE posterior: the mediator k ranges over
-            # the same node set as the parents j.  In split mode each block sees
-            # only a slice (the S->X block is (L_X, L_S) — S nodes are never
-            # children there), so no mediated path is even representable inside
-            # one block.  Supporting it would require probing the RE-FUSED
-            # (L_X, L_S+L_X) posterior and scattering the weights back per
-            # block; not done, so refuse rather than silently under-correct.
+        if (
+            self.transitive_correction
+            and not self.homogeneous_nodes
+            and self_attention_type is None
+        ):
+            # CROSS-ONLY is the only unsupported topology: ONE bipartite
+            # (L_X, L_S+L_X) block has no mediator axis (a node that is both
+            # parent and child) and there is no X->X self block to supply it.
+            # Homogeneous probes its own square posterior inside the block;
+            # split is orchestrated by this layer's forward (two-pass over the
+            # re-fused posterior — see forward_with_actual).
             raise ValueError(
-                "transitive_correction=True currently requires "
-                "homogeneous_nodes=True (ONE square (N, N) block).  In split "
-                "mode the per-block posteriors are not square, so the mediator "
-                "axis does not exist inside a block."
+                "transitive_correction=True with homogeneous_nodes=False "
+                "requires self_attention_type (the split cross + self "
+                "topology): the mediated paths span the two blocks.  The "
+                "cross-only single block has no X->X self block and is not "
+                "supported."
             )
+        if (
+            self.transitive_correction
+            and not self.homogeneous_nodes
+            and not shared_query
+        ):
+            # The fused trigger mixes the cross and self posteriors of the SAME
+            # child, and the cross-freed norm budget must renormalise the query
+            # the self block scores (the joint-cap reallocation; see
+            # TRANSITIVE_CORRECTION.md F6).  Both require ONE shared query
+            # geometry; shared_query=False gives the self block its own
+            # Q = W_q(xk_struct), a different child representation.
+            raise ValueError(
+                "transitive_correction=True in split mode requires "
+                "shared_query=True (ONE query geometry scored by both "
+                "blocks).  Without it the fused (L_X, L_S+L_X) posterior mixes "
+                "two different child representations and the cross-block "
+                "correction cannot be chained into the self block's query."
+            )
+        # Split-mode orchestration state: the COMBINED [S ; X] key-frame Gram
+        # is checked once (the frame is fixed by construction), and
+        # ``last_transitive_W`` stashes the fused (L_X, L_S+L_X) weights for
+        # diagnostics (the applied per-block slices live on the two
+        # AttentionLayer wrappers' own ``last_transitive_W``).
+        self._transitive_frame_checked = False
+        self.last_transitive_W: Optional[torch.Tensor] = None
         self.N = S_seq_len + X_seq_len
 
         # ------------------------------------------------------------------
@@ -618,7 +691,26 @@ class AttentionSelectorLayer(nn.Module):
         # In homogeneous mode the ONE square (N, N) block IS the self attention
         # (stored in ``self.attention``), so there is no separate split block.
         self.split_xx = not self.homogeneous_nodes and not self.cross_only
-        self.dir_tau = dir_tau
+
+        # ------------------------------------------------------------------
+        # Harmonized attention temperatures (see
+        # docs/documentation/ATTENTION_TEMPERATURES.md).  Fallback chain:
+        # explicit split key -> legacy shared key -> calculated default.
+        # ------------------------------------------------------------------
+        self.init_tau_act = 3.0 if init_tau is None else float(init_tau)
+        _legacy_hc = None if init_tau is None else float(init_tau)
+        self.init_tau_cross = (
+            float(init_tau_cross) if init_tau_cross is not None
+            else (_legacy_hc if _legacy_hc is not None else DEFAULT_GATE_TAU)
+        )
+        self.init_tau_self = (
+            float(init_tau_self) if init_tau_self is not None
+            else (_legacy_hc if _legacy_hc is not None else DEFAULT_GATE_TAU)
+        )
+        self.dir_tau = (
+            float(dir_tau_self) if dir_tau_self is not None
+            else (float(dir_tau) if dir_tau is not None else DEFAULT_DIR_TAU)
+        )
 
         # Shared structural query projection (W_q) across the cross (S→X) and
         # self (X→X) blocks.  Only meaningful in split mode; ignored otherwise.
@@ -639,6 +731,22 @@ class AttentionSelectorLayer(nn.Module):
                 "there is a SINGLE attention block, so the key projection is "
                 "shared by construction (all N keys pass through the same W_K, "
                 "which preserves the orthogonality of the structural keys)."
+            )
+
+        # The sharing flags need TWO blocks: in cross-only mode there is ONE
+        # block and nothing to share with, so the flags would be silently
+        # ignored — refuse loudly instead of running a mis-configured arm.
+        if self.shared_query and self.cross_only:
+            raise ValueError(
+                "shared_query=True requires self_attention_type (split mode): "
+                "in cross-only mode there is a SINGLE attention block, so "
+                "there is no second block to share the query projection with."
+            )
+        if self.shared_key and self.cross_only:
+            raise ValueError(
+                "shared_key=True requires self_attention_type (split mode): "
+                "in cross-only mode there is a SINGLE attention block, so "
+                "there is no second block to share the key projection with."
             )
 
 
@@ -743,7 +851,18 @@ class AttentionSelectorLayer(nn.Module):
                 S_seq_len if self.split_xx else S_seq_len + X_seq_len
             )
 
+        # Temperature routed to the MAIN block: in homogeneous mode it IS the
+        # self gate; otherwise the cross existence gate (Hard-Concrete) or the
+        # legacy activation temperature (non-gated attentions).
+        if self.homogeneous_nodes:
+            main_tau = self.init_tau_self
+        elif att_cls in (GatedCrossAttention, HardConcreteCrossAttention):
+            main_tau = self.init_tau_cross
+        else:
+            main_tau = self.init_tau_act
+
         self.attention = AttentionLayer(
+
             attention=att_cls,
             d_model_queries=d_model,
             d_model_keys=d_model,
@@ -757,11 +876,12 @@ class AttentionSelectorLayer(nn.Module):
             layer_name="selector_att",
             query_seq_len=query_seq_len,
             key_seq_len=cross_key_seq_len,
-            init_tau=init_tau,
+            init_tau=main_tau,
             # Direction-gate parameters: consumed only when THIS block is the
             # square (N, N) self attention (homogeneous mode); the cross
             # attentions ignore them.
-            dir_tau=dir_tau,
+            dir_tau=self.dir_tau,
+
             direction_mode=commutator_direction_mode,
             direction_rank=commutator_direction_rank,
             shared_dag_across_heads=shared_dag_across_heads,
@@ -834,7 +954,7 @@ class AttentionSelectorLayer(nn.Module):
                 layer_name="selector_self_att",
                 query_seq_len=X_seq_len,
                 key_seq_len=X_seq_len,
-                init_tau=init_tau,
+                init_tau=self.init_tau_self,
                 shared_dag_across_heads=shared_dag_across_heads,
                 # Shared structural query projection: when True the self block
                 # does NOT own a W_q; the cross block's W_q is applied to the X
@@ -857,7 +977,7 @@ class AttentionSelectorLayer(nn.Module):
                 init_zeta=init_zeta,
                 gain_tau=gain_tau,
                 use_gain=use_gain,
-                dir_tau=dir_tau,
+                dir_tau=self.dir_tau,
                 # CommutatorSelfAttention direction-gate parametrisation
                 # ("qk" or "skew_query"); ignored by GatedSelfAttention.
                 direction_mode=commutator_direction_mode,
@@ -1563,6 +1683,72 @@ class AttentionSelectorLayer(nn.Module):
                 cross_hard = oracle_combined_mask[:, : self.S_seq_len] * cross_hard
                 self_hard = oracle_combined_mask[:, self.S_seq_len :] * self_hard
 
+            # ---- Transitive correction, PASS 1 (split orchestration) -----
+            # Neither block alone sees a square posterior: the mediator k of a
+            # path j -> k -> i ranges over the X nodes (the S rows are empty by
+            # construction), while the parents j span [S ; X].  So the LAYER
+            # probes BOTH blocks' deterministic posteriors, fuses them into the
+            # (L_X, L_S+L_X) graph, pads it to the square (N, N) with zero
+            # S-rows (the descendant_mask convention), computes the shrink
+            # weights ONCE, and scatters the per-block slices into the two
+            # forward calls below.  The probes are dropout-free and consume no
+            # RNG, so a disabled correction leaves the forward bit-identical.
+            tc_cross = None
+            tc_self = None
+            if self._transitive_cfg is not None and not oracle:
+                with torch.no_grad():
+                    # Mirror the shared-projection choices of the scored pass
+                    # below, but WITHOUT dropout (deterministic trigger).
+                    probe_self_q = (
+                        self.attention.query_projection(x_q_emb)
+                        if self.shared_query
+                        else xk_struct
+                    )
+                    probe_self_k = (
+                        self.attention.key_projection(xk_struct)
+                        if self.shared_key
+                        else xk_struct
+                    )
+                    pi_cross, k_cross = self.attention.transitive_probe(
+                        x_q_emb, s_struct, cross_hard
+                    )                                        # (L_X, L_S)
+                    pi_self, k_self = self.self_attention.transitive_probe(
+                        probe_self_q, probe_self_k, self_hard
+                    )                                        # (L_X, L_X)
+                    if not self._transitive_frame_checked:
+                        # The component removal is only exact on an orthonormal
+                        # frame; check the COMBINED [S ; X] keys (per-block
+                        # checks would miss mutually rotated frames).
+                        assert_orthonormal_frame(
+                            torch.cat([k_cross[0], k_self[0]], dim=0),
+                            context="split-mode combined [S ; X] key frame",
+                        )
+                        self._transitive_frame_checked = True
+                    # Pad to the square (N, N) graph: nothing points INTO an S
+                    # node, so the top L_S rows are zero and every mediator is
+                    # an X node — exactly the S -> X -> X grandparent case.
+                    pi_sq = pi_cross.new_zeros(self.N, self.N)
+                    pi_sq[self.S_seq_len :, :] = torch.cat(
+                        [pi_cross, pi_self], dim=-1
+                    )
+                    W_sq = transitive_weights(
+                        pi_sq,
+                        alpha=self.transitive_alpha,
+                        tnorm=self.transitive_tnorm,
+                        margin=self.transitive_margin,
+                        symmetric=self.transitive_symmetric,
+                        # Only the square X-X self block is symmetrised; the
+                        # bipartite S->X block has no reverse entry to balance.
+                        symmetric_span=(
+                            (self.S_seq_len, self.N)
+                            if self.transitive_symmetric
+                            else None
+                        ),
+                    )
+                W = W_sq[self.S_seq_len :, :]                    # (L_X, N)
+                tc_cross = {**self._transitive_cfg, "W": W[:, : self.S_seq_len]}
+                tc_self = {**self._transitive_cfg, "W": W[:, self.S_seq_len :]}
+
             # ---- S→X cross block (keys/values = S only) -----------------
             out_sx, attn_sx, aux_sx = self.attention(
                 query=x_q_emb,
@@ -1578,6 +1764,7 @@ class AttentionSelectorLayer(nn.Module):
                 gain_key=gk_S,
                 value_structure=vsi_S,
                 value_structure_query=vsq_X,
+                transitive_cfg=tc_cross,
             )
 
 
@@ -1624,6 +1811,25 @@ class AttentionSelectorLayer(nn.Module):
                 self_query = self.attention.dropout_qkv(
                     self.attention.query_projection(x_q_emb)
                 )
+                if tc_cross is not None:
+                    # Chain the S-side correction into the SHARED query before
+                    # the self block scores it: the budget freed on the S keys
+                    # renormalises the SAME query the X-X block reads, so the
+                    # freed mass can land on the X parents (joint-cap
+                    # reallocation, TRANSITIVE_CORRECTION.md F6).  The self
+                    # block then applies its own X-key slice (tc_self) on top.
+                    # The weights are gated by the SAME (possibly oracle-
+                    # intersected) cross mask the cross block applies; the
+                    # probe keys are detached — the correction is a structural
+                    # bias, and the sanctioned configuration (frozen
+                    # orthonormal frame, no key projection) owns no key
+                    # parameters to route gradients to anyway.
+                    self_query = correct_query(
+                        self_query,
+                        k_cross,
+                        tc_cross["W"] * cross_hard.to(tc_cross["W"].dtype),
+                        delta=self.transitive_delta,
+                    )
             else:
                 self_query = xk_struct
 
@@ -1663,7 +1869,19 @@ class AttentionSelectorLayer(nn.Module):
                 gain_key=self_gain_k,
                 value_structure=vsi_X,
                 value_structure_query=vsq_X,
+                transitive_cfg=tc_self,
             )
+
+            # Diagnostics: the fused (L_X, L_S+L_X) weights AS APPLIED (each
+            # wrapper gated its own slice by its hard mask).
+            if tc_cross is not None:
+                self.last_transitive_W = torch.cat(
+                    [
+                        self.attention.last_transitive_W,
+                        self.self_attention.last_transitive_W,
+                    ],
+                    dim=-1,
+                )
 
 
 

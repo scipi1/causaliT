@@ -109,6 +109,28 @@ class linear_emb(nn.Module):
         
 
 
+class mlp_emb(nn.Module):
+    """
+    Small shared MLP value embedding: nonlinear alternative to linear_emb.
+    One hidden layer: Linear(input_dim -> hidden_dim) -> activation -> Linear(hidden_dim -> embedding_dim).
+    The same weights are applied to every node (shared across nodes), exactly like linear_emb.
+    """
+    ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "tanh": nn.Tanh}
+
+    def __init__(self, input_dim, embedding_dim, device, hidden_dim=64, activation="gelu"):
+        super().__init__()
+        assert activation in self.ACTIVATIONS, f"Invalid activation '{activation}'. Choose from {list(self.ACTIVATIONS)}."
+        self.embedding = nn.Sequential(
+            nn.Linear(in_features=input_dim, out_features=hidden_dim, device=device, dtype=torch.float32),
+            self.ACTIVATIONS[activation](),
+            nn.Linear(in_features=hidden_dim, out_features=embedding_dim, device=device, dtype=torch.float32),
+        )
+
+    def forward(self, X: torch.Tensor):
+        return self.embedding(X.unsqueeze(-1))
+        
+
+
 
 def main():
     # quick Time2Vec test

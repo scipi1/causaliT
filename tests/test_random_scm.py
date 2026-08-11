@@ -13,6 +13,7 @@ Covers:
 - Label permutation hides the topological order (anti-leak)
 - Acyclicity (topo-sort succeeds)
 - Structural-equation family (linear vs nonlinear expressions)
+- Numerical stability: nonlinear links are bounded, so deep DAGs stay finite
 - Config + graph statistics persisted in metadata
 - End-to-end `generate_ds`, including `compute_ate=False` (skipped without the
   graphviz `dot` binary)
@@ -27,6 +28,7 @@ import numpy as np
 import pytest
 
 from scm_ds.random_scm import (
+    SUPPORTED_NONLINEAR_FNS,
     RandomSCMConfig,
     _sample_dag,
     expected_er_roots,
@@ -273,7 +275,58 @@ def test_nonlinear_expressions_contain_nonlinearity():
     ds = sample_random_scm_dataset(
         RandomSCMConfig(n_nodes=25, degree=3, seed=0, linearity="nonlinear"))
     joined = " ".join(spec.expr for spec in ds.specs)
-    assert any(tok in joined for tok in ("**2", "**3", "sin(", "tanh("))
+    assert any(tok in joined for tok in ("sin(", "tanh("))
+
+
+# --------------------------------------------------------------------------- #
+# Bounded nonlinearities / numerical stability
+# --------------------------------------------------------------------------- #
+
+def test_default_nonlinear_pool_is_bounded():
+    """
+    Guard against reintroducing unbounded links.
+
+    ``x**2`` / ``x**3`` are re-applied at every layer of the DAG, so values grow
+    geometrically with depth and overflow to inf on realistic graphs (ER4 over 50
+    nodes is ~13 layers deep). Only bounded links may be in the default pool.
+    """
+    assert RandomSCMConfig(n_nodes=10, degree=2, seed=0).nonlinear_fns == ("sin", "tanh")
+    assert set(SUPPORTED_NONLINEAR_FNS) == {"sin", "tanh"}
+
+
+@pytest.mark.parametrize("fn", ["square", "cube"])
+def test_removed_unbounded_fns_raise(fn):
+    """Pre-existing configs asking for monomials must fail loudly, not silently."""
+    cfg = RandomSCMConfig(n_nodes=10, degree=2, seed=0,
+                          linearity="nonlinear", nonlinear_fns=(fn,))
+    with pytest.raises(ValueError, match="no longer supported"):
+        sample_random_scm_dataset(cfg)
+
+
+def test_unknown_nonlinear_fn_raises():
+    cfg = RandomSCMConfig(n_nodes=10, degree=2, seed=0,
+                          linearity="nonlinear", nonlinear_fns=("relu",))
+    with pytest.raises(ValueError, match="Unknown nonlinear"):
+        sample_random_scm_dataset(cfg)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("noise", ["gaussian", "nongaussian"])
+def test_nonlinear_data_is_finite_and_bounded(seed, noise):
+    """
+    Regression test for the ER4/n=50 blow-up that crashed the SHD experiments.
+
+    With the old ``("square", "cube", "sin", "tanh")`` pool, max |x| reached
+    1e18..1e305 and seed 3 overflowed to inf, killing normalization with
+    "Input X contains infinity". Bounded links keep |x| <= sum_p |w_p| + |eps|
+    regardless of depth.
+    """
+    ds = sample_random_scm_dataset(
+        RandomSCMConfig(n_nodes=50, degree=4, seed=seed,
+                        linearity="nonlinear", noise=noise))
+    values = ds.sample(n=500, seed=seed).to_numpy(dtype=float)
+    assert np.isfinite(values).all(), "non-finite values in sampled data"
+    assert np.abs(values).max() < 50.0, "values are diverging with DAG depth"
 
 
 # --------------------------------------------------------------------------- #

@@ -31,6 +31,9 @@ MAX_CONCURRENT_JOBS=6
 # Walltime of ONE array task (a single Optuna trial / a single training run),
 # not of the whole sweep: the chain runs as long as it needs to.
 WALLTIME="2-00:00:00"
+# GPU memory of one trial/train task.  Set to null to run the arrays on CPU
+# nodes (no --gpus / --gres=gpumem is emitted), e.g. for the CPU-only
+# benchmark trainers (training.trainer: benchmark).
 GPU_MEM="11g"
 MEM_PER_CPU="10g"
 
