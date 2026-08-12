@@ -342,13 +342,18 @@ class AttentionSelectorLayer(nn.Module):
         init_gamma: float = DEFAULT_GATE_GAMMA,
         init_zeta: float = DEFAULT_GATE_ZETA,
         # Additive logit offset on the S→X cross existence gate ONLY, to balance
-        # its initialization against the directed X→X self edge.  The cross
-        # existence posterior is P = sigmoid(logα − init_edge_offset); with the
-        # default 0.0 the cross edge starts at ≈0.5 while a directed self edge
-        # (p_exist·direction) starts at ≈0.25, giving the (often spurious) S→X
-        # edges a 2× head start.  Setting init_edge_offset = ln 3 ≈ 1.0986 lands
-        # the cross init edge prob at 0.25, so S→X and X→X start balanced.  Only
-        # applies to GatedCrossAttention; the self block is never offset.
+        # its initialization against the directed X→X self edge (which the
+        # undecided direction gate halves: P = p_exist·0.5).  The cross
+        # posterior at the centroid init is
+        # P = sigmoid(x − init_edge_offset − κ).  The config value is resolved
+        # at data-load time by
+        # causaliT.utils.query_norm.resolve_init_edge_offset: "auto" picks the
+        # MATCHED offset ln(e^(x−κ) + 2) so the cross gate starts at the
+        # DIRECTED self posterior (directed-level balance); a float pins a
+        # legacy ablation; 0.0 disables it (existence-level balance).  The
+        # offset NEVER enters the query_fanin_scale (F) derivation — F targets
+        # the offset-free existence posterior of BOTH gates.  Only
+        # GatedCrossAttention consumes it; the self block is never offset.
         init_edge_offset: float = 0.0,
         # Direction-aware self-attention block.  MANDATORY (the legacy
         # cross-only variant, where the right-hand columns of one combined cross
@@ -899,7 +904,8 @@ class AttentionSelectorLayer(nn.Module):
             init_gamma=init_gamma,
             init_zeta=init_zeta,
             # Init-balancing offset on the S→X cross existence gate ONLY (see
-            # __init__ docstring); the self block below is never offset.
+            # __init__ docstring; resolved by resolve_init_edge_offset, never
+            # entering F); the self block below is never offset.
             init_edge_offset=init_edge_offset,
             gain_tau=gain_tau,
             use_gain=use_gain,

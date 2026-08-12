@@ -143,14 +143,19 @@ class GatedCrossAttention(nn.Module):
 
         # Additive logit offset on the STRUCTURE gate (init-balancing).  The
         # effective alignment logit becomes ``log_alpha - init_edge_offset`` in
-        # BOTH the Hard-Concrete sample and the P(z>0) posterior, so at init
-        # (``log_alpha ~= 0``) the edge-existence posterior is
-        # ``sigmoid(-init_edge_offset)`` instead of 0.5.  Set it to ``ln 3``
-        # (~1.0986) to bring a directed S->X cross edge to the same 0.25 init
-        # probability a directed X->X self edge gets from its undecided
-        # direction gate (P = p_exist * 0.5), removing the 2x head start the
-        # cross edges otherwise enjoy (see COND_INDEPENDENCE investigation
-        # investigate_S2_X5_spurious_first.ipynb).  Default 0.0 = no offset.
+        # BOTH the Hard-Concrete sample and the P(z>0) posterior, so at the
+        # centroid init the cross posterior is
+        # ``sigmoid(x - init_edge_offset - kappa)`` instead of
+        # ``sigmoid(x - kappa)``.  The offset balances the (direction-free)
+        # cross edge against the directed X->X self edge, which the undecided
+        # direction gate halves (P = p_exist * 0.5).  The config value is
+        # resolved at data-load time by
+        # ``causaliT.utils.query_norm.resolve_init_edge_offset``: ``auto``
+        # picks the MATCHED offset ``ln(exp(x - kappa) + 2)`` so both blocks
+        # start at the same DIRECTED posterior; a float pins a legacy ablation
+        # (ln 3 ~ 1.0986 was the pre-F-auto choice); 0.0 disables it.  The
+        # offset NEVER enters the query_fanin_scale (F) derivation.  Only this
+        # block consumes it; the self block is never offset.
         init_edge_offset: float = 0.0,
         # Reconstruction-gain temperature (scales the sigmoid logit).
         gain_tau: float = 1.0,
@@ -215,6 +220,14 @@ class GatedCrossAttention(nn.Module):
 
         # Additive logit offset on the structure gate (init-balancing); see the
         # ``init_edge_offset`` docstring above.  Non-learnable constant.
+        if isinstance(init_edge_offset, str):
+            raise ValueError(
+                f"init_edge_offset={init_edge_offset!r} was never resolved to a "
+                "number.  It is derived from the node count and F by "
+                "causaliT.utils.query_norm.resolve_init_edge_offset, which runs "
+                "in populate_seq_lengths_from_dataset; build the model from a "
+                "config passed through that hook, or set an explicit float."
+            )
         self.edge_offset = float(init_edge_offset)
 
         self.gain_tau = float(gain_tau)

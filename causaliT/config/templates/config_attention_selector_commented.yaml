@@ -1,0 +1,809 @@
+# AttentionSelectorLayer Template
+#
+# Research question:
+#   Can a single cross-attention block recover causal parent sets from
+#   observational data when given the actual values of all candidate
+#   parents (S and X) as keys?
+#
+# Architecture:
+#   Q: X_blanked  (variable identity only)
+#   K/V: [S_actual, X_actual]  (actual values of all variables)
+#   Hard mask: diagonal of X-X sub-block zeroed (no self-loops)
+#   No self-attention block.
+#
+# Attention type recommendation:
+#   CausalCrossAttention (ReLU-Tanh):  non-normalized, can be zero → sparse
+#   SigmoidCrossAttention:             bounded [0,1], can be near-zero → sparse
+#   ScaledDotSoftmax:                  softmax, always dense → use only as baseline
+#
+# Suggested workflow:
+#   1. Run with lambda_hsic=0, lambda_score_sparse=0 to verify reconstruction works.
+#   2. Add score sparsity (lambda_score_sparse=0.01) to drive attention sparse.
+#   3. Add HSIC (lambda_hsic=0.1) to drive independence between sources and residuals.
+#   4. Enable gradient routing for cleaner structure optimization.
+
+experiment:
+  d_model_set: 24
+  n_heads: 1
+  d_ff_mult: 2.0
+  d_qk_mult: 0.5
+  d_ff: null
+  d_qk: null
+  dropout: 0.0
+
+  lr: 0.001
+  batch_size: 64
+  max_epochs: 2
+
+  attention_type: "CausalCrossAttention"
+  # --- Harmonized attention temperatures ------------------------------------
+  # See docs/documentation/ATTENTION_TEMPERATURES.md for the full derivation.
+  #
+  # init_tau        — activation temperature of the NON-gated attentions
+  #                   (CausalCrossAttention / SigmoidCrossAttention, default
+  #                   3.0); also the shared FALLBACK for the two Hard-Concrete
+  #                   existence gates when the split keys below are null.
+  # init_tau_cross  — Hard-Concrete existence-gate temperature of the S->X
+  #                   cross block (GatedCrossAttention /
+  #                   HardConcreteCrossAttention).  Calculated default 0.5:
+  #                   with the symmetric stretch gamma=-1.1, zeta=1.1 the gate
+  #                   opens exactly at logit 0 (kappa = 0.5*ln(1) = 0) and
+  #                   saturates at kappa_1 = 0.5*ln(21) ~= 1.5223.
+  # init_tau_self   — same, for the X->X self block (GatedSelfAttention /
+  #                   CommutatorSelfAttention; also the single square block in
+  #                   homogeneous mode).
+  # init_gamma / init_zeta — Hard-Concrete stretch bounds (gamma < 0 < 1 <
+  #                   zeta).  The default pair (-1.1, 1.1) is SYMMETRIC, which
+  #                   is what makes kappa = 0 independent of the temperature.
+  init_tau: 3.0
+  init_tau_cross: 0.5
+  init_tau_self: 0.5
+  init_gamma: -1.1
+  init_zeta: 1.1
+
+  # SVFA: when True a single (L_X, L_S+L_X) DAG score is shared across all
+  # value heads (Sparse Value-Function Attention).  Set False to give each
+  # head its own independent score (no sharing).
+  shared_dag_across_heads: true
+  # Embedding composition mode.
+  # "summation"  — standard: all sub-modules summed into one d_model vector.
+  # "svfa"       — SVFA multi-head values: sub-modules split into value/structure
+  #                roles and projected into H separate value heads.
+  #                Requires n_heads > 1 and shared_dag_across_heads: true.
+  comps_embed: "svfa"
+  use_gradient_routing: true
+
+  # Structural (Q/K stream) embedding scheme.  One of:
+  #   "standard_learnable"   — standard learnable nn_embedding (ModularEmbedding).
+  #   "orthogonal_learnable" — OrthogonalMaskEmbedding: learnable, but disjoint
+  #                            d_model partitions make S and X keys mutually
+  #                            orthogonal (gates zero out per-variable dims).
+  #   "orthogonal_fixed"     — FixedOrthonormalEmbedding: dense frozen rows
+  #                            spanning the full d_model space, mutually
+  #                            orthonormal and value-independent.
+  # The value stream is unchanged in all cases.
+  struct_embedding_type: "standard_learnable"
+
+  # Decoupled key/query embedding for the predicted (X) nodes.
+  # In the combined attention each X_i is used BOTH as a key (offered as a
+  # parent to other X_j) and as a query (selecting its own parents).  With a
+  # single shared embedding, updating "X_i-as-child" also perturbs
+  # "X_i-as-parent", so X_i ← S and X_i ← X_j cannot be learned independently.
+  # When True, the X QUERY gets its own free (unconstrained) identity embedding
+  # (FreeQueryEmbedding), removing this coupling.  The X KEY stream keeps its
+  # configured embedding (orthogonal or standard); the value stream is
+  # unchanged.  The query embedding is classified as a STRUCTURAL parameter by
+  # gradient routing (feeds Q only).
+  free_query_embedding: false
+
+  # Initialise the free X query at the centroid of the (projected) keys.
+  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): starting
+  # every query from the SAME point makes it read all candidate parents
+  # uniformly (identical <q, k_j> for an orthonormal key frame), giving HSIC a
+  # symmetric start to break toward the TRUE parents before the directional
+  # budget saturates — instead of falling into an early spurious basin.
+  # Only the X QUERY embedding is written (the query projection W_q is left
+  # untouched and inverted via least squares when present), so it works both
+  # WITH and WITHOUT the query/key projections; when the KEY projection is used
+  # the centroid is taken in the projected key space, so it adapts accordingly.
+  # Requires free_query_embedding=true.  The write happens lazily on the first
+  # training batch (value-modulated key embeddings need real data) and is NOT
+  # re-applied on warm-start/resume (a trained query is never clobbered).
+  query_centroid_init: false
+
+  # Centroid-collapse fix (GatedCrossAttention / split GatedSelfAttention).
+
+  # When True, L2-normalise the STRUCTURAL query before scoring and replace the
+  # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  Rationale
+  # (see diagnose_block_dags / simulate_centroid_collapse): with a FREE query
+  # norm the cheapest way to raise a child's parent-scores is to align the query
+  # with the all-keys centroid, which lights EVERY key at once → a "block" row.
+  # Normalising the query makes its DIRECTION (not its unbounded norm) drive
+  # parent selection, so a flat centroid row no longer wins.  Pair with a
+  # positive gate offset (init_gamma < -init_zeta) so an undecided raw≈0 key
+  # defaults OFF.
+  # Structure gate only — never touches the value / reconstruction-gain streams.
+  normalize_query: false
+
+  # ``query_fanin_scale`` (F) is the score temperature of the capped path.  Keep
+  # it "auto": F = n_keys * (x/M)^2 is DERIVED from the data at load time
+  # (causaliT/utils/query_norm.py::resolve_query_fanin_scale), because F SCALES
+  # WITH THE NODE COUNT - a value tuned for 10 nodes under-scores a 400-node row
+  # by 40x.  A literal float pins it instead (legacy runs reproduce exactly).
+  query_fanin_scale: auto
+  # The single knob behind the derivation: the edge posterior P(z>0) that a
+  # CENTROID-initialised query gives EVERY candidate parent.  It is a
+  # probability, so 1.0 is unreachable (asymptotic sigmoid); use 0.5-0.9.
+  # Higher = hotter scores = more init mass on every edge.
+  query_centroid_max_p: 0.9
+
+  # --- The two front-door keys: query_norm and fanin_prior ---------------
+  # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
+  # Everything else on the normalised-query path is DERIVED from these two and
+  # from the node count N, by query_norm.resolve_query_norm at data-load time.
+  #
+  # ``query_norm: true`` is a MASTER SWITCH.  It overwrites normalize_query,
+  # query_centroid_init (following free_query_embedding), query_norm_learnable,
+  # query_norm_init_scale and query_fanin_scale with the consistent set, so the
+  # five keys below it no longer have to be kept in sync by hand.  The scale is
+  # F^2 = N*x(p*)^2, i.e. the centroid init gives EVERY candidate parent the
+  # posterior query_centroid_max_p whatever N is.  An explicit numeric
+  # query_fanin_scale still wins (legacy runs reproduce exactly).
+  query_norm: false
+  #
+  # ``fanin_prior: K*`` declares a PRIOR on the in-degree, in EDGES.  By Lemma 1
+  # a row with budget M_i holds at most (M_i*F/x(p*))^2 parents at p*, so at
+  # M_i = 1 the capacity is N: no cap at all.  The prior is priced by lowering
+  # the over-spend TARGET to mu = sqrt(K*/N) - NOT by shrinking F, which would
+  # decay the init signal like sqrt(K*/N) and can close the gate outright.
+  # null = disabled.  Requires query_norm: true and lambda_query_norm > 0
+  # (a prior with a zero weight is silently inert, so it raises instead).
+  # For the random ER-k DAGs use er_indegree_quantile(n, degree, 0.95) - about
+  # 10 for ER-4 - NOT ``degree`` itself: the mean in-degree is k, but the last
+  # topological node already expects 2k parents and the max is larger still.
+  fanin_prior: null
+
+
+
+
+  # Adaptive learnable per-node query-norm budget (only active when
+  # normalize_query=true).  See causaliT/utils/query_norm.py.  Plain
+  # unit-normalisation HARD-caps the directional budget
+  # (sum_j cos^2(q_hat, k_j) <= 1); the SELF_ATTENTION spurious-S3->X4 study
+  # showed a node sometimes needs to OVERSPEND that budget (host several parents
+  # at once), and — after removing W_q/W_K — this saturation bites LATE, past any
+  # preset epoch window.  Instead of an epoch schedule, each child i owns a
+  # learnable multiplier ``M_i = exp(log_scale_i)`` (init ``query_norm_init_scale``)
+  # scaling its unit query: ``q_eff = (q/||q||) * M_i``.  The structural loss
+  # charges ``lambda_query_norm * sum_i relu(M_i - query_norm_target)^2`` so a
+  # node raises its own budget only when the structural signal (HSIC / L0) pays
+  # for it, exactly when saturation actually bites.  Disabled (or init_scale=1.0
+  # with lambda_query_norm=0) reproduces plain unit-normalisation.
+  query_norm_learnable: false
+  query_norm_init_scale: 1.0
+  query_norm_target: 1.0
+
+  # Reconstruction-gain bypass (GatedCrossAttention / GatedSelfAttention only).
+  # By default (true) the final attention weight is the causal structure gate
+  # MULTIPLIED by a learnable reconstruction gain: A = z * g.  When set to false
+  # the gain is bypassed entirely and the structure gate becomes the final
+  # attention score (A = z), i.e. the reconstruction magnitude is carried solely
+  # by the value stream.  Ignored for non-gated attention types.
+  use_gain: true
+
+  # Value-structure injection (SVFA only).  By default ("none") the value
+  # projection depends on DATA ONLY (standard Structure-Value Factorized
+  # attention), so W_V cannot learn a per-source-node functional.  When set, a
+  # per-SOURCE-node identity code is CONCATENATED onto the value before W_V
+  # (V_j = W_V([v_j ; e_j])), letting the shared W_V specialise per parent while
+  # preserving SVFA's source-shared value.  One of:
+  #   "none"            — disabled (default; original data-only value).
+  #   "separate"        — dedicated reconstruction-routed identity tables.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  Identity tables are classified as
+  # RECONSTRUCTION parameters by gradient routing.
+  value_structure_injection: "none"
+
+  # Value-structure QUERY injection (SVFA only).  Complements
+  # ``value_structure_injection`` (which keys the value on the SOURCE/parent
+  # node) by additionally conditioning the value on the QUERY (child) node.
+  # A per-child identity code is mapped by a dedicated bias-free W_V^q and ADDED
+  # to the value output, so the shared W_V can learn DIFFERENT functionals of the
+  # same parent depending on which child it feeds (e.g. X2 predicting X4 vs X5).
+  # Because the query term is key-independent it factors out of the softmax as
+  # ``(sum_j A_ij) * W_V^q(e_i)`` — an exact, memory-cheap decomposition. One of:
+  #   "none"            — disabled (default; value independent of the child).
+  #   "separate"        — dedicated reconstruction-routed child identity table.
+  #   "struct_detached" — reuse the structural identity, detached (0 new params).
+  # Requires comps_embed: "svfa".  The W_V^q projection and the identity table
+  # are classified as RECONSTRUCTION parameters by gradient routing.
+  value_structure_query_injection: "none"
+
+  # Direction-aware X→X self-attention block.  MANDATORY (the legacy
+  # "one combined cross block also models X→X" variant was removed because it
+  # cannot express edge direction — double-edges / two-cycles): passing null
+  # raises ValueError.  The X→X interaction is always a dedicated
+  # direction-aware self block whose antisymmetric direction gate suppresses
+  # two-cycles.  In homogeneous mode (see homogeneous_nodes below) this type
+  # builds the SINGLE square (N, N) block.  One of:
+  #   "GatedSelfAttention"       — SYMMETRIC Hard-Concrete existence gate (on the
+  #                                symmetric Toeplitz part) x antisymmetric
+  #                                direction gate x reconstruction gain.
+  #   "CommutatorSelfAttention"  — UNIFIED existence gate: an ASYMMETRIC
+  #                                Hard-Concrete L0 gate applied directly to the
+  #                                raw alignment score (identical mechanism/L0
+  #                                semantics to the S→X GatedCrossAttention),
+  #                                x the same antisymmetric direction gate x gain.
+  #                                Prefer this to keep S→X and X→X edge existence
+  #                                on ONE gating code path.
+  self_attention_type: "GatedSelfAttention"
+
+  # ------------------------------------------------------------------
+  # Node topology: heterogeneous (default) vs homogeneous nodes
+  # ------------------------------------------------------------------
+  # false — SPLIT (default).  The S/X prior is kept: only the L_X variables are
+  #         children.  ``attention`` is the S→X cross block (attention_type) and
+  #         ``self_attention`` the direction-aware X→X block
+  #         (self_attention_type); the posterior is (B, L_X, L_S+L_X).
+  # true  — HOMOGENEOUS.  The S/X prior is DROPPED: [S ; X] is one set of
+  #         N = L_S + L_X nodes, each simultaneously a value-blanked query and
+  #         an actual-value key/value.  ONE square block is built from
+  #         ``self_attention_type`` and the posterior is the full directed
+  #         (B, N, N) adjacency; the S variables are reconstructed too.
+  #
+  # In homogeneous mode:
+  #   * ``attention_type`` is IGNORED (only the self block is built);
+  #   * ``self_attention_type`` is REQUIRED (it is mandatory in both modes);
+  #   * ``shared_query`` / ``shared_key`` MUST be false — a single block shares
+  #     its projections by construction, so setting them raises ValueError.
+  homogeneous_nodes: false
+  # Direction-gate Binary-Concrete temperature of the self block's
+  # antisymmetric term (GatedSelfAttention / CommutatorSelfAttention only).
+  # Lower = sharper direction commitment.  The default 2/3 (Louizos et al.,
+  # ICLR 2018) places the 0.9-posterior point at ln(9)*2/3 ~= 1.465, just below
+  # the existence-gate saturation logit kappa_1 ~= 1.5223, so an edge's
+  # DIRECTION commits slightly before its EXISTENCE saturates (see
+  # docs/documentation/ATTENTION_TEMPERATURES.md).  The legacy key ``dir_tau``
+  # remains accepted as a fallback when dir_tau_self is unset.
+  dir_tau_self: 0.6666666667
+
+
+  # Shared structural query projection (W_q) across the S→X cross block and the
+  # X→X self block.  SPLIT MODE ONLY (requires ``self_attention_type`` set).
+
+  # When true, the self block does NOT own its own W_q; the cross block's W_q is
+  # applied to the X structural identity and fed to the self block as a
+  # pre-projected query.  This ties "how a child reads a candidate parent" to a
+  # SINGLE projection whether the parent is an S or an X node, so the S→X and
+  # X→X selectors share one query geometry (fewer params, consistent selection).
+  #   false — each block owns an independent W_q (default, original behaviour).
+  #   true  — one shared W_q across both blocks.
+  shared_query: false
+
+  # --- Remove / freeze the structural query & key projections (W_q / W_K) ---
+  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): the
+  # shared query projection W_q couples every node's query together and aligns
+  # them to the keys, "numbing" the per-node query embeddings (they receive a
+  # single-node gradient while W_q aggregates all nodes).  These levers let the
+  # query/key be read DIRECTLY from the (identity) embeddings.
+  #   remove_query_projection — drop W_q entirely: the structural query is the
+  #     raw query embedding (Q = e_q).  Requires d_qk == d_model.
+  #   remove_key_projection   — drop W_K entirely: the structural key is the raw
+  #     key embedding (K = e_k).  Requires d_qk == d_model.
+  #   freeze_query_projection — keep W_q but set requires_grad=False (frozen at
+  #     init); the freeze persists across adaptive phase switches.
+  #   freeze_key_projection   — same, for W_K.
+  # ``remove_*`` and ``freeze_*`` for the same stream are mutually exclusive
+  # (removing already means "no learnable projection").  Threaded into BOTH the
+  # S->X cross block and (when split) the X->X self block; on the self block
+  # they are a no-op whenever it borrows the projection via shared_query /
+  # shared_key (the shared W_q / W_K then lives in — and is removed/frozen on —
+  # the cross block).
+  remove_query_projection: false
+  remove_key_projection: false
+  freeze_query_projection: false
+  freeze_key_projection: false
+
+
+model:
+
+
+
+
+  model_object: "AttentionSelectorLayer"
+
+  embed_dim:
+    d_model_set: ${experiment.d_model_set}
+    val_emb_hidden: ${experiment.d_model_set}
+    var_emb_hidden: ${experiment.d_model_set}
+
+  kwargs:
+    model: ${model.model_object}
+
+    # S embedding (actual values used as keys)
+    ds_embed_S:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_S}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: false
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_S: ${experiment.comps_embed}
+
+    # X embedding — SAME module used for both:
+    #   queries (blanked: value=0, only variable identity)
+    #   keys    (actual: value + variable identity)
+    ds_embed_X:
+      setting:
+        d_model: ${model.embed_dim.d_model_set}
+        sparse_grad: false
+      modules:
+        - idx: ${data.feature_indices.value}
+          embed: "linear"
+          label: "value"
+          role: "value"
+          kwargs:
+            input_dim: 1
+            embedding_dim: ${model.embed_dim.val_emb_hidden}
+        - idx: ${data.feature_indices.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          role: "structure"
+          kwargs:
+            num_embeddings: ${data.num_embeddings_X}
+            embedding_dim: ${model.embed_dim.var_emb_hidden}
+            padding_idx: 0
+            sparse: ${model.kwargs.ds_embed_X.setting.sparse_grad}
+            max_norm: 1
+        - idx: ${data.feature_indices.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+
+    comps_embed_X: ${experiment.comps_embed}
+
+    # Attention
+    attention_type: ${experiment.attention_type}
+    n_heads: ${experiment.n_heads}
+    # Harmonized temperatures; see the experiment block for the derivation.
+    init_tau: ${experiment.init_tau}
+    init_tau_cross: ${experiment.init_tau_cross}
+    init_tau_self: ${experiment.init_tau_self}
+    init_gamma: ${experiment.init_gamma}
+    init_zeta: ${experiment.init_zeta}
+    shared_dag_across_heads: ${experiment.shared_dag_across_heads}
+
+
+    # Structural embedding variant (Q/K stream); see experiment.struct_embedding_type.
+    struct_embedding_type: ${experiment.struct_embedding_type}
+    # Decoupled X query embedding (Q only); see experiment.free_query_embedding.
+    free_query_embedding: ${experiment.free_query_embedding}
+    # Initialise the free X query at the key centroid; see experiment.query_centroid_init.
+    query_centroid_init: ${experiment.query_centroid_init}
+    # Centroid-collapse fix (structure gate only); see experiment.normalize_query.
+
+    normalize_query: ${experiment.normalize_query}
+    query_fanin_scale: ${experiment.query_fanin_scale}
+    # Adaptive learnable per-node query-norm budget; see experiment.query_norm_learnable.
+    query_norm_learnable: ${experiment.query_norm_learnable}
+    query_norm_init_scale: ${experiment.query_norm_init_scale}
+    query_norm_target: ${experiment.query_norm_target}
+    # Reconstruction-gain bypass (gated attentions only); see experiment.use_gain.
+    use_gain: ${experiment.use_gain}
+    # Value-structure injection (SVFA only); see experiment.value_structure_injection.
+    value_structure_injection: ${experiment.value_structure_injection}
+    # Value-structure QUERY injection (SVFA only); see experiment.value_structure_query_injection.
+    value_structure_query_injection: ${experiment.value_structure_query_injection}
+    # Direction-aware X→X self-attention split; see experiment.self_attention_type.
+    self_attention_type: ${experiment.self_attention_type}
+    # Homogeneous node topology (square (N, N) posterior over [S ; X]);
+    # see experiment.homogeneous_nodes.
+    homogeneous_nodes: ${experiment.homogeneous_nodes}
+    # Direction-gate temperature of the self block's antisymmetric term;
+    # see experiment.dir_tau_self.
+    dir_tau_self: ${experiment.dir_tau_self}
+
+    # Shared structural query projection across cross/self blocks (split only);
+    # see experiment.shared_query.
+    shared_query: ${experiment.shared_query}
+    # Remove / freeze the structural query & key projections (W_q / W_K);
+    # see experiment.remove_query_projection etc.
+    remove_query_projection: ${experiment.remove_query_projection}
+    remove_key_projection: ${experiment.remove_key_projection}
+    freeze_query_projection: ${experiment.freeze_query_projection}
+    freeze_key_projection: ${experiment.freeze_key_projection}
+
+
+
+
+    # Dropout
+
+
+    dropout_emb: ${experiment.dropout}
+    dropout_attn_out: ${experiment.dropout}
+    dropout_ff: ${experiment.dropout}
+    dropout_qkv: ${experiment.dropout}
+    attention_dropout: ${experiment.dropout}
+
+    # Architecture
+    activation: "gelu"
+    norm: "layer"
+    use_final_norm: true
+    device: "cuda"
+
+    # Dimensions
+    out_dim: 1
+    d_ff: ${experiment.d_ff}
+    d_model: ${model.embed_dim.d_model_set}
+    d_qk: ${experiment.d_qk}
+
+    # Sequence lengths
+    S_seq_len: ${data.S_seq_len}
+    X_seq_len: ${data.X_seq_len}
+
+    # Output MLP head
+    output_mlp_layers: 1
+    output_mlp_hidden: ${experiment.d_ff}
+    output_mlp_activation: "relu"
+    output_mlp_dropout: 0.0
+
+
+training:
+  optimizer: "adamw"
+  lr: ${experiment.lr}
+  weight_decay: 0.01
+  use_scheduler: false
+
+  loss_fn: "mse"
+  lambda_recon: 1.0
+
+  # --- Structural reconstruction mixing (convex mix on structural pathway) ---
+  # Convex mix between HSIC and reconstruction on the STRUCTURAL loss (Q/K +
+  # structural embeddings), mirroring SingleCausalForecaster:
+  #   L_struct = (1 - alpha) * HSIC_reg + alpha * loss_recon
+  #              + score_sparse + group_l1 + notears + l0
+  # alpha = lambda_struct_recon in [0, 1]:
+  #   * 0.0 → pure-HSIC structural stream (original behaviour, default).
+  #   * >0  → re-inject a controlled dose of reconstruction signal into the
+  #           structural params.  Motivated by: causal parents must also be
+  #           predictive (aligns with fit-driven NOTEARS/DAG-GNN/GraN-DAG/DCDI).
+  # Only meaningful with use_gradient_routing: true (otherwise reconstruction
+  # already updates every parameter via the total loss).
+  lambda_struct_recon: 0.0
+
+
+  batch_size: ${experiment.batch_size}
+  max_epochs: ${experiment.max_epochs}
+  k_fold: 1
+  seed: 42
+  save_ckpt_every_n_epochs: 10
+
+  # --- Score sparsity (L1 on attention weights) ---
+  # Set >0 to encourage sparse attention (structure recovery).
+  # Recommended range: 0.001 to 0.1.
+  lambda_score_sparse: 0.0
+
+  # --- HSIC regularization (unified over [S, X] source) ---
+  # Minimizes HSIC(source_j, residual_i) for all (i,j) pairs.
+  # Drives residuals towards independence from all candidate parents.
+  # Correct parents: residuals ≈ noise → HSIC → 0.
+  # Wrong parents (descendants/spurious): HSIC > 0 → penalized.
+  # Recommended range: 0.01 to 1.0.
+  lambda_hsic: 1.0
+  hsic_sigma: 1.0
+  hsic_adaptive_bandwidth: true
+  hsic_kernel_source: "rbf"
+  hsic_mode: "biased"
+  nhsic_epsilon: 0.01
+
+  # --- Descendant-excluding HSIC (self-attention block only) --------------
+  # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is
+  # independent of every NON-descendant of i, but NECESSARILY dependent on
+  #   * its DESCENDANTS  (X_j downstream of i is a function of e_i), and
+  #   * X_i itself       (X_i contains e_i).
+  # Averaging those pairs into the HSIC term means the TRUE DAG is NOT a
+  # minimiser of the structural loss: the only way the optimiser can shrink a
+  # descendant term is to stop having r_i = e_i, i.e. to regress X_i on its own
+  # child — the classic "attends to descendants instead of parents" failure.
+  # Excluding Desc(i) U {i} removes that bias and makes the objective
+  # consistent.  The exclusion set is read off the LEARNED directed posterior
+  # (thresholded + transitive closure) and is always DETACHED, so the model can
+  # never create an edge just to delete its own penalty term.
+  #
+  # Only applies to the SELF-attention columns: cross-attention keys are
+  # exogenous S nodes, which can never be descendants of an X node.
+  # Requires self_attention_type: GatedSelfAttention (a DIRECTED posterior is
+  # needed to tell descendants from ancestors); otherwise it is disabled.
+  #
+  # CAUTION — self-confirmation risk: the mask comes from the adjacency that the
+  # masked HSIC is itself training.  Early on the graph is ~random, so masking
+  # can delete exactly the parent signal you are trying to find and lock in a
+  # wrong orientation.  Use warmup / threshold / weight / hops to temper it.
+  #
+  # Suggested experiment ladder (safest -> strongest):
+  #   hops=1,    weight=0.5, warmup=10   ->  hops=1, weight=0.0
+  #   -> hops=null (full closure), weight=0.0
+  hsic_exclude_descendants: false      # master switch (false = legacy behaviour)
+  hsic_descendant_threshold: 0.5       # p_directed above which an edge is "present"
+  hsic_descendant_hops: null           # null = full transitive closure; 1 = direct children only
+  hsic_descendant_exclude_self: true   # also drop the equally-biased HSIC(X_i, r_i) diagonal
+  hsic_descendant_weight: 0.0          # weight GIVEN TO excluded pairs (0 = drop; >0 = soft down-weight)
+  hsic_descendant_warmup_epochs: 0     # no masking for the first N epochs of STRUCTURE
+                                       # learning (the graph is still ~random, so masking
+                                       # would delete the parent signal itself).  Counted
+                                       # from run start under the plain/staged trainers;
+                                       # under the ADAPTIVE trainer it is counted from the
+                                       # first epoch of the FIRST structure phase and is
+                                       # then served once (never re-paid per cycle).
+
+  hsic_descendant_min_kept_frac: 0.25  # collapse guard: if a dense graph would mask more
+                                       # than this, fall back to unmasked HSIC for the step
+                                       # (otherwise the structural gradient dies silently)
+  hsic_descendant_ema: 0.0             # EMA on the adjacency in [0,1) to stop mask thrashing
+  # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic.
+  # NOTE: with masking ON, {stage}_hsic is a MASKED mean whose normalisation set
+  # drifts across epochs, so it is not comparable epoch-to-epoch.  Prefer
+  # kept_frac for health monitoring, and keep this in mind for
+  # ``adaptive_training.hsic_monitor`` and the lambda calibration search.
+
+  # --- Group-L1 (embedding column sparsity) ---
+  lambda_group_l1: 0.0
+
+  # --- L0 regularization (HardConcreteCrossAttention only) ---
+  # Expected number of active edges = sum P(z_ij > 0).  Set >0 to encourage
+  # sparse hard-concrete gates.  Ignored for non-HardConcrete attention types.
+  lambda_l0: 0.0
+
+  # --- Query-norm over-spend penalty (learnable per-node budget) ---
+  # Weight on ``sum_i relu(M_i - query_norm_target)^2`` (see
+  # experiment.query_norm_learnable and causaliT/utils/query_norm.py).  Charged
+  # on the STRUCTURAL loss only.  0.0 lets each budget grow unpenalised; a small
+  # positive value keeps M_i near the target unless the structural signal pays
+  # for over-spending.  Ignored when query_norm_learnable=false.
+  #
+  # With ``experiment.fanin_prior`` set, this is the PRICE OF THE PRIOR and must
+  # be positive (a zero weight makes the prior inert, so the resolver raises).
+  # It is NOT derivable and does NOT transfer across n_keys unless the capacity
+  # penalty form is used - keep it an explicit axis of every experiment.
+  lambda_query_norm: 0.0
+  # STRUCTURE epochs over which the fan-in squeeze walks K(t): n_keys -> K*
+  # (linear in EDGES, so the schedule is interpretable).  Counted from the first
+  # structure phase, never from the global epoch - under adaptive training the
+  # long reconstruct phases would otherwise consume the whole window.
+  #   auto (default) - n_keys - K*, i.e. one edge per structure epoch
+  #   0              - immediate squeeze (the ablation: expect DEFLATED rows,
+  #                    since re-concentrating the budget needs gradient steps)
+  # Ignored when fanin_prior is null.
+  fanin_anneal_epochs: auto
+
+
+  # --- L0 <-> HSIC gradient-interference diagnostic ---
+  # When True AND attention_type == "HardConcreteCrossAttention" AND
+  # lambda_l0 > 0 AND lambda_hsic > 0, log the per-structural-block cosine
+  # similarity between the L0 gradient and the HSIC gradient.  Metrics are
+  # emitted to the CSV logger as ``train_interf_cos_<block>`` for blocks:
+  #   query_projection, key_projection, embedding_S, embedding_X,
+  #   query_embedding_X, attention_internals   (plus ``train_interf_cos_overall``).
+  #   cos ~ +1 -> aligned;  cos ~ 0 -> orthogonal;  cos ~ -1 -> conflict.
+  # The probe uses autograd.grad(retain_graph=True) and never writes .grad,
+  # so it does NOT perturb training.  It runs on the first batch of every
+  # ``interference_log_every_n_epochs`` epochs to keep the overhead low.
+  log_l0_hsic_interference: false
+  interference_log_every_n_epochs: 1
+
+  # --- Gradient routing ---
+  # When True: structural params (Q, K) updated by HSIC + sparsity;
+  #            reconstruction params (V, output, FFN) updated by MSE.
+  # Requires lambda_hsic > 0 or lambda_score_sparse > 0 to be meaningful.
+  use_gradient_routing: ${experiment.use_gradient_routing}
+
+  # Oracle mode: bypass QK^T, use hard mask directly as attention weights.
+  # Useful as an upper-bound reconstruction baseline.
+  use_oracle_attention: false
+
+
+# ---------------------------------------------------------------------------
+# ANM staged training (cross-fit / bilevel data splits)
+# ---------------------------------------------------------------------------
+# Consumed by ``anm_alternating_trainer`` (causaliT.training.anm_staged_trainer)
+# when this config is run via the ANM entry point.  A standard single-run
+# trainer ignores this block, so it is safe to keep in the template.
+#
+# Cross-fit rationale (Double ML / DARTS style "honesty"):
+#   The reconstruction map f and the causal structure are trained on DISJOINT
+#   subsets of the training data.  The residual-independence signal (HSIC) that
+#   drives structure learning is only a valid independence test if residuals are
+#   OUT-OF-SAMPLE w.r.t. the reconstruction fit — otherwise f can memorise the
+#   very samples used to judge independence and bias edge scores toward false
+#   independence.  ``data_split_ratio`` sets the fraction assigned to the
+#   ``recon`` subset (the rest go to ``struct``); validation stays shared.
+#
+# Per-stage key ``data_split``:  "recon" | "struct" | "full"
+#   recon  — reconstruction-warmup stage trains on the recon subset.
+#   struct — structure stage trains (and measures HSIC) on the held-out subset.
+#   full   — (default) use the entire training set = classic joint behaviour.
+anm_training:
+  starting_checkpoint: null      # optional warm-start before stage 0
+  data_split_ratio: 0.5          # fraction of train samples in the "recon" subset
+
+  stages:
+    # Stage 1 — RECON WARMUP: freeze structure (Q/K + gates), fit only V/FFN/MLP
+    #           on the recon subset.
+    - name: recon_warmup
+      max_epochs: ${experiment.max_epochs}
+      lambda_hsic: 0.0
+      lambda_recon: 1.0
+      freeze_structural_params: true
+      freeze_reconstruction_params: false
+      data_split: recon
+      eval_every_n_epochs: 0
+      eval_dag: true
+      evaluation:
+        functions: []
+
+    # Stage 2 — STRUCTURAL LEARNING: freeze reconstruction, let HSIC drive the
+    #           structure on the held-out "struct" subset (out-of-sample residuals).
+    - name: struct_phase
+      max_epochs: ${experiment.max_epochs}
+      lambda_hsic: 1.0
+      lambda_recon: 0.0
+      freeze_structural_params: false
+      freeze_reconstruction_params: true
+      data_split: struct
+      eval_every_n_epochs: 0
+      eval_dag: true
+      evaluation:
+        functions:
+          - eval_train_metrics
+          - eval_attention_selector_scores
+
+
+# ---------------------------------------------------------------------------
+# Consumed by ``adaptive_trainer`` (causaliT.training.adaptive_trainer) when
+# this config is run via the ``adaptivetrain`` CLI entry point.  Unlike
+# ``anm_training`` (fixed per-stage epoch budgets, disk-chained checkpoints),
+# this runs a SINGLE in-memory pl.Trainer.fit() and switches between two
+# mutually-exclusive phases automatically by monitoring a metric:
+#
+#   * reconstruct — train reconstruction params only (structure frozen);
+#                   re-adapt the predictor to the current structure.
+#                   Stops on a validation-metric plateau or an epoch cap.
+#   * structure   — train structural params only (reconstruction frozen);
+#                   keep learning structure against a frozen good predictor.
+#                   Stops when the monitored metric degrades past a threshold
+#                   (default +20% over the per-phase best) or an epoch cap.
+#
+# Requires ``training.use_gradient_routing: true`` (true requires_grad freeze).
+adaptive_training:
+  total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
+  start_phase: reconstruct         # warm up the predictor before structure
+  max_cycles: null                 # OPTIONAL safety cap on structure phases
+                                   # (null = unbounded; total_epoch_budget is
+                                   # the real budget)
+
+  starting_checkpoint: null        # optional warm-start (weights only)
+  reset_optimizer_state_on_switch: false
+  monitor: val_x_mae               # metric driving both phase triggers
+  eval_dag: true                   # capture DAG diagnostics at each switch
+  # Cross-fitting (DML/DARTS honest split): fraction of the training set given
+  # to the reconstruct phase; the disjoint remainder is used by the structure
+  # phase so residual-HSIC is measured out-of-sample w.r.t. the reconstruction
+  # fit.  null (or a value outside the open interval (0, 1)) disables it and
+  # both phases train on the full training set (default behaviour).
+  data_split_ratio: null
+
+
+  reconstruct:
+    max_epochs: 100                # per-phase safety cap
+    min_epochs: 0                  # floor: no plateau early-exit before N epochs
+                                   # (applies to every reconstruct phase)
+    warmup_min_epochs: 0           # larger floor for the INITIAL warmup phase
+                                   # (falls back to min_epochs when unset)
+    plateau_patience: 5            # stop after N val epochs w/o rel. improvement
+    plateau_min_delta: 1.0e-4      # relative improvement threshold
+
+
+  structure:
+    max_epochs: 200                # per-phase safety cap
+    lambda_hsic_cross: 1.0         # translated → lambda_hsic for AttentionSelectorLayer
+    lambda_hsic_self: 0.0
+    drop_pct: 0.20                 # switch when monitor rises 20% over phase best
+    drop_patience: 5
+    # HSIC-plateau early switch: watch the structural signal (``hsic_monitor``,
+    # lower is better) and switch back to reconstruct when it stops improving,
+    # freeing budget for an earlier reconstruction update instead of wasting
+    # epochs on a stalled HSIC.  Reason precedence at the switch is:
+    #   struct_drop (predictor stale) > struct_hsic_plateau > struct_budget (cap).
+    hsic_monitor: val_hsic         # structural signal watched (e.g. val_hsic / train_hsic)
+    hsic_patience: 0               # switch after N val epochs w/o HSIC improvement
+                                   # (0 = disabled; no behaviour change)
+    hsic_min_delta: 1.0e-4         # relative HSIC improvement threshold
+    min_epochs: 0                  # floor: suppress BOTH structure early-exits
+                                   # (struct_drop AND struct_hsic_plateau) before N
+                                   # epochs — guards against early structure-learning
+                                   # latency (the max_epochs cap always takes precedence)
+
+    # --- Descendant-excluding HSIC, PER PHASE (optional) ---
+    # Any of the ``training.hsic_descendant_*`` / ``hsic_exclude_descendants``
+    # keys may be repeated here (and under ``reconstruct:``) to override the
+    # ``training:``-level value while that phase is active.  Keys that are OMITTED
+    # are left untouched, so this block is a pure no-op by default.
+    #
+    # This is the RECOMMENDED curriculum lever for the feature.  The mask is read
+    # off the very adjacency the masked HSIC is training, so enabling it while the
+    # graph is still ~random risks deleting the parent signal and locking in a
+    # wrong orientation.  The adaptive schedule fixes that far better than a raw
+    # epoch count: the first structure phase(s) run unmasked, and the mask is
+    # switched on only once the predictor and adjacency have co-adapted.
+    # ``hsic_descendant_warmup_epochs`` is anchored to the FIRST structure phase:
+    # the controller counts it from that phase's first epoch (NOT from the start
+    # of the run — the reconstruct warmup would otherwise expire it before a
+    # single structural step had run) and marks it served afterwards, so later
+    # structure phases start masked immediately instead of re-paying the delay.
+    # Keep it comfortably below ``min_epochs`` if you want the FIRST phase itself
+    # to train under the mask, since an HSIC-plateau exit can end that phase as
+    # soon as the floor clears.
+
+    #
+    # Example — enable the safest variant during the structure phase only:
+    #   hsic_exclude_descendants: true
+    #   hsic_descendant_hops: 1        # direct children only
+    #   hsic_descendant_weight: 0.5    # soft down-weight rather than a hard drop
+    # The EMA state is reset at every phase switch, so a phase change never
+    # inherits an adjacency smoothed under different settings.
+
+
+
+
+data:
+  dataset: "scm1_continuous"
+  filename_input: "ds.npz"
+
+  train_file: "ds_train.npz"
+  test_file: "ds_test.npz"
+
+  val_idx: ${data.feature_indices.value}
+  test_ds_ixd: null
+  max_data_size: null
+
+  S_seq_len: null
+  X_seq_len: null
+  Y_seq_len: null
+  num_embeddings_S: null
+  num_embeddings_X: null
+  num_embeddings_Y: null
+  num_embeddings_shared: null
+
+  feature_indices:
+    value: null
+    variable: null
+
+
+evaluation:
+  dag_threshold: 0.5
+  functions:
+    - "eval_train_metrics"
+    - "eval_attention_selector_scores"
+
+special:
+  mode: []

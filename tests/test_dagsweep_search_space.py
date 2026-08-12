@@ -281,8 +281,10 @@ def test_fanin_rule_matches_the_closed_form():
     derive_size_fields(config, 10, {
         "experiment.query_fanin_scale": {"rule": "fanin_saturating"},
     })
-    # x_sat = 0.5 * ln(2.1/0.1) + ln 3 = 2.6209 -> F = 10 * x_sat^2 = 68.69
-    assert config.experiment.query_fanin_scale == pytest.approx(68.69, abs=0.01)
+    # T-free: x_sat = kappa_1 = 0.5 * ln(2.1/0.1) = 1.5223 -> F = 10 * x_sat^2 = 23.17
+    # (init_edge_offset no longer enters F; it is the cross-gate init-balance
+    # device resolved separately by resolve_init_edge_offset.)
+    assert config.experiment.query_fanin_scale == pytest.approx(23.17, abs=0.01)
 
     # And it scales linearly with the node count.
     assert saturating_query_fanin(config, 400) == pytest.approx(
@@ -334,9 +336,10 @@ def test_repair_sets_d_qk_when_projections_are_removed():
 
 
 def test_repair_updates_a_stale_fanin_scale():
-    config = _full_config()                        # 68.69, derived for n = 10
+    config = _full_config()                        # 68.69, a stale pinned value
     validate_dimensions(config, n_keys=6)
-    assert config.experiment.query_fanin_scale == pytest.approx(41.21, abs=0.05)
+    # n * kappa_1^2 = 6 * 1.5223^2 = 13.90
+    assert config.experiment.query_fanin_scale == pytest.approx(13.90, abs=0.05)
 
 
 def test_consistent_config_is_left_untouched():

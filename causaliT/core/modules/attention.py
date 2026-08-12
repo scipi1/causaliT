@@ -1353,8 +1353,10 @@ class AttentionLayer(nn.Module):
 
         # Additive init-balancing logit offset on the GatedCrossAttention
         # structure gate only (ignored by all other inner attentions).  See
-        # GatedCrossAttention.init_edge_offset; ln 3 (~1.0986) lands the cross
-        # S->X init edge probability at 0.25 to match a directed self edge.
+        # GatedCrossAttention.init_edge_offset; the config value is resolved by
+        # causaliT.utils.query_norm.resolve_init_edge_offset ("auto" = the
+        # matched offset ln(e^(x-kappa)+2), balancing the cross gate against
+        # the directed self edge) and never enters the F derivation.
         init_edge_offset: float = 0.0,
         gain_tau: float = 1.0,
         dir_tau: float = DEFAULT_DIR_TAU,
@@ -1563,7 +1565,7 @@ class AttentionLayer(nn.Module):
                     gamma=init_gamma,
                     zeta=init_zeta,
                     # Init-balancing offset on the S->X existence gate (lands the
-                    # cross init edge prob at sigmoid(-offset); ln 3 -> 0.25).
+                    # cross init posterior at sigmoid(x - offset - kappa)).
                     init_edge_offset=init_edge_offset,
                     gain_tau=gain_tau,
                     use_gain=use_gain,

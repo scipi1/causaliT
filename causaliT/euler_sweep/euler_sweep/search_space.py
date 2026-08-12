@@ -371,7 +371,7 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
     With a unit-norm query on an orthonormal key frame the centroid logit is
     ``sqrt(F / n)``, and the Hard-Concrete gate saturates (z = 1) at
 
-        x_sat = init_tau * ln((1 - init_gamma) / (init_zeta - 1)) + init_edge_offset
+        x_sat = init_tau * ln((1 - init_gamma) / (init_zeta - 1)) = kappa_1
 
     so ``F = n_keys * x_sat^2``.  F therefore SCALES WITH THE NODE COUNT: a value
     derived for 10 nodes under-scores a 400-node row by a factor of 40.
@@ -381,7 +381,12 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
     in the config is the general alternative: it targets an explicit centroid
     posterior ``query_centroid_max_p`` instead (query_norm.py).
 
-    ``x_sat = kappa_1 + T`` is eq (2e) of
+    The rule is T-FREE: ``init_edge_offset`` (the cross-gate init-balance
+    device, resolved by ``resolve_init_edge_offset``) never enters F.  Note
+    that with a positive cross offset the cross gate then deliberately starts
+    BELOW saturation at the centroid - that is what the offset is for.
+
+    ``x_sat = kappa_1`` is eq (2e) of
     docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md; the
     constant is imported from ``query_norm`` so it has ONE definition.
     """
@@ -393,8 +398,7 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
     tau = gate_tau_from_experiment(exp, homogeneous)
     gamma = float(exp.get("init_gamma", None) or DEFAULT_GATE_GAMMA)
     zeta = float(exp.get("init_zeta", None) or DEFAULT_GATE_ZETA)
-    offset = 0.0 if homogeneous else float(exp.get("init_edge_offset", 0.0) or 0.0)
-    x_sat = kappa_1(tau, gamma, zeta) + offset
+    x_sat = kappa_1(tau, gamma, zeta)
     return float(n_keys) * x_sat ** 2
 
 

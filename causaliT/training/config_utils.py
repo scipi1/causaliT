@@ -11,7 +11,9 @@ from typing import Dict, Any
 from omegaconf import OmegaConf, DictConfig
 
 from causaliT.utils.query_norm import (
+    format_init_edge_offset_log,
     format_query_norm_log,
+    resolve_init_edge_offset,
     resolve_query_fanin_scale,
     resolve_query_norm,
 )
@@ -200,8 +202,15 @@ def populate_seq_lengths_from_dataset(
     if fanin_info is not None:
         print(f"  query_fanin_scale: {fanin_info['query_fanin_scale']:.4f} (auto, "
               f"n_keys={fanin_info['n_keys']}, centroid P(edge)="
-              f"{fanin_info['query_centroid_max_p']:.3g}, "
-              f"edge_offset={fanin_info['init_edge_offset']:.4g})")
+              f"{fanin_info['query_centroid_max_p']:.3g}, T-free)")
+
+    # Init balance between the S->X cross gate and the direction-halved X->X
+    # self gate.  Runs AFTER the F resolution because "auto" (the matched
+    # offset) derives T from the centroid logit x = M*sqrt(F/n_keys).  The
+    # offset is subtracted on the cross gate only and never enters F.
+    offset_info = resolve_init_edge_offset(config, n_keys=n_keys)
+    if offset_info is not None:
+        print(format_init_edge_offset_log(offset_info))
 
     return config
 

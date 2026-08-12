@@ -86,6 +86,13 @@ Settings, code and comments
 `query_norm`: applies the normalization but this should also be the default now
 
 $T$ should be computed automatically when both cross-/self-attention are selected.
+**[Implemented, 2026-08]** — `experiment.init_edge_offset: auto` resolves
+$T = \ln(e^{x-\kappa}+2)$ at data-load time (`resolve_init_edge_offset`), the
+value that lowers the cross gate onto the DIRECTED self posterior $p^*/2$ at
+init; a float pins a legacy ablation, $0$ disables the offset.  Crucially, $T$
+no longer enters $x(p^*)$ in ANY mode: $F$ is T-free
+($x(p^*) = \mathrm{logit}(p^*) + \kappa$ everywhere below), so the capacity
+calculus never sees the offset.
 
 
 
@@ -339,6 +346,13 @@ Three numbers the implementation needs, all consequences of Section 1-2.
 
 ### 3.1 The init gate, and why $F$ must not be shrunk (the guard)
 
+> **Note (2026-08):** the numbers below are the historical arm with $T = \ln 3$
+> folded into $x(p^*)$ ($x = 2.6211$).  The resolved derivation is now T-free,
+> $x(p^*) = 1.5225$, so eq (8) holds with $T = 0$ — and with $\kappa = 0$ the
+> init gate then survives at EVERY size ($z > 0$ for any $\ell > 0$), which
+> strengthens the conclusion.  The point of the guard is unchanged: do not
+> shrink $F$.
+
 The tempting shortcut is to set $F=x(p^*)\sqrt{K^{\star}}$ and be done. It fails,
 because the initialisation is the centroid of **all** $N$ keys, where
 $c_{ij}=1/\sqrt{N}$ by (3a), not $1/\sqrt{K^{\star}}$. Substituting into (2) with
@@ -589,10 +603,23 @@ Arms:
 
 * **`query_centroid_init`** - unchanged by construction, since $\mu(0)=1$ and
   $F=x(p^*)\sqrt{N}$. It is what breaks if $F$ is shrunk instead, eq (8).
-* **homogeneous mode** - `init_edge_offset` is dropped ($T=0$), so $x(p^*)$ is
-  smaller ($1.5225$ instead of $2.6211$), $F$ is smaller by the factor
-  $1.5225/2.6211=0.581$, and the init gate can never die by (2g). All
-  equations hold with $T=0$.
+* **homogeneous mode** - no cross gate exists, so `init_edge_offset` has no
+  consumer ($T=0$).  Since 2026-08 F is T-free in ALL modes ($x(p^*)=1.5225$,
+  never the $2.6211$ of the old T-in-F derivation), and with the offset off the
+  init gate can never die by (2g). All equations hold with $T=0$.
+* **split mode, prior x offset** - a pinned $T>0$ raises the CROSS-side
+  threshold logit from $x(p^*)$ to $x(p^*)+T$, so the capacity that $\mu(t)$
+  prices (Lemma 1, calibrated at $x(p^*)$) is under-delivered on the cross gate
+  by $(x/(x+T))^2$ (~0.2 at the matched value): the prior would over-prune
+  S->X parents.  `FaninPriorSchedule` therefore anneals
+  $T(t)=T_0\,(1-\rho(t))$ to zero on the SAME structure clock
+  (`training.anneal_edge_offset: auto`, the default, only alongside an active
+  prior; `true` forces it without one, `false` disables): the directed-level
+  init balance holds early, and the calibration above is exact again at the end
+  of the squeeze - where, the direction gate having committed, the end state is
+  again balanced at $p^*$.  Side effect: as $T\to 0$ the cross non-parent floor
+  rises from $\sigma(-T)$ to $\sigma(0)=0.5$; any edge with a negative logit
+  stays below the 0.5 eval threshold.
 * **$\ell_0$ / `lambda_l0`** - complementary: $\ell_0$ prices *posterior mass*,
   the fan-in prior prices *how many edges can be confident at once*. The prior
   costs nothing at eval time and does not shift the $\ell_0$ threshold.
@@ -657,7 +684,7 @@ by the forecaster.
 | $\lambda_{\text{qn}}$ | `training.lambda_query_norm` | `attention_selector_forecaster.py` / `self_selector_forecaster.py`, `qn_reg = lambda * penalty` |
 | $\tau$ | `init_tau` | module attr `self.beta` (the code still uses the old name $\beta$ for the temperature) |
 | $\gamma,\zeta$ | `init_gamma`, `init_zeta` | module attrs `self.gamma`, `self.zeta` |
-| $T$ | `init_edge_offset` | module attr `edge_offset`; forced to $0$ when `homogeneous_nodes=True` |
+| $T$ | `init_edge_offset` | module attr `edge_offset`; resolved by `resolve_init_edge_offset` (`auto` = matched $\ln(e^{x-\kappa}+2)$, float = pinned, $0$ = off); never enters $F$; inert when `homogeneous_nodes=True` |
 | $p^*$ | `query_centroid_max_p` (default `DEFAULT_CENTROID_MAX_P = 0.9`) | local `max_p` in `resolve_query_fanin_scale` |
 | $x(p^*)$ | (derived) | local `x` in `query_fanin_scale_from_centroid_p` |
 | $\kappa$ | (derived) | local `stretch` in `query_fanin_scale_from_centroid_p` |

@@ -3,7 +3,11 @@
 F is the only temperature left in the capped scoring path and it SCALES WITH THE
 NODE COUNT, so it must be derived from the data instead of hard-coded.  These
 tests pin the closed form, its inverse (the realised centroid posterior), the
-split-vs-homogeneous offset semantics and the config plumbing.
+T-free semantics (``init_edge_offset`` never enters F; it is resolved on its own
+by ``resolve_init_edge_offset``) and the config plumbing.
+
+The PURE closed form ``query_fanin_scale_from_centroid_p`` keeps its
+``init_edge_offset`` parameter for legacy/ablation use; the RESOLVER passes 0.
 """
 
 import math
@@ -104,7 +108,9 @@ def test_auto_sentinels_are_resolved(sentinel):
     config = _config(query_fanin_scale=sentinel, query_centroid_max_p=0.9)
     info = resolve_query_fanin_scale(config, n_keys=10)
     assert info is not None
-    assert config.experiment.query_fanin_scale == pytest.approx(108.62, rel=1e-3)
+    # T-free: F = n * logit(0.9)^2 = 10 * (ln 9)^2 = 48.28; the configured
+    # init_edge_offset (ln 3 in _config) is NOT read into F.
+    assert config.experiment.query_fanin_scale == pytest.approx(48.28, rel=1e-3)
 
 
 def test_explicit_float_is_never_overwritten():
@@ -120,15 +126,19 @@ def test_default_max_p_is_used_when_unset():
     assert info["query_centroid_max_p"] == DEFAULT_CENTROID_MAX_P
 
 
-def test_homogeneous_mode_drops_the_cross_edge_offset():
-    # init_edge_offset lives only on the S->X cross gate, which does not exist
-    # when the model is one square block over [S ; X].
+def test_the_fanin_scale_never_reads_the_offset():
+    # init_edge_offset is a cross-gate init-balance device resolved separately
+    # (resolve_init_edge_offset); F is identical with it pinned, absent, or in
+    # homogeneous mode (where no cross gate exists at all).
     split = resolve_query_fanin_scale(_config(query_centroid_max_p=0.9), n_keys=10)
     homo = resolve_query_fanin_scale(
         _config(query_centroid_max_p=0.9, homogeneous_nodes=True), n_keys=10)
-    assert split["init_edge_offset"] == pytest.approx(math.log(3.0))
-    assert homo["init_edge_offset"] == 0.0
-    assert homo["query_fanin_scale"] < split["query_fanin_scale"]
+    free = resolve_query_fanin_scale(
+        _config(query_centroid_max_p=0.9, init_edge_offset=0.0), n_keys=10)
+    assert "init_edge_offset" not in split
+    assert "init_edge_offset" not in homo
+    assert split["query_fanin_scale"] == homo["query_fanin_scale"]
+    assert homo["query_fanin_scale"] == free["query_fanin_scale"]
     assert homo["query_fanin_scale"] == pytest.approx(
         10.0 * math.log(9.0) ** 2, rel=1e-9)
 

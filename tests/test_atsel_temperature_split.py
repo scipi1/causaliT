@@ -163,7 +163,7 @@ def test_homogeneous_block_gets_the_SELF_temperatures():
 
 
 def test_gate_tau_from_experiment_resolution_order():
-    # Split mode: the CROSS key wins (it carries init_edge_offset).
+    # Split mode: the CROSS key wins (the F derivation targets the cross gate).
     assert gate_tau_from_experiment(
         {"init_tau_cross": 0.2, "init_tau_self": 0.8, "init_tau": 0.5},
         homogeneous=False,

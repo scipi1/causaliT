@@ -40,6 +40,12 @@ posterior of ``query_centroid_max_p``" - see the derivation on
 ``query_fanin_scale_from_centroid_p`` and
 docs/experimental_elaborations/QUERY_FANIN_SCALE_BUDGET.md.
 
+The derivation is T-FREE by design: ``init_edge_offset`` (the cross-gate
+init-balance offset) never enters F.  It is resolved separately by
+``resolve_init_edge_offset``: ``auto`` lowers the cross gate onto the DIRECTED
+self posterior at init (the matched offset ``ln(exp(x - kappa) + 2)``), a float
+pins a legacy ablation, 0 disables it (existence-level balance only).
+
 Capacity and the fan-in prior
 -----------------------------
 ``F`` is not just a temperature: it is a fan-in CAPACITY measured in edges.
@@ -275,6 +281,25 @@ def set_query_norm_target(model: torch.nn.Module, target: float,
         if form is not None:
             object.__setattr__(m, "query_norm_penalty_form", str(form))
     return len(modules)
+
+
+def set_edge_offset(model: torch.nn.Module, value: float) -> int:
+    """Write ``edge_offset`` (the cross-gate init-balance offset) on every module
+    that owns one, deduplicated by module id.
+
+    Only ``GatedCrossAttention`` carries the attribute, so this is a no-op in
+    homogeneous / cross-only mode.  Idempotent, so it can be re-run on every
+    epoch start.  Returns how many modules were written.
+    """
+    written = 0
+    seen = set()
+    for m in model.modules():
+        if getattr(m, "edge_offset", None) is None or id(m) in seen:
+            continue
+        seen.add(id(m))
+        object.__setattr__(m, "edge_offset", float(value))
+        written += 1
+    return written
 
 
 
@@ -616,13 +641,13 @@ def gate_tau_from_experiment(exp: Any, homogeneous: bool) -> float:
     """Existence-gate temperature of the block the F-derivation targets.
 
     Harmonized split keys win: ``init_tau_cross`` (split mode: the S->X cross
-    gate, where ``init_edge_offset`` lives) or ``init_tau_self`` (homogeneous
-    mode: the single square block IS the self gate).  The legacy shared
-    ``init_tau`` is the fallback so pre-split configs reproduce exactly;
-    ``DEFAULT_GATE_TAU`` is the calculated default.  When the split keys set
-    DIFFERENT cross/self temperatures the shared scale F is derived for the
-    block named above and a warning is emitted: the gates then saturate at
-    different logits, which the single-F capacity calculus cannot represent.
+    gate) or ``init_tau_self`` (homogeneous mode: the single square block IS
+    the self gate).  The legacy shared ``init_tau`` is the fallback so
+    pre-split configs reproduce exactly; ``DEFAULT_GATE_TAU`` is the calculated
+    default.  When the split keys set DIFFERENT cross/self temperatures the
+    shared scale F is derived for the block named above and a warning is
+    emitted: the gates then saturate at different logits, which the single-F
+    capacity calculus cannot represent.
     """
     if not hasattr(exp, "get"):
         return DEFAULT_GATE_TAU
@@ -644,8 +669,8 @@ def gate_tau_from_experiment(exp: Any, homogeneous: bool) -> float:
     ):
         logger.warning(
             "[query-norm] init_tau_cross=%.4g differs from init_tau_self=%.4g: "
-            "query_fanin_scale is derived for the CROSS gate (the one carrying "
-            "init_edge_offset); the self gate saturates at a different logit.",
+            "query_fanin_scale is derived for the CROSS gate temperature; the "
+            "self gate saturates at a different logit.",
             primary, secondary,
         )
     return float(tau)
@@ -655,10 +680,12 @@ def resolve_query_fanin_scale(config: Any, n_keys: int) -> Optional[Dict[str, An
 
     """Fill ``experiment.query_fanin_scale`` IN PLACE when it is ``auto``.
 
-    ``init_edge_offset`` lives ONLY on the S->X ``GatedCrossAttention`` gate, so
-    it is dropped in ``homogeneous_nodes`` mode (one square block, no cross
-    block).  An explicit numeric ``query_fanin_scale`` is always honoured (old
-    configs reproduce exactly) and returns ``None``.
+    The derivation is T-FREE: F places the offset-free EXISTENCE posterior of
+    both gates at ``query_centroid_max_p`` at the centroid init, so
+    ``init_edge_offset`` (the cross-gate init-balance device) is never read
+    here - it is resolved on its own by ``resolve_init_edge_offset``.  An
+    explicit numeric ``query_fanin_scale`` is always honoured (old configs
+    reproduce exactly) and returns ``None``.
     """
     exp = config.get("experiment", None) if hasattr(config, "get") else None
     if exp is None or "query_fanin_scale" not in exp:
@@ -671,7 +698,6 @@ def resolve_query_fanin_scale(config: Any, n_keys: int) -> Optional[Dict[str, An
         return default if value is None else value
 
     homogeneous = bool(_get("homogeneous_nodes", False))
-    offset = 0.0 if homogeneous else float(_get("init_edge_offset", 0.0))
     max_p = float(_get("query_centroid_max_p", DEFAULT_CENTROID_MAX_P))
     fanin = query_fanin_scale_from_centroid_p(
         n_keys=n_keys,
@@ -679,13 +705,191 @@ def resolve_query_fanin_scale(config: Any, n_keys: int) -> Optional[Dict[str, An
         init_tau=gate_tau_from_experiment(exp, homogeneous),
         init_gamma=float(_get("init_gamma", DEFAULT_GATE_GAMMA)),
         init_zeta=float(_get("init_zeta", DEFAULT_GATE_ZETA)),
-        init_edge_offset=offset,
+        init_edge_offset=0.0,
         query_norm_init_scale=float(_get("query_norm_init_scale", 1.0)),
     )
 
     exp["query_fanin_scale"] = fanin
     return {"query_fanin_scale": fanin, "n_keys": int(n_keys),
-            "query_centroid_max_p": max_p, "init_edge_offset": offset}
+            "query_centroid_max_p": max_p}
+
+
+# =============================================================================
+# Init balance: the cross-gate offset (init_edge_offset)
+# =============================================================================
+
+def is_auto_offset(value: Any) -> bool:
+    """True when ``init_edge_offset`` asks for the matched value (``auto``)."""
+    return isinstance(value, str) and value.strip().lower() in ("auto", "matched")
+
+
+def matched_edge_offset(x: float, kappa: float = 0.0) -> float:
+    """Cross-gate offset matching the cross posterior to the DIRECTED self edge.
+
+    At the centroid init both gates see the same logit ``x`` (one global F, one
+    orthonormal frame).  The split-mode self block factors the directed X->X
+    posterior as ``p_exist * d`` with an undecided direction gate at init
+    (``d = 0.5``), so a self edge starts at ``0.5 * sigmoid(x - kappa)`` while
+    the direction-free cross gate starts at ``sigmoid(x - kappa)``.  Solving
+    ``sigmoid(x - kappa - T) = 0.5 * sigmoid(x - kappa)`` for the cross offset
+    gives ``T = ln(exp(x - kappa) + 2)`` - the "matched offset" of
+    docs/experimental_elaborations/QUERY_FANIN_SCALE_BUDGET.md (Section 7.2).
+    """
+    return math.log(math.exp(float(x) - float(kappa)) + 2.0)
+
+
+def resolve_init_edge_offset(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
+    """Resolve ``experiment.init_edge_offset`` IN PLACE (off / auto / pinned).
+
+    The offset is SUBTRACTED on the S->X ``GatedCrossAttention`` gate only and
+    balances its init posterior against the direction-halved X->X self edge.
+    It never enters the ``query_fanin_scale`` (F) derivation - F is calibrated
+    for the offset-free EXISTENCE posterior ``query_centroid_max_p`` of both
+    gates.
+
+    Modes:
+
+    * unset / None / 0.0 -> ``0.0``: no offset.  Both existence gates start at
+      p*; the directed self edge starts at p*/2 (existence-level balance).
+    * ``"auto"`` -> the MATCHED offset ``T = ln(exp(x - kappa) + 2)`` with
+      ``x = query_norm_init_scale * sqrt(query_fanin_scale / n_keys)`` the
+      centroid logit: the cross gate is lowered onto the DIRECTED self
+      posterior, so both blocks start at the same directed level
+      ``sigmoid(x - kappa) / 2`` (directed-level balance).  Requires split mode
+      with a ``GatedCrossAttention`` cross block (else the offset has no
+      consumer), ``normalize_query=True`` and an ALREADY-RESOLVED numeric
+      ``query_fanin_scale`` - so this must run after ``resolve_query_norm`` /
+      ``resolve_query_fanin_scale``.
+    * a float -> pinned value (legacy ablation), honoured verbatim.  Note the
+      deterministic cross gate starts CLOSED whenever the pinned offset pushes
+      the centroid logit below the opening threshold (posterior < 0.5).
+
+    Returns an info dict for the startup log, or ``None`` when the key is
+    absent from the config.
+    """
+    exp = config.get("experiment", None) if hasattr(config, "get") else None
+    if exp is None or "init_edge_offset" not in exp:
+        return None
+
+    def _get(key, default):
+        value = exp.get(key, default)
+        return default if value is None else value
+
+    _unstruct(config)
+    raw = exp.get("init_edge_offset", None)
+    n = int(n_keys)
+
+    homogeneous = bool(_get("homogeneous_nodes", False))
+    has_self_block = _get("self_attention_type", None) is not None
+    cross_is_gated = str(_get("attention_type", "")) == "GatedCrossAttention"
+    applicable = (not homogeneous) and has_self_block and cross_is_gated
+
+    # --- centroid logit x and the gate constants (when computable) ----------
+    fanin_raw = exp.get("query_fanin_scale", None)
+    fanin_resolved = fanin_raw is not None and not is_auto_fanin(fanin_raw)
+    tau = gate_tau_from_experiment(exp, homogeneous)
+    gamma = float(_get("init_gamma", DEFAULT_GATE_GAMMA))
+    zeta = float(_get("init_zeta", DEFAULT_GATE_ZETA))
+    kap = kappa(tau, gamma, zeta)
+    x: Optional[float] = None
+    if fanin_resolved:
+        x = (float(_get("query_norm_init_scale", 1.0))
+             * math.sqrt(float(fanin_raw) / float(n)))
+
+    def _posteriors(offset: float) -> Dict[str, Optional[float]]:
+        if x is None:
+            return {"p_cross": None, "p_self_existence": None,
+                    "p_self_directed": None, "z_cross": None}
+        _, pi_cross, z_cross = init_gate_at_centroid(
+            n, n, x, tau, gamma, zeta, offset)
+        _, pi_exist, _ = init_gate_at_centroid(
+            n, n, x, tau, gamma, zeta, 0.0)
+        return {"p_cross": pi_cross, "p_self_existence": pi_exist,
+                "p_self_directed": 0.5 * pi_exist, "z_cross": z_cross}
+
+    # --- off ---------------------------------------------------------------
+    if raw is None or (not is_auto_offset(raw) and float(raw) == 0.0):
+        exp["init_edge_offset"] = 0.0
+        info = {"mode": "off", "init_edge_offset": 0.0, "n_keys": n,
+                "x": x, "kappa": kap}
+        info.update(_posteriors(0.0))
+        return info
+
+    # --- auto: the matched offset ------------------------------------------
+    if is_auto_offset(raw):
+        if not applicable:
+            logger.warning(
+                "[init-balance] init_edge_offset='auto' ignored: there is no "
+                "S->X GatedCrossAttention / X->X self pair to balance "
+                "(homogeneous_nodes=%s, self_attention_type=%s, attention_type=%s). "
+                "Forced to 0.0.",
+                homogeneous, _get("self_attention_type", None),
+                _get("attention_type", None),
+            )
+            exp["init_edge_offset"] = 0.0
+            info = {"mode": "off", "init_edge_offset": 0.0, "n_keys": n,
+                    "x": x, "kappa": kap}
+            info.update(_posteriors(0.0))
+            return info
+        if not bool(_get("normalize_query", False)):
+            raise ValueError(
+                "init_edge_offset='auto' needs normalize_query=True: the matched "
+                "offset T = ln(exp(x - kappa) + 2) is derived from the centroid "
+                "logit x = M*sqrt(F/N), which only exists on the normalised-query "
+                "path."
+            )
+        if not fanin_resolved:
+            raise ValueError(
+                "init_edge_offset='auto' needs a resolved numeric "
+                "query_fanin_scale (it derives T from the centroid logit "
+                "x = M*sqrt(F/N)).  Run resolve_query_fanin_scale / "
+                "resolve_query_norm first (populate_seq_lengths_from_dataset "
+                "does), or pin query_fanin_scale to a float."
+            )
+        offset = matched_edge_offset(x, kap)
+        exp["init_edge_offset"] = offset
+        info = {"mode": "auto", "init_edge_offset": offset, "n_keys": n,
+                "x": x, "kappa": kap}
+        info.update(_posteriors(offset))
+        return info
+
+    # --- pinned float (legacy ablation) -------------------------------------
+    offset = float(raw)
+    if not applicable and offset != 0.0:
+        logger.warning(
+            "[init-balance] init_edge_offset=%.4g is inert here: only the S->X "
+            "GatedCrossAttention gate consumes it (homogeneous_nodes=%s, "
+            "self_attention_type=%s, attention_type=%s).",
+            offset, homogeneous, _get("self_attention_type", None),
+            _get("attention_type", None),
+        )
+    info = {"mode": "pinned", "init_edge_offset": offset, "n_keys": n,
+            "x": x, "kappa": kap}
+    info.update(_posteriors(offset))
+    return info
+
+
+def format_init_edge_offset_log(info: Dict[str, Any]) -> str:
+    """Human-readable startup line for ``resolve_init_edge_offset``'s dict."""
+    mode = info["mode"]
+    x, kap = info["x"], info["kappa"]
+    if x is None:
+        return (f"[init-balance] init_edge_offset={info['init_edge_offset']:.4g} "
+                f"({mode}); centroid logit unavailable (query_fanin_scale "
+                "unresolved).")
+    p_exist = info["p_self_existence"]
+    base = (f"[init-balance] x={x:.4f} kappa={kap:.4g} | self existence "
+            f"P={p_exist:.4f}, directed P={info['p_self_directed']:.4f}")
+    if mode == "off":
+        return (base + " | init_edge_offset=0 (off): cross P="
+                f"{info['p_cross']:.4f} -> existence-level balance "
+                "(the directed self edge starts halved).")
+    z_state = "CLOSED" if info["z_cross"] <= 0.0 else (
+        "saturated" if info["z_cross"] >= 1.0 else "open")
+    tag = "matched" if mode == "auto" else "pinned"
+    return (base + f" | init_edge_offset={info['init_edge_offset']:.4f} ({tag}): "
+            f"cross P={info['p_cross']:.4f} (z_init={info['z_cross']:.3f}, "
+            f"{z_state}) -> directed-level balance.")
 
 
 # =============================================================================
@@ -762,7 +966,9 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
     gamma = float(_get("init_gamma", DEFAULT_GATE_GAMMA))
     zeta = float(_get("init_zeta", DEFAULT_GATE_ZETA))
 
-    offset = 0.0 if homogeneous else float(_get("init_edge_offset", 0.0))
+    # F is T-FREE: the cross init-balance offset never enters x(p*); it is
+    # resolved separately by resolve_init_edge_offset.
+    offset = 0.0
     p_star = float(_get("query_centroid_max_p", DEFAULT_CENTROID_MAX_P))
     x = x_of_p(p_star, tau, gamma, zeta, offset)
 
@@ -770,11 +976,10 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
         raise ValueError(
             f"query_centroid_max_p={p_star} closes the deterministic gate at "
             f"initialisation: with the centroid init the logit is x(p*)={x:.4g} "
-            f"and the gate opens only above T+kappa="
-            f"{offset + kappa(tau, gamma, zeta):.4g} (eq 2g), which needs p* > 0.5. "
+            f"and the gate opens only above kappa="
+            f"{kappa(tau, gamma, zeta):.4g} (eq 2g), which needs p* > 0.5. "
             "Raise query_centroid_max_p (>= "
-            f"{p_at_saturation(tau, gamma, zeta):.4f} also saturates it) or drop "
-            "init_edge_offset."
+            f"{p_at_saturation(tau, gamma, zeta):.4f} also saturates it)."
         )
     p_sat = p_at_saturation(tau, gamma, zeta)
     if p_star < p_sat:
@@ -871,7 +1076,6 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
         "x": x,
         "kappa": kappa(tau, gamma, zeta),
         "kappa_1": kappa_1(tau, gamma, zeta),
-        "init_edge_offset": offset,
         "F": f_scale,
         "query_fanin_scale": float(exp["query_fanin_scale"]),
         "query_fanin_scale_explicit": fanin_explicit,
@@ -902,6 +1106,21 @@ class FaninPriorSchedule:
     only advances while ``in_structure_phase`` is True (the adaptive trainer
     flips it; the plain trainers leave it True forever, which reproduces the
     global-epoch behaviour exactly).
+
+    The cross-gate init-balance offset T (``init_edge_offset``) can anneal to
+    zero on the SAME clock (``training.anneal_edge_offset``).  Rationale: T
+    raises the cross-side threshold logit from ``x(p*)`` to ``x(p*) + T``, so
+    the capacity that ``mu(t)`` prices (Lemma 1, calibrated at ``x(p*)``) is
+    under-delivered on the cross gate by the factor ``(x / (x + T))^2`` - the
+    prior would over-prune S->X parents.  Annealing ``T(t) = T0 * (1 - rho(t))``
+    keeps the directed-level init balance early and restores the exact
+    calibration at the end of the squeeze (where, the direction gate having
+    committed, the end state is again balanced at p*).  The default ``auto``
+    anneals ONLY alongside an active fan-in prior; ``true`` forces the anneal
+    even without one (over ``fanin_anneal_epochs``); ``false`` never anneals.
+    Note the rising side effect: as T -> 0 the cross non-parent floor goes from
+    ``sigmoid(-T)`` to ``sigmoid(0) = 0.5`` (the homogeneous-mode floor); any
+    edge with a negative logit stays below the 0.5 eval threshold.
     """
 
     def __init__(self, config: Any, n_keys: int):
@@ -925,23 +1144,75 @@ class FaninPriorSchedule:
         self.k_t = float(self.n_keys)
         self.mu_t = 1.0
 
+        # --- Cross-gate offset anneal (T -> 0 on the same clock) ------------
+        # init_edge_offset is expected RESOLVED to a float here (that happens
+        # in populate_seq_lengths_from_dataset, before the forecaster is built).
+        offset_raw = exp.get("init_edge_offset", 0.0) if hasattr(exp, "get") else 0.0
+        if is_auto_offset(offset_raw):
+            raise ValueError(
+                f"init_edge_offset={offset_raw!r} was never resolved to a number. "
+                "It is derived by causaliT.utils.query_norm."
+                "resolve_init_edge_offset, which runs in "
+                "populate_seq_lengths_from_dataset; build the forecaster from "
+                "a config passed through that hook, or set an explicit float."
+            )
+        self.offset0 = float(offset_raw or 0.0)
+        mode_raw = (train.get("anneal_edge_offset", "auto")
+                    if hasattr(train, "get") else "auto")
+        self.offset_anneal_mode = (
+            "auto" if mode_raw is None else str(mode_raw).strip().lower()
+        )
+        if self.offset_anneal_mode not in ("auto", "true", "false"):
+            raise ValueError(
+                f"training.anneal_edge_offset={mode_raw!r} must be one of "
+                "'auto' | 'true' | 'false'."
+            )
+        self.offset_t = self.offset0
+
     @property
     def enabled(self) -> bool:
         return self.k_star is not None and self.k_star < self.n_keys
 
+    @property
+    def offset_annealing(self) -> bool:
+        """Whether the cross-gate offset T anneals to zero on structural time.
+
+        ``false`` -> never; no offset -> nothing to anneal; ``true`` -> always
+        (over ``fanin_anneal_epochs``); ``auto`` (default) -> only alongside an
+        active fan-in prior.
+        """
+        if self.offset0 <= 0.0 or self.offset_anneal_mode == "false":
+            return False
+        if self.offset_anneal_mode == "true":
+            return True
+        return self.enabled
+
     def on_epoch_start(self, model: torch.nn.Module) -> None:
-        """Write ``mu(t)`` on every module, then advance the structural clock.
+        """Write ``mu(t)`` (and the decaying ``edge_offset``), then advance the clock.
 
         Idempotent, so it is safe to re-run on a phase switch.  The write
-        happens BEFORE the increment, so epoch 0 sees ``mu(0) = 1`` exactly and
-        the initialisation is never destroyed.
+        happens BEFORE the increment, so epoch 0 sees ``mu(0) = 1`` and
+        ``T(0) = T0`` exactly and the initialisation is never destroyed.
         """
-        if not self.enabled:
-            return
-        self.k_t, self.mu_t = capacity_schedule(
-            self.struct_epoch, self.anneal_epochs, self.n_keys, self.k_star)
-        set_query_norm_target(model, self.mu_t, self.penalty_form)
-        if self.in_structure_phase:
+        active = False
+        if self.enabled:
+            self.k_t, self.mu_t = capacity_schedule(
+                self.struct_epoch, self.anneal_epochs, self.n_keys, self.k_star)
+            set_query_norm_target(model, self.mu_t, self.penalty_form)
+            active = True
+        if self.offset_annealing:
+            if self.enabled:
+                # rho(t) of the capacity ramp: 0 at epoch 0, 1 at K(t) = K*.
+                rho = ((self.n_keys - self.k_t)
+                       / max(self.n_keys - self.k_star, 1e-12))
+            else:
+                rho = (1.0 if self.anneal_epochs <= 0 else
+                       min(max(float(self.struct_epoch)
+                               / float(self.anneal_epochs), 0.0), 1.0))
+            self.offset_t = self.offset0 * (1.0 - rho)
+            set_edge_offset(model, self.offset_t)
+            active = True
+        if active and self.in_structure_phase:
             self.struct_epoch += 1
 
     def metrics(self, model: torch.nn.Module) -> Dict[str, float]:
@@ -950,12 +1221,15 @@ class FaninPriorSchedule:
         ``cap_actual_edges`` is the fan-in the average row could hold at ``p*``
         with its CURRENT budget (Lemma 1); it should track ``cap_target_edges``
         down if the squeeze prunes, and the gap is the buy-out of eq (11).
+        ``edge_offset`` is the current cross-gate offset T(t) of the anneal.
         """
         out = {
             "query_norm/target_mu": self.mu_t,
             "query_norm/cap_target_edges": self.k_t,
             "query_norm/struct_epoch": float(self.struct_epoch),
         }
+        if self.offset0 > 0.0:
+            out["query_norm/edge_offset"] = self.offset_t
         actual = query_norm_capacity(model, self.n_keys)
         if actual is not None:
             out["query_norm/cap_actual_edges"] = actual

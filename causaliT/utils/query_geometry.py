@@ -42,9 +42,10 @@ Three design choices, all settled by the offline probe on a trained checkpoint
 
 ``delta`` lives in COSINE space (it is a query coordinate), NOT in logit space:
 it must stay inside ``[-1, 1]``, so it cannot be rescaled by a block's logit
-offsets.  A block with a positive ``init_edge_offset`` (the S->X cross block) is
-already biased OFF, so the same cosine push is simply more than it needs — never
-less, which is the safe direction.
+offsets.  A block with a positive ``init_edge_offset`` (the S->X cross block
+when the init balance is active) is already biased OFF, so the same cosine push
+is simply more than it needs — never less, which is the safe direction.  With
+the offset disabled (existence-level balance) the push is exactly enough.
 
 The margin gate ``relu(m_ij - Pi_ij)`` makes the correction self-silencing: it is
 exactly 0 while the direct edge is better supported than the mediated path, which

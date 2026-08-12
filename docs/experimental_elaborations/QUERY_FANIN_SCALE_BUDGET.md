@@ -141,14 +141,26 @@ vanishing-gradient trade-off in this direction.
    block costs ~5e-2, genuinely strong). Watch `l0_penalty` / mean in-degree in the
    first structure epochs; if rows do not deflate, the follow-up arm is
    `lambda_l0 = 1e-5`.
-2. **Cross-vs-self init balance drifts.** `init_edge_offset = ln 3` equalised the
-   cross gate (0.25) with the directed self edge (0.5 * 0.5) *at* `log_alpha = 0`.
-   The general matched value is `offset = ln(2 + e^x)` — 2.757 at `F = 68.69`,
-   3.368 at `F = 108.66`. We deliberately **keep** `ln 3`: raising the offset also
-   raises `T` in the capacity formula and gives the budget back (m=3 would fall to
-   0.86/0.14). The new starts are cross 0.821 vs self-directed 0.466 (arm 1) and
-   0.900 vs 0.482 (arm 2). If spurious S->X edges reappear, the *next* arm is the
-   matched offset — not a smaller F.
+2. **Cross-vs-self init balance drifts — RESOLVED (auto-matched offset).**
+   `init_edge_offset = ln 3` equalised the cross gate (0.25) with the directed
+   self edge (0.5 * 0.5) *at* `log_alpha = 0`.  The general matched value is
+   `offset = ln(2 + e^x)` — 2.757 at `F = 68.69`, 3.368 at `F = 108.66`. Keeping
+   `ln 3` while F grew let the starts drift to cross 0.821 vs self-directed 0.466
+   (arm 1) and 0.900 vs 0.482 (arm 2).  **Resolution (2026-08):** F is now T-FREE
+   (`x = logit(p*) + kappa`, so the old coupling "raising the offset raises T in
+   the capacity formula" is gone — the capacity calculus never sees the offset),
+   and `init_edge_offset: auto` resolves the matched offset
+   `T = ln(exp(x - kappa) + 2)` at data-load time
+   (`query_norm.resolve_init_edge_offset`): the cross gate starts exactly at the
+   directed self posterior `p*/2`.  Note the deterministic cross gate then starts
+   CLOSED (posterior < 0.5), so the reconstruct phase runs through the stochastic
+   gate on the cross side, and a large pinned offset still taxes S->X rows with
+   3+ parents at steady state (harmless for S fan-in <= 2).  `0.0` disables the
+   offset (existence-level balance: cross at p*, directed self at p*/2).
+   When a fan-in prior is active, the offset anneals to zero on the prior's
+   structure-epoch clock (`training.anneal_edge_offset: auto`), because a fixed
+   T would otherwise shrink the cross-side capacity mu(t) prices by
+   (x/(x+T))^2 (see QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md, Section 5).
 3. **`M_i` should relax toward 1.0.** With enough F, nodes no longer need to
    over-spend; `M_i` staying above ~1.2 would mean F is still too small.
 
@@ -169,11 +181,13 @@ experiment:
 algebra used above,
 
 ```
-x = logit(max_p) + T + beta*ln(-gamma/zeta)      F = n_keys * (x / M)^2
+x = logit(max_p) + beta*ln(-gamma/zeta)      F = n_keys * (x / M)^2
 ```
 
-with `T = init_edge_offset` (dropped in `homogeneous_nodes` mode — there is no
-S->X cross gate to offset) and `M = query_norm_init_scale`. The stretch term
+with `M = query_norm_init_scale`.  **The derivation is T-FREE** (2026-08): the
+S->X cross gate's init-balance offset `init_edge_offset` no longer enters F in
+ANY mode; it is resolved separately by `resolve_init_edge_offset` (`auto` =
+the matched offset of Section 7.2).  The stretch term
 `beta*ln(-gamma/zeta)` is 0 for the symmetric `gamma=-1.1, zeta=1.1` arm and is
 otherwise absorbed automatically, so the Hard-Concrete parameters can be swept
 without invalidating F.

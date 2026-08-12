@@ -37,8 +37,10 @@ from causaliT.utils.query_norm import (
     overspend_penalty,
     p_at_saturation,
     query_norm_capacity,
+    resolve_init_edge_offset,
     resolve_query_fanin_scale,
     resolve_query_norm,
+    set_edge_offset,
     set_query_norm_target,
     x_of_p,
 )
@@ -47,7 +49,8 @@ from causaliT.utils.query_norm import (
 T = math.log(3.0)
 GATE = dict(init_tau=0.5, init_gamma=-1.1, init_zeta=1.1)
 P_SAT = 0.8209                      # sigmoid(kappa_1), the doc's p*
-X_REF = 2.6211                      # x(p*) in split mode
+X_REF = 2.6211                      # x(p*) with T = ln 3 (pure-function calls)
+X_TFREE = 1.5225                    # x(p*) as resolved: T-free (logit(p*) + kappa)
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +293,15 @@ def test_realised_capacity_is_m_squared_times_n():
 # FaninPriorSchedule: the STRUCTURE-epoch clock
 # ---------------------------------------------------------------------------
 
-def _cfg(n_keys=400, prior=10, anneal=30, form="capacity"):
+def _cfg(n_keys=400, prior=10, anneal=30, form="capacity",
+         offset=None, offset_mode="auto"):
+    exp = {"fanin_prior": prior, "query_norm_penalty_form": form}
+    if offset is not None:
+        exp["init_edge_offset"] = offset
     return {
-        "experiment": {"fanin_prior": prior, "query_norm_penalty_form": form},
-        "training": {"fanin_anneal_epochs": anneal},
+        "experiment": exp,
+        "training": {"fanin_anneal_epochs": anneal,
+                     "anneal_edge_offset": offset_mode},
     }
 
 
@@ -348,6 +356,127 @@ def test_metrics_report_target_and_both_capacities():
 
 
 # ---------------------------------------------------------------------------
+# The cross-gate offset anneal (T -> 0 on the same structure clock)
+# ---------------------------------------------------------------------------
+
+T0 = 1.8846          # the matched offset at p* = 0.8209
+
+
+class _CrossModel(nn.Module):
+    """Split-mode stand-in: the cross block owns the offset; the self never does."""
+
+    def __init__(self, offset=T0):
+        super().__init__()
+        self.cross = _Block()
+        self.cross.edge_offset = float(offset)
+        self.self_attn = _Block()
+
+
+def test_set_edge_offset_writes_only_offset_owners():
+    model = _CrossModel()
+    assert set_edge_offset(model, 0.7) == 1
+    assert model.cross.edge_offset == pytest.approx(0.7)
+    assert not hasattr(model.self_attn, "edge_offset")
+    # Homogeneous stand-in: no offset owner -> a no-op.
+    assert set_edge_offset(_Model(shared=False), 1.0) == 0
+
+
+def test_offset_anneals_to_zero_alongside_the_prior():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(_cfg(anneal=4, offset=T0), n_keys=400)
+    assert sched.offset_annealing
+    sched.on_epoch_start(model)      # struct_epoch 0 (write BEFORE increment)
+    assert model.cross.edge_offset == pytest.approx(T0)          # rho = 0
+    sched.on_epoch_start(model)      # struct_epoch 1 -> rho = 1/4
+    assert model.cross.edge_offset == pytest.approx(0.75 * T0, rel=1e-4)
+    for _ in range(3):               # struct_epochs 2, 3, 4 -> rho = 1
+        sched.on_epoch_start(model)
+    assert model.cross.edge_offset == pytest.approx(0.0, abs=1e-12)
+    assert sched.offset_t == 0.0
+    # The mu ramp walked to its end on the same clock.
+    assert model.cross.query_norm_target == pytest.approx(math.sqrt(10 / 400))
+
+
+def test_offset_anneal_freezes_outside_a_structure_phase():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(_cfg(anneal=4, offset=T0), n_keys=400)
+    sched.in_structure_phase = False
+    for _ in range(10):                       # a long reconstruct phase
+        sched.on_epoch_start(model)
+    assert sched.struct_epoch == 0
+    assert model.cross.edge_offset == pytest.approx(T0)
+
+
+def test_offset_anneal_auto_is_inert_without_a_prior():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(_cfg(prior=None, offset=T0), n_keys=400)
+    assert not sched.offset_annealing
+    sched.on_epoch_start(model)
+    assert model.cross.edge_offset == pytest.approx(T0)      # untouched
+
+
+def test_offset_anneal_false_mode_never_writes():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(_cfg(anneal=4, offset=T0, offset_mode="false"),
+                               n_keys=400)
+    assert not sched.offset_annealing
+    for _ in range(6):
+        sched.on_epoch_start(model)
+    assert model.cross.edge_offset == pytest.approx(T0)
+    # ... while mu still anneals (the prior is active).
+    assert model.cross.query_norm_target == pytest.approx(math.sqrt(10 / 400))
+
+
+def test_offset_anneal_true_mode_runs_without_a_prior():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(
+        _cfg(prior=None, anneal=2, offset=T0, offset_mode="true"), n_keys=400)
+    assert sched.offset_annealing
+    sched.on_epoch_start(model)                     # rho = 0
+    assert model.cross.edge_offset == pytest.approx(T0)
+    sched.on_epoch_start(model)                     # rho = 1/2
+    assert model.cross.edge_offset == pytest.approx(0.5 * T0)
+    sched.on_epoch_start(model)                     # rho = 1
+    assert model.cross.edge_offset == pytest.approx(0.0, abs=1e-12)
+
+
+def test_offset_anneal_is_a_noop_without_an_offset():
+    model = _CrossModel(offset=0.0)
+    sched = FaninPriorSchedule(_cfg(anneal=4, offset=0.0), n_keys=400)
+    assert not sched.offset_annealing
+    for _ in range(6):
+        sched.on_epoch_start(model)
+    assert model.cross.edge_offset == 0.0
+
+
+def test_unresolved_offset_sentinel_and_bad_mode_raise():
+    with pytest.raises(ValueError, match="never resolved"):
+        FaninPriorSchedule(_cfg(offset="auto"), n_keys=400)
+    with pytest.raises(ValueError, match="anneal_edge_offset"):
+        FaninPriorSchedule(_cfg(offset=T0, offset_mode="sometimes"), n_keys=400)
+
+
+def test_metrics_report_the_current_offset():
+    model = _CrossModel()
+    sched = FaninPriorSchedule(_cfg(anneal=4, offset=T0), n_keys=400)
+    sched.on_epoch_start(model)
+    assert sched.metrics(model)["query_norm/edge_offset"] == pytest.approx(T0)
+
+
+def test_prior_and_auto_offset_resolve_together_end_to_end():
+    cfg = _exp_cfg(fanin_prior=10, init_edge_offset="auto",
+                   attention_type="GatedCrossAttention",
+                   self_attention_type="GatedSelfAttention",
+                   homogeneous_nodes=False)
+    assert resolve_query_norm(cfg, n_keys=400) is not None
+    off = resolve_init_edge_offset(cfg, n_keys=400)
+    assert off["mode"] == "auto"
+    sched = FaninPriorSchedule(cfg, n_keys=400)
+    assert sched.offset_annealing                 # auto + active prior
+    assert sched.offset0 == pytest.approx(off["init_edge_offset"])
+
+
+# ---------------------------------------------------------------------------
 # Config resolution
 # ---------------------------------------------------------------------------
 
@@ -389,7 +518,8 @@ def test_master_switch_derives_the_whole_stack():
     assert exp["query_norm_learnable"] is True
     assert exp["query_norm_init_scale"] == 1.0
     assert exp["query_norm_target"] == pytest.approx(1.0)     # no prior yet
-    assert exp["query_fanin_scale"] == pytest.approx(400 * X_REF ** 2, rel=1e-3)
+    # T-free: the configured init_edge_offset (T in _exp_cfg) never enters F.
+    assert exp["query_fanin_scale"] == pytest.approx(400 * X_TFREE ** 2, rel=1e-3)
     assert info["z_init"] == pytest.approx(1.0)               # gate saturated
 
 
@@ -402,12 +532,13 @@ def test_an_explicit_fanin_scale_still_wins():
 
 def test_legacy_auto_path_is_untouched_by_the_new_key():
     # resolve_query_fanin_scale (the OLD entry point) must keep working on a
-    # config that never heard of query_norm.
+    # config that never heard of query_norm.  The derivation is T-free: the
+    # pinned init_edge_offset below is NOT read into F (F = 10 * (ln 9)^2).
     cfg = {"experiment": {"query_fanin_scale": "auto", "query_centroid_max_p": 0.9,
                           "init_tau": 0.5, "init_gamma": -1.1, "init_zeta": 1.1,
                           "init_edge_offset": T}}
     out = resolve_query_fanin_scale(cfg, n_keys=10)
-    assert out["query_fanin_scale"] == pytest.approx(108.62, rel=1e-3)
+    assert out["query_fanin_scale"] == pytest.approx(48.28, rel=1e-3)
 
 
 def test_prior_sets_mu_and_selects_the_capacity_penalty():
@@ -432,7 +563,7 @@ def test_prior_sets_mu_and_selects_the_capacity_penalty():
 
     # F is NOT shrunk by the prior: the init gate must survive (Section 3.1).
     assert cfg["experiment"]["query_fanin_scale"] == pytest.approx(
-        400 * X_REF ** 2, rel=1e-3)
+        400 * X_TFREE ** 2, rel=1e-3)
     assert info["z_init"] == pytest.approx(1.0)
 
 
@@ -469,13 +600,17 @@ def test_a_closed_init_gate_raises_with_the_remedies():
         resolve_query_norm(_exp_cfg(query_centroid_max_p=0.5), n_keys=400)
 
 
-def test_homogeneous_mode_drops_the_offset():
-    cfg = _exp_cfg(homogeneous_nodes=True)
-    info = _resolve(cfg)
-    assert info["init_edge_offset"] == 0.0
-    assert info["x"] == pytest.approx(1.5225, abs=1e-3)
-
-    assert info["F"] < X_REF * math.sqrt(400)
+def test_the_offset_never_enters_the_master_switch_derivation():
+    # Split and homogeneous resolve the SAME T-free x(p*) and F, whatever
+    # init_edge_offset the config pins (T in _exp_cfg).
+    split = _resolve(_exp_cfg())
+    homo = _resolve(_exp_cfg(homogeneous_nodes=True))
+    assert "init_edge_offset" not in split
+    assert "init_edge_offset" not in homo
+    assert split["x"] == pytest.approx(X_TFREE, abs=1e-3)
+    assert homo["x"] == split["x"]
+    assert homo["F"] == split["F"]
+    assert split["F"] == pytest.approx(X_TFREE * math.sqrt(400), rel=1e-3)
 
 
 def test_log_line_mentions_the_prior_state():

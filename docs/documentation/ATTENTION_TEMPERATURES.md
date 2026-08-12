@@ -95,10 +95,29 @@ required.  Equivalently, at l = kappa_1 the direction posterior is already
 ### init_edge_offset (not a temperature; recorded here for completeness)
 
 The cross existence gate additionally accepts T = `init_edge_offset`, an
-additive logit shift that balances the S->X cross prior against a directed X->X
-edge at initialisation: without it P_cross(init) = sigmoid(-kappa) = 0.5 while
-a directed self edge starts at p_exist * d = 0.5 * 0.5 = 0.25.  T = ln 3 =
-1.0986 lands P_cross(init) = sigmoid(-ln 3) = 0.25 - no 2x head start.
+additive logit shift that balances the S->X cross gate against the DIRECTED
+X->X self edge at initialisation: the self edge starts at
+p_exist * d = 0.5 * p_exist (undecided direction gate), so the direction-free
+cross gate would otherwise start twice as high.
+
+The offset NEVER enters the `query_fanin_scale` (F) derivation - F is T-free
+and places the offset-free EXISTENCE posterior of both gates at
+`query_centroid_max_p`.  The offset itself is resolved at data-load time by
+`query_norm.resolve_init_edge_offset`:
+
+* `0.0` (off): existence-level balance - cross at p*, directed self at p*/2;
+* `auto`: the MATCHED offset T = ln(exp(x - kappa) + 2) with
+  x = M * sqrt(F / n_keys) the centroid logit, so the cross gate starts exactly
+  at the directed self posterior p*/2 (directed-level balance; note the
+  deterministic cross gate then starts CLOSED and the reconstruct phase runs
+  through the stochastic gate - the accepted trade-off);
+* a float: pinned legacy ablation (ln 3 = 1.0986 was the pre-F-auto choice,
+  derived when the neutral init gave P_cross = 0.5 vs self-directed 0.25).
+
+When a fan-in prior is active, the offset anneals to zero on the prior's
+structure-epoch clock (`training.anneal_edge_offset: auto`; `FaninPriorSchedule`),
+because a fixed T raises the cross-side threshold logit to x + T and would
+otherwise under-deliver the capacity the prior prices by (x/(x+T))^2.
 
 ## 3. Interaction with the query-fanin derivation
 
