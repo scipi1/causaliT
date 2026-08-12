@@ -35,7 +35,6 @@ from causaliT.training.forecasters import (
     NoiseAwareCausalResForecaster,
     VarianceCausalForecaster,
     AttentionSelectorForecaster,
-    SelfSelectorForecaster,
 )
 
 from causaliT.training.dataloader import ProcessDataModule
@@ -596,7 +595,6 @@ def get_model_class(config: dict):
         "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes",
         "VarianceCausalLayer",
         "AttentionSelectorLayer",
-        "SelfSelectorLayer",
         "LSTM", "GRU", "TCN", "MLP",
     ]
 
@@ -612,7 +610,6 @@ def get_model_class(config: dict):
         "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResForecaster,
         "VarianceCausalLayer": VarianceCausalForecaster,
         "AttentionSelectorLayer": AttentionSelectorForecaster,
-        "SelfSelectorLayer": SelfSelectorForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
@@ -645,8 +642,6 @@ def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningMod
         return VarianceCausalForecaster(config, data_dir=data_dir)
     elif model_obj == "AttentionSelectorLayer":
         return AttentionSelectorForecaster(config, data_dir=data_dir)
-    elif model_obj == "SelfSelectorLayer":
-        return SelfSelectorForecaster(config, data_dir=data_dir)
     elif model_obj == "proT":
 
         return TransformerForecaster(config)
@@ -705,7 +700,6 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
         "NoiseAwareSingleCausalLayerRes": StageCausalDataModule,
         "VarianceCausalLayer": StageCausalDataModule,
         "AttentionSelectorLayer": StageCausalDataModule,
-        "SelfSelectorLayer": StageCausalDataModule,
         "LSTM": ProcessDataModule,
 
         "GRU": ProcessDataModule,
@@ -714,7 +708,7 @@ def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
     }
     DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
 
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer", "SelfSelectorLayer"]:
+    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer"]:
 
         return DataModuleClass(
             data_dir=join(data_dir, config["data"]["dataset"]),

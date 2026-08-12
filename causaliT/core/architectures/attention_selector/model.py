@@ -332,13 +332,8 @@ class AttentionSelectorLayer(nn.Module):
         # CausalCrossAttention: None disables; 0 = residual-only floor;
         # 1 = uniform mixing (pair with heavy batch_key_dropout).
         optuna_protocol: Optional[float] = None,
-        # GatedCrossAttention (attention_type="GatedCrossAttention"):
-        # disentangled structure-gate x reconstruction-gain. See gain_stream_source.
-        gain_stream_source: str = "separate",
-        gain_tau: float = 1.0,
-        # When False, bypass the learnable reconstruction gain in the gated
-        # attentions: the structure gate becomes the final attention weight.
-        use_gain: bool = True,
+        # The reconstruction-gain stream (use_gain / gain_tau / gain_stream_source)
+        # has been REMOVED from the gated attentions: A = structure gate.
         init_gamma: float = DEFAULT_GATE_GAMMA,
         init_zeta: float = DEFAULT_GATE_ZETA,
         # Additive logit offset on the S→X cross existence gate ONLY, to balance
@@ -611,14 +606,11 @@ class AttentionSelectorLayer(nn.Module):
                 "(there is no dedicated X query embedding table to initialise "
                 "at the key centroid otherwise)."
             )
-        # In homogeneous mode the single block is ALWAYS a gated self attention,
-        # so the reconstruction-gain stream is always active (and its identity
-        # tables must be built) regardless of the ignored ``attention_type``.
+        # Whether the cross block is a gated attention (structure-gated).  Kept
+        # for diagnostics; the reconstruction-gain stream has been removed.
         self.is_gated = (
             attention_type == "GatedCrossAttention" or self.homogeneous_nodes
         )
-
-        self.gain_stream_source = gain_stream_source
 
         # ------------------------------------------------------------------
         # Value-structure injection scheme selection.
@@ -755,24 +747,6 @@ class AttentionSelectorLayer(nn.Module):
             )
 
 
-        if gain_stream_source not in ("separate", "shared"):
-
-            raise ValueError(
-                f"gain_stream_source='{gain_stream_source}' is invalid. "
-                f"Must be one of: 'separate', 'shared'."
-            )
-        # 'shared' mode reuses the structural Q/K inputs for the gain stream.
-        # That is only safe when those inputs carry NO structural gradient
-        # (frozen fixed orthonormal frame); otherwise the reconstruction loss
-        # would leak into the structure via the shared embedding.
-        if self.is_gated and gain_stream_source == "shared" and not self.orthogonal_fixed:
-            raise ValueError(
-                "gain_stream_source='shared' requires "
-                "struct_embedding_type='orthogonal_fixed' so the shared struct "
-                "embeddings carry no structural gradient. "
-                "Use gain_stream_source='separate' otherwise."
-            )
-
         # Orthogonal (isometric) key projection.  When "orthogonal", the shared
         # W_K is constrained so that W_K^T W_K = I (Cayley parametrisation inside
         # OrthogonalLinear).  An isometry preserves inner products, so
@@ -907,8 +881,6 @@ class AttentionSelectorLayer(nn.Module):
             # __init__ docstring; resolved by resolve_init_edge_offset, never
             # entering F); the self block below is never offset.
             init_edge_offset=init_edge_offset,
-            gain_tau=gain_tau,
-            use_gain=use_gain,
 
             # Centroid-collapse fix: unit-normalise the structural query and use
             # a fixed sqrt(query_fanin_scale) score scale (structure gate only).
@@ -981,8 +953,6 @@ class AttentionSelectorLayer(nn.Module):
                 optuna_protocol=optuna_protocol,
                 init_gamma=init_gamma,
                 init_zeta=init_zeta,
-                gain_tau=gain_tau,
-                use_gain=use_gain,
                 dir_tau=self.dir_tau,
                 # CommutatorSelfAttention direction-gate parametrisation
                 # ("qk" or "skew_query"); ignored by GatedSelfAttention.
@@ -1189,45 +1159,6 @@ class AttentionSelectorLayer(nn.Module):
         else:
             self.query_embed_X = None
             self.query_embed_S = None
-
-        # ------------------------------------------------------------------
-        # Gain-stream embeddings (GatedCrossAttention, gain_stream_source="separate")
-        # ------------------------------------------------------------------
-        # The reconstruction-gain g_ij needs its OWN query/key identity signal,
-        # fully decoupled from the structural gate's query/key.  We give each of
-        # the three roles (X-as-child query, S-as-parent key, X-as-parent key) a
-        # dedicated free learnable identity table.  The names start with "gain_"
-        # and do NOT contain "query_projection"/"key_projection"/"query_embed_X",
-        # so the gradient router classifies them as RECONSTRUCTION parameters.
-        # In "shared" mode the gain stream reuses the (frozen) structural inputs
-        # and no separate tables are created.
-        # In homogeneous mode S is also a child, so it needs a gain QUERY table.
-        self.gain_q_embed_X: Optional[FreeQueryEmbedding]
-        self.gain_q_embed_S: Optional[FreeQueryEmbedding]
-        self.gain_k_embed_S: Optional[FreeQueryEmbedding]
-        self.gain_k_embed_X: Optional[FreeQueryEmbedding]
-        if self.is_gated and self.gain_stream_source == "separate":
-            self.gain_q_embed_X = FreeQueryEmbedding(
-                num_variables=X_seq_len, d_model=d_model, device=device,
-            )
-            self.gain_k_embed_S = FreeQueryEmbedding(
-                num_variables=S_seq_len, d_model=d_model, device=device,
-            )
-            self.gain_k_embed_X = FreeQueryEmbedding(
-                num_variables=X_seq_len, d_model=d_model, device=device,
-            )
-            self.gain_q_embed_S = (
-                FreeQueryEmbedding(
-                    num_variables=S_seq_len, d_model=d_model, device=device,
-                )
-                if self.homogeneous_nodes
-                else None
-            )
-        else:
-            self.gain_q_embed_X = None
-            self.gain_q_embed_S = None
-            self.gain_k_embed_S = None
-            self.gain_k_embed_X = None
 
         # ------------------------------------------------------------------
         # Value-structure injection identity tables (value_structure_injection
@@ -1550,30 +1481,6 @@ class AttentionSelectorLayer(nn.Module):
             sx_vals = sx_keys                                # summation: K = V
         x_q_emb = xq_struct                                 # query tensor
 
-        # ---- Reconstruction-gain stream (GatedCrossAttention only) -------
-        # Build the gain query/key identity signals.  In "separate" mode they
-        # come from their OWN free identity tables (reconstruction-routed);
-        # in "shared" mode they reuse the (frozen) structural embeddings, so
-        # gain_query/gain_key are left as None and the AttentionLayer falls
-        # back to the structural q/k inputs internally.
-        # ``gk_S`` / ``gk_X`` are kept separately so the split path can feed the
-        # cross block S-only gain keys and the self block X-only gain keys.
-        gain_query = None
-        gain_key = None
-        gk_S = None
-        gk_X = None
-        if self.is_gated and self.gain_stream_source == "separate":
-            assert self.gain_q_embed_X is not None
-            gain_query = self.dropout_emb(self.gain_q_embed_X(x_blanked))
-            gk_S = self.dropout_emb(self.gain_k_embed_S(source_tensor))
-            gk_X = self.dropout_emb(self.gain_k_embed_X(x_actual))
-            gain_key = torch.cat([gk_S, gk_X], dim=1)       # (B, L_S+L_X, d)
-            if self.homogeneous_nodes:
-                # S is a child too: prepend its gain query identity.
-                assert self.gain_q_embed_S is not None
-                gq_S = self.dropout_emb(self.gain_q_embed_S(s_blanked))
-                gain_query = torch.cat([gq_S, gain_query], dim=1)
-
         # ---- Value-structure injection identity codes -------------------
         # Per-SOURCE-node identity concatenated onto the value stream before
         # W_V (see __init__).  "separate" pulls dedicated reconstruction-routed
@@ -1640,8 +1547,6 @@ class AttentionSelectorLayer(nn.Module):
                 causal_mask=False,
                 hard_mask=hard_mask,
                 oracle=oracle,
-                gain_query=gain_query,
-                gain_key=gain_key,
                 value_structure=vsi_SX,
                 value_structure_query=vsq_all,
                 transitive_cfg=self._transitive_cfg,
@@ -1671,8 +1576,6 @@ class AttentionSelectorLayer(nn.Module):
                 causal_mask=False,
                 hard_mask=hard_mask,
                 oracle=oracle,
-                gain_query=gain_query,
-                gain_key=gain_key,
                 value_structure=vsi_SX,
                 value_structure_query=vsq_X,
             )
@@ -1766,8 +1669,6 @@ class AttentionSelectorLayer(nn.Module):
                 causal_mask=False,
                 hard_mask=cross_hard,
                 oracle=oracle,
-                gain_query=gain_query,
-                gain_key=gk_S,
                 value_structure=vsi_S,
                 value_structure_query=vsq_X,
                 transitive_cfg=tc_cross,
@@ -1790,14 +1691,6 @@ class AttentionSelectorLayer(nn.Module):
             #   * shared_query=False → the classic Toeplitz split with Q=K on
             #     ``xk_struct`` (original behaviour).
             self_value = xk_val if xk_val is not None else xk_struct
-
-            self_gain_q = None
-            self_gain_k = None
-            if self.gain_stream_source == "separate" and self.gain_q_embed_X is not None:
-                # GatedSelfAttention always needs a gain stream; reuse the X
-                # gain identity tables (X-as-child query, X-as-parent key).
-                self_gain_q = self.dropout_emb(self.gain_q_embed_X(x_blanked))
-                self_gain_k = self.dropout_emb(self.gain_k_embed_X(x_actual))
 
             # ---- Shared structural query projection ---------------------
             # When shared_query=True the self block owns NO W_q (built with
@@ -1871,8 +1764,6 @@ class AttentionSelectorLayer(nn.Module):
                 causal_mask=False,
                 hard_mask=self_hard,
                 oracle=oracle,
-                gain_query=self_gain_q,
-                gain_key=self_gain_k,
                 value_structure=vsi_X,
                 value_structure_query=vsq_X,
                 transitive_cfg=tc_self,

@@ -614,20 +614,7 @@ Arms:
   S->X parents.  `FaninPriorSchedule` therefore anneals
   $T(t)=T_0\,(1-\rho(t))$ to zero on the SAME structure clock
   (`training.anneal_edge_offset: auto`, the default, only alongside an active
-  prior; `true` forces it without one, `false` disables): the directed-level
-  init balance holds early, and the calibration above is exact again at the end
-  of the squeeze - where, the direction gate having committed, the end state is
-  again balanced at $p^*$.  Side effect: as $T\to 0$ the cross non-parent floor
-  rises from $\sigma(-T)$ to $\sigma(0)=0.5$; any edge with a negative logit
-  stays below the 0.5 eval threshold.
-* **$\ell_0$ / `lambda_l0`** - complementary: $\ell_0$ prices *posterior mass*,
-  the fan-in prior prices *how many edges can be confident at once*. The prior
-  costs nothing at eval time and does not shift the $\ell_0$ threshold.
-* **gradient routing** - `query_norm_log_scale` is a structural parameter, so
-  the squeeze acts on the structural stream only. Unchanged.
-* **`shared_query`** - a single `log_scale` shared by the cross and self blocks
-  must be de-duplicated by parameter id when the target is written,
-  symmetrically to `collect_query_norm_penalty`.
+  prior; `true` forces it without one, `
 * **adaptive phases** - anchor as in Section 3.2; the target must be re-applied on
   every phase switch (a cheap idempotent write in `on_train_epoch_start`).
 * **sweeps** - `max_in_edges` is a *prior*, therefore an OPT-IN extra arm, never

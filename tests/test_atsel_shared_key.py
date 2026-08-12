@@ -131,7 +131,6 @@ def _make_model(
         key_projection_type=key_projection_type,
         orthogonal_key_scale=orthogonal_key_scale,
         free_query_embedding=free_query_embedding,
-        gain_stream_source=gain_stream_source,
         self_attention_type=self_attention_type,
         shared_query=shared_query,
         shared_key=shared_key,

@@ -49,7 +49,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
-from causaliT.core.architectures.self_selector.model import SelfSelectorLayer
 from causaliT.training.gradient_routing import _is_structural_param
 
 
@@ -140,8 +139,6 @@ def _make_atsel(
     # wiring checks (projection presence/width, tables, routing) are inner-
     # attention agnostic and use the default ScaledDotSoftmax.
     extra = {}
-    if attention_type == "GatedCrossAttention":
-        extra["gain_stream_source"] = "separate"
     return AttentionSelectorLayer(
         model="test_model",
         ds_embed_S=_svfa_embed_cfg(VOCAB_S),
@@ -193,62 +190,6 @@ def _atsel_inputs():
     x_blanked[:, :, 0] = 0.0  # zero the VALUE column (col 0)
     return source, x_actual, x_blanked
 
-
-
-
-# ---------------------------------------------------------------------------
-# SelfSelectorLayer helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_self(
-    value_structure_injection: str = "none",
-    comps_embed: str = "svfa",
-    value_structure_query_injection: str = "none",
-):
-    ds_embed = (
-        _svfa_embed_cfg(VOCAB_SHARED)
-        if comps_embed == "svfa"
-        else _summation_embed_cfg(VOCAB_SHARED)
-    )
-    return SelfSelectorLayer(
-        model="test_self",
-        ds_embed=ds_embed,
-        comps_embed=comps_embed,
-        attention_type="GatedSelfAttention",
-        n_heads=1,
-        dropout_emb=0.0,
-        dropout_attn_out=0.0,
-        dropout_ff=0.0,
-        dropout_qkv=0.0,
-        attention_dropout=0.0,
-        activation="relu",
-        norm="layer",
-        use_final_norm=False,
-        device="cpu",
-        out_dim=1,
-        d_ff=D_FF,
-        d_model=D_MODEL,
-        d_qk=D_QK,
-        S_seq_len=S_SEQ_LEN,
-        X_seq_len=X_SEQ_LEN,
-        shared_dag_across_heads=True,
-        gain_stream_source="separate",
-        value_structure_injection=value_structure_injection,
-        value_structure_query_injection=value_structure_query_injection,
-    )
-
-
-def _self_inputs():
-    # Column convention: value at col 0, 1-indexed variable-ID at col 1.
-    N = S_SEQ_LEN + X_SEQ_LEN
-    all_actual = torch.zeros(BATCH, N, 2)
-    all_actual[:, :, 0] = torch.randn(BATCH, N)
-    all_actual[:, :, 1] = torch.arange(1, N + 1).float().unsqueeze(0)
-
-    all_blanked = all_actual.clone()
-    all_blanked[:, :, 0] = 0.0  # zero the VALUE column (col 0)
-    return all_blanked, all_actual
 
 
 
@@ -489,188 +430,6 @@ class TestAtselKeyAndQueryCombined:
         pred, attn, _ = model.forward_with_actual(source, x_blanked, x_actual)
         assert pred.shape == (BATCH, X_SEQ_LEN, 1)
         assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
-
-
-# ===========================================================================
-# SelfSelectorLayer -- value_structure_injection (source / key keying)
-# ===========================================================================
-
-
-class TestSelfBackwardCompat:
-    def test_default_is_none(self):
-        model = _make_self()
-        assert model.value_structure_injection == "none"
-        assert model.inject_value_structure is False
-        assert model.val_id_embed is None
-        assert model.attention.value_projection.in_features == D_MODEL
-
-    def test_none_forward_shapes(self):
-        model = _make_self("none")
-        all_blanked, all_actual = _self_inputs()
-        pred, attn, _ = model.forward_with_actual(all_blanked, all_actual)
-        N = S_SEQ_LEN + X_SEQ_LEN
-        assert pred.shape == (BATCH, N, 1)
-        assert attn.shape == (BATCH, N, N)
-
-
-class TestSelfInjectionModes:
-    @pytest.mark.parametrize("mode", ["separate", "struct_detached"])
-    def test_value_projection_widened(self, mode):
-        model = _make_self(mode)
-        assert model.attention.value_projection.in_features == 2 * D_MODEL
-
-    @pytest.mark.parametrize("mode", ["separate", "struct_detached"])
-    def test_forward_shapes(self, mode):
-        model = _make_self(mode)
-        all_blanked, all_actual = _self_inputs()
-        pred, attn, _ = model.forward_with_actual(all_blanked, all_actual)
-        N = S_SEQ_LEN + X_SEQ_LEN
-        assert pred.shape == (BATCH, N, 1)
-        assert attn.shape == (BATCH, N, N)
-
-    def test_separate_adds_table(self):
-        assert _make_self("separate").val_id_embed is not None
-
-    def test_struct_detached_no_table(self):
-        assert _make_self("struct_detached").val_id_embed is None
-
-
-class TestSelfSvfaRequirement:
-    def test_summation_raises(self):
-        with pytest.raises(ValueError, match="requires SVFA"):
-            _make_self("separate", comps_embed="summation")
-
-
-class TestSelfGradientRouting:
-    def test_identity_table_is_reconstruction(self):
-        model = _make_self("separate")
-        structural, reconstruction = model.parameter_groups()
-        struct_ids = {id(p) for p in structural}
-        val_id_params = list(model.val_id_embed.parameters())
-        assert len(val_id_params) > 0
-        for p in val_id_params:
-            assert id(p) not in struct_ids, (
-                "val_id_embed must be in the RECONSTRUCTION group"
-            )
-
-
-# ===========================================================================
-# SelfSelectorLayer -- value_structure_query_injection (query / child keying)
-# ===========================================================================
-
-
-class TestSelfQueryBackwardCompat:
-    def test_default_is_none(self):
-        model = _make_self()
-        assert model.value_structure_query_injection == "none"
-        assert model.inject_value_structure_query is False
-        assert model.val_q_id_embed is None
-        assert model.attention.value_query_proj is None
-
-
-class TestSelfQueryInjectionModes:
-    @pytest.mark.parametrize("mode", ["separate", "struct_detached"])
-    def test_value_query_proj_created(self, mode):
-        model = _make_self(value_structure_query_injection=mode)
-        assert model.inject_value_structure_query is True
-        assert model.attention.value_query_proj is not None
-        assert model.attention.value_query_proj.in_features == D_MODEL
-        assert model.attention.value_query_proj.bias is None
-
-    @pytest.mark.parametrize("mode", ["separate", "struct_detached"])
-    def test_value_projection_not_widened(self, mode):
-        model = _make_self(value_structure_query_injection=mode)
-        assert model.attention.value_projection.in_features == D_MODEL
-
-    @pytest.mark.parametrize("mode", ["separate", "struct_detached"])
-    def test_forward_shapes(self, mode):
-        model = _make_self(value_structure_query_injection=mode)
-        all_blanked, all_actual = _self_inputs()
-        pred, attn, _ = model.forward_with_actual(all_blanked, all_actual)
-        N = S_SEQ_LEN + X_SEQ_LEN
-        assert pred.shape == (BATCH, N, 1)
-        assert attn.shape == (BATCH, N, N)
-
-    def test_separate_adds_query_table(self):
-        assert _make_self(value_structure_query_injection="separate").val_q_id_embed is not None
-
-    def test_struct_detached_no_query_table(self):
-        assert _make_self(value_structure_query_injection="struct_detached").val_q_id_embed is None
-
-
-class TestSelfQuerySvfaRequirement:
-    def test_summation_raises(self):
-        with pytest.raises(ValueError, match="requires SVFA"):
-            _make_self(
-                comps_embed="summation",
-                value_structure_query_injection="separate",
-            )
-
-
-class TestSelfQueryGradientRouting:
-    def test_query_identity_table_is_reconstruction(self):
-        model = _make_self(value_structure_query_injection="separate")
-        structural, reconstruction = model.parameter_groups()
-        struct_ids = {id(p) for p in structural}
-        val_q_params = list(model.val_q_id_embed.parameters())
-        assert len(val_q_params) > 0
-        for p in val_q_params:
-            assert id(p) not in struct_ids, (
-                "val_q_id_embed must be in the RECONSTRUCTION group"
-            )
-
-    def test_value_query_proj_is_reconstruction(self):
-        model = _make_self(value_structure_query_injection="separate")
-        structural, reconstruction = model.parameter_groups()
-        struct_ids = {id(p) for p in structural}
-        vq_params = list(model.attention.value_query_proj.parameters())
-        assert len(vq_params) > 0
-        for p in vq_params:
-            assert id(p) not in struct_ids, (
-                "value_query_proj must be in the RECONSTRUCTION group"
-            )
-
-
-class TestSelfQueryOutputDependsOnIdentity:
-    def test_perturbing_query_identity_changes_prediction(self):
-        # GatedSelfAttention (used by _make_self) applies the additive query term.
-        model_a = _make_self(value_structure_query_injection="separate")
-        model_b = _make_self(value_structure_query_injection="separate")
-        model_a.eval(); model_b.eval()
-        model_b.load_state_dict(model_a.state_dict())
-
-        perturbed = False
-        for name, param in model_b.named_parameters():
-            if "val_q_id_embed" in name:
-                param.data += torch.randn_like(param) * 5.0
-                perturbed = True
-        assert perturbed
-
-        all_blanked, all_actual = _self_inputs()
-        with torch.no_grad():
-            pred_a, _, _ = model_a.forward_with_actual(all_blanked, all_actual)
-            pred_b, _, _ = model_b.forward_with_actual(all_blanked, all_actual)
-        assert not torch.allclose(pred_a, pred_b), (
-            "Perturbing the value-structure QUERY identity must change pred."
-        )
-
-
-class TestSelfKeyAndQueryCombined:
-    def test_both_injections_together(self):
-        model = _make_self(
-            value_structure_injection="separate",
-            value_structure_query_injection="separate",
-        )
-        assert model.attention.value_projection.in_features == 2 * D_MODEL
-        assert model.attention.value_query_proj is not None
-        assert model.val_id_embed is not None
-        assert model.val_q_id_embed is not None
-
-        all_blanked, all_actual = _self_inputs()
-        pred, attn, _ = model.forward_with_actual(all_blanked, all_actual)
-        N = S_SEQ_LEN + X_SEQ_LEN
-        assert pred.shape == (BATCH, N, 1)
-        assert attn.shape == (BATCH, N, N)
 
 
 if __name__ == "__main__":

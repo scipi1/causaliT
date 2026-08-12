@@ -155,7 +155,7 @@ class TestOverspendPenalty:
 class TestCollectAndStats:
     def _learnable_block(self, num_nodes=X_SEQ_LEN):
         return GatedCrossAttention(
-            use_gain=False, attention_dropout=0.0,
+            attention_dropout=0.0,
             normalize_query=True, query_fanin_scale=4.0,
             query_norm_learnable=True,
             query_norm_init_scale=1.0,
@@ -239,7 +239,6 @@ def _make_model(
         S_seq_len=S_SEQ_LEN, X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
-        gain_stream_source="separate",
         normalize_query=True,
         query_fanin_scale=4.0,
         query_norm_learnable=True,

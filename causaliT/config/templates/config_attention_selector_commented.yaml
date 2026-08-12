@@ -1,32 +1,10 @@
-# AttentionSelectorLayer Template
-#
-# Research question:
-#   Can a single cross-attention block recover causal parent sets from
-#   observational data when given the actual values of all candidate
-#   parents (S and X) as keys?
-#
-# Architecture:
-#   Q: X_blanked  (variable identity only)
-#   K/V: [S_actual, X_actual]  (actual values of all variables)
-#   Hard mask: diagonal of X-X sub-block zeroed (no self-loops)
-#   No self-attention block.
-#
-# Attention type recommendation:
-#   CausalCrossAttention (ReLU-Tanh):  non-normalized, can be zero → sparse
-#   SigmoidCrossAttention:             bounded [0,1], can be near-zero → sparse
-#   ScaledDotSoftmax:                  softmax, always dense → use only as baseline
-#
-# Suggested workflow:
-#   1. Run with lambda_hsic=0, lambda_score_sparse=0 to verify reconstruction works.
-#   2. Add score sparsity (lambda_score_sparse=0.01) to drive attention sparse.
-#   3. Add HSIC (lambda_hsic=0.1) to drive independence between sources and residuals.
-#   4. Enable gradient routing for cleaner structure optimization.
+
 
 experiment:
   d_model_set: 24
   n_heads: 1
   d_ff_mult: 2.0
-  d_qk_mult: 0.5
+  d_qk_mult: 1.0
   d_ff: null
   d_qk: null
   dropout: 0.0
@@ -35,237 +13,71 @@ experiment:
   batch_size: 64
   max_epochs: 2
 
-  attention_type: "CausalCrossAttention"
-  # --- Harmonized attention temperatures ------------------------------------
-  # See docs/documentation/ATTENTION_TEMPERATURES.md for the full derivation.
-  #
-  # init_tau        — activation temperature of the NON-gated attentions
-  #                   (CausalCrossAttention / SigmoidCrossAttention, default
-  #                   3.0); also the shared FALLBACK for the two Hard-Concrete
-  #                   existence gates when the split keys below are null.
-  # init_tau_cross  — Hard-Concrete existence-gate temperature of the S->X
-  #                   cross block (GatedCrossAttention /
-  #                   HardConcreteCrossAttention).  Calculated default 0.5:
-  #                   with the symmetric stretch gamma=-1.1, zeta=1.1 the gate
-  #                   opens exactly at logit 0 (kappa = 0.5*ln(1) = 0) and
-  #                   saturates at kappa_1 = 0.5*ln(21) ~= 1.5223.
-  # init_tau_self   — same, for the X->X self block (GatedSelfAttention /
-  #                   CommutatorSelfAttention; also the single square block in
-  #                   homogeneous mode).
-  # init_gamma / init_zeta — Hard-Concrete stretch bounds (gamma < 0 < 1 <
-  #                   zeta).  The default pair (-1.1, 1.1) is SYMMETRIC, which
-  #                   is what makes kappa = 0 independent of the temperature.
-  init_tau: 3.0
-  init_tau_cross: 0.5
-  init_tau_self: 0.5
-  init_gamma: -1.1
-  init_zeta: 1.1
+  attention_type: "GatedCrossAttention" #[!] call this key cross_attention_type and set "GatedCrossAttention" as default
 
-  # SVFA: when True a single (L_X, L_S+L_X) DAG score is shared across all
-  # value heads (Sparse Value-Function Attention).  Set False to give each
-  # head its own independent score (no sharing).
-  shared_dag_across_heads: true
-  # Embedding composition mode.
-  # "summation"  — standard: all sub-modules summed into one d_model vector.
-  # "svfa"       — SVFA multi-head values: sub-modules split into value/structure
-  #                roles and projected into H separate value heads.
-  #                Requires n_heads > 1 and shared_dag_across_heads: true.
-  comps_embed: "svfa"
-  use_gradient_routing: true
+  init_tau: 3.0 # [!] deprecated removed option from the AttentionSelector class and config
+  
+  init_tau_cross: 0.5 # [?] is it the default value?
+  init_tau_self: 0.5 # [?] is it the default value?
+  init_gamma: -1.1 # [?] is it the default value?
+  init_zeta: 1.1 # [?] is it the default value?
+  dir_tau_self: 0.6666666667 # [?] is it the default value?
 
-  # Structural (Q/K stream) embedding scheme.  One of:
-  #   "standard_learnable"   — standard learnable nn_embedding (ModularEmbedding).
-  #   "orthogonal_learnable" — OrthogonalMaskEmbedding: learnable, but disjoint
-  #                            d_model partitions make S and X keys mutually
-  #                            orthogonal (gates zero out per-variable dims).
-  #   "orthogonal_fixed"     — FixedOrthonormalEmbedding: dense frozen rows
-  #                            spanning the full d_model space, mutually
-  #                            orthonormal and value-independent.
-  # The value stream is unchanged in all cases.
-  struct_embedding_type: "standard_learnable"
+  init_edge_offset: "auto" # [!] set default to "auto", keep key 
+  shared_dag_across_heads: true # [!] set default to true. Keep it for ablation/baselines 
 
-  # Decoupled key/query embedding for the predicted (X) nodes.
-  # In the combined attention each X_i is used BOTH as a key (offered as a
-  # parent to other X_j) and as a query (selecting its own parents).  With a
-  # single shared embedding, updating "X_i-as-child" also perturbs
-  # "X_i-as-parent", so X_i ← S and X_i ← X_j cannot be learned independently.
-  # When True, the X QUERY gets its own free (unconstrained) identity embedding
-  # (FreeQueryEmbedding), removing this coupling.  The X KEY stream keeps its
-  # configured embedding (orthogonal or standard); the value stream is
-  # unchanged.  The query embedding is classified as a STRUCTURAL parameter by
-  # gradient routing (feeds Q only).
-  free_query_embedding: false
 
-  # Initialise the free X query at the centroid of the (projected) keys.
-  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): starting
-  # every query from the SAME point makes it read all candidate parents
-  # uniformly (identical <q, k_j> for an orthonormal key frame), giving HSIC a
-  # symmetric start to break toward the TRUE parents before the directional
-  # budget saturates — instead of falling into an early spurious basin.
-  # Only the X QUERY embedding is written (the query projection W_q is left
-  # untouched and inverted via least squares when present), so it works both
-  # WITH and WITHOUT the query/key projections; when the KEY projection is used
-  # the centroid is taken in the projected key space, so it adapts accordingly.
-  # Requires free_query_embedding=true.  The write happens lazily on the first
-  # training batch (value-modulated key embeddings need real data) and is NOT
-  # re-applied on warm-start/resume (a trained query is never clobbered).
-  query_centroid_init: false
+  comps_embed: "svfa" # [!] main decision point, set to default, leave it for ablation/baselines
+  
+  use_gradient_routing: true # [!] always true when svfa, else false, removed option from the AttentionSelector class and config
 
-  # Centroid-collapse fix (GatedCrossAttention / split GatedSelfAttention).
+  struct_embedding_type: "orthogonal_fixed" #[!] set default keep it for baselines
 
-  # When True, L2-normalise the STRUCTURAL query before scoring and replace the
-  # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  Rationale
-  # (see diagnose_block_dags / simulate_centroid_collapse): with a FREE query
-  # norm the cheapest way to raise a child's parent-scores is to align the query
-  # with the all-keys centroid, which lights EVERY key at once → a "block" row.
-  # Normalising the query makes its DIRECTION (not its unbounded norm) drive
-  # parent selection, so a flat centroid row no longer wins.  Pair with a
-  # positive gate offset (init_gamma < -init_zeta) so an undecided raw≈0 key
-  # defaults OFF.
-  # Structure gate only — never touches the value / reconstruction-gain streams.
-  normalize_query: false
+  free_query_embedding: true # [!] set default to true. Keep it for ablation/baselines
 
-  # ``query_fanin_scale`` (F) is the score temperature of the capped path.  Keep
-  # it "auto": F = n_keys * (x/M)^2 is DERIVED from the data at load time
-  # (causaliT/utils/query_norm.py::resolve_query_fanin_scale), because F SCALES
-  # WITH THE NODE COUNT - a value tuned for 10 nodes under-scores a 400-node row
-  # by 40x.  A literal float pins it instead (legacy runs reproduce exactly).
-  query_fanin_scale: auto
-  # The single knob behind the derivation: the edge posterior P(z>0) that a
-  # CENTROID-initialised query gives EVERY candidate parent.  It is a
-  # probability, so 1.0 is unreachable (asymptotic sigmoid); use 0.5-0.9.
-  # Higher = hotter scores = more init mass on every edge.
-  query_centroid_max_p: 0.9
-
-  # --- The two front-door keys: query_norm and fanin_prior ---------------
-  # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
-  # Everything else on the normalised-query path is DERIVED from these two and
-  # from the node count N, by query_norm.resolve_query_norm at data-load time.
-  #
-  # ``query_norm: true`` is a MASTER SWITCH.  It overwrites normalize_query,
-  # query_centroid_init (following free_query_embedding), query_norm_learnable,
-  # query_norm_init_scale and query_fanin_scale with the consistent set, so the
-  # five keys below it no longer have to be kept in sync by hand.  The scale is
-  # F^2 = N*x(p*)^2, i.e. the centroid init gives EVERY candidate parent the
-  # posterior query_centroid_max_p whatever N is.  An explicit numeric
-  # query_fanin_scale still wins (legacy runs reproduce exactly).
-  query_norm: false
-  #
-  # ``fanin_prior: K*`` declares a PRIOR on the in-degree, in EDGES.  By Lemma 1
-  # a row with budget M_i holds at most (M_i*F/x(p*))^2 parents at p*, so at
-  # M_i = 1 the capacity is N: no cap at all.  The prior is priced by lowering
-  # the over-spend TARGET to mu = sqrt(K*/N) - NOT by shrinking F, which would
-  # decay the init signal like sqrt(K*/N) and can close the gate outright.
-  # null = disabled.  Requires query_norm: true and lambda_query_norm > 0
-  # (a prior with a zero weight is silently inert, so it raises instead).
-  # For the random ER-k DAGs use er_indegree_quantile(n, degree, 0.95) - about
-  # 10 for ER-4 - NOT ``degree`` itself: the mean in-degree is k, but the last
-  # topological node already expects 2k parents and the max is larger still.
-  fanin_prior: null
+  query_centroid_init: true # [!] set default to true. Keep it for ablation/baselines
 
 
 
+  normalize_query: true # [?] if it is deprecated (new query_norm), remove forever
 
-  # Adaptive learnable per-node query-norm budget (only active when
-  # normalize_query=true).  See causaliT/utils/query_norm.py.  Plain
-  # unit-normalisation HARD-caps the directional budget
-  # (sum_j cos^2(q_hat, k_j) <= 1); the SELF_ATTENTION spurious-S3->X4 study
-  # showed a node sometimes needs to OVERSPEND that budget (host several parents
-  # at once), and — after removing W_q/W_K — this saturation bites LATE, past any
-  # preset epoch window.  Instead of an epoch schedule, each child i owns a
-  # learnable multiplier ``M_i = exp(log_scale_i)`` (init ``query_norm_init_scale``)
-  # scaling its unit query: ``q_eff = (q/||q||) * M_i``.  The structural loss
-  # charges ``lambda_query_norm * sum_i relu(M_i - query_norm_target)^2`` so a
-  # node raises its own budget only when the structural signal (HSIC / L0) pays
-  # for it, exactly when saturation actually bites.  Disabled (or init_scale=1.0
-  # with lambda_query_norm=0) reproduces plain unit-normalisation.
-  query_norm_learnable: false
-  query_norm_init_scale: 1.0
-  query_norm_target: 1.0
+  
+  query_fanin_scale: auto #[!] set to default when normalizing query and remove option from the AttentionSelector class and config
 
-  # Reconstruction-gain bypass (GatedCrossAttention / GatedSelfAttention only).
-  # By default (true) the final attention weight is the causal structure gate
-  # MULTIPLIED by a learnable reconstruction gain: A = z * g.  When set to false
-  # the gain is bypassed entirely and the structure gate becomes the final
-  # attention score (A = z), i.e. the reconstruction magnitude is carried solely
-  # by the value stream.  Ignored for non-gated attention types.
-  use_gain: true
+  query_centroid_max_p: 0.9 #[!] set to default, keep it
+  
+  query_norm: false #[!] set default to true, keep it for ablation
+  
 
-  # Value-structure injection (SVFA only).  By default ("none") the value
-  # projection depends on DATA ONLY (standard Structure-Value Factorized
-  # attention), so W_V cannot learn a per-source-node functional.  When set, a
-  # per-SOURCE-node identity code is CONCATENATED onto the value before W_V
-  # (V_j = W_V([v_j ; e_j])), letting the shared W_V specialise per parent while
-  # preserving SVFA's source-shared value.  One of:
-  #   "none"            — disabled (default; original data-only value).
-  #   "separate"        — dedicated reconstruction-routed identity tables.
-  #   "struct_detached" — reuse the structural identity, detached (0 new params).
-  # Requires comps_embed: "svfa".  Identity tables are classified as
-  # RECONSTRUCTION parameters by gradient routing.
-  value_structure_injection: "none"
+  query_norm_learnable: false #[?] still active? If not, remove forever
+  query_norm_init_scale: 1.0 #[?] still active? If not, remove forever
+  query_norm_target: 1.0 #[?] still active? If not, remove forever
 
-  # Value-structure QUERY injection (SVFA only).  Complements
-  # ``value_structure_injection`` (which keys the value on the SOURCE/parent
-  # node) by additionally conditioning the value on the QUERY (child) node.
-  # A per-child identity code is mapped by a dedicated bias-free W_V^q and ADDED
-  # to the value output, so the shared W_V can learn DIFFERENT functionals of the
-  # same parent depending on which child it feeds (e.g. X2 predicting X4 vs X5).
-  # Because the query term is key-independent it factors out of the softmax as
-  # ``(sum_j A_ij) * W_V^q(e_i)`` — an exact, memory-cheap decomposition. One of:
-  #   "none"            — disabled (default; value independent of the child).
-  #   "separate"        — dedicated reconstruction-routed child identity table.
-  #   "struct_detached" — reuse the structural identity, detached (0 new params).
-  # Requires comps_embed: "svfa".  The W_V^q projection and the identity table
-  # are classified as RECONSTRUCTION parameters by gradient routing.
-  value_structure_query_injection: "none"
 
-  # Direction-aware X→X self-attention block.  MANDATORY (the legacy
-  # "one combined cross block also models X→X" variant was removed because it
-  # cannot express edge direction — double-edges / two-cycles): passing null
-  # raises ValueError.  The X→X interaction is always a dedicated
-  # direction-aware self block whose antisymmetric direction gate suppresses
-  # two-cycles.  In homogeneous mode (see homogeneous_nodes below) this type
-  # builds the SINGLE square (N, N) block.  One of:
-  #   "GatedSelfAttention"       — SYMMETRIC Hard-Concrete existence gate (on the
-  #                                symmetric Toeplitz part) x antisymmetric
-  #                                direction gate x reconstruction gain.
-  #   "CommutatorSelfAttention"  — UNIFIED existence gate: an ASYMMETRIC
-  #                                Hard-Concrete L0 gate applied directly to the
-  #                                raw alignment score (identical mechanism/L0
-  #                                semantics to the S→X GatedCrossAttention),
-  #                                x the same antisymmetric direction gate x gain.
-  #                                Prefer this to keep S→X and X→X edge existence
-  #                                on ONE gating code path.
-  self_attention_type: "GatedSelfAttention"
+  use_gain: true #[!!] remove forever everywhere, very dangerous!
 
-  # ------------------------------------------------------------------
-  # Node topology: heterogeneous (default) vs homogeneous nodes
-  # ------------------------------------------------------------------
-  # false — SPLIT (default).  The S/X prior is kept: only the L_X variables are
-  #         children.  ``attention`` is the S→X cross block (attention_type) and
-  #         ``self_attention`` the direction-aware X→X block
-  #         (self_attention_type); the posterior is (B, L_X, L_S+L_X).
-  # true  — HOMOGENEOUS.  The S/X prior is DROPPED: [S ; X] is one set of
-  #         N = L_S + L_X nodes, each simultaneously a value-blanked query and
-  #         an actual-value key/value.  ONE square block is built from
-  #         ``self_attention_type`` and the posterior is the full directed
-  #         (B, N, N) adjacency; the S variables are reconstructed too.
-  #
-  # In homogeneous mode:
-  #   * ``attention_type`` is IGNORED (only the self block is built);
-  #   * ``self_attention_type`` is REQUIRED (it is mandatory in both modes);
-  #   * ``shared_query`` / ``shared_key`` MUST be false — a single block shares
-  #     its projections by construction, so setting them raises ValueError.
+  
+  value_structure_injection: "none" #[!] set to default with svfa and remove this option from the AttentionSelector class and config
+  value_structure_query_injection: "none" #[!] set to default with svfa and remove this option from the AttentionSelector class and config
+
+
+  self_attention_type: "GatedSelfAttention" #[!] set default
+
+  # only important public settings, leave them
   homogeneous_nodes: false
-  # Direction-gate Binary-Concrete temperature of the self block's
-  # antisymmetric term (GatedSelfAttention / CommutatorSelfAttention only).
-  # Lower = sharper direction commitment.  The default 2/3 (Louizos et al.,
-  # ICLR 2018) places the 0.9-posterior point at ln(9)*2/3 ~= 1.465, just below
-  # the existence-gate saturation logit kappa_1 ~= 1.5223, so an edge's
-  # DIRECTION commits slightly before its EXISTENCE saturates (see
-  # docs/documentation/ATTENTION_TEMPERATURES.md).  The legacy key ``dir_tau``
-  # remains accepted as a fallback when dir_tau_self is unset.
-  dir_tau_self: 0.6666666667
+  fanin_prior: null
+  
+  # those we'll check later
+  transitive_correction: true # [!] false by default
+  transitive_alpha: 0.5       # strength; 1.0 starts eating true edges
+  transitive_delta: 0.5       # target COSINE on the negative side of threshold
+  transitive_tnorm: min       # Goedel; "prod" deflates and barely fires
+  transitive_margin: true     # relu(m - Pi): silent at the all-on init
+  transitive_symmetric: true  # the existence part of the gate is symmetric
+
+
+
+  
 
 
   # Shared structural query projection (W_q) across the S→X cross block and the
@@ -278,31 +90,13 @@ experiment:
   # X→X selectors share one query geometry (fewer params, consistent selection).
   #   false — each block owns an independent W_q (default, original behaviour).
   #   true  — one shared W_q across both blocks.
-  shared_query: false
-
-  # --- Remove / freeze the structural query & key projections (W_q / W_K) ---
-  # Motivation (see SELF_ATTENTION investigate_S3_X4_spurious_barrier): the
-  # shared query projection W_q couples every node's query together and aligns
-  # them to the keys, "numbing" the per-node query embeddings (they receive a
-  # single-node gradient while W_q aggregates all nodes).  These levers let the
-  # query/key be read DIRECTLY from the (identity) embeddings.
-  #   remove_query_projection — drop W_q entirely: the structural query is the
-  #     raw query embedding (Q = e_q).  Requires d_qk == d_model.
-  #   remove_key_projection   — drop W_K entirely: the structural key is the raw
-  #     key embedding (K = e_k).  Requires d_qk == d_model.
-  #   freeze_query_projection — keep W_q but set requires_grad=False (frozen at
-  #     init); the freeze persists across adaptive phase switches.
-  #   freeze_key_projection   — same, for W_K.
-  # ``remove_*`` and ``freeze_*`` for the same stream are mutually exclusive
-  # (removing already means "no learnable projection").  Threaded into BOTH the
-  # S->X cross block and (when split) the X->X self block; on the self block
-  # they are a no-op whenever it borrows the projection via shared_query /
-  # shared_key (the shared W_q / W_K then lives in — and is removed/frozen on —
-  # the cross block).
-  remove_query_projection: false
-  remove_key_projection: false
-  freeze_query_projection: false
-  freeze_key_projection: false
+  
+  shared_query: false # [!] make it available only for homogeneous = False
+  
+  remove_query_projection: false #[!] set default to true, keep key
+  remove_key_projection: false #[!] set default to true, keep key
+  freeze_query_projection: false #[!] remove option entirely from config and code
+  freeze_key_projection: false #[!] remove option entirely from config and code
 
 
 model:
@@ -408,6 +202,12 @@ model:
     query_norm_learnable: ${experiment.query_norm_learnable}
     query_norm_init_scale: ${experiment.query_norm_init_scale}
     query_norm_target: ${experiment.query_norm_target}
+    transitive_correction: ${experiment.transitive_correction}
+    transitive_alpha: ${experiment.transitive_alpha}
+    transitive_delta: ${experiment.transitive_delta}
+    transitive_tnorm: ${experiment.transitive_tnorm}
+    transitive_margin: ${experiment.transitive_margin}
+    transitive_symmetric: ${experiment.transitive_symmetric}
     # Reconstruction-gain bypass (gated attentions only); see experiment.use_gain.
     use_gain: ${experiment.use_gain}
     # Value-structure injection (SVFA only); see experiment.value_structure_injection.

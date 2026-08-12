@@ -1555,8 +1555,9 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                 )
             elif attention is GatedCrossAttention:
-                # GatedCrossAttention: HardConcrete structure gate x sigmoid
-                # reconstruction gain.  Needs gamma/zeta (gate) + gain_tau.
+                # GatedCrossAttention: HardConcrete structure gate (A = z).
+                # Needs gamma/zeta (gate).  The reconstruction-gain stream has
+                # been removed from this module.
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
@@ -1567,8 +1568,6 @@ class AttentionLayer(nn.Module):
                     # Init-balancing offset on the S->X existence gate (lands the
                     # cross init posterior at sigmoid(x - offset - kappa)).
                     init_edge_offset=init_edge_offset,
-                    gain_tau=gain_tau,
-                    use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
                     query_norm_learnable=query_norm_learnable,
@@ -1620,7 +1619,7 @@ class AttentionLayer(nn.Module):
                 # GatedSelfAttention: direction-aware selector.  Toeplitz split
                 # of the structural score → symmetric HardConcrete existence gate
                 # (gamma/zeta, init_tau) × antisymmetric coupled direction gate
-                # (dir_tau) × sigmoid reconstruction gain (gain_tau).
+                # (dir_tau).  The reconstruction-gain stream has been removed.
                 self.inner_attention = attention(
                     attention_dropout=attention_dropout,
                     register_entropy=register_entropy,
@@ -1629,8 +1628,6 @@ class AttentionLayer(nn.Module):
                     gamma=init_gamma,
                     zeta=init_zeta,
                     dir_tau=dir_tau,
-                    gain_tau=gain_tau,
-                    use_gain=use_gain,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
                     query_norm_learnable=query_norm_learnable,
@@ -1819,19 +1816,19 @@ class AttentionLayer(nn.Module):
             self.value_projection_struct = None
             self.out_projection_struct = None
 
-        # Reconstruction-gain projections (GatedCrossAttention only).
+        # Reconstruction-gain projections (CommutatorSelfAttention only; the
+        # gain stream has been REMOVED from GatedCrossAttention / GatedSelfAttention).
         # Named ``gain_q_proj`` / ``gain_k_proj`` — deliberately WITHOUT the
         # substrings "query_projection" / "key_projection" — so the name-based
         # gradient router classifies them as RECONSTRUCTION parameters (driven
         # by the MSE loss), keeping them disentangled from the structural gate.
         self._gated_gain = (
-            attention in (GatedCrossAttention, GatedSelfAttention, CommutatorSelfAttention)
+            attention is CommutatorSelfAttention
         ) and (shared_qk_inner is None)
         if self._gated_gain:
             if not self.shared_dag_across_heads:
                 raise ValueError(
-                    "GatedCrossAttention / GatedSelfAttention / "
-                    "CommutatorSelfAttention require shared_dag_across_heads=True "
+                    "CommutatorSelfAttention requires shared_dag_across_heads=True "
                     "(single structural head)."
                 )
 
@@ -2052,9 +2049,9 @@ class AttentionLayer(nn.Module):
 
         if self._gated_gain:
 
-            # Reconstruction-gain stream (GatedCrossAttention).  gain_query /
-            # gain_key default to the structural query/key inputs when the
-            # caller does not supply dedicated gain embeddings (shared mode).
+            # Reconstruction-gain stream (CommutatorSelfAttention only).
+            # gain_query / gain_key default to the structural query/key inputs
+            # when the caller does not supply dedicated gain embeddings.
             gq_in = gain_query if gain_query is not None else query
             gk_in = gain_key if gain_key is not None else key
             gq = self.dropout_qkv(self.gain_q_proj(gq_in)).view(B, L, -1)

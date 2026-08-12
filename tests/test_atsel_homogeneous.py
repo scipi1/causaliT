@@ -155,7 +155,6 @@ def _make_model(
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
-        gain_stream_source="separate",
     )
     kwargs.update(overrides)
     return AttentionSelectorLayer(**kwargs)
@@ -262,19 +261,16 @@ class TestConstruction:
         assert _make_model().is_gated is True
 
     def test_s_side_tables_are_built(self):
-        """S is a child too, so it needs its own query / gain-query tables."""
+        """S is a child too, so it needs its own query table."""
         m = _make_model(free_query_embedding=True)
         assert m.query_embed_S is not None
         assert m.query_embed_X is not None
-        assert m.gain_q_embed_S is not None
-        assert m.gain_q_embed_X is not None
 
     def test_s_side_query_table_absent_in_split_mode(self):
         """Contrast: split mode has no S query (S is never a child there)."""
         m = _make_model(homogeneous_nodes=False, free_query_embedding=True)
         assert m.query_embed_X is not None
         assert m.query_embed_S is None
-        assert m.gain_q_embed_S is None
 
 
 # ===========================================================================
@@ -633,7 +629,7 @@ class TestGradients:
         pred, _, _ = _forward(model)
         pred.sum().backward()
 
-        for name in ("query_embed_S", "gain_q_embed_S", "val_q_id_embed_S"):
+        for name in ("query_embed_S", "val_q_id_embed_S"):
             table = getattr(model, name)
             assert table is not None, f"{name} must exist in homogeneous mode."
             grad = table.embedding.weight.grad
@@ -667,11 +663,6 @@ class TestGradients:
             p = getattr(model, name).embedding.weight
             assert id(p) in struct_ids, f"{name} must be STRUCTURAL."
             assert id(p) not in recon_ids
-
-        # The gain tables stay on the reconstruction pathway.
-        for name in ("gain_q_embed_S", "gain_q_embed_X"):
-            p = getattr(model, name).embedding.weight
-            assert id(p) in recon_ids, f"{name} must be RECONSTRUCTION."
 
 
 # ===========================================================================

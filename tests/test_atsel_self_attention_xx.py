@@ -122,7 +122,6 @@ def _make_model(
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
         free_query_embedding=free_query_embedding,
-        gain_stream_source=gain_stream_source,
         self_attention_type=self_attention_type,
     )
 

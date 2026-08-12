@@ -120,7 +120,6 @@ def _make_model(
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
         free_query_embedding=free_query_embedding,
-        gain_stream_source="separate",
         self_attention_type=self_attention_type,
         shared_query=shared_query,
         remove_query_projection=remove_query_projection,

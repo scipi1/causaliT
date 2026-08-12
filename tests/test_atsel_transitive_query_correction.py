@@ -340,7 +340,6 @@ def _l_make_layer(
         normalize_query=True,
         shared_dag_across_heads=True,
         init_edge_offset=1.1,
-        use_gain=False,
         transitive_correction=transitive_correction,
     )
     if homogeneous_nodes:   # a single block forbids the sharing flags

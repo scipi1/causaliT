@@ -31,10 +31,7 @@ MAX_CONCURRENT_JOBS=6
 # Walltime of ONE array task (a single Optuna trial / a single training run),
 # not of the whole sweep: the chain runs as long as it needs to.
 WALLTIME="36:00:00"
-MEM_PER_CPU="32g"
-# No spaces around '=' in bash assignments.  "none"/"null"/"" requests NO GPU:
-# the trial/train arrays are then emitted without --gpus / --gres=gpumem and
-# are scheduled on CPU nodes (e.g. for the CPU-only benchmark trainers).
+MEM_PER_CPU="256g"
 GPU_MEM="none"
 # Python environment; also passed on, so the worker jobs activate the same one.
 VENV_PATH="$HOME/myenv"
@@ -72,7 +69,7 @@ rsync -av --exclude 'groups/' "$HOME_EXP/" "$SCRATCH_EXP/"
 # ---------------------------------------------------------------------------
 module load stack/2024-06
 module load gcc/12.2.0
-module load python/3.11.6
+module load python_cuda/3.11.6
 
 source "$VENV_PATH/bin/activate"
 

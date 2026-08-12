@@ -235,7 +235,9 @@ class TestNoStructuralMachinery:
     def test_no_gain_stream(self):
         m = _make_vanilla()
         assert m.is_gated is False
-        assert m.gain_q_embed_X is None and m.gain_k_embed_S is None
+        # The reconstruction-gain stream has been removed entirely.
+        assert not hasattr(m, "gain_q_embed_X")
+        assert not hasattr(m, "gain_k_embed_S")
 
 
 # ---------------------------------------------------------------------------

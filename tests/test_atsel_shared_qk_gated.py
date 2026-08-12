@@ -127,7 +127,6 @@ def _make_model(
         struct_embedding_type=struct_embedding_type,
         key_projection_type=key_projection_type,
         free_query_embedding=True,
-        gain_stream_source="separate",
         self_attention_type="GatedSelfAttention",
         shared_query=shared_query,
         shared_key=shared_key,
@@ -235,7 +234,7 @@ class TestAntisymmetryUsesBothInputs:
 
     def _mod_and_inputs(self, seed=0):
         g = torch.Generator().manual_seed(seed)
-        mod = GatedSelfAttention(use_gain=False).eval()  # A = structure (no gain)
+        mod = GatedSelfAttention().eval()  # A = structure gate (gain removed)
         q = torch.randn(self.B, self.N, self.E, generator=g)
         k = torch.randn(self.B, self.N, self.E, generator=g)
         v = torch.randn(self.B, self.N, self.D, generator=g)

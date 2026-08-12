@@ -99,7 +99,6 @@ def _make_model(**kwargs) -> AttentionSelectorLayer:
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
-        use_gain=False,
         struct_embedding_type="standard_learnable",
         key_projection_type="linear",
         free_query_embedding=True,
