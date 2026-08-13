@@ -341,6 +341,10 @@ def _l_make_layer(
         shared_dag_across_heads=True,
         init_edge_offset=1.1,
         transitive_correction=transitive_correction,
+        # Pin the pre-default-flip geometry: this arm predates the SVFA defaults
+        # (free_query_embedding / query_centroid_init now default True).
+        free_query_embedding=False,
+        query_centroid_init=False,
     )
     if homogeneous_nodes:   # a single block forbids the sharing flags
         kwargs["shared_query"] = False

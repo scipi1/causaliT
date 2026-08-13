@@ -125,6 +125,14 @@ def _make_model(comps_embed_X: str) -> AttentionSelectorLayer:
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
+        # Pin the pre-default-flip geometry: this test mocks embedding_X and
+        # expects the X streams to flow from it.  free_query_embedding=True
+        # would reroute the query to query_embed_X, and an orthogonal
+        # struct_embedding_type would override the structural stream with
+        # orth_embed_X — both bypass the mock and starve it of gradient.
+        struct_embedding_type="standard_learnable",
+        free_query_embedding=False,
+        query_centroid_init=False,
     )
 
 

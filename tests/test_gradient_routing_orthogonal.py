@@ -112,6 +112,9 @@ def _make_model(
         key_projection_type=key_projection_type,
         free_query_embedding=free_query_embedding,
         homogeneous_nodes=homogeneous_nodes,
+        # Keep the centroid init independent of the free-query toggle so the
+        # free_query_embedding=False tests build (the SVFA default couples them).
+        query_centroid_init=False,
     )
 
 

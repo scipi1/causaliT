@@ -290,10 +290,8 @@ class AttentionSelectorLayer(nn.Module):
         # Sequence lengths
         S_seq_len: int,
         X_seq_len: int,
-        # Attention temperatures (harmonized; the legacy shared ``init_tau``
-        # doubles as the non-gated activation temperature AND as the shared
-        # fallback for the two Hard-Concrete existence gates).
-        init_tau: Optional[float] = None,
+        # Attention temperatures (harmonized split keys; the legacy shared
+        # ``init_tau`` key has been REMOVED).
         init_tau_cross: Optional[float] = None,
         init_tau_self: Optional[float] = None,
         # MLP output head
@@ -304,22 +302,23 @@ class AttentionSelectorLayer(nn.Module):
         # Multi-head semantics
         shared_dag_across_heads: bool = True,
         # Structural (Q/K) embedding scheme.  One of STRUCT_EMBEDDING_TYPES:
-        #   "standard_learnable"   → ModularEmbedding (nn_embedding)
+        #   "orthogonal_fixed"     → FixedOrthonormalEmbedding (dense frozen frame;
+        #                          the DEFAULT for the SVFA stack).
         #   "orthogonal_learnable" → OrthogonalMaskEmbedding (disjoint blocks)
-        #   "orthogonal_fixed"     → FixedOrthonormalEmbedding (dense frozen frame)
-        struct_embedding_type: str = "standard_learnable",
+        #   "standard_learnable"   → ModularEmbedding (nn_embedding; baseline)
+        struct_embedding_type: str = "orthogonal_fixed",
         # Sub-options for struct_embedding_type="orthogonal_fixed".
         orthogonal_fixed_frame_type: str = "random",
         orthogonal_fixed_scale: float = 1.0,
         # Decoupled key/query embedding for X
-        free_query_embedding: bool = False,
+        free_query_embedding: bool = True,
         # Initialise the free X query embedding at the centroid of the (projected)
         # keys so every query starts from the SAME point and reads all candidate
         # parents uniformly (see init_query_at_key_centroid).  Requires
         # free_query_embedding=True.  The actual write happens lazily on the first
         # training batch (the forecaster calls the method), since value-modulated
         # key embeddings need real data.
-        query_centroid_init: bool = False,
+        query_centroid_init: bool = True,
         # Orthogonal (isometric) key projection: W_K^T W_K = I
 
         key_projection_type: str = "linear",
@@ -691,18 +690,18 @@ class AttentionSelectorLayer(nn.Module):
 
         # ------------------------------------------------------------------
         # Harmonized attention temperatures (see
-        # docs/documentation/ATTENTION_TEMPERATURES.md).  Fallback chain:
-        # explicit split key -> legacy shared key -> calculated default.
+        # docs/documentation/ATTENTION_TEMPERATURES.md).  The legacy shared
+        # ``init_tau`` key has been REMOVED: the split keys fall back straight
+        # to the calculated defaults.
         # ------------------------------------------------------------------
-        self.init_tau_act = 3.0 if init_tau is None else float(init_tau)
-        _legacy_hc = None if init_tau is None else float(init_tau)
+        self.init_tau_act = 3.0   # non-gated activation temperature (CausalCross/Sigmoid)
         self.init_tau_cross = (
             float(init_tau_cross) if init_tau_cross is not None
-            else (_legacy_hc if _legacy_hc is not None else DEFAULT_GATE_TAU)
+            else DEFAULT_GATE_TAU
         )
         self.init_tau_self = (
             float(init_tau_self) if init_tau_self is not None
-            else (_legacy_hc if _legacy_hc is not None else DEFAULT_GATE_TAU)
+            else DEFAULT_GATE_TAU
         )
         self.dir_tau = (
             float(dir_tau_self) if dir_tau_self is not None

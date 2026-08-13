@@ -127,6 +127,7 @@ def _make_model(value_embed: str = "mlp") -> AttentionSelectorLayer:
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
         free_query_embedding=False,
+        query_centroid_init=False,
     )
 
 

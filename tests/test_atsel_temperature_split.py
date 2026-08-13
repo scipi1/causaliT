@@ -1,21 +1,22 @@
-"""Verification: the three harmonized attention temperatures are wired to the
-right modules, with the legacy fallback chain intact.
+"""Verification: the harmonized attention temperatures are wired to the right
+modules, with the calculated defaults applied when a split key is unset.
 
 Run with:  pytest tests/test_atsel_temperature_split.py -v
 
 Background
 ----------
-See docs/documentation/ATTENTION_TEMPERATURES.md.  Three temperatures:
+See docs/documentation/ATTENTION_TEMPERATURES.md.  Temperatures:
 
 1. ``init_tau_cross`` -> cross-block Hard-Concrete existence gate (``beta``).
 2. ``init_tau_self``  -> self-block Hard-Concrete existence gate (``beta``);
    also the single square block in homogeneous mode.
 3. ``dir_tau_self``   -> self-block antisymmetric direction gate (``dir_beta``).
 
-Fallback chain when a split key is unset: legacy shared ``init_tau`` (resp.
-``dir_tau``), then the calculated defaults (0.5 / 0.5 / 2/3 with the symmetric
-stretch gamma=-1.1, zeta=1.1).  ``init_tau`` alone stays the activation
-temperature of the NON-gated attentions (default 3.0).
+The legacy shared ``init_tau`` / ``dir_tau`` keys have been REMOVED: when a
+split key is unset the temperature falls straight back to the calculated
+defaults (0.5 / 0.5 / 2/3 with the symmetric stretch gamma=-1.1, zeta=1.1).
+The NON-gated attentions keep a constant activation temperature (default 3.0),
+no longer overridable from the removed shared key.
 """
 
 import logging
@@ -121,13 +122,6 @@ def test_explicit_split_keys_land_on_the_right_modules():
     assert d_self == pytest.approx(0.9)
 
 
-def test_legacy_shared_keys_fallback():
-    m = _make_model(init_tau=0.5, dir_tau=0.3)
-    b_cross, b_self, d_self = _betas(m)
-    assert b_cross == 0.5 and b_self == 0.5
-    assert d_self == pytest.approx(0.3)
-
-
 def test_bare_construction_uses_the_calculated_defaults():
     m = _make_model()
     b_cross, b_self, d_self = _betas(m)
@@ -144,11 +138,6 @@ def test_bare_construction_uses_the_calculated_defaults():
 def test_non_gated_cross_attention_keeps_its_activation_temperature():
     m = _make_model(attention_type="CausalCrossAttention", self_attention_type=None)
     assert m.attention.inner_attention.tau == 3.0
-    m = _make_model(
-        attention_type="CausalCrossAttention", self_attention_type=None,
-        init_tau=7.0,
-    )
-    assert m.attention.inner_attention.tau == 7.0
 
 
 def test_homogeneous_block_gets_the_SELF_temperatures():
@@ -156,24 +145,23 @@ def test_homogeneous_block_gets_the_SELF_temperatures():
     block = m.attention.inner_attention
     assert block.beta == 0.6
     assert block.dir_beta == pytest.approx(0.42)
-    # Homogeneous + legacy shared key falls back.
-    m = _make_model(homogeneous_nodes=True, init_tau=0.31)
-    assert m.attention.inner_attention.beta == 0.31
+    # Bare homogeneous construction uses the calculated defaults.
+    m = _make_model(homogeneous_nodes=True)
+    assert m.attention.inner_attention.beta == DEFAULT_GATE_TAU
 
 
 def test_gate_tau_from_experiment_resolution_order():
     # Split mode: the CROSS key wins (the F derivation targets the cross gate).
     assert gate_tau_from_experiment(
-        {"init_tau_cross": 0.2, "init_tau_self": 0.8, "init_tau": 0.5},
+        {"init_tau_cross": 0.2, "init_tau_self": 0.8},
         homogeneous=False,
     ) == 0.2
     # Homogeneous mode: the SELF key wins.
     assert gate_tau_from_experiment(
-        {"init_tau_cross": 0.2, "init_tau_self": 0.8, "init_tau": 0.5},
+        {"init_tau_cross": 0.2, "init_tau_self": 0.8},
         homogeneous=True,
     ) == 0.8
-    # Legacy fallback, then the calculated default.
-    assert gate_tau_from_experiment({"init_tau": 0.5}, homogeneous=False) == 0.5
+    # Unset -> the calculated default.
     assert gate_tau_from_experiment({}, homogeneous=False) == DEFAULT_GATE_TAU
 
 
@@ -197,16 +185,10 @@ def test_fanin_derivation_uses_the_split_temperature():
     }
     n_keys = S_SEQ_LEN + X_SEQ_LEN
 
-    cfg_legacy = {"experiment": {**base, "init_tau": 0.25}}
-    out_legacy = resolve_query_fanin_scale(cfg_legacy, n_keys=n_keys)
-
     cfg_split = {"experiment": {**base, "init_tau_cross": 0.25}}
     out_split = resolve_query_fanin_scale(cfg_split, n_keys=n_keys)
-    assert out_split["query_fanin_scale"] == pytest.approx(
-        out_legacy["query_fanin_scale"]
-    )
 
-    # ... and it really is the CROSS temperature (a different value changes F).
+    # A different CROSS temperature changes F.
     cfg_other = {"experiment": {**base, "init_tau_cross": 0.5}}
     out_other = resolve_query_fanin_scale(cfg_other, n_keys=n_keys)
     assert out_other["query_fanin_scale"] != pytest.approx(

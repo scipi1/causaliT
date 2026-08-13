@@ -162,6 +162,9 @@ def _make_model(
             else "standard_learnable"
         ),
         free_query_embedding=free_query_embedding,
+        # Keep the centroid init independent of the free-query toggle so the
+        # False arm builds (the SVFA default couples them via query_norm).
+        query_centroid_init=False,
     )
 
 

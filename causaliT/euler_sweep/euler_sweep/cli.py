@@ -990,7 +990,23 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 @click.option(
     "--mem_per_cpu",
     default="10g",
-    help="CPU memory requirement (default: 10g)",
+    help="CPU memory requirement per allocated CPU (default: 10g). "
+         "Ignored when --mem is given.",
+)
+@click.option(
+    "--mem",
+    default=None,
+    help="TOTAL memory per job, e.g. '16G' (emits '#SBATCH --mem=...' instead "
+         "of --mem-per-cpu). NOTE: rejected on Euler - its job-submit plugin "
+         "answers 'Requesting memory by node is not supported. Use "
+         "--mem-per-cpu.', so use --mem_per_cpu (x --cpus_per_task) there.",
+)
+@click.option(
+    "--cpus_per_task",
+    default=None,
+    type=int,
+    help="Emit '#SBATCH --cpus-per-task=N' in every stage script (default: "
+         "unset, SLURM assigns 1 CPU per task)",
 )
 @click.option(
     "--venv_path",
@@ -999,7 +1015,7 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 )
 def dagsweep(exp_id, cluster, sequential, keep_data, skip_optuna, force_optuna,
              dry_run, scratch_path, max_concurrent_jobs, walltime, gpu_mem,
-             mem_per_cpu, venv_path):
+             mem_per_cpu, mem, cpus_per_task, venv_path):
 
     """
     Run a grouped DAG sweep: one Optuna study per DAG size, shared by all seeds.
@@ -1092,6 +1108,9 @@ def dagsweep(exp_id, cluster, sequential, keep_data, skip_optuna, force_optuna,
                 # 'null' -> None: CPU-only trial/train arrays (benchmarks)
                 "gpu_mem": normalize_gpu_mem(gpu_mem),
                 "mem_per_cpu": mem_per_cpu,
+                # Optional Euler-style resource form: total --mem + N CPUs/task
+                "mem": mem,
+                "cpus_per_task": cpus_per_task,
                 "venv_path": venv_path,
             },
             keep_data=keep_data,

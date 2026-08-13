@@ -31,7 +31,19 @@ MAX_CONCURRENT_JOBS=6
 # Walltime of ONE array task (a single Optuna trial / a single training run),
 # not of the whole sweep: the chain runs as long as it needs to.
 WALLTIME="36:00:00"
-MEM_PER_CPU="256g"
+# Resource request for the generated stage scripts.  NOTE: Euler's job-submit
+# plugin REJECTS a total --mem ("Requesting memory by node is not supported.
+# Use --mem-per-cpu."), so memory must be requested per CPU and the task total
+# is CPUS_PER_TASK x MEM_PER_CPU = 8 x 2g = 16 GB.  That is ~8x the measured
+# steady state of one DagmaMLP fit (~1-2 GB even at n=50000/d=80); the
+# oom_kills seen on 2026-08-12 (run ..._10507061, 32g per task) were glibc
+# arena stranding from 128 threads on a 1-CPU allocation, fixed by the
+# OMP/MKL + MALLOC_* guards the stage scripts now export.  Do not raise the
+# request into the hundreds of GB: it only slows scheduling.  The 8 CPUs keep
+# torch's full-batch matmuls fast (the kill logs showed 128-thread thrash
+# collapsing to 1-5 s/iter).
+CPUS_PER_TASK=8
+MEM_PER_CPU="2g"
 GPU_MEM="none"
 # Python environment; also passed on, so the worker jobs activate the same one.
 VENV_PATH="$HOME/myenv"
@@ -52,7 +64,8 @@ echo "[$(date)] Scratch folder  : $SCRATCH_EXP"
 echo "[$(date)] Max concurrent  : $MAX_CONCURRENT_JOBS"
 echo "[$(date)] Task walltime   : $WALLTIME"
 echo "[$(date)] GPU memory      : $GPU_MEM"
-echo "[$(date)] Memory per CPU  : $MEM_PER_CPU"
+echo "[$(date)] Memory per CPU  : $MEM_PER_CPU (x $CPUS_PER_TASK CPUs)"
+echo "[$(date)] CPUs per task   : $CPUS_PER_TASK"
 
 # ---------------------------------------------------------------------------
 # COPY INPUTS TO SCRATCH
@@ -97,7 +110,7 @@ echo "[$(date)] Submitting parallel DAG sweep..."
 
 # Add --dry_run to write the job scripts into $SCRATCH_EXP/dagsweep/scripts/ and
 # print the plan WITHOUT submitting anything.
-python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id "$EXPERIMENT_ID" --cluster --scratch_path "$SCRATCH_EXP" --max_concurrent_jobs "$MAX_CONCURRENT_JOBS" --walltime "$WALLTIME" --gpu_mem "$GPU_MEM" --mem_per_cpu "$MEM_PER_CPU" --venv_path "$VENV_PATH"
+python -m causaliT.euler_sweep.euler_sweep.cli dagsweep --exp_id "$EXPERIMENT_ID" --cluster --scratch_path "$SCRATCH_EXP" --max_concurrent_jobs "$MAX_CONCURRENT_JOBS" --walltime "$WALLTIME" --gpu_mem "$GPU_MEM" --mem_per_cpu "$MEM_PER_CPU" --cpus_per_task "$CPUS_PER_TASK" --venv_path "$VENV_PATH"
 
 deactivate
 echo "[$(date)] Python environment deactivated"

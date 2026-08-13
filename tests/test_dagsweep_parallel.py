@@ -644,6 +644,43 @@ def test_null_gpu_mem_yields_cpu_only_scripts(tmp_path):
         assert "--mem-per-cpu=8g" in train
 
 
+def test_total_mem_and_cpus_per_task_override(tmp_path):
+    """
+    Euler's recommended form for single-process jobs is ``--cpus-per-task=1``
+    plus a TOTAL ``--mem=<...>``.  When ``mem`` is given it must REPLACE
+    ``--mem-per-cpu`` in every stage (mixing both directives is confusing),
+    and ``cpus_per_task`` must land in every header.
+    """
+    exp_dir, plan = _plan(tmp_path, dag_seeds=(0, 1), model_seeds=(7, 8),
+                          n_trials=3)
+    scripts = dsp.generate_stage_scripts(
+        str(exp_dir), plan,
+        {"max_concurrent_jobs": 2, "walltime": "1:00:00", "gpu_mem": None,
+         "mem_per_cpu": "8g", "mem": "300g", "cpus_per_task": 1,
+         "venv_path": "/env"},
+    )
+
+    for name, path in scripts.items():
+        content = Path(path).read_text()
+        assert "#SBATCH --mem=300g" in content, f"{name} misses --mem"
+        assert "--mem-per-cpu" not in content, f"{name} mixes --mem-per-cpu"
+        assert "#SBATCH --cpus-per-task=1" in content, f"{name} misses cpus"
+
+
+def test_default_scripts_have_no_mem_or_cpus_overrides(tmp_path):
+    """Without the new options the scripts keep the historical mem-per-cpu form."""
+    exp_dir, plan = _plan(tmp_path, optuna_enabled=False)
+    scripts = dsp.generate_stage_scripts(
+        str(exp_dir), plan,
+        {"max_concurrent_jobs": 2, "mem_per_cpu": "8g"},
+    )
+    for name, path in scripts.items():
+        content = Path(path).read_text()
+        assert "--mem-per-cpu=8g" in content
+        assert "#SBATCH --mem=" not in content
+        assert "#SBATCH --cpus-per-task" not in content
+
+
 @pytest.mark.parametrize("value,expected", [
     (None, None), ("", None), ("null", None), ("NULL", None), ("None", None),
     (" none ", None), ("11g", "11g"), ("24G", "24G"),

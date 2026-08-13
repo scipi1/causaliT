@@ -845,6 +845,17 @@ module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 
+# Threading + allocator guards (matter most for the CPU-only stages).  Without
+# them torch spawns one thread per NODE core while SLURM allocates
+# --cpus-per-task (default 1), and glibc's per-thread malloc arenas (default
+# 8 x nthreads) strand the large per-iteration transient tensors, so RSS grows
+# until the cgroup oom-kills the job - observed on Euler with the DAGMA
+# benchmark fits (oom_kill at ~30% of a fit whose steady state is ~1 GB).
+export OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}
+export MKL_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}
+export MALLOC_ARENA_MAX=4
+export MALLOC_TRIM_THRESHOLD_=65536
+
 VENV_PATH="{venv_path}"
 source "$VENV_PATH/bin/activate"
 
@@ -859,7 +870,9 @@ echo "[$(date)] Python env: $VIRTUAL_ENV"
 def _script_header(job_name: str, log_dir: str, log_tag: str, walltime: str,
                    mem_per_cpu: str, array: Optional[str] = None,
                    gpu_mem: Optional[str] = None,
-                   dependency: Optional[str] = None) -> str:
+                   dependency: Optional[str] = None,
+                   cpus_per_task: Optional[int] = None,
+                   mem: Optional[str] = None) -> str:
     lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
@@ -869,8 +882,16 @@ def _script_header(job_name: str, log_dir: str, log_tag: str, walltime: str,
         else f"#SBATCH --error={log_dir}/{log_tag}_%j.err",
         "#SBATCH --ntasks=1",
         f"#SBATCH --time={walltime}",
-        f"#SBATCH --mem-per-cpu={mem_per_cpu}",
     ]
+    if cpus_per_task is not None:
+        lines.append(f"#SBATCH --cpus-per-task={int(cpus_per_task)}")
+    if mem:
+        # A total --mem request replaces --mem-per-cpu entirely: Euler's docs
+        # recommend exactly this (--cpus-per-task=1 + --mem=<total>) for
+        # single-process jobs, and mixing both directives is confusing.
+        lines.append(f"#SBATCH --mem={mem}")
+    else:
+        lines.append(f"#SBATCH --mem-per-cpu={mem_per_cpu}")
     if array:
         lines.append(f"#SBATCH --array={array}")
     if gpu_mem:
@@ -903,6 +924,12 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
 
     A null ``gpu_mem`` (None / "null") yields CPU-only trial/train arrays:
     no ``--gpus`` / ``--gres=gpumem`` request is emitted.
+
+    ``slurm_params`` also accepts two optional keys:
+
+    * ``cpus_per_task``: emit ``#SBATCH --cpus-per-task=N`` in every stage;
+    * ``mem``: emit ``#SBATCH --mem=<total>`` INSTEAD of ``--mem-per-cpu``
+      (the Euler-recommended pair for single-process jobs).
     """
     scripts_dir = state_dir(exp_dir) / "scripts"
     log_dir = str(state_dir(exp_dir) / "slurm_logs")
@@ -911,6 +938,9 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     exp_id = plan["experiment"]
     walltime = slurm_params.get("walltime", "4:00:00")
     mem = slurm_params.get("mem_per_cpu", "10g")
+    total_mem = slurm_params.get("mem")  # total per-job memory; wins over mem_per_cpu
+    cpus = slurm_params.get("cpus_per_task")
+    cpus = int(cpus) if cpus is not None else None
     # A null gpu_mem (None / "null") means CPU-only: the trial/train arrays
     # then emit no --gpus / --gres=gpumem request at all.
     gpu_mem = normalize_gpu_mem(slurm_params.get("gpu_mem", "11g"))
@@ -933,11 +963,13 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
         )
 
 
+    header_kwargs: Dict[str, Any] = {"cpus_per_task": cpus, "mem": total_mem}
     scripts: Dict[str, str] = {}
 
     scripts["prep"] = _write_script(
         scripts_dir / "prep.sh",
-        _script_header(f"dagprep_{exp_id}", log_dir, "prep", walltime, mem)
+        _script_header(f"dagprep_{exp_id}", log_dir, "prep", walltime, mem,
+                       **header_kwargs)
         + _body("prepare", False))
 
     if plan["n_trial_tasks"] > 0:
@@ -945,23 +977,25 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
             scripts_dir / "trials.sh",
             _script_header(f"dagtrial_{exp_id}", log_dir, "trial", walltime, mem,
                            array=f"0-{plan['n_trial_tasks'] - 1}%{concurrent}",
-                           gpu_mem=gpu_mem)
+                           gpu_mem=gpu_mem, **header_kwargs)
             + _body("trial", True))
         scripts["select"] = _write_script(
             scripts_dir / "select.sh",
-            _script_header(f"dagselect_{exp_id}", log_dir, "select", walltime, mem)
+            _script_header(f"dagselect_{exp_id}", log_dir, "select", walltime, mem,
+                           **header_kwargs)
             + _body("select", False))
 
     scripts["train"] = _write_script(
         scripts_dir / "train.sh",
         _script_header(f"dagtrain_{exp_id}", log_dir, "train", walltime, mem,
                        array=f"0-{max(plan['n_train_tasks'] - 1, 0)}%{concurrent}",
-                       gpu_mem=gpu_mem)
+                       gpu_mem=gpu_mem, **header_kwargs)
         + _body("train", True))
 
     scripts["cleanup"] = _write_script(
         scripts_dir / "cleanup.sh",
-        _script_header(f"dagclean_{exp_id}", log_dir, "cleanup", walltime, mem)
+        _script_header(f"dagclean_{exp_id}", log_dir, "cleanup", walltime, mem,
+                       **header_kwargs)
         + _body("cleanup", False))
 
     return scripts
@@ -1016,6 +1050,12 @@ def submit_parallel_dag_sweep(exp_dir: str, home_exp_dir: str,
     print(f"Walltime        : {slurm_params.get('walltime')}")
     gpu_mem = normalize_gpu_mem(slurm_params.get("gpu_mem"))
     print(f"GPU memory      : {gpu_mem if gpu_mem else 'none (CPU-only)'}")
+    if slurm_params.get("mem"):
+        print(f"CPU memory      : {slurm_params['mem']} (total, --mem)")
+    else:
+        print(f"CPU memory      : {slurm_params.get('mem_per_cpu', '10g')} per CPU")
+    if slurm_params.get("cpus_per_task") is not None:
+        print(f"CPUs per task   : {slurm_params['cpus_per_task']}")
     print(f"State folder    : {state_dir(exp_dir)}")
     print("=" * 60)
 

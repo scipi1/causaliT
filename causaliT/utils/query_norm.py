@@ -642,9 +642,9 @@ def gate_tau_from_experiment(exp: Any, homogeneous: bool) -> float:
 
     Harmonized split keys win: ``init_tau_cross`` (split mode: the S->X cross
     gate) or ``init_tau_self`` (homogeneous mode: the single square block IS
-    the self gate).  The legacy shared ``init_tau`` is the fallback so
-    pre-split configs reproduce exactly; ``DEFAULT_GATE_TAU`` is the calculated
-    default.  When the split keys set DIFFERENT cross/self temperatures the
+    the self gate).  The legacy shared ``init_tau`` key has been REMOVED: an
+    unset split key falls straight back to ``DEFAULT_GATE_TAU`` (the calculated
+    default).  When the split keys set DIFFERENT cross/self temperatures the
     shared scale F is derived for the block named above and a warning is
     emitted: the gates then saturate at different logits, which the single-F
     capacity calculus cannot represent.
@@ -658,9 +658,7 @@ def gate_tau_from_experiment(exp: Any, homogeneous: bool) -> float:
 
     primary = _get("init_tau_self" if homogeneous else "init_tau_cross")
     secondary = _get("init_tau_cross" if homogeneous else "init_tau_self")
-    legacy = _get("init_tau")
-    tau = primary if primary is not None else (
-        legacy if legacy is not None else DEFAULT_GATE_TAU)
+    tau = primary if primary is not None else DEFAULT_GATE_TAU
     if (
         not homogeneous
         and primary is not None

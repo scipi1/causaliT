@@ -771,6 +771,16 @@ module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 
+# Threading + allocator guards: without them torch spawns one thread per NODE
+# core while SLURM allocates --cpus-per-task (default 1), and glibc's
+# per-thread malloc arenas (default 8 x nthreads) strand large per-iteration
+# transient tensors, so RSS grows until the cgroup oom-kills the job (seen on
+# Euler with CPU-only nonlinear DAGMA fits).
+export OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}
+export MKL_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}}
+export MALLOC_ARENA_MAX=4
+export MALLOC_TRIM_THRESHOLD_=65536
+
 # TODO: Update this path to your virtual environment
 VENV_PATH="$HOME/myenv"
 source "$VENV_PATH/bin/activate"
