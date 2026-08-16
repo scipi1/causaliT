@@ -24,7 +24,7 @@ from causaliT.training.callbacks import (
     get_checkpoint_callback, get_early_stopping_callback, MemoryLoggerCallback,
     GradientLogger, MetricsAggregator, PerRunManifest,
     BestReconstructionCheckpoint, BestCausalCheckpoint, DataIndexTracker,
-    KFoldResultsTracker, GradientJacobianLogger
+    KFoldResultsTracker, GradientJacobianLogger, MemoryReportCallback
 )
 from causaliT.training.forecasters import (
     TransformerForecaster,
@@ -149,6 +149,11 @@ def train_single_fold(
 
     callbacks_list = list(checkpoint_callback)
     callbacks_list += [manifest_callback, best_reconstruction_callback, best_causal_checkpoint, data_index_tracker]
+
+    # One-shot GPU memory profile of the first training step (no-op without
+    # CUDA; writes memory_report.json into the fold folder and a summary into
+    # the training log / SLURM log).
+    callbacks_list.append(MemoryReportCallback(save_dir_k))
 
     # Early stopping: config-driven (new) with legacy fallback
     es_callback = get_early_stopping_callback(config)

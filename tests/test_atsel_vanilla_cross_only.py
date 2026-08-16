@@ -93,6 +93,9 @@ def _make_vanilla(n_heads: int = 1) -> AttentionSelectorLayer:
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         struct_embedding_type="standard_learnable",
+        # Probe the Q/K projections: keep them (remove_*=True default would drop).
+        remove_query_projection=False,
+        remove_key_projection=False,
     )
 
 

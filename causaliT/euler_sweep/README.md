@@ -187,6 +187,8 @@ size_derived:               # config field <- f(node count), same in both phases
   experiment.batch_size:
     rule: activation_budget
     C: auto                 # from `calibrate-batch-budget`
+    pairwise_hsic: true     # price the N^2 x B^2 per-pair HSIC kernel graphs
+                            # (AttentionSelector forecaster; quadratic in B)
   experiment.query_fanin_scale:
     rule: fanin_saturating  # F = n_keys * x_sat^2
 

@@ -305,6 +305,72 @@ def test_activation_budget_helpers():
 
 
 # =============================================================================
+# 4a-bis. Pairwise-HSIC aware batch rule (quadratic memory term)
+# =============================================================================
+
+def test_pairwise_hsic_known_values():
+    """
+    The quadratic rule must price the N^2 x B^2 HSIC kernel graphs.
+
+    With the 24 GB default budget (C = 4.9e8), d_ref = 2N and H = 4 the
+    closed-form solution lands on 2048/1024/512/256 for N = 10/20/40/80 -
+    i.e. a CONSTANT HSIC footprint (~8.4 GB) per size instead of the linear
+    rule's flat 2048, which is exactly the OOM pattern seen on an 11 GB GPU.
+    """
+    budget = 4.9e8
+    expected = {10: 2048, 20: 1024, 40: 512, 80: 256}
+    for n_keys, want in expected.items():
+        got = activation_batch_size(n_keys, 2 * n_keys, 4, budget=budget,
+                                    min_batch=32, max_batch=2048,
+                                    pairwise_hsic=True)
+        assert got == want, f"n_keys={n_keys}: got {got}, want {want}"
+
+
+def test_pairwise_hsic_never_exceeds_linear_rule():
+    """The quadratic term can only shrink the batch (it ADDS a cost)."""
+    budget = 4.9e8
+    for n_keys in (6, 10, 20, 40, 80, 200, 400):
+        linear = activation_batch_size(n_keys, 2 * n_keys, 4, budget=budget)
+        hsic = activation_batch_size(n_keys, 2 * n_keys, 4, budget=budget,
+                                     pairwise_hsic=True)
+        assert hsic <= linear
+        assert hsic & (hsic - 1) == 0, "batch size must stay a power of two"
+
+
+def test_pairwise_hsic_scales_with_the_device_budget():
+    """A smaller device must yield smaller (or equal) batches everywhere."""
+    for n_keys in (10, 20, 40, 80):
+        big = activation_batch_size(n_keys, 2 * n_keys, 4, budget=4.9e8,
+                                    pairwise_hsic=True)
+        small = activation_batch_size(n_keys, 2 * n_keys, 4, budget=8.31e7,
+                                      pairwise_hsic=True)
+        assert small <= big
+    # And a tiny budget hits the floor instead of going to zero.
+    assert activation_batch_size(80, 160, 4, budget=1.0, min_batch=16,
+                                 pairwise_hsic=True) == 16
+
+
+def test_size_derived_passes_pairwise_hsic_through():
+    """The YAML key must reach the rule (declared C: no cache dependence)."""
+    config = _full_config()
+    derive_size_fields(config, 80, {
+        "experiment.batch_size": {"rule": "activation_budget", "C": 4.9e8,
+                                  "d_ref_mult": 2.0, "n_heads": 4,
+                                  "min": 32, "max": 2048,
+                                  "pairwise_hsic": True},
+    })
+    assert config.experiment.batch_size == 256
+
+    config_lin = _full_config()
+    derive_size_fields(config_lin, 80, {
+        "experiment.batch_size": {"rule": "activation_budget", "C": 4.9e8,
+                                  "d_ref_mult": 2.0, "n_heads": 4,
+                                  "min": 32, "max": 2048},
+    })
+    assert config_lin.experiment.batch_size == 2048  # default: linear rule
+
+
+# =============================================================================
 # 4b. Dimension repair
 # =============================================================================
 

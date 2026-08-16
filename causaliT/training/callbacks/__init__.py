@@ -31,6 +31,11 @@ from .gradient_jacobian_logger import (
     GradientJacobianLogger,
 )
 
+# One-shot GPU memory report of the first training step
+from .memory_report import (
+    MemoryReportCallback,
+)
+
 __all__ = [
     # Training callbacks
     'PerRunManifest',
@@ -47,4 +52,6 @@ __all__ = [
     'MetricsAggregator',
     # Gradient Jacobian
     'GradientJacobianLogger',
+    # Memory report
+    'MemoryReportCallback',
 ]

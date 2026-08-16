@@ -1447,12 +1447,20 @@ class AttentionLayer(nn.Module):
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
         optuna_protocol: Optional[float] = None,
-        # Value-structure injection (source-node identity concatenated onto the
-        # value stream before W_V).  When >0, the reconstruction value_projection
-        # accepts ``d_model_values + value_structure_dim`` inputs and the caller
-        # must pass a ``value_structure`` tensor of that trailing width to
-        # ``forward``.  0 (default) preserves the original data-only value stream.
+        # Value-structure injection (source-node identity combined with the
+        # value stream before W_V).  When >0, the caller must pass a
+        # ``value_structure`` tensor of that trailing width to ``forward``.
+        # The combination is selected by ``value_structure_mode``:
+        #   "concat" (default) — CONCATENATE the identity code onto the value;
+        #       the reconstruction value_projection is widened to
+        #       ``d_model_values + value_structure_dim`` inputs:
+        #       V_j = W_V([v_j ; e_j]).
+        #   "sum" — SUM the identity code onto the value token before W_V (the
+        #       vanilla/benchmark composition): V_j = W_V(v_j + e_j).  W_V is
+        #       NOT widened; requires value_structure_dim == d_model_values.
+        # 0 (default) preserves the original data-only value stream.
         value_structure_dim: int = 0,
+        value_structure_mode: str = "concat",
         # Value-structure QUERY injection (target/child identity).  When >0 the
         # value additionally depends on the QUERY node:
         #     V_ij = W_V([v_j ; e_j])  +  W_V^q(e_i^q).
@@ -1757,14 +1765,32 @@ class AttentionLayer(nn.Module):
         # V projection, output projection, and dropout are always per-layer.
 
         # Value-structure injection: when ``value_structure_dim > 0`` the value
-        # projection accepts the data value CONCATENATED with a source-node
-        # identity code of that width (``V_j = W_V([v_j ; e_j])``), giving the
-        # otherwise data-only value stream a per-source-node functional.  The
-        # output width (``d_model_values * n_heads``) is unchanged.
+        # stream is combined with a source-node identity code before W_V, giving
+        # the otherwise data-only value stream a per-source-node functional.
+        #   "concat": the code is CONCATENATED (``V_j = W_V([v_j ; e_j])``) and
+        #     W_V is widened by ``value_structure_dim`` columns.
+        #   "sum": the code is SUMMED onto the value token
+        #     (``V_j = W_V(v_j + e_j)``, the vanilla/benchmark composition) and
+        #     W_V keeps its original width (the code spans the full value width).
+        # The output width (``d_model_values * n_heads``) is unchanged either way.
         self.value_structure_dim = int(value_structure_dim)
-        self.value_projection = nn.Linear(
-            d_model_values + self.value_structure_dim, d_model_values * n_heads
-        )
+        self.value_structure_mode = str(value_structure_mode)
+        if self.value_structure_mode not in ("concat", "sum"):
+            raise ValueError(
+                f"value_structure_mode='{value_structure_mode}' is invalid. "
+                "Must be one of: ['concat', 'sum']."
+            )
+        if self.value_structure_mode == "sum":
+            if self.value_structure_dim not in (0, d_model_values):
+                raise ValueError(
+                    "value_structure_mode='sum' requires value_structure_dim == "
+                    f"d_model_values ({d_model_values}) so the identity code can "
+                    f"be summed onto the value token; got {self.value_structure_dim}."
+                )
+            _v_in = d_model_values  # no widening: e_j is summed, not concatenated
+        else:
+            _v_in = d_model_values + self.value_structure_dim
+        self.value_projection = nn.Linear(_v_in, d_model_values * n_heads)
         self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
@@ -1967,12 +1993,17 @@ class AttentionLayer(nn.Module):
 
         q, k = self._project_qk(query, key)
 
-        # Value-structure injection: concatenate the per-source-node identity
-        # code onto the data value BEFORE the (widened) reconstruction W_V, so
-        # V_j = W_V([v_j ; e_j]).  Only active when the layer was built with
-        # value_structure_dim > 0 AND a value_structure tensor is supplied.
+        # Value-structure injection: combine the per-source-node identity code
+        # with the data value BEFORE the reconstruction W_V — CONCATENATED
+        # (widened W_V, V_j = W_V([v_j ; e_j])) or SUMMED (vanilla/benchmark
+        # composition, V_j = W_V(v_j + e_j)), per ``value_structure_mode``.
+        # Only active when the layer was built with value_structure_dim > 0
+        # AND a value_structure tensor is supplied.
         if self.value_structure_dim > 0 and value_structure is not None:
-            value = torch.cat([value, value_structure], dim=-1)
+            if self.value_structure_mode == "sum":
+                value = value + value_structure
+            else:
+                value = torch.cat([value, value_structure], dim=-1)
 
         if H > 1:
             v = self.dropout_qkv(self.value_projection(value)).view(B, S, H, -1)

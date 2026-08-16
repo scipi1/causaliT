@@ -124,6 +124,10 @@ def _make_forecaster_config(
                 "d_qk": d_model,
                 "S_seq_len": S_SEQ_LEN,
                 "X_seq_len": X_SEQ_LEN,
+                # Keep the Q/K projections: these tests assert they exist and are
+                # classified STRUCTURAL (remove_*=True default would drop them).
+                "remove_query_projection": False,
+                "remove_key_projection": False,
             },
         },
         "training": {

@@ -127,6 +127,8 @@ def _make_model(
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
+        remove_query_projection=False,
+        remove_key_projection=False,
         struct_embedding_type=struct_embedding_type,
         key_projection_type=key_projection_type,
         orthogonal_key_scale=orthogonal_key_scale,

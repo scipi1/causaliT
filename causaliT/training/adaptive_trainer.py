@@ -43,6 +43,18 @@ safety guard (default: unbounded), not a budget: it only exists to cap
 degenerate fast cycling (phases that exit almost immediately, each incurring a
 checkpoint + DAG-diagnostics write).
 
+An optional **final reconstruction-only phase** (``final_reconstruct``) can be
+appended AFTER the alternating schedule: the structural parameters stay frozen
+at their learned values, the cross-fit data split is disabled (the full
+training set is used), and the predictor is refined against the frozen
+structure - empirically useful for polishing the reconstruction before the
+model is used to estimate the ATE.  Its epochs are ADDED ON TOP of
+``total_epoch_budget`` (``pl.Trainer.max_epochs = total_epoch_budget +
+final_reconstruct.max_epochs``), so the alternating schedule keeps its full
+budget.  The phase exits on a validation reconstruction plateau (same
+rate-of-improvement trigger as the reconstruct phase) or its own epoch cap,
+then the run stops.
+
 
 Requirements
 ------------
@@ -69,6 +81,16 @@ Example ``config['adaptive_training']`` block::
                                        # suite on <save_dir> once the fit ends
                                        # (the functions themselves are selected by
                                        # the top-level ``evaluation.functions``)
+
+      final_reconstruct:               # OPTIONAL final reconstruction-only phase
+        enabled: false                 # appended AFTER the alternating schedule
+        max_epochs: 100                # (Trainer max_epochs = total_epoch_budget
+                                       # + these epochs).  Structure stays frozen,
+                                       # cross-fit split OFF (full training set).
+        min_epochs: 0                  # floor: suppress plateau exit before N epochs
+        plateau_patience: 5            # stop after N val epochs w/o rel. improvement
+                                       # (falls back to the reconstruct values)
+        plateau_min_delta: 1.0e-4      # relative improvement threshold (ditto)
 
       reconstruct:
         max_epochs: 100                # per-phase safety cap
@@ -126,8 +148,8 @@ logger = logging.getLogger(__name__)
 
 # Numeric encoding of the active phase so it can be logged as a CSV metric
 # alongside the loss curves (strings cannot be logged via ``self.log``).
-# reconstruct → 0, structure → 1.
-_PHASE_CODE = {"reconstruct": 0, "structure": 1}
+# reconstruct -> 0, structure -> 1, final_reconstruct -> 2.
+_PHASE_CODE = {"reconstruct": 0, "structure": 1, "final_reconstruct": 2}
 
 
 # =============================================================================
@@ -248,6 +270,33 @@ class PhaseController(Callback):
             self.struct_cfg.get("hsic_min_delta", 1e-4)
         )
         self.struct_min_epochs: int = int(self.struct_cfg.get("min_epochs", 0))
+
+        # Final reconstruction-only phase (optional, APPENDED after the
+        # alternating schedule): structure stays frozen, cross-fit split OFF
+        # (full training set).  Refines the predictor against the frozen,
+        # learned structure before the model is used for ATE estimation.
+        self.final_cfg: Dict[str, Any] = _to_plain_container(
+            ad.get("final_reconstruct", {})
+        ) or {}
+        self.final_enabled: bool = bool(self.final_cfg.get("enabled", False))
+        self.final_max_epochs: int = int(self.final_cfg.get("max_epochs", 100))
+        self.final_min_epochs: int = int(self.final_cfg.get("min_epochs", 0))
+        # Plateau triggers fall back to the reconstruct-phase values so the
+        # final phase behaves like a regular reconstruct phase unless
+        # explicitly overridden.
+        self.final_plateau_patience: int = int(
+            self.final_cfg.get("plateau_patience", self.plateau_patience)
+        )
+        self.final_plateau_min_delta: float = float(
+            self.final_cfg.get("plateau_min_delta", self.plateau_min_delta)
+        )
+        if self.final_enabled and self.final_max_epochs <= 0:
+            logger.warning(
+                "[adaptive] final_reconstruct.enabled=true but max_epochs=%d "
+                "<= 0 - disabling the final phase.",
+                self.final_max_epochs,
+            )
+            self.final_enabled = False
 
 
         # Model object (for per-arch lambda translation)
@@ -433,14 +482,20 @@ class PhaseController(Callback):
         self._apply_fanin_phase(pl_module, phase)
 
 
-        if phase == "reconstruct":
+        if phase in ("reconstruct", "final_reconstruct"):
             for p in struct_params:
                 p.requires_grad_(False)
             for p in recon_params:
                 p.requires_grad_(True)
-            # Descendant-HSIC overrides are honoured in BOTH phases so a run can
+            # Descendant-HSIC overrides are honoured in every phase so a run can
             # e.g. keep the mask off during reconstruct and on during structure.
-            self._apply_descendant_mask_cfg(pl_module, self.recon_cfg)
+            # The final phase inherits the reconstruct block's settings and lets
+            # its own block override individual keys.
+            mask_cfg = (
+                self.recon_cfg if phase == "reconstruct"
+                else {**self.recon_cfg, **self.final_cfg}
+            )
+            self._apply_descendant_mask_cfg(pl_module, mask_cfg)
         elif phase == "structure":
             for p in recon_params:
                 p.requires_grad_(False)
@@ -606,6 +661,23 @@ class PhaseController(Callback):
                   f"| {self.monitor}={monitor_val:.5f}")
 
 
+    def _final_boundary_reached(self, trainer: pl.Trainer) -> bool:
+        """True once the alternating schedule's epoch budget is exhausted.
+
+        The final phase is APPENDED on top of ``total_epoch_budget``
+        (``Trainer.max_epochs = total_epoch_budget + final_max_epochs``), so
+        the alternating schedule owns epochs ``0 .. max_epochs -
+        final_max_epochs - 1`` (0-based).  Switching at the validation
+        boundary of the last owned epoch hands every remaining epoch to the
+        final phase.  With sparse validation (``check_val_every_n_epoch > 1``)
+        the switch fires at the first validation epoch past the boundary.
+        """
+        max_epochs = getattr(trainer, "max_epochs", None)
+        if max_epochs is None:
+            return False
+        alternating_budget = int(max_epochs) - self.final_max_epochs
+        return trainer.current_epoch >= alternating_budget - 1
+
     def on_validation_epoch_end(self, trainer: pl.Trainer,
                                 pl_module: pl.LightningModule) -> None:
         if trainer.sanity_checking:
@@ -636,6 +708,25 @@ class PhaseController(Callback):
             on_step=False, on_epoch=True,
         )
 
+
+        # ---------- Final reconstruction-only phase: entry trigger ----------
+        # The alternating schedule owns the first ``total_epoch_budget`` epochs;
+        # the optional final phase is appended on top of them.  Switch to it at
+        # the first validation boundary on/after the alternating budget is
+        # exhausted, from whichever phase is currently active.
+        if (
+            self.final_enabled
+            and self.current_phase != "final_reconstruct"
+            and self._final_boundary_reached(trainer)
+        ):
+            self._record_transition(
+                trainer, pl_module, "alternating_budget",
+                from_phase=self.current_phase, to_phase="final_reconstruct",
+                monitor_val=current,
+            )
+            self._phase_index += 1
+            self._apply_phase(trainer, pl_module, "final_reconstruct")
+            return
 
         # ---------------- Reconstruct phase: plateau / budget ----------------
         if self.current_phase == "reconstruct":
@@ -747,6 +838,24 @@ class PhaseController(Callback):
                 # (Trainer max_epochs) — i.e. it does as many cycles as fit.
                 if self.max_cycles is not None and self._cycle_count >= self.max_cycles:
 
+                    # With the final phase enabled, do not stop yet: refine the
+                    # reconstruction against the frozen structure on the full
+                    # training set first (the final phase's own epoch cap still
+                    # guarantees termination).
+                    if self.final_enabled:
+                        self._record_transition(
+                            trainer, pl_module, f"{reason}_final",
+                            from_phase="structure",
+                            to_phase="final_reconstruct",
+                            monitor_val=current,
+                        )
+                        self._phase_index += 1
+                        if not self.cluster:
+                            print(f"  [adaptive] max_cycles={self.max_cycles} "
+                                  f"reached - entering final reconstruct phase.")
+                        self._apply_phase(trainer, pl_module, "final_reconstruct")
+                        return
+
                     self._record_transition(
                         trainer, pl_module, f"{reason}_final",
                         from_phase="structure", to_phase="stop",
@@ -767,6 +876,43 @@ class PhaseController(Callback):
                 )
                 self._phase_index += 1
                 self._apply_phase(trainer, pl_module, "reconstruct")
+
+        # --------- Final reconstruction-only phase: plateau / budget ---------
+        elif self.current_phase == "final_reconstruct":
+            # Same rate-of-improvement plateau logic as the reconstruct phase,
+            # with the final block's own patience / min_delta (which fall back
+            # to the reconstruct values) and its own min-epoch floor.  The
+            # ``max_epochs`` cap always takes precedence over the floor.
+            if current <= self._phase_best * (1.0 - self.final_plateau_min_delta):
+                self._phase_best = current
+                self._plateau_counter = 0
+            else:
+                if current < self._phase_best:
+                    self._phase_best = current
+                self._plateau_counter += 1
+
+            min_epochs_reached = phase_epochs >= self.final_min_epochs
+            plateaued = (
+                self._plateau_counter >= self.final_plateau_patience
+                and min_epochs_reached
+            )
+            budget_hit = phase_epochs >= self.final_max_epochs
+
+            if plateaued or budget_hit:
+                reason = (
+                    "final_recon_plateau" if plateaued else "final_recon_budget"
+                )
+                self._record_transition(
+                    trainer, pl_module, reason,
+                    from_phase="final_reconstruct", to_phase="stop",
+                    monitor_val=current,
+                )
+                self._phase_index += 1
+                if not self.cluster:
+                    print(f"  [adaptive] final reconstruct phase ended ({reason}) "
+                          f"- stopping.")
+                trainer.should_stop = True
+                return
 
 
 # =============================================================================
@@ -876,6 +1022,7 @@ def adaptive_trainer(
         resolve_seeds,
     )
     from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+    from causaliT.training.experiment_control import update_config
 
     ad_cfg = _to_plain_container(config.get("adaptive_training", {})) or {}
     if not ad_cfg:
@@ -883,6 +1030,12 @@ def adaptive_trainer(
             "config['adaptive_training'] is empty or missing. Define the "
             "adaptive schedule block (see module docstring)."
         )
+
+    # Resolve multiplier-derived fields (experiment.d_ff / d_qk) so configs with
+    # ``d_ff: null`` / ``d_qk: null`` also work when adaptive_trainer is called
+    # directly (the sweeper and the CLI's find_yml_files already do this; the
+    # call is idempotent - it only fills nulls).
+    config = update_config(config)
 
     if not config["training"].get("use_gradient_routing", False):
         raise ValueError(
@@ -913,12 +1066,31 @@ def adaptive_trainer(
     )
     train_local_idx, val_local_idx = fold_splits[0]
 
-    # --- Global epoch budget → pl.Trainer max_epochs ---
+    # --- Global epoch budget -> pl.Trainer max_epochs ---
     total_budget = int(ad_cfg.get("total_epoch_budget",
                                   config["training"].get("max_epochs", 800)))
-    config["training"]["max_epochs"] = total_budget
+
+    # Optional final reconstruction-only phase: its epochs are APPENDED on top
+    # of the alternating budget, so the alternating schedule keeps all
+    # ``total_budget`` epochs and the refinement runs afterwards (structure
+    # frozen, cross-fit split off -> full training set).
+    final_cfg = _to_plain_container(ad_cfg.get("final_reconstruct", {})) or {}
+    final_enabled = bool(final_cfg.get("enabled", False))
+    final_max_epochs = int(final_cfg.get("max_epochs", 100))
+    if final_enabled and final_max_epochs <= 0:
+        logger.warning(
+            "adaptive_trainer: final_reconstruct.enabled=true but max_epochs=%d "
+            "<= 0 - disabling the final phase.", final_max_epochs,
+        )
+        final_enabled = False
+    if final_enabled:
+        config["training"]["max_epochs"] = total_budget + final_max_epochs
+    else:
+        config["training"]["max_epochs"] = total_budget
     if config["training"].get("save_ckpt_every_n_epochs") is None:
-        config["training"]["save_ckpt_every_n_epochs"] = total_budget
+        config["training"]["save_ckpt_every_n_epochs"] = (
+            config["training"]["max_epochs"]
+        )
 
     # Training output goes straight into save_dir (train_single_fold appends the
     # ``k_{fold}`` subfolder), matching the layout produced by ``trainer()``.
@@ -948,6 +1120,13 @@ def adaptive_trainer(
         )
 
         stage_splits = {"reconstruct": recon_idx, "structure": struct_idx}
+        # Final reconstruction-only phase: data split OFF.  Register the FULL
+        # fold training indices under the final phase's key so the controller
+        # swaps back to the complete training set when the phase starts
+        # (train_local_idx still holds the full fold indices here; it is
+        # narrowed to the starting phase's subset only below).
+        if final_enabled:
+            stage_splits["final_reconstruct"] = np.asarray(train_local_idx)
         # The datamodule OWNS the phase→subset mapping; the controller only
         # requests a phase by name (dm.set_active_phase).  val/test are held
         # constant so stage-to-stage metrics stay comparable.
@@ -1011,6 +1190,10 @@ def adaptive_trainer(
               f"warmup_min_epochs {controller.recon_warmup_min_epochs}")
         print(f"  max_cycles         : "
               f"{'unbounded (epoch-budget only)' if controller.max_cycles is None else controller.max_cycles}")
+        if controller.final_enabled:
+            print(f"  final reconstruct  : +{controller.final_max_epochs} epochs "
+                  f"appended (structure frozen, full training set; "
+                  f"plateau patience {controller.final_plateau_patience})")
 
 
         print("=" * 70)
@@ -1062,6 +1245,13 @@ def adaptive_trainer(
         "n_transitions": len(controller.transitions),
 
         "n_cycles": controller._cycle_count,
+        "final_reconstruct": {
+            "enabled": controller.final_enabled,
+            "max_epochs": (controller.final_max_epochs
+                           if controller.final_enabled else None),
+            "ran": any(r.get("phase") == "final_reconstruct"
+                       for r in controller.phase_rows),
+        },
         "final_metrics": {
             k: (v.item() if isinstance(v, torch.Tensor) else v)
             for k, v in fold_metrics.items()

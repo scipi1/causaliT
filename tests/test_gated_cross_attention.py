@@ -285,6 +285,8 @@ def _make_gated_model(optuna_protocol=None) -> AttentionSelectorLayer:
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
+        remove_query_projection=False,
+        remove_key_projection=False,
         struct_embedding_type="standard_learnable",
     )
 

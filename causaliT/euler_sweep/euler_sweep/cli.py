@@ -1210,8 +1210,10 @@ def calibrate_batch_budget(safety, multiplicity, dtype_bytes, no_cache):
     Measure this machine's activation budget C for the size-derived batch size.
 
     ``dagsweep``'s ``size_derived`` rule ``activation_budget`` solves
-    ``B = C / (N * H * (N + d))`` for the batch size, so C is the one
-    device-specific number in the whole scaling sweep.  Running this once per
+    ``B = C / (N * H * (N + d))`` for the batch size (with ``pairwise_hsic``
+    the rule adds the quadratic N^2 x B^2 HSIC term and solves the resulting
+    quadratic instead), so C is the one device-specific number in the whole
+    scaling sweep.  Running this once per
     machine writes it to ``~/.causalit/activation_budget.json`` (or
     ``$CAUSALIT_CACHE_DIR``), keyed by GPU name, so the same ``dagsweep.yaml``
     yields a device-appropriate batch on a laptop and on a cluster node.
@@ -1251,7 +1253,11 @@ def calibrate_batch_budget(safety, multiplicity, dtype_bytes, no_cache):
     print("Derived batch size (d_ref = 2 * n_keys, n_heads = 4):")
     for n_keys in (10, 50, 100, 200, 400, 800):
         batch = activation_batch_size(n_keys, 2 * n_keys, 4, budget=report["C"])
-        print(f"  n_keys={n_keys:>4} -> batch_size={batch}")
+        batch_hsic = activation_batch_size(n_keys, 2 * n_keys, 4,
+                                           budget=report["C"],
+                                           pairwise_hsic=True)
+        print(f"  n_keys={n_keys:>4} -> batch_size={batch}"
+              f"  (pairwise_hsic: {batch_hsic})")
     print("=" * 60)
 
 

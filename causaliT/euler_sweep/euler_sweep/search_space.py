@@ -35,7 +35,9 @@ be unit-tested without touching Optuna or a GPU:
 
 4. SIZE-DERIVED FIELDS.  Some config fields are not hyper-parameters at all, they
    are functions of the node count and must be recomputed per group:
-   * ``batch_size`` - from an activation budget, so large DAGs do not OOM;
+   * ``batch_size`` - from an activation budget, so large DAGs do not OOM
+     (linear in B by default; ``pairwise_hsic: true`` adds the quadratic
+     N^2 x B^2 memory of the per-pair HSIC term, see ``activation_batch_size``);
    * ``query_fanin_scale`` - ``F = n_keys * x_sat^2`` (opt-in for now).
 
 All samplers emit DOTTED config paths as the Optuna parameter names.  This is
@@ -53,6 +55,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from omegaconf import OmegaConf
 
+from causaliT.euler_sweep.euler_sweep.batch_budget import DEFAULT_MULTIPLICITY
 from causaliT.utils.query_norm import (
     DEFAULT_GATE_GAMMA,
     DEFAULT_GATE_ZETA,
@@ -75,6 +78,17 @@ DEFAULT_MAX_CHOICES = 8
 DEFAULT_ACTIVATION_BUDGET = 4.9e8
 DEFAULT_MIN_BATCH = 32
 DEFAULT_MAX_BATCH = 2048
+
+#: Retained (B, B) fp32 tensors per (source, residual) pair of the per-pair
+#: HSIC term (causaliT.utils.hsic_utils.hsic, biased mode, RBF source kernel):
+#: the residual distance matrix, the residual kernel L, the centering matrix H
+#: and the two centered products KH / LH.  ``hsic_pair_matrix`` stacks every
+#: pair's value into one tensor, so ALL pair graphs stay alive until backward
+#: and the term costs HSIC_RETAINED_TENSORS * n_pairs * B^2 * 4 bytes -
+#: QUADRATIC in the batch size.  A batch rule that only models the (linear)
+#: attention activations cannot see this and happily picks a B that OOMs.
+#: Declared here (not imported) to keep this module torch-free.
+HSIC_RETAINED_TENSORS = 5
 
 
 # =============================================================================
@@ -341,7 +355,10 @@ def _prev_pow2(value: float) -> int:
 def activation_batch_size(n_keys: int, d_model: int, n_heads: int,
                           budget: float = DEFAULT_ACTIVATION_BUDGET,
                           min_batch: int = DEFAULT_MIN_BATCH,
-                          max_batch: int = DEFAULT_MAX_BATCH) -> int:
+                          max_batch: int = DEFAULT_MAX_BATCH,
+                          pairwise_hsic: bool = False,
+                          hsic_retained: int = HSIC_RETAINED_TENSORS,
+                          multiplicity: int = DEFAULT_MULTIPLICITY) -> int:
     """
     Largest power-of-two batch size that fits an activation budget.
 
@@ -354,13 +371,30 @@ def activation_batch_size(n_keys: int, d_model: int, n_heads: int,
     clamped.  ``budget`` is a single device-specific constant, measured by
     ``batch_budget.calibrate_activation_budget``.
 
+    With ``pairwise_hsic=True`` the per-pair HSIC term of the AttentionSelector
+    forecaster is priced in as well.  That term retains ~``hsic_retained``
+    (B, B) fp32 kernel tensors per (source, residual) pair until backward (see
+    ``HSIC_RETAINED_TENSORS``), so its memory is QUADRATIC in B and a purely
+    linear rule cannot see it.  ``budget`` counts ``multiplicity`` tensors of
+    the dominant shape, so in budget elements the constraint becomes
+
+        B * N * H * (N + d) + (hsic_retained / multiplicity) * N^2 * B^2 <= C
+
+    which is solved in closed form (``hsic_retained -> 0`` recovers the linear
+    rule).  The pair count is taken as N^2 (homogeneous mode); split-mode
+    models have fewer pairs, so the estimate is conservative for them.
+
     Deriving the batch size instead of fixing it is what allows one config to
     cover 6-node and 400-node DAGs without OOM.  The SAME derived value must be
     used in the search and in the evaluation runs, otherwise the tuned learning
     rate is calibrated for a batch that never occurs.
     """
     denom = float(n_keys) * float(n_heads) * (float(n_keys) + float(d_model))
-    raw = float(budget) / max(denom, 1.0)
+    if pairwise_hsic:
+        a = (float(hsic_retained) / float(multiplicity)) * float(n_keys) ** 2
+        raw = (-denom + math.sqrt(denom ** 2 + 4.0 * a * float(budget))) / (2.0 * a)
+    else:
+        raw = float(budget) / max(denom, 1.0)
     return int(min(max(_prev_pow2(raw), int(min_batch)), int(max_batch)))
 
 
@@ -443,6 +477,8 @@ def derive_size_fields(config: Any, n_keys: int,
                 budget=resolve_budget(entry.get("C", None)),
                 min_batch=int(entry.get("min", DEFAULT_MIN_BATCH)),
                 max_batch=int(entry.get("max", DEFAULT_MAX_BATCH)),
+                pairwise_hsic=bool(entry.get("pairwise_hsic", False)),
+                hsic_retained=int(entry.get("hsic_retained", HSIC_RETAINED_TENSORS)),
             )
         elif rule == "fanin_saturating":
             value = saturating_query_fanin(config, n_keys)
@@ -703,6 +739,7 @@ def select_best(study: Any, selection: Optional[Dict[str, Any]] = None,
 
 __all__ = [
     "DEFAULT_ACTIVATION_BUDGET",
+    "HSIC_RETAINED_TENSORS",
     "RECONSTRUCTION_PROTOCOL",
     "SEARCH_PROTOCOLS",
     "SIZE_DERIVED_RULES",

@@ -152,6 +152,9 @@ def _make_model(
         struct_embedding_type=struct_embedding_type,
         orthogonal_fixed_frame_type=frame_type,
         key_projection_type=key_projection_type,
+        # Probe the W_K projection: keep it (remove_*=True default would drop it).
+        remove_query_projection=False,
+        remove_key_projection=False,
     )
 
 

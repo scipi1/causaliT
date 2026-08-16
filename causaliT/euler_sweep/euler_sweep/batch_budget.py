@@ -10,6 +10,10 @@ OOMs on a 400-node one.  ``search_space.activation_batch_size`` therefore solves
 for the batch, where ``C`` is a single number describing *how much activation the
 device can hold*.  This module is where ``C`` comes from.
 
+(With ``pairwise_hsic: true`` the rule additionally prices the per-pair HSIC
+term, whose retained kernel graphs grow like ``N^2 * B^2``; the constraint then
+is quadratic in B and is solved in closed form.  C is unchanged either way.)
+
 Two ways to obtain it, in order of preference:
 
 1. MEASURED (``calibrate_activation_budget``): read the real total memory of the

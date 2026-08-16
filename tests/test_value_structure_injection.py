@@ -21,8 +21,17 @@ complementary options condition the value on the structural identity:
 Both share the same option set:
 
     "none"            -- disabled (default; data-only value, backward compatible).
-    "separate"        -- dedicated reconstruction-routed identity table(s).
+    "separate"        -- dedicated reconstruction-routed identity table(s)
+                         (FreeQueryEmbedding), CONCATENATED on the source side.
     "struct_detached" -- reuse the (detached) structural identity, no new params.
+    "learned_sum"     -- dedicated reconstruction-routed identity table(s)
+                         (ValueIdentityEmbedding: plain nn.Embedding with
+                         max_norm=1, matching the vanilla benchmark's variable
+                         embedding), SUMMED onto the value token before W_V on
+                         the source side (V_j = W_V(v_j + e_j); W_V NOT
+                         widened).  On the query side the combination is
+                         already additive, so "learned_sum" only swaps the
+                         table class.
 
 Covered here for BOTH ``AttentionSelectorLayer`` and ``SelfSelectorLayer``:
 
@@ -49,6 +58,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
+from causaliT.core.modules.value_identity_embedding import ValueIdentityEmbedding
 from causaliT.training.gradient_routing import _is_structural_param
 
 
@@ -167,6 +177,13 @@ def _make_atsel(
         S_seq_len=S_SEQ_LEN,
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
+        remove_query_projection=False,
+        remove_key_projection=False,
+        # Pin the pre-default-flip geometry so the injection perturbation
+        # propagates as originally written (the SVFA defaults changed it).
+        struct_embedding_type="standard_learnable",
+        free_query_embedding=False,
+        query_centroid_init=False,
         value_structure_injection=value_structure_injection,
         value_structure_query_injection=value_structure_query_injection,
         **extra,
@@ -422,6 +439,171 @@ class TestAtselKeyAndQueryCombined:
         )
         # Key injection widens W_V; query injection adds W_V^q.
         assert model.attention.value_projection.in_features == 2 * D_MODEL
+        assert model.attention.value_query_proj is not None
+        assert model.val_id_embed_X is not None
+        assert model.val_q_id_embed_X is not None
+
+        source, x_actual, x_blanked = _atsel_inputs()
+        pred, attn, _ = model.forward_with_actual(source, x_blanked, x_actual)
+        assert pred.shape == (BATCH, X_SEQ_LEN, 1)
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+
+
+
+# ===========================================================================
+# AttentionSelectorLayer -- "learned_sum" (vanilla-style SUMMED identity)
+# ===========================================================================
+
+
+class TestAtselLearnedSum:
+    """Source-side ``learned_sum``: a learnable per-node identity SUMMED onto
+    the value stream before W_V (``V_j = W_V(v_j + e_j)``) -- the vanilla /
+    benchmark value composition.  W_V is NOT widened and the tables are plain
+    ``nn.Embedding`` with ``max_norm=1`` (``ValueIdentityEmbedding``), matching
+    the benchmark's variable embedding."""
+
+    def test_value_projection_not_widened(self):
+        model = _make_atsel("learned_sum")
+        assert model.attention.value_projection.in_features == D_MODEL
+        assert model.self_attention.value_projection.in_features == D_MODEL
+
+    def test_sum_mode_selected(self):
+        model = _make_atsel("learned_sum")
+        assert model.attention.value_structure_mode == "sum"
+        assert model.self_attention.value_structure_mode == "sum"
+
+    def test_adds_vanilla_style_identity_tables(self):
+        model = _make_atsel("learned_sum")
+        assert model.val_id_embed_S is not None
+        assert model.val_id_embed_X is not None
+        # Vanilla benchmark variable embedding: plain nn.Embedding, max_norm=1.
+        assert isinstance(model.val_id_embed_X, ValueIdentityEmbedding)
+        assert model.val_id_embed_X.embedding.max_norm == 1.0
+        assert model.val_id_embed_X.embedding.padding_idx == 0
+
+    def test_forward_shapes(self):
+        model = _make_atsel("learned_sum")
+        source, x_actual, x_blanked = _atsel_inputs()
+        pred, attn, _ = model.forward_with_actual(source, x_blanked, x_actual)
+        assert pred.shape == (BATCH, X_SEQ_LEN, 1)
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+
+    def test_summation_raises(self):
+        with pytest.raises(ValueError, match="requires SVFA"):
+            _make_atsel("learned_sum", comps_embed_X="summation")
+
+    def test_identity_tables_are_reconstruction(self):
+        model = _make_atsel("learned_sum")
+        names = [n for n, _ in model.named_parameters() if "val_id_embed" in n]
+        assert len(names) > 0, "expected val_id_embed_* parameters"
+        for name in names:
+            assert not _is_structural_param(name), (
+                f"{name} must be classified as a RECONSTRUCTION parameter"
+            )
+
+    def test_fewer_params_than_separate(self):
+        # Same tables as "separate" but W_V is NOT widened.
+        n_sum = sum(p.numel() for p in _make_atsel("learned_sum").parameters())
+        n_sep = sum(p.numel() for p in _make_atsel("separate").parameters())
+        assert n_sum < n_sep
+
+    def test_zero_tables_reduce_to_none(self):
+        # With the identity tables zeroed, learned_sum coincides EXACTLY with
+        # "none": W_V keeps the same width, so every shared weight transfers.
+        model = _make_atsel("learned_sum")
+        model_none = _make_atsel("none")
+        model.eval(); model_none.eval()
+        sd = model.state_dict()
+        for k, v in model_none.state_dict().items():
+            assert sd[k].shape == v.shape, k
+            sd[k].copy_(v)
+        with torch.no_grad():
+            model.val_id_embed_S.embedding.weight.zero_()
+            model.val_id_embed_X.embedding.weight.zero_()
+            source, x_actual, x_blanked = _atsel_inputs()
+            pred_none, _, _ = model_none.forward_with_actual(
+                source, x_blanked, x_actual
+            )
+            pred_sum, _, _ = model.forward_with_actual(
+                source, x_blanked, x_actual
+            )
+        assert torch.allclose(pred_none, pred_sum, atol=1e-6), (
+            "learned_sum with zeroed identity tables must equal 'none'."
+        )
+
+    def test_perturbing_identity_changes_prediction(self):
+        model_a = _make_atsel("learned_sum")
+        model_b = _make_atsel("learned_sum")
+        model_a.eval(); model_b.eval()
+        model_b.load_state_dict(model_a.state_dict())
+
+        perturbed = False
+        for name, param in model_b.named_parameters():
+            if "val_id_embed_X" in name:
+                param.data += torch.randn_like(param) * 2.0
+                perturbed = True
+        assert perturbed
+
+        source, x_actual, x_blanked = _atsel_inputs()
+        with torch.no_grad():
+            pred_a, _, _ = model_a.forward_with_actual(source, x_blanked, x_actual)
+            pred_b, _, _ = model_b.forward_with_actual(source, x_blanked, x_actual)
+        assert not torch.allclose(pred_a, pred_b), (
+            "Perturbing the summed value identity must change pred_x."
+        )
+
+
+class TestAtselQueryLearnedSum:
+    """Query-side ``learned_sum``: the query combination is ALREADY additive
+    (``(sum_j A_ij) * W_V^q(e_i)``), so the mode only swaps the identity table
+    to the vanilla-style ``ValueIdentityEmbedding``."""
+
+    def test_query_table_created_vanilla_style(self):
+        model = _make_atsel(value_structure_query_injection="learned_sum")
+        assert model.val_q_id_embed_X is not None
+        assert isinstance(model.val_q_id_embed_X, ValueIdentityEmbedding)
+        assert model.val_q_id_embed_X.embedding.max_norm == 1.0
+
+    def test_value_query_proj_created_and_wv_not_widened(self):
+        model = _make_atsel(value_structure_query_injection="learned_sum")
+        assert model.inject_value_structure_query is True
+        assert model.attention.value_query_proj is not None
+        assert model.attention.value_query_proj.bias is None
+        assert model.attention.value_projection.in_features == D_MODEL
+
+    def test_forward_shapes(self):
+        model = _make_atsel(value_structure_query_injection="learned_sum")
+        source, x_actual, x_blanked = _atsel_inputs()
+        pred, attn, _ = model.forward_with_actual(source, x_blanked, x_actual)
+        assert pred.shape == (BATCH, X_SEQ_LEN, 1)
+        assert attn.shape == (BATCH, X_SEQ_LEN, S_SEQ_LEN + X_SEQ_LEN)
+
+    def test_summation_raises(self):
+        with pytest.raises(ValueError, match="requires SVFA"):
+            _make_atsel(
+                comps_embed_X="summation",
+                value_structure_query_injection="learned_sum",
+            )
+
+    def test_query_identity_table_is_reconstruction(self):
+        model = _make_atsel(value_structure_query_injection="learned_sum")
+        names = [n for n, _ in model.named_parameters() if "val_q_id_embed" in n]
+        assert len(names) > 0, "expected val_q_id_embed_* parameters"
+        for name in names:
+            assert not _is_structural_param(name), (
+                f"{name} must be classified as a RECONSTRUCTION parameter"
+            )
+
+
+class TestAtselLearnedSumCombined:
+    def test_source_and_query_together(self):
+        model = _make_atsel(
+            value_structure_injection="learned_sum",
+            value_structure_query_injection="learned_sum",
+            attention_type="GatedCrossAttention",
+        )
+        # Source injection SUMS (W_V NOT widened); query injection adds W_V^q.
+        assert model.attention.value_projection.in_features == D_MODEL
         assert model.attention.value_query_proj is not None
         assert model.val_id_embed_X is not None
         assert model.val_q_id_embed_X is not None

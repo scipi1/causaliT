@@ -155,6 +155,9 @@ def _make_model(
         X_seq_len=X_SEQ_LEN,
         shared_dag_across_heads=True,
         struct_embedding_type="standard_learnable",
+        # Probe the Q/K projections: keep them (remove_*=True default would drop).
+        remove_query_projection=False,
+        remove_key_projection=False,
     )
     kwargs.update(overrides)
     return AttentionSelectorLayer(**kwargs)

@@ -110,6 +110,7 @@ from causaliT.core.modules import (
 # Imported directly from the submodule so the layer does not depend on the
 # package ``__init__`` re-export being present.
 from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
+from causaliT.core.modules.value_identity_embedding import ValueIdentityEmbedding
 from causaliT.utils.query_geometry import (
     assert_orthonormal_frame,
     correct_query,
@@ -358,7 +359,9 @@ class AttentionSelectorLayer(nn.Module):
         #     one value residual stream; posteriors re-concatenated.
         #   * homogeneous_nodes=True: THIS is the only block — a square (N, N)
         #     attention over all nodes; ``attention_type`` is ignored.
-        self_attention_type: Optional[str] = None,
+        # Default "GatedSelfAttention" (the SVFA stack); None selects the
+        # cross-only vanilla-transformer benchmark arm.
+        self_attention_type: Optional[str] = "GatedSelfAttention",
         # Homogeneous N-node mode: ignore the S/X (source) prior entirely.  The
         # whole datastream [S ; X] becomes one set of N = L_S + L_X nodes, each
         # simultaneously a value-blanked QUERY (candidate child) and an
@@ -422,16 +425,23 @@ class AttentionSelectorLayer(nn.Module):
         query_norm_learnable: bool = False,
         query_norm_init_scale: float = 1.0,
         query_norm_target: float = 1.0,
-        # Value-structure injection: concatenate a per-source-node identity code
-
-        # onto the (data-only) value stream before W_V, so V_j = W_V([v_j ; e_j])
-        # and the model can learn a per-source-node functional.  One of:
+        # Value-structure injection: combine a per-source-node identity code
+        # with the (data-only) value stream before W_V, so the model can learn
+        # a per-source-node functional.  One of:
         #   "none"           — disabled (default, original data-only value).
         #   "separate"       — dedicated reconstruction-routed identity tables
-        #                      (val_id_embed_S / val_id_embed_X).
+        #                      (val_id_embed_S / val_id_embed_X), CONCATENATED:
+        #                      V_j = W_V([v_j ; e_j]) (W_V widened by d_model).
         #   "struct_detached"— reuse the structural identity embeddings, detached
         #                      before concat (zero new params, no gradient leak).
-        # Requires SVFA (comps_embed_X="svfa"); combination is concatenation.
+        #   "learned_sum"    — dedicated reconstruction-routed identity tables
+        #                      (val_id_embed_S / val_id_embed_X; vanilla-style
+        #                      nn.Embedding with max_norm=1), SUMMED onto the
+        #                      value token before W_V: V_j = W_V(v_j + e_j).
+        #                      This is the vanilla/benchmark value composition
+        #                      (token = value map + learnable node embedding);
+        #                      W_V is NOT widened.
+        # Requires SVFA (comps_embed_X="svfa").
         value_structure_injection: str = "none",
         # Value-structure QUERY injection: make the value additionally depend on
         # the QUERY (child) node identity, so the shared W_V learns DIFFERENT
@@ -476,8 +486,8 @@ class AttentionSelectorLayer(nn.Module):
         # embedding width matches the score width.  ``freeze_*`` merely sets
         # requires_grad=False (the freeze persists across adaptive phase switches
         # because the gradient router keeps only requires_grad=True params).
-        remove_query_projection: bool = False,
-        remove_key_projection: bool = False,
+        remove_query_projection: bool = True,
+        remove_key_projection: bool = True,
         freeze_query_projection: bool = False,
         freeze_key_projection: bool = False,
 
@@ -613,15 +623,19 @@ class AttentionSelectorLayer(nn.Module):
 
         # ------------------------------------------------------------------
         # Value-structure injection scheme selection.
-        # Concatenate a per-SOURCE-node identity code onto the (data-only) value
-        # stream before W_V, so V_j = W_V([v_j ; e_j]) and the shared W_V can
-        # specialise per source variable (a per-node functional).  The identity
-        # is the KEY/source identity, giving per-parent output functions while
-        # preserving SVFA's source-shared value.  Combination is concatenation.
-        # The extra width ``vsi_dim`` is threaded into the AttentionLayer(s) so
-        # the reconstruction ``value_projection`` accepts d_model + vsi_dim.
+        # Combine a per-SOURCE-node identity code with the (data-only) value
+        # stream before W_V, so the shared W_V can specialise per source
+        # variable (a per-node functional).  The identity is the KEY/source
+        # identity, giving per-parent output functions while preserving SVFA's
+        # source-shared value.  Combination is concatenation for "separate" /
+        # "struct_detached" (V_j = W_V([v_j ; e_j]), W_V widened by vsi_dim) and
+        # SUMMATION for "learned_sum" (V_j = W_V(v_j + e_j), the vanilla/
+        # benchmark composition; W_V keeps its width).  ``vsi_dim`` and
+        # ``vsi_mode`` are threaded into the AttentionLayer(s).
         # ------------------------------------------------------------------
-        VALUE_STRUCTURE_INJECTION_TYPES = ("none", "separate", "struct_detached")
+        VALUE_STRUCTURE_INJECTION_TYPES = (
+            "none", "separate", "struct_detached", "learned_sum",
+        )
         if value_structure_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
             raise ValueError(
                 f"value_structure_injection='{value_structure_injection}' is "
@@ -637,8 +651,15 @@ class AttentionSelectorLayer(nn.Module):
                 "(comps_embed_X='svfa'); got comps_embed_X="
                 f"'{comps_embed_X}'."
             )
-        # Width of the injected identity code (0 disables the widening).
+        # Width of the injected identity code (0 disables the injection).
         vsi_dim = d_model if self.inject_value_structure else 0
+        # Combination mode threaded into the AttentionLayer(s): "learned_sum"
+        # SUMS the code onto the value token before W_V (V_j = W_V(v_j + e_j),
+        # the vanilla/benchmark composition; W_V is NOT widened); every other
+        # scheme CONCATENATES (V_j = W_V([v_j ; e_j]), widened W_V).
+        vsi_mode = (
+            "sum" if value_structure_injection == "learned_sum" else "concat"
+        )
 
         # --- Value-structure QUERY injection (additive child-identity term) ---
         if value_structure_query_injection not in VALUE_STRUCTURE_INJECTION_TYPES:
@@ -896,8 +917,10 @@ class AttentionSelectorLayer(nn.Module):
             remove_key_projection=remove_key_projection,
             freeze_query_projection=freeze_query_projection,
             freeze_key_projection=freeze_key_projection,
-            # Value-structure injection: widen W_V to accept [v ; e_source].
+            # Value-structure injection: combine the source identity code with
+            # the value stream ("concat" widens W_V; "sum" keeps its width).
             value_structure_dim=vsi_dim,
+            value_structure_mode=vsi_mode,
             # Value-structure QUERY injection: add W_V^q(e_child) query term.
             value_structure_query_dim=vsq_dim,
         )
@@ -971,8 +994,10 @@ class AttentionSelectorLayer(nn.Module):
                 remove_key_projection=remove_key_projection,
                 freeze_query_projection=freeze_query_projection,
                 freeze_key_projection=freeze_key_projection,
-                # Value-structure injection: widen W_V to accept [v ; e_source].
+                # Value-structure injection: combine the source identity code
+                # with the value stream ("concat" widens W_V; "sum" keeps it).
                 value_structure_dim=vsi_dim,
+                value_structure_mode=vsi_mode,
                 # Value-structure QUERY injection: add W_V^q(e_child) query term.
                 value_structure_query_dim=vsq_dim,
             )
@@ -1161,14 +1186,18 @@ class AttentionSelectorLayer(nn.Module):
 
         # ------------------------------------------------------------------
         # Value-structure injection identity tables (value_structure_injection
-        # == "separate").  Dedicated free identity tables (one per S / X source
-        # variable) whose names ("val_id_") contain NO structural pattern, so
-        # the gradient router classifies them as RECONSTRUCTION parameters.
+        # in {"separate", "learned_sum"}).  Dedicated identity tables (one per
+        # S / X source variable) whose names ("val_id_") contain NO structural
+        # pattern, so the gradient router classifies them as RECONSTRUCTION
+        # parameters.  "separate" uses the unconstrained FreeQueryEmbedding;
+        # "learned_sum" uses the vanilla-style ValueIdentityEmbedding (plain
+        # nn.Embedding with max_norm=1, matching the benchmark's variable
+        # embedding) since its code is SUMMED directly onto the value token.
         # The "struct_detached" scheme reuses the (detached) structural identity
         # and needs no new parameters, so no tables are created there.
         # ------------------------------------------------------------------
-        self.val_id_embed_S: Optional[FreeQueryEmbedding]
-        self.val_id_embed_X: Optional[FreeQueryEmbedding]
+        self.val_id_embed_S: Optional[nn.Module]
+        self.val_id_embed_X: Optional[nn.Module]
         if self.value_structure_injection == "separate":
             self.val_id_embed_S = FreeQueryEmbedding(
                 num_variables=S_seq_len, d_model=d_model, device=device,
@@ -1176,16 +1205,26 @@ class AttentionSelectorLayer(nn.Module):
             self.val_id_embed_X = FreeQueryEmbedding(
                 num_variables=X_seq_len, d_model=d_model, device=device,
             )
+        elif self.value_structure_injection == "learned_sum":
+            self.val_id_embed_S = ValueIdentityEmbedding(
+                num_variables=S_seq_len, d_model=d_model, device=device,
+            )
+            self.val_id_embed_X = ValueIdentityEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
         else:
             self.val_id_embed_S = None
             self.val_id_embed_X = None
 
-        # Value-structure QUERY injection identity table (== "separate").  The
-        # query is always an X node (candidate child), so a single per-X-node
-        # code is enough.  Name ("val_q_id_") keeps it in the RECONSTRUCTION
-        # group; "struct_detached" reuses the detached X identity (0 params).
-        self.val_q_id_embed_X: Optional[FreeQueryEmbedding]
-        self.val_q_id_embed_S: Optional[FreeQueryEmbedding]
+        # Value-structure QUERY injection identity table ("separate" /
+        # "learned_sum").  The query is always an X node (candidate child), so
+        # a single per-X-node code is enough.  Name ("val_q_id_") keeps it in
+        # the RECONSTRUCTION group; "struct_detached" reuses the detached X
+        # identity (0 params).  The query combination is ADDITIVE in both
+        # table-bearing schemes ((sum_j A_ij) * W_V^q(e_i)); "learned_sum" only
+        # swaps the table class to the vanilla-style ValueIdentityEmbedding.
+        self.val_q_id_embed_X: Optional[nn.Module]
+        self.val_q_id_embed_S: Optional[nn.Module]
         if self.value_structure_query_injection == "separate":
             self.val_q_id_embed_X = FreeQueryEmbedding(
                 num_variables=X_seq_len, d_model=d_model, device=device,
@@ -1193,6 +1232,17 @@ class AttentionSelectorLayer(nn.Module):
             # Homogeneous mode: S nodes are queries (children) too.
             self.val_q_id_embed_S = (
                 FreeQueryEmbedding(
+                    num_variables=S_seq_len, d_model=d_model, device=device,
+                )
+                if self.homogeneous_nodes
+                else None
+            )
+        elif self.value_structure_query_injection == "learned_sum":
+            self.val_q_id_embed_X = ValueIdentityEmbedding(
+                num_variables=X_seq_len, d_model=d_model, device=device,
+            )
+            self.val_q_id_embed_S = (
+                ValueIdentityEmbedding(
                     num_variables=S_seq_len, d_model=d_model, device=device,
                 )
                 if self.homogeneous_nodes
@@ -1481,17 +1531,19 @@ class AttentionSelectorLayer(nn.Module):
         x_q_emb = xq_struct                                 # query tensor
 
         # ---- Value-structure injection identity codes -------------------
-        # Per-SOURCE-node identity concatenated onto the value stream before
-        # W_V (see __init__).  "separate" pulls dedicated reconstruction-routed
-        # tables; "struct_detached" reuses the (detached) structural identity so
-        # no gradient leaks into the structure.  vsi_S / vsi_X match the S / X
-        # value token order; vsi_SX is their concatenation for the single-block
-        # path.  All None when injection is disabled (value stream unchanged).
+        # Per-SOURCE-node identity combined with the value stream before W_V
+        # (see __init__; concatenated or summed per ``vsi_mode`` inside the
+        # AttentionLayer).  "separate" / "learned_sum" pull dedicated
+        # reconstruction-routed tables; "struct_detached" reuses the (detached)
+        # structural identity so no gradient leaks into the structure.  vsi_S /
+        # vsi_X match the S / X value token order; vsi_SX is their
+        # concatenation for the single-block path.  All None when injection is
+        # disabled (value stream unchanged).
         vsi_S = None
         vsi_X = None
         vsi_SX = None
         if self.inject_value_structure:
-            if self.value_structure_injection == "separate":
+            if self.value_structure_injection in ("separate", "learned_sum"):
                 assert self.val_id_embed_S is not None
                 assert self.val_id_embed_X is not None
                 vsi_S = self.dropout_emb(self.val_id_embed_S(source_tensor))
@@ -1506,7 +1558,7 @@ class AttentionSelectorLayer(nn.Module):
         # code for the S->X, X->X and single-block paths (queries are X nodes).
         vsq_X = None
         if self.inject_value_structure_query:
-            if self.value_structure_query_injection == "separate":
+            if self.value_structure_query_injection in ("separate", "learned_sum"):
                 assert self.val_q_id_embed_X is not None
                 vsq_X = self.dropout_emb(self.val_q_id_embed_X(x_blanked))
             else:  # "struct_detached": reuse the X identity, detached.
@@ -1515,7 +1567,7 @@ class AttentionSelectorLayer(nn.Module):
         # Homogeneous mode: the query-identity code covers ALL N children.
         vsq_all = vsq_X
         if self.homogeneous_nodes and self.inject_value_structure_query:
-            if self.value_structure_query_injection == "separate":
+            if self.value_structure_query_injection in ("separate", "learned_sum"):
                 assert self.val_q_id_embed_S is not None
                 vsq_S = self.dropout_emb(self.val_q_id_embed_S(s_blanked))
             else:  # "struct_detached"

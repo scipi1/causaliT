@@ -115,6 +115,10 @@ def _make_model(
         # Keep the centroid init independent of the free-query toggle so the
         # free_query_embedding=False tests build (the SVFA default couples them).
         query_centroid_init=False,
+        # Keep the Q/K projections: these tests assert they are classified
+        # STRUCTURAL, which requires them to exist (remove_*=True default drops).
+        remove_query_projection=False,
+        remove_key_projection=False,
     )
 
 

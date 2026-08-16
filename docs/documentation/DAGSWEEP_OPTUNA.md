@@ -149,6 +149,23 @@ sampled width).  Using the ceiling makes the batch a pure function of the DAG
 size: identical for every trial of a group and for the evaluation runs, so the
 tuned learning rate remains valid.
 
+With `pairwise_hsic: true` (AttentionSelector configs) the rule also prices the
+per-pair HSIC term: `hsic_pair_matrix` computes all `N^2` (source, residual)
+pairs and keeps every pair's `(B, B)` kernel tensors alive until backward
+(~5 fp32 tensors per pair), so its memory is **quadratic** in B and dominates
+for large N.  In budget elements the constraint becomes
+
+```
+B * N * H * (N + d_ref) + (5 / multiplicity) * N^2 * B^2 <= C
+```
+
+which is solved in closed form.  Without the flag the linear rule can clamp
+every size to `max` on a small GPU - the failure mode of the first
+`sva_homo_linear_ER4_10_80` cluster run, where all N >= 20 trials OOM'd at
+B = 2048 on a 10.6 GiB GPU (the HSIC graph alone needs ~84 MB x N^2 there).
+With the flag the same budget yields 2048/1024/512/256 for N = 10/20/40/80,
+i.e. a constant HSIC footprint across sizes.
+
 `C` is the single device-specific constant.  Measure it once per machine:
 
 ```bash
