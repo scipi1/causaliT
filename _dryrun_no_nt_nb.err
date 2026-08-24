@@ -1,0 +1,64 @@
+<cell 2>:29: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 3>:51: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+<cell 5>:20: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 5>:40: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 6>:25: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 8>:22: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 8>:45: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 9>:14: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 9>:46: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 10>:16: RuntimeWarning: Mean of empty slice
+<cell 10>:36: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 11>:25: RuntimeWarning: Mean of empty slice
+<cell 11>:34: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 12>:43: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+<cell 13>:52: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+<cell 15>:53: RuntimeWarning: Mean of empty slice
+<cell 16>:27: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 17>:37: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 17>:59: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 19>:40: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+<cell 20>:31: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+on_load_checkpoint: migrated 80 per-node value-MLP key(s) from mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in mlp_per_node_emb).
+<cell 15>:53: RuntimeWarning: Mean of empty slice
+<cell 21>:71: UserWarning: FigureCanvasAgg is non-interactive, and thus cannot be shown

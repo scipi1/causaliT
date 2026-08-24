@@ -106,6 +106,7 @@ from causaliT.core.modules import (
     OrthogonalMaskEmbedding,
     FixedOrthonormalEmbedding,
 )
+from causaliT.core.modules.mlp_head import PerNodeMLPHead
 
 # Imported directly from the submodule so the layer does not depend on the
 # package ``__init__`` re-export being present.
@@ -504,6 +505,32 @@ class AttentionSelectorLayer(nn.Module):
         # Ω (defaults to full rank = d_qk).
         commutator_direction_mode: str = "qk",
         commutator_direction_rank: Optional[int] = None,
+
+        # ---- Prior-softmax reconstruction gain (ATE_FIXCAP design) --------
+        # Adds the GainSoftmax stage to the gated blocks (see
+        # causaliT/core/modules/gain_softmax.py): the applied weight becomes
+        # A = (1-lambda)*z + lambda*n*z*e^s/D — the gate stays the sole owner
+        # of the support (z=0 -> A=0 exactly), the gain score s only
+        # REDISTRIBUTES each row's gate mass within the support.  The score is
+        # s = a_ij (zero-init static per-edge logit) + an optional
+        # DATA-dependent term <q^v, k^v>/sqrt(d_g) built from the
+        # value-identity tables and the value stream — NEVER the structural
+        # embeddings (rule: the gain carries no structural signal).  lambda is
+        # a buffer ramped by the trainer (``set_gain_lambda``); at lambda=0
+        # (default) the model is bit-identical to the gate-only baseline.
+        # Requires the gated blocks (split mode: GatedCrossAttention +
+        # GatedSelfAttention; homogeneous: GatedSelfAttention) and, for
+        # ``gain_data=True``, the "separate"/"learned_sum" value-identity
+        # tables on both the source and the query side.
+        use_gain_softmax: bool = False,
+        gain_data: bool = True,
+        gain_score_dim: Optional[int] = None,
+        # Per-node output head (DAGMA-style): one independent decoder MLP per
+        # variable.  When True, ``self.forecaster`` is a ``PerNodeMLPHead``
+        # instead of the shared ``MLPHead``.  Requires the variable-ID column
+        # at index 1 in the input tensors (production convention).
+        per_node_output: bool = False,
+        per_node_output_hidden: int = 32,
     ):
 
 
@@ -676,6 +703,53 @@ class AttentionSelectorLayer(nn.Module):
                 f"(comps_embed_X='svfa'); got comps_embed_X='{comps_embed_X}'."
             )
         vsq_dim = d_model if self.inject_value_structure_query else 0
+
+        # ------------------------------------------------------------------
+        # Prior-softmax reconstruction gain (validation; see the ctor docs).
+        # The gain lives on the gated blocks only and reuses the
+        # reconstruction-routed value-identity tables for its data term.
+        # ------------------------------------------------------------------
+        self.use_gain_softmax = bool(use_gain_softmax)
+        self.gain_data = bool(gain_data)
+        if self.use_gain_softmax:
+            # NB: ``self.cross_only`` is not defined yet at this point; the
+            # cross-only variant is exactly ``self_attention_type is None``.
+            if self_attention_type is None:
+                raise ValueError(
+                    "use_gain_softmax=True requires a gated attention block "
+                    "(GatedCrossAttention / GatedSelfAttention); the cross-only "
+                    "vanilla block (self_attention_type=None) has no structure "
+                    "gate to use as the softmax prior."
+                )
+            if not self.homogeneous_nodes and attention_type != "GatedCrossAttention":
+                raise ValueError(
+                    "use_gain_softmax=True in split mode requires "
+                    f"attention_type='GatedCrossAttention', got {attention_type!r}."
+                )
+            if self_attention_type != "GatedSelfAttention":
+                raise ValueError(
+                    "use_gain_softmax=True requires "
+                    "self_attention_type='GatedSelfAttention' "
+                    f"(got {self_attention_type!r}); CommutatorSelfAttention "
+                    "owns the legacy sigmoid gain stream instead."
+                )
+            if self.gain_data:
+                if self.value_structure_injection not in ("separate", "learned_sum"):
+                    raise ValueError(
+                        "gain_data=True requires value_structure_injection in "
+                        "('separate', 'learned_sum') so the reconstruction-routed "
+                        "per-source identity tables (val_id_embed_*) exist; the "
+                        "gain key is built from them and the value stream, NEVER "
+                        "from the structural embeddings.  Got "
+                        f"{self.value_structure_injection!r}."
+                    )
+                if self.value_structure_query_injection not in ("separate", "learned_sum"):
+                    raise ValueError(
+                        "gain_data=True requires value_structure_query_injection "
+                        "in ('separate', 'learned_sum') so the per-child identity "
+                        "table (val_q_id_embed_X) exists for the gain query.  "
+                        f"Got {self.value_structure_query_injection!r}."
+                    )
 
 
 
@@ -923,6 +997,10 @@ class AttentionSelectorLayer(nn.Module):
             value_structure_mode=vsi_mode,
             # Value-structure QUERY injection: add W_V^q(e_child) query term.
             value_structure_query_dim=vsq_dim,
+            # Prior-softmax reconstruction gain (inert at gain_lambda=0).
+            use_gain_softmax=use_gain_softmax,
+            gain_data=gain_data,
+            gain_score_dim=gain_score_dim,
         )
 
 
@@ -1000,6 +1078,10 @@ class AttentionSelectorLayer(nn.Module):
                 value_structure_mode=vsi_mode,
                 # Value-structure QUERY injection: add W_V^q(e_child) query term.
                 value_structure_query_dim=vsq_dim,
+                # Prior-softmax reconstruction gain (inert at gain_lambda=0).
+                use_gain_softmax=use_gain_softmax,
+                gain_data=gain_data,
+                gain_score_dim=gain_score_dim,
             )
 
             # Tie the learnable per-node query-norm multiplier across the cross
@@ -1258,16 +1340,32 @@ class AttentionSelectorLayer(nn.Module):
 
         # ------------------------------------------------------------------
 
-        mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
-        self.forecaster = MLPHead(
-            d_model=d_model,
-            out_dim=out_dim,
-            n_layers=output_mlp_layers,
-            d_hidden=mlp_hidden,
-            activation=output_mlp_activation,
-            dropout=output_mlp_dropout,
-            bias=(output_mlp_layers > 1),
-        )
+        self.per_node_output = bool(per_node_output)
+        if self.per_node_output:
+            # DAGMA-style per-node decoder: one MLP per variable.  In
+            # homogeneous mode the head must cover ALL N = L_S + L_X nodes
+            # (S is also reconstructed); otherwise only the X nodes.
+            n_out_nodes = self.N if self.homogeneous_nodes else X_seq_len
+            self.forecaster = PerNodeMLPHead(
+                d_model=d_model,
+                out_dim=out_dim,
+                num_variables=n_out_nodes,
+                d_hidden=per_node_output_hidden,
+                activation=output_mlp_activation,
+                dropout=output_mlp_dropout,
+                bias=True,
+            )
+        else:
+            mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
+            self.forecaster = MLPHead(
+                d_model=d_model,
+                out_dim=out_dim,
+                n_layers=output_mlp_layers,
+                d_hidden=mlp_hidden,
+                activation=output_mlp_activation,
+                dropout=output_mlp_dropout,
+                bias=(output_mlp_layers > 1),
+            )
 
     # ------------------------------------------------------------------
     # Query centroid initialisation
@@ -1574,6 +1672,26 @@ class AttentionSelectorLayer(nn.Module):
                 vsq_S = s_struct.detach()
             vsq_all = torch.cat([vsq_S, vsq_X], dim=1)      # (B, N, d)
 
+        # ---- Prior-softmax gain tensors (value-identity + value stream) ---
+        # The gain score's data term is built from the reconstruction-routed
+        # value-identity tables and the value stream — NEVER the structural
+        # embeddings (the gain carries no structural signal).  key = value +
+        # source identity; query = child identity (the query value is blanked
+        # by design).  Consumed by the AttentionLayer only when the inner
+        # GainSoftmax module is active (gain_lambda > 0); None otherwise.
+        gain_query = None
+        gain_key_cross = None
+        gain_key_self = None
+        gain_key_all = None
+        if self.use_gain_softmax and self.gain_data:
+            if self.homogeneous_nodes:
+                gain_query = vsq_all
+                gain_key_all = torch.cat([s_val, xk_val], dim=1) + vsi_SX
+            else:
+                gain_query = vsq_X
+                gain_key_cross = s_val + vsi_S               # (B, L_S, d)
+                gain_key_self = xk_val + vsi_X               # (B, L_X, d)
+
         if self.homogeneous_nodes:
             # ==============================================================
             # HOMOGENEOUS MODE — ONE square (N, N) self-attention block.
@@ -1601,6 +1719,8 @@ class AttentionSelectorLayer(nn.Module):
                 value_structure=vsi_SX,
                 value_structure_query=vsq_all,
                 transitive_cfg=self._transitive_cfg,
+                gain_query=gain_query,
+                gain_key=gain_key_all,
             )
         elif self.cross_only:
             # ==============================================================
@@ -1723,6 +1843,8 @@ class AttentionSelectorLayer(nn.Module):
                 value_structure=vsi_S,
                 value_structure_query=vsq_X,
                 transitive_cfg=tc_cross,
+                gain_query=gain_query,
+                gain_key=gain_key_cross,
             )
 
 
@@ -1818,6 +1940,8 @@ class AttentionSelectorLayer(nn.Module):
                 value_structure=vsi_X,
                 value_structure_query=vsq_X,
                 transitive_cfg=tc_self,
+                gain_query=gain_query,
+                gain_key=gain_key_self,
             )
 
             # Diagnostics: the fused (L_X, L_S+L_X) weights AS APPLIED (each
@@ -1899,7 +2023,19 @@ class AttentionSelectorLayer(nn.Module):
         # In SVFA mode `x` is the value stream (set above); in standard mode
         # it is the single fused stream.  Either way, the forecaster reads from
         # the correct (reconstruction-targeted) stream.
-        pred_x = self.forecaster(x)
+        if self.per_node_output:
+            # Per-node decoder: route each token to its own MLP using the
+            # variable-ID column.  In homogeneous mode the query stream spans
+            # [S ; X], so the IDs are concatenated; otherwise only X IDs.
+            if self.homogeneous_nodes:
+                var_ids = torch.cat(
+                    [s_blanked[:, :, 1], x_blanked[:, :, 1]], dim=1
+                )
+            else:
+                var_ids = x_blanked[:, :, 1]
+            pred_x = self.forecaster(x, var_ids)
+        else:
+            pred_x = self.forecaster(x)
 
         return pred_x, attention_weights, _aux
 
@@ -1997,6 +2133,34 @@ class AttentionSelectorLayer(nn.Module):
         if cross is None or self_score is None:
             return None
         return torch.cat([cross, self_score], dim=-1)   # (L_X, L_S + L_X)
+
+    # ------------------------------------------------------------------
+    # Prior-softmax gain schedule
+    # ------------------------------------------------------------------
+
+    def set_gain_lambda(self, value: float) -> int:
+        """Set the prior-softmax gain interpolation weight ``lambda`` on every
+        gated block that owns a ``GainSoftmax`` module.  Returns the number of
+        blocks updated (0 when the gain is disabled).  Called by the adaptive
+        trainer to ramp lambda 0 -> 1 in the gain (final) phase.
+        """
+        n = 0
+        for layer in (self.attention, self.self_attention):
+            inner = getattr(layer, "inner_attention", None)
+            gs = getattr(inner, "gain_softmax", None)
+            if gs is not None:
+                gs.set_gain_lambda(value)
+                n += 1
+        return n
+
+    def gain_lambda(self) -> float:
+        """The current gain interpolation weight (0.0 when gain is disabled)."""
+        for layer in (self.attention, self.self_attention):
+            inner = getattr(layer, "inner_attention", None)
+            gs = getattr(inner, "gain_softmax", None)
+            if gs is not None:
+                return float(gs.gain_lambda.item())
+        return 0.0
 
     # ------------------------------------------------------------------
     # Freezing utilities (mirrors SingleCausalLayer)

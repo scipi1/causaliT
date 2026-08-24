@@ -19,6 +19,7 @@ from .attention import (
 from .gated_cross_attention import GatedCrossAttention
 from .gated_self_attention import GatedSelfAttention
 from .commutator_self_attention import CommutatorSelfAttention
+from .gain_softmax import GainSoftmax
 
 from .encoder import Encoder, EncoderLayer
 from .decoder import Decoder, DecoderLayer
@@ -29,7 +30,7 @@ from .embedding_layers import *
 from .extra_layers import Normalization, UniformAttentionMask
 from .noise_layers import AmbientNoiseLayer, ReadingNoiseHead, GaussianNLLLoss, VariancePropagationTracker
 from .variance_layers import IntrinsicNoiseLayer, AnalyticalVarianceHead, ResidualCovarianceLoss
-from .mlp_head import MLPHead
+from .mlp_head import MLPHead, PerNodeMLPHead
 
 __all__ = [
     'ScaledDotSoftmax',
@@ -39,6 +40,7 @@ __all__ = [
     'GatedCrossAttention',
     'GatedSelfAttention',
     'CommutatorSelfAttention',
+    'GainSoftmax',
     'ToeplitzAttention',
 
     'AttentionLayer',
@@ -63,4 +65,5 @@ __all__ = [
     'ResidualCovarianceLoss',
     # Output head
     'MLPHead',
+    'PerNodeMLPHead',
 ]

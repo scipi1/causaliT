@@ -90,6 +90,14 @@ adaptive_training:
   # (num_workers=0) on the reload path for correctness/speed on Windows+Linux.
   data_split_ratio: null
 
+  # Exchange the recon/structure subsets after EACH completed recon+structure
+  # cycle (recon_1 on split A, struct_1 on B, recon_2 on B, struct_2 on A, ...).
+  # Within every recon->struct pairing the subsets stay disjoint (structure never
+  # reuses the split of the reconstruction that preceded it), so the honesty
+  # property above is preserved while each sample serves both roles across the
+  # run.  Requires data_split_ratio; ignored (with a warning) when it is null.
+  swap_splits: false
+
   # --- RECONSTRUCT phase ----------------------------------------------------
   reconstruct:
     max_epochs: 100                # per-phase safety cap

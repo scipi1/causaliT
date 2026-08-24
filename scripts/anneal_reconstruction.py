@@ -183,6 +183,8 @@ def anneal_run(
     eval_dag: bool = True,
     overwrite: bool = False,
     device_str: str = "auto",
+    gain_lambda: float = 1.0,
+    gain_ramp: int = 50,
 ) -> dict:
     """Anneal one run's best-causal checkpoint on the full train split.
 
@@ -196,6 +198,16 @@ def anneal_run(
     config before the model is built (e.g. value_structure_injection=separate).
     New modules introduced by an override are absent from the checkpoint and
     start randomly initialised (state_dict loads with strict=False).
+
+    Prior-softmax gain (``--override model.kwargs.use_gain_softmax=true``):
+    when the rebuilt model owns GainSoftmax modules, the interpolation weight
+    lambda is ramped linearly 0 -> ``gain_lambda`` over the first
+    ``gain_ramp`` epochs (0 = jump to the target at epoch 0) and the persistent
+    buffer is saved into the annealed checkpoint, so the evaluation reloads the
+    model with the gain ACTIVE.  ``gain_lambda`` is a no-op without the
+    override.  Combine with ``--mode joint`` to keep the structure training in
+    its new role as the softmax prior (all losses), or ``--mode frozen`` for
+    the conservative structure-frozen variant.
     """
     assert mode in ("frozen", "joint", "joint_full"), mode
     run_dir = Path(run_dir)
@@ -293,6 +305,16 @@ def anneal_run(
           f"test={len(test_idx) if test_idx is not None else 0} | "
           f"frozen={n_frozen:,d} trainable={n_train:,d} | lr={lr} epochs<={epochs}")
 
+    # --- Prior-softmax gain: does the rebuilt model own GainSoftmax modules? --
+    gain_setter = getattr(getattr(model, "model", None), "set_gain_lambda", None)
+    gain_enabled = callable(gain_setter) and bool(
+        getattr(model.model, "use_gain_softmax", False)
+    )
+    if gain_enabled:
+        gain_setter(0.0)   # the ramp starts from the gate-only baseline
+        print(f"  prior-softmax gain ACTIVE: lambda 0 -> {gain_lambda} "
+              f"over {gain_ramp} epochs")
+
     # --- Loop -----------------------------------------------------------------
     val_idx = model.val_idx
     history = []
@@ -301,6 +323,11 @@ def anneal_run(
     t0 = time.time()
 
     for epoch in range(epochs):
+        if gain_enabled:
+            lam = gain_lambda if gain_ramp <= 0 else (
+                min(1.0, (epoch + 1) / float(gain_ramp)) * gain_lambda
+            )
+            gain_setter(lam)
         model.train()
         if mode == "joint_full":
             # Advance the fan-in squeeze clock (no-op when fanin_prior unset).
@@ -582,13 +609,20 @@ def main():
     ap.add_argument("--overwrite", action="store_true",
                     help="Re-run even if the mode's anneal folder already exists.")
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--gain_lambda", type=float, default=1.0,
+                    help="Prior-softmax gain: ramp target for lambda (only with "
+                         "--override model.kwargs.use_gain_softmax=true).")
+    ap.add_argument("--gain_ramp", type=int, default=50,
+                    help="Prior-softmax gain: epochs to ramp lambda 0 -> "
+                         "gain_lambda (0 = jump to the target at epoch 0).")
     args = ap.parse_args()
 
     if args.run_dir:
         anneal_run(Path(args.run_dir), epochs=args.epochs, patience=args.patience,
                    lr=args.lr, mode=args.mode, overrides=args.override,
                    eval_ate=not args.no_ate, eval_dag=not args.no_dag,
-                   overwrite=args.overwrite, device_str=args.device)
+                   overwrite=args.overwrite, device_str=args.device,
+                   gain_lambda=args.gain_lambda, gain_ramp=args.gain_ramp)
         return
 
     # Sweep mode: anneal every run, then write a compact before/after table.
@@ -601,7 +635,8 @@ def main():
             s = anneal_run(run_dir, epochs=args.epochs, patience=args.patience,
                            lr=args.lr, mode=args.mode, overrides=args.override,
                            eval_ate=not args.no_ate, eval_dag=not args.no_dag,
-                           overwrite=args.overwrite, device_str=args.device)
+                           overwrite=args.overwrite, device_str=args.device,
+                           gain_lambda=args.gain_lambda, gain_ramp=args.gain_ramp)
         except Exception as exc:
             print(f"  [FAIL] {run_dir.name}: {exc}")
             continue

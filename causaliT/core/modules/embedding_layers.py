@@ -1,49 +1,6 @@
 import torch
 from torch import nn
 
-class Time2Vec(nn.Module):
-    """
-    Time2Vec embeddings (https://arxiv.org/abs/1907.05321) from Borealis AI
-    implementation from Spacetimeformer 
-    """
-    def __init__(self, input_dim:int, embed_dim:int, device):
-        super(Time2Vec, self).__init__()
-        activation = torch.sin
-        assert embed_dim % input_dim == 0
-        
-        self.embed_dim = embed_dim // input_dim # so that the final dimension is embed_dim
-        self.input_dim = input_dim
-        self.activation = activation
-        
-        # initialize learnable weights and biases
-        self.embed_weight = nn.parameter.Parameter(torch.rand(self.input_dim,self.embed_dim,device=device))
-        self.embed_bias = nn.parameter.Parameter(torch.rand(self.input_dim,self.embed_dim,device=device))
-
-    def forward(self, x: torch.Tensor):
-        if self.embed_dim == 0:
-            # for ablation study
-            return torch.empty((x.shape[0], x.shape[1],0), device=x.get_device())
-        
-        else:
-            x = torch.nan_to_num(x) # shape: (B, L, input_dim)
-
-            x_diag = torch.diag_embed(x).clone().detach()
-            x_affine = torch.matmul(x_diag, self.embed_weight) + self.embed_bias # shape: (B, L, input_dim, embed_dim)
-            
-            # separate the first dimension (no activation applied)
-            x_affine_0, x_affine_remain = torch.split(x_affine, [1, self.embed_dim - 1], dim=-1) # shapes: (B, L, 1) and (B, L, emb_dim-1)
-            
-            # apply activation on the remaining dimensions
-            x_affine_remain = self.activation(x_affine_remain)
-            
-            # join again the zero and activated dimensions
-            x_out = torch.cat([x_affine_0, x_affine_remain], dim=-1)
-            
-            # different time components are concatenated
-            x_out = x_out.view(x_out.size(0), x_out.size(1), -1)
-            return x_out
-
-
 
 class SinusoidalPosition(nn.Module):
     """
@@ -131,23 +88,95 @@ class mlp_emb(nn.Module):
         
 
 
+class mlp_per_node_emb(nn.Module):
+    """
+    Per-node MLP value embedding (DAGMA-style): one independent MLP per variable.
 
-def main():
-    # quick Time2Vec test
-    
-    BATCH_SIZE = 1
-    seq_len = 5
-    time_dim = 5
-    embed_dim = 10
-    
-    x_test = torch.rand(BATCH_SIZE,seq_len,time_dim)
-    time_embed = Time2Vec(input_dim=time_dim, embed_dim=embed_dim)
-    
-    x_out = time_embed.forward(x_test)
-    print(f"Actual latent dimension: {embed_dim} --> {time_embed.embed_dim}")
-    print(f"X input shape check: {x_test.shape} <--> {BATCH_SIZE},{seq_len},{time_dim}")
-    print(f"X output shape: {x_out.shape} <--> {BATCH_SIZE},{seq_len},{embed_dim}")
-    
-if __name__ == "__main__":
-    main()
+    Each variable j has its own MLP:
+        Linear(input_dim -> hidden_dim) -> activation -> Dropout -> Linear(hidden_dim -> embedding_dim)
 
+    The forward pass receives the scalar value column (B, L) and the variable-ID
+    column (B, L) and routes each token to its variable's MLP.  This lets every
+    node learn its own nonlinear value functional while the hidden_dim stays
+    fixed (does not scale with the number of nodes).
+
+    Args:
+        input_dim: Dimension of the scalar value input (typically 1).
+        embedding_dim: Output dimension (must equal d_model for the value stream).
+        num_variables: Number of variables (nodes) in the dataset.
+        device: Torch device.
+        hidden_dim: Hidden width of each per-node MLP (fixed, independent of
+            the number of nodes).  Default 32.
+        activation: Activation function ("gelu", "relu", "tanh").  Default "gelu".
+        var_id_offset: Variable IDs are 1-indexed in SCM datasets (0 = padding),
+            so the ID is shifted by this offset before indexing the MLP list.
+            Default 1.
+        dropout: Dropout rate applied after the hidden activation (train mode
+            only).  Default 0.0 (disabled; nn.Identity, no behaviour change).
+    """
+    ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "tanh": nn.Tanh}
+
+    def __init__(
+        self,
+        input_dim,
+        embedding_dim,
+        num_variables,
+        device,
+        hidden_dim=32,
+        activation="gelu",
+        var_id_offset=1,
+        dropout=0.0,
+    ):
+        super().__init__()
+        assert activation in self.ACTIVATIONS, (
+            f"Invalid activation '{activation}'. Choose from {list(self.ACTIVATIONS)}."
+        )
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.num_variables = num_variables
+        self.hidden_dim = hidden_dim
+        self.var_id_offset = var_id_offset
+
+        # Dropout after the hidden activation (stateless, so one module is
+        # shared by all per-node MLPs; Identity keeps dropout=0.0 a no-op).
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        # One independent MLP per variable (node).
+        self.mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, hidden_dim, device=device, dtype=torch.float32),
+                self.ACTIVATIONS[activation](),
+                self.dropout,
+                nn.Linear(hidden_dim, embedding_dim, device=device, dtype=torch.float32),
+            )
+            for _ in range(num_variables)
+        ])
+
+    def forward(self, values: torch.Tensor, var_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            values: (B, L) scalar values.
+            var_ids: (B, L) variable IDs (1-indexed; 0 = padding).
+
+        Returns:
+            (B, L, embedding_dim) per-node embedded values.
+        """
+        B, L = values.shape
+        # Shift to 0-indexed for ModuleList lookup; clamp padding to 0.
+        idx = (var_ids.long() - self.var_id_offset).clamp(min=0, max=self.num_variables - 1)
+
+        # Run every MLP on the full (B, L) batch and select the correct output
+        # per token.  This is vectorised and avoids a Python loop over the batch.
+        # values: (B, L) -> (B, L, 1) -> (B, L, hidden) -> (B, L, emb)
+        all_outs = torch.stack(
+            [mlp(values.unsqueeze(-1)) for mlp in self.mlps], dim=2
+        )  # (B, L, num_variables, embedding_dim)
+
+        # Gather the output of the MLP matching each token's variable ID.
+        out = torch.gather(
+            all_outs,
+            dim=2,
+            index=idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.embedding_dim),
+        ).squeeze(2)  # (B, L, embedding_dim)
+
+        return out

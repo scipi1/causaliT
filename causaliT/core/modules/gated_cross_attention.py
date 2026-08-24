@@ -65,6 +65,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from causaliT.core.modules.gain_softmax import GainSoftmax
 from causaliT.utils.query_geometry import correct_query
 from causaliT.utils.query_norm import (
     DEFAULT_GATE_GAMMA,
@@ -141,6 +142,19 @@ class GatedCrossAttention(nn.Module):
         # gate z is frozen at this constant on every edge (0 = residual floor,
         # 1 = uniform mixing).
         optuna_protocol: Optional[float] = None,
+        # Prior-softmax reconstruction gain (see causaliT/core/modules/
+        # gain_softmax.py).  When True, a ``GainSoftmax`` module sized
+        # ``(query_seq_len, key_seq_len)`` redistributes the gate's row mass
+        # within the gate's own support: A = (1-lambda)*z + lambda*n*z*e^s/D.
+        # The gate stays the sole owner of the support (z=0 -> A=0 exactly);
+        # the gain score s = static per-edge logit (zero-init) + an optional
+        # data-dependent term supplied via ``gain_scores`` in forward.  The
+        # interpolation weight lambda is a buffer ramped by the trainer
+        # (``set_gain_lambda``); at lambda=0 (default) the module is inert and
+        # the forward is bit-identical to the gate-only path.
+        use_gain_softmax: bool = False,
+        gain_num_queries: Optional[int] = None,
+        gain_num_keys: Optional[int] = None,
     ):
         super().__init__()
 
@@ -204,6 +218,16 @@ class GatedCrossAttention(nn.Module):
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+
+        # Prior-softmax reconstruction gain (inert at lambda=0, the default).
+        self.gain_softmax: Optional[GainSoftmax] = None
+        if use_gain_softmax:
+            if gain_num_queries is None or gain_num_keys is None:
+                raise ValueError(
+                    "use_gain_softmax=True requires gain_num_queries and "
+                    "gain_num_keys (the static per-edge logit table shape)."
+                )
+            self.gain_softmax = GainSoftmax(gain_num_queries, gain_num_keys)
 
         # Diagnostics / regularisation hooks (populated in forward).
         #   score_tensor_for_sparsity - the GATE posterior edge prob (B-mean),
@@ -301,6 +325,10 @@ class GatedCrossAttention(nn.Module):
         # posterior (see causaliT/utils/query_geometry.py); None = disabled.
         transitive_W: Optional[torch.Tensor] = None,
         transitive_delta: float = 0.0,
+        # Prior-softmax gain: precomputed data-dependent score ``<q^v, k^v> /
+        # sqrt(d_g)``, shape (B, L, S); None = static-logit-only gain.  Only
+        # consumed when the GainSoftmax module exists and lambda > 0.
+        gain_scores: Optional[torch.Tensor] = None,
     ):
         if causal_mask:
             raise NotImplementedError(
@@ -407,6 +435,14 @@ class GatedCrossAttention(nn.Module):
             p_edge_masked = p_edge_on * hm
         else:
             p_edge_masked = p_edge_on
+
+        # ---- Prior-softmax reconstruction gain (lambda-ramped) -----------
+        # Redistributes each row's gate mass within the gate's own support:
+        # A = (1-lambda)*A + lambda*n*A*e^s/D.  The masked gate A is the prior,
+        # so gated-off / forbidden edges stay EXACTLY zero and the row mass is
+        # preserved.  Inert (returns A unchanged) while lambda == 0.
+        if self.gain_softmax is not None:
+            A = self.gain_softmax(A, gain_scores)
 
         # ---- L0 penalty: expected number of active (allowed) edges -------
         l0_penalty = p_edge_masked.sum(dim=(-2, -1)).mean()

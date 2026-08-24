@@ -1447,6 +1447,20 @@ class AttentionLayer(nn.Module):
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
         optuna_protocol: Optional[float] = None,
+        # Prior-softmax reconstruction gain (GatedCrossAttention /
+        # GatedSelfAttention only; see causaliT/core/modules/gain_softmax.py).
+        # ``use_gain_softmax`` builds the inner GainSoftmax module (static
+        # per-edge logit table, zero-init; inert while its ``gain_lambda``
+        # buffer is 0).  ``gain_data`` additionally builds the projections for
+        # the DATA-dependent score term <q^v, k^v>/sqrt(d_g), computed in
+        # ``forward`` from the caller-supplied ``gain_query`` / ``gain_key``
+        # tensors (value-identity codes / value stream - NEVER the structural
+        # embeddings).  ``gain_score_dim`` is the projection width d_g
+        # (default: d_queries_keys).  Invalid for CommutatorSelfAttention
+        # (which owns the legacy sigmoid gain stream).
+        use_gain_softmax: bool = False,
+        gain_data: bool = True,
+        gain_score_dim: Optional[int] = None,
         # Value-structure injection (source-node identity combined with the
         # value stream before W_V).  When >0, the caller must pass a
         # ``value_structure`` tensor of that trailing width to ``forward``.
@@ -1589,6 +1603,11 @@ class AttentionLayer(nn.Module):
                     # Optuna capacity-search protocol: freeze the STRUCTURE gate
                     # at a constant (0/1) while the reconstruction gain learns.
                     optuna_protocol=optuna_protocol,
+                    # Prior-softmax reconstruction gain (static table sized
+                    # (query_seq_len, key_seq_len); inert at gain_lambda=0).
+                    use_gain_softmax=use_gain_softmax,
+                    gain_num_queries=query_seq_len,
+                    gain_num_keys=key_seq_len,
                 )
 
             elif attention is CommutatorSelfAttention:
@@ -1646,6 +1665,11 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
                     optuna_protocol=optuna_protocol,
+                    # Prior-softmax reconstruction gain (static table sized
+                    # (query_seq_len, key_seq_len); inert at gain_lambda=0).
+                    use_gain_softmax=use_gain_softmax,
+                    gain_num_queries=query_seq_len,
+                    gain_num_keys=key_seq_len,
                 )
             elif attention is CausalCrossAttention:
 
@@ -1863,6 +1887,37 @@ class AttentionLayer(nn.Module):
         else:
             self.gain_q_proj = None
             self.gain_k_proj = None
+
+        # Prior-softmax gain DATA-term projections (GatedCrossAttention /
+        # GatedSelfAttention with use_gain_softmax=True).  The static per-edge
+        # logit table lives in the inner GainSoftmax module; these projections
+        # map the caller-supplied gain query / key tensors (value-identity
+        # codes / value stream — NEVER the structural embeddings) to the score
+        # width d_g for the data-dependent term <q^v, k^v>/sqrt(d_g).  Named
+        # WITHOUT the structural routing patterns -> RECONSTRUCTION group.
+        # ``gain_softmax_k_proj`` is ZERO-INITIALISED so the data term is
+        # exactly 0 at init: with the zero-init static table the gain is an
+        # exact identity (A = z) at any lambda (smooth turn-on).
+        if use_gain_softmax and attention is CommutatorSelfAttention:
+            raise ValueError(
+                "use_gain_softmax is invalid for CommutatorSelfAttention: it "
+                "owns the legacy sigmoid gain stream (use_gain / gain_tau)."
+            )
+        self._gain_softmax_data = (
+            bool(use_gain_softmax)
+            and bool(gain_data)
+            and attention in (GatedCrossAttention, GatedSelfAttention)
+            and shared_qk_inner is None
+        )
+        if self._gain_softmax_data:
+            _d_g = int(gain_score_dim) if gain_score_dim is not None else int(d_queries_keys)
+            self.gain_softmax_q_proj = nn.Linear(d_model_queries, _d_g)
+            self.gain_softmax_k_proj = nn.Linear(d_model_keys, _d_g)
+            nn.init.zeros_(self.gain_softmax_k_proj.weight)
+            nn.init.zeros_(self.gain_softmax_k_proj.bias)
+        else:
+            self.gain_softmax_q_proj = None
+            self.gain_softmax_k_proj = None
 
     def get_shared_qk_inner(self) -> dict:
         if self._uses_shared_structure:
@@ -2103,6 +2158,25 @@ class AttentionLayer(nn.Module):
                 **tw_kwargs,
             )
         else:
+            # Prior-softmax gain: compute the DATA-dependent score term only
+            # when the inner GainSoftmax exists AND is currently active
+            # (gain_lambda > 0) AND the caller supplied the gain tensors.
+            # Otherwise gain_scores stays None -> static-logit-only gain (and
+            # at lambda=0 the inner module short-circuits before reading it).
+            gs_kwargs = {}
+            _gs = getattr(self.inner_attention, "gain_softmax", None)
+            if _gs is not None:
+                gain_scores = None
+                if (
+                    _gs.active
+                    and self.gain_softmax_q_proj is not None
+                    and gain_query is not None
+                    and gain_key is not None
+                ):
+                    gq = self.gain_softmax_q_proj(gain_query)   # (B, L, d_g)
+                    gk = self.gain_softmax_k_proj(gain_key)     # (B, S, d_g)
+                    gain_scores = torch.einsum("ble,bse->bls", gq, gk) / sqrt(gq.shape[-1])
+                gs_kwargs["gain_scores"] = gain_scores
             out, attn, aux = self.inner_attention(
                 query=q,
                 key=k,
@@ -2113,6 +2187,7 @@ class AttentionLayer(nn.Module):
                 causal_mask=causal_mask,
                 hard_mask=hard_mask,
                 oracle=oracle,
+                **gs_kwargs,
                 **vq_kwargs,
                 **tw_kwargs,
             )

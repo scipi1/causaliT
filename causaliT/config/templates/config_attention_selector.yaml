@@ -190,6 +190,19 @@ experiment:
   # independent W_q).  Option true: one shared W_q across both blocks.
   shared_query: false
 
+  # --- Per-node value embedding & output head (DAGMA-style) ------------------
+  # To enable the DAGMA-style per-node MLP value embedding, change the
+  # ``embed`` field of the value module in ds_embed_S / ds_embed_X below from
+  # "linear" to "mlp_per_node" and add the kwargs:
+  #   hidden_dim: 32          # fixed, does NOT scale with node count
+  #   num_variables: ${data.S_seq_len}   # or ${data.X_seq_len} for ds_embed_X
+  #   dropout: 0.0            # optional dropout after the hidden activation
+  # per_node_output — DEFAULT false (shared MLPHead).  Option true: replace the
+  #   forecaster with a PerNodeMLPHead (one decoder MLP per variable).  Makes
+  #   the structural attention the sole cross-node mixing point.
+  per_node_output: false
+  per_node_output_hidden: 32
+
 
 model:
 
@@ -348,6 +361,9 @@ model:
     output_mlp_hidden: ${experiment.d_ff}
     output_mlp_activation: "relu"
     output_mlp_dropout: 0.0
+    # Per-node output head (DAGMA-style); see experiment.per_node_output.
+    per_node_output: ${experiment.per_node_output}
+    per_node_output_hidden: ${experiment.per_node_output_hidden}
 
 
 training:
@@ -355,6 +371,33 @@ training:
   lr: ${experiment.lr}
   weight_decay: 0.01
   use_scheduler: false
+  # optimizer_kwargs: {}             # extra kwargs for the recon optimizer ctor
+                                      # (e.g. {momentum: 0.9, nesterov: true} for SGD)
+
+  # --- Structural optimizer (only used with use_gradient_routing: true) ---
+  # null = inherit the reconstruction setting above.  The kwargs default to {}
+  # (NOT to optimizer_kwargs), so e.g. SGD momentum must be set explicitly here.
+  structural_optimizer: null         # adamw, adam, sgd, adagrad, rmsprop
+  structural_lr: null
+  structural_weight_decay: null
+  structural_optimizer_kwargs: {}    # e.g. {momentum: 0.9, nesterov: true}
+
+  # --- Node-wise (per-query) winner-take-all structural update ---------------
+  # Each structural step updates only the ``topk`` query nodes whose gradient
+  # has the strongest SNR evidence (streaming-EMA t-statistic); all other
+  # query rows and their optimizer state are reverted after the step, so any
+  # optimizer above works unchanged.  Hard-coded strategy constants (see
+  # causaliT/training/nodewise_update.py): selector=snr, EMA beta=0.95,
+  # bias correction on, min SNR=1.0 (below the noise floor NO node updates
+  # this step), epsilon-greedy off, M_i (query_norm_log_scale) tied to its
+  # query row.  Diagnostics (selection histogram, max SNR, gate-fired
+  # fraction) are always logged under struct/nodewise_* when enabled.
+  # Requires use_gradient_routing: true and free query embeddings.
+  nodewise_update:
+    enabled: false             # master switch; off = current behaviour
+    topk: 1                    # query nodes updated per structural step
+    reset_every_stage: true    # clear the SNR statistics at every phase switch
+                               # (reconstruct<->structure)
 
   loss_fn: "mse"
   lambda_recon: 1.0
@@ -593,6 +636,12 @@ adaptive_training:
   # fit.  null (or a value outside the open interval (0, 1)) disables it and
   # both phases train on the full training set (default behaviour).
   data_split_ratio: null
+  # Exchange the recon/structure subsets after EACH completed recon+structure
+  # cycle (recon_1 on split A, struct_1 on B, recon_2 on B, struct_2 on A, ...).
+  # Within every recon->struct pairing the subsets stay disjoint, so the honesty
+  # property above is preserved while each sample serves both roles across the
+  # run.  Requires data_split_ratio; ignored (with a warning) when it is null.
+  swap_splits: false
 
 
   reconstruct:

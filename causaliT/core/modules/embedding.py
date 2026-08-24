@@ -7,7 +7,7 @@ from os.path import dirname, abspath
 import sys
 # root_path = dirname(dirname(dirname(abspath(__file__))))
 # sys.path.append(root_path)
-from causaliT.core.modules.embedding_layers import Time2Vec, SinusoidalPosition, identity_emb, nn_embedding, linear_emb, mlp_emb
+from causaliT.core.modules.embedding_layers import SinusoidalPosition, identity_emb, nn_embedding, linear_emb, mlp_emb, mlp_per_node_emb
 
 
 class EmbeddingMap(nn.Module):
@@ -36,6 +36,26 @@ class EmbeddingMap(nn.Module):
         return out
 
 
+class PerNodeEmbeddingMap(nn.Module):
+    """Embedding map for per-node value embeddings (e.g. mlp_per_node_emb).
+
+    Unlike EmbeddingMap, this map needs BOTH the value column and the
+    variable-ID column to route each token to its own MLP.  It is stored
+    separately from the standard embed_list so the ModularEmbedding forward
+    can handle it explicitly.
+    """
+    def __init__(self, val_idx: int, var_idx: int, embedding: nn.Module, kwargs: dict, device):
+        super().__init__()
+        self.val_idx = val_idx
+        self.var_idx = var_idx
+        self.embedding = embedding(**kwargs, device=device)
+
+    def __call__(self, X: torch.Tensor):
+        values = torch.nan_to_num(X[:, :, self.val_idx])
+        var_ids = X[:, :, self.var_idx].long()
+        return self.embedding(values, var_ids)
+
+
 
 
 class ModularEmbedding(nn.Module):
@@ -59,7 +79,7 @@ class ModularEmbedding(nn.Module):
     ]
 
     Options
-    - embed: "mask", "nn_embedding", "time2vec", "identity", "linear", "mlp", "pass"
+    - embed: "mask", "nn_embedding", "sinusoidal", "identity", "linear", "mlp", "mlp_per_node", "pass"
     - role (for SVFA mode): "structure" (used for Q, K) or "value" (used for V)
     
     SVFA (Structure-Value Factorized Attention) mode:
@@ -94,6 +114,8 @@ class ModularEmbedding(nn.Module):
         # SVFA-specific: separate lists for structure and value embeddings
         self.structure_embed_list = []
         self.value_embed_list = []
+        # Per-node value embeddings (need both value and variable-ID columns)
+        self.per_node_value_embed_list = []
         
         # unpack settings for spatiotemporal
         d_model = ds_embed["setting"]["d_model"] if comps == "spatiotemporal" else None
@@ -113,7 +135,7 @@ class ModularEmbedding(nn.Module):
                 assert role_ in ["structure", "value"], f"Invalid role '{role_}' for SVFA mode. Must be 'structure' or 'value'."
             
             # assign embedding layers
-            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","mlp","pass","value"], AssertionError("Invalid embedding selected!")
+            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","identity","linear","mlp","mlp_per_node","pass","value"], AssertionError("Invalid embedding selected!")
             
             if embed_ == "mask":
                 self.mask_idx = idx_
@@ -129,9 +151,6 @@ class ModularEmbedding(nn.Module):
             if embed_ == "sinusoidal":
                 emb_module = SinusoidalPosition
                 
-            if embed_ == "time2vec":
-                emb_module = Time2Vec
-                
             if embed_ == "identity":
                 emb_module = identity_emb
                 
@@ -140,6 +159,9 @@ class ModularEmbedding(nn.Module):
             
             if embed_ == "mlp":
                 emb_module = mlp_emb
+            
+            if embed_ == "mlp_per_node":
+                emb_module = mlp_per_node_emb
             
             # store value index
             if embed_ == "value":
@@ -160,20 +182,52 @@ class ModularEmbedding(nn.Module):
                 
                 
             if emb_module is not None:
-                emb_map = EmbeddingMap(var_idx=idx_, embedding=emb_module, kwargs=kwargs, device=device)
-                self.embed_list.append(emb_map)
-                
-                if label_ is not None:
-                    self.embed_label_list.append(label_)
+                if embed_ == "mlp_per_node":
+                    # Per-node value embedding needs the variable-ID column too.
+                    # We store it separately and handle it in the forward pass.
+                    # The variable-ID column is found from the structure role.
+                    var_idx = None
+                    for v in ds_embed["modules"]:
+                        if v.get("role") == "structure" and v["embed"] == "nn_embedding":
+                            var_idx = v["idx"]
+                            break
+                    if var_idx is None:
+                        raise ValueError(
+                            "mlp_per_node requires a structure embedding with "
+                            "embed='nn_embedding' to provide the variable-ID column."
+                        )
+                    emb_map = PerNodeEmbeddingMap(
+                        val_idx=idx_, var_idx=var_idx,
+                        embedding=emb_module, kwargs=kwargs, device=device,
+                    )
+                    self.per_node_value_embed_list.append(emb_map)
+                    # Also register in the standard lists so SVFA validation passes
+                    # and gradient routing picks it up via value_modules_list.
+                    self.embed_list.append(emb_map)
+                    if label_ is not None:
+                        self.embed_label_list.append(label_)
+                    else:
+                        self.embed_label_list.append("empty_label")
+                    self.embed_role_list.append(role_)
+                    if role_ == "structure":
+                        self.structure_embed_list.append(emb_map)
+                    elif role_ == "value":
+                        self.value_embed_list.append(emb_map)
                 else:
-                    self.embed_label_list.append("empty_label")
-                
-                # SVFA: track role and add to appropriate list
-                self.embed_role_list.append(role_)
-                if role_ == "structure":
-                    self.structure_embed_list.append(emb_map)
-                elif role_ == "value":
-                    self.value_embed_list.append(emb_map)
+                    emb_map = EmbeddingMap(var_idx=idx_, embedding=emb_module, kwargs=kwargs, device=device)
+                    self.embed_list.append(emb_map)
+                    
+                    if label_ is not None:
+                        self.embed_label_list.append(label_)
+                    else:
+                        self.embed_label_list.append("empty_label")
+                    
+                    # SVFA: track role and add to appropriate list
+                    self.embed_role_list.append(role_)
+                    if role_ == "structure":
+                        self.structure_embed_list.append(emb_map)
+                    elif role_ == "value":
+                        self.value_embed_list.append(emb_map)
                     
         
         # save the list into a ModuleList to train/save them
@@ -317,6 +371,8 @@ class ModularEmbedding(nn.Module):
         )
         
         # Sum all value embeddings (for V projection and residual)
+        # Per-node embeddings are already in value_embed_list (registered above),
+        # so they are included here automatically.
         val_embs = [embed(X) for embed in self.value_embed_list]
         emb_val = torch.sum(
             torch.stack([e for e in val_embs if e.shape[-1] != 0], dim=-1), 

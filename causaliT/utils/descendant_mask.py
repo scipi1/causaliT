@@ -71,6 +71,8 @@ __all__ = [
     "harden_adjacency",
     "transitive_closure",
     "build_hsic_pair_mask",
+    "soft_transitive_closure",
+    "build_hsic_pair_mask_budgeted",
 ]
 
 
@@ -254,6 +256,187 @@ def build_hsic_pair_mask(
         # future change to the cross block cannot silently mask S keys.
         excluded = excluded.clone()
         excluded[:, :S] = False
+
+    mask = torch.where(
+        excluded,
+        torch.full_like(score, float(excluded_weight)),
+        torch.ones_like(score),
+    )
+
+    total = excluded.numel()
+    kept_frac = float((~excluded).sum().item()) / float(total) if total > 0 else 1.0
+
+    return mask.detach(), kept_frac, is_cyclic
+
+
+def soft_transitive_closure(
+    pi: torch.Tensor,
+    tnorm: str = "min",
+    hops: Optional[int] = None,
+) -> torch.Tensor:
+    """Soft (fuzzy) reachability closure of a directed edge posterior.
+
+    The continuous analogue of :func:`transitive_closure`: ``pi[i, j]`` is
+    ``P(j -> i)`` (child <- parent), and the result ``desc[i, j]`` is the soft
+    score that ``j`` is reachable FROM ``i`` (a descendant of ``i``), computed
+    by iterating the t-norm composition ``desc <- max(desc, desc . desc)`` to
+    the full closure (or the ``hops``-limited one).
+
+    Args:
+        pi: ``(N, N)`` posterior with ``pi[i, j] = P(j -> i)``, values in [0, 1].
+        tnorm: ``"min"`` (Goedel — a chain keeps the confidence of its weakest
+            link) or ``"prod"`` (the literal product, which deflates).
+        hops: Maximum path length to follow.  ``None`` (default) = full closure;
+            ``1`` = direct children only; ``k`` = paths up to length ``k``.
+
+    Returns:
+        ``(N, N)`` soft descendant scores in [0, 1].  The diagonal is > 0 only
+        when the graph has a (soft) cycle.
+    """
+    if pi.dim() != 2 or pi.shape[0] != pi.shape[1]:
+        raise ValueError(
+            f"soft_transitive_closure expects a square (N, N) posterior, got "
+            f"{tuple(pi.shape)}."
+        )
+    n = pi.shape[0]
+    # ``pi[i, j]`` means ``j -> i``; reachability from i follows the reversed
+    # arrow, so (as in ``transitive_closure``) we work with the transpose.
+    M = pi.transpose(0, 1)
+    if hops is not None and int(hops) <= 1:
+        return M
+    desc = M
+    if n <= 1:
+        return desc
+    if hops is None:
+        n_steps = max(1, math.ceil(math.log2(n)))
+    else:
+        n_steps = max(1, math.ceil(math.log2(float(int(hops)))))
+    for _ in range(n_steps):
+        a = desc.unsqueeze(-1)          # (i, k, 1) -> desc[i, k]
+        b = desc.unsqueeze(-3)          # (1, k, j) -> desc[k, j]
+        if tnorm == "prod":
+            joint = a * b
+        elif tnorm == "min":
+            joint = torch.minimum(a.expand(*desc.shape, n),
+                                  b.expand(*desc.shape, n))
+        else:
+            raise ValueError(f"unknown tnorm={tnorm!r} (expected 'min' or 'prod')")
+        desc = torch.maximum(desc, joint.max(dim=-2).values)
+    return desc
+
+
+def build_hsic_pair_mask_budgeted(
+    score_tensor: torch.Tensor,
+    s_seq_len: int,
+    homogeneous_nodes: bool,
+    budget_frac: float = 0.25,
+    per_row: bool = True,
+    exclude_self: bool = True,
+    excluded_weight: float = 0.0,
+    tnorm: str = "min",
+    hops: Optional[int] = None,
+) -> Tuple[torch.Tensor, float, bool]:
+    """Budgeted descendant-excluding HSIC pair mask: the cap IS the guard.
+
+    The threshold-based :func:`build_hsic_pair_mask` is brittle: it hardens the
+    learned posterior at a fixed threshold and hopes the result is a DAG.  When
+    the learned graph is dense and cyclic (the common case early in training),
+    the transitive closure saturates, every pair is flagged as a descendant,
+    and the collapse guard falls back to the unmasked HSIC — so the feature
+    never acts.
+
+    This budgeted variant replaces the threshold with a CAP on how many pairs
+    are removed: the pairs are ranked by a SOFT descendant score (the detached
+    posterior's fuzzy transitive closure, see :func:`soft_transitive_closure`)
+    and the top ``budget_frac`` are excluded — per child row (``per_row=True``,
+    the default: every child keeps most of its candidates) or globally.  The
+    cap makes the collapse mode impossible by construction, so the mask
+    triggers every step, and it is self-normalizing across training: early on
+    the diffuse posterior still ranks the most descendant-ish pairs on top, and
+    the exclusion sharpens as the posterior sharpens.
+
+    Args:
+        score_tensor: Directed edge posterior from the attention block
+            (``[i, j] = P(j -> i)``); same layout as :func:`build_hsic_pair_mask`.
+        s_seq_len: ``L_S`` — number of leading S (source) nodes.
+        homogeneous_nodes: Node topology flag (see the module docstring).
+        budget_frac: Fraction of pairs to exclude (per row when ``per_row``,
+            globally otherwise).  The diagonal is always ranked first when
+            ``exclude_self``.
+        per_row: Rank per child row (default) rather than globally.
+        exclude_self: Also exclude the diagonal pair ``HSIC(X_i, r_i)``.
+        excluded_weight: Weight GIVEN TO excluded pairs (0.0 = drop entirely).
+        tnorm: T-norm for the soft closure (``"min"`` default, ``"prod"``).
+        hops: Maximum path length for the closure; ``None`` = full.
+
+    Returns:
+        ``(mask, kept_frac, is_cyclic)`` mirroring :func:`build_hsic_pair_mask`:
+        ``mask`` is detached and directly multiplicable with the HSIC pair
+        matrix; ``kept_frac`` is the combinatorial fraction of pairs kept;
+        ``is_cyclic`` flags a soft cycle (a node strongly reachable from
+        itself) as a diagnostic.
+    """
+    if score_tensor.dim() != 2:
+        raise ValueError(
+            f"build_hsic_pair_mask_budgeted expects a 2-D (target, source) "
+            f"score tensor, got {tuple(score_tensor.shape)}."
+        )
+    if not (0.0 < float(budget_frac) <= 1.0):
+        raise ValueError(f"budget_frac must be in (0, 1], got {budget_frac!r}.")
+
+    score = score_tensor.detach()
+    L_target, L_source = score.shape
+    S = int(s_seq_len)
+
+    if homogeneous_nodes:
+        if L_target != L_source:
+            raise ValueError(
+                f"homogeneous_nodes=True requires a square (N, N) score tensor, "
+                f"got {tuple(score.shape)}."
+            )
+        square = score
+    else:
+        # Split mode: pad the top L_S rows with zeros (nothing points into an S
+        # node) to obtain the square (N, N) graph over all nodes.
+        N = L_source
+        if L_target + S != N:
+            raise ValueError(
+                f"split-mode score tensor shape {tuple(score.shape)} is "
+                f"inconsistent with s_seq_len={S} (expected L_target + L_S == "
+                f"L_source)."
+            )
+        square = torch.zeros((N, N), dtype=score.dtype, device=score.device)
+        square[S:, :] = score
+
+    desc = soft_transitive_closure(square, tnorm=tnorm, hops=hops)
+    # Diagnostic only: a node strongly reachable from itself means a soft cycle.
+    is_cyclic = bool((desc.diagonal() > 0.5).any())
+
+    if exclude_self:
+        desc = desc.clone()
+        desc.fill_diagonal_(1.0)   # the self pair is always top-ranked
+
+    # Slice back to the (target, source) layout of the HSIC matrix.
+    excluded_score = desc if homogeneous_nodes else desc[S:, :]
+    if not homogeneous_nodes:
+        # Invariant pin (mirrors the threshold variant): the cross (S) columns
+        # can never be descendants of an X node.
+        excluded_score = excluded_score.clone()
+        excluded_score[:, :S] = 0.0
+
+    # Rank by the soft descendant score and exclude the top budget_frac.  Pairs
+    # with a zero score (no path) are never excluded, so a sink row keeps all
+    # its off-diagonal candidates.
+    if per_row:
+        k = max(1, int(math.ceil(budget_frac * L_source)))
+        # The k-th largest score per row is the per-row exclusion threshold.
+        thr = excluded_score.sort(dim=-1, descending=True).values[:, k - 1:k]
+        excluded = (excluded_score >= thr) & (excluded_score > 0)
+    else:
+        flat = excluded_score.reshape(-1)
+        k = max(1, int(math.ceil(budget_frac * flat.numel())))
+        thr = flat.sort(descending=True).values[k - 1]
+        excluded = (excluded_score >= thr) & (excluded_score > 0)
 
     mask = torch.where(
         excluded,

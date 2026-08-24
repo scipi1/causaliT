@@ -63,6 +63,16 @@ Two config keys drive all of this - ``experiment.query_norm`` (a master switch
 that derives the whole normalised-query stack) and ``experiment.fanin_prior``
 (``K*`` in EDGES).  See ``resolve_query_norm`` and
 docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
+
+Starting below the calibration: ``score_at_init``
+-------------------------------------------------
+``p*`` (``query_centroid_max_p``) is the ASYMPTOTIC calibration: the posterior
+a fully grown row at ``M = 1`` gives each parent.  Training can instead START
+from a lower score - deterministic gates closed, sampled gates still
+trainable - without touching ``F`` or ``p*``: ``experiment.score_at_init: s``
+initialises the learnable multiplier at ``M_i(0) = s / x(p*)`` so the centroid
+logit starts at ``s``.  Budget growth back to (and above) 1 is paid for by the
+structural signal as usual, and is penalty-free up to the target.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -920,6 +930,17 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
     centroid initialisation gives every candidate parent the posterior ``p*``
     whatever ``N`` is.
 
+    ``experiment.score_at_init: s`` - the OPTIONAL init score (default ``null``).
+    ``p*`` is the ASYMPTOTIC calibration: the posterior a fully grown row at
+    ``M = 1`` gives each parent at the centroid.  The STARTING score is a
+    separate degree of freedom, realised through the learnable multiplier:
+    ``M_i(0) = s / x(p*)`` (``null`` -> ``M_i(0) = 1``).  F and the whole
+    capacity calculus keep the ``p*`` calibration untouched; ``M_i`` can grow
+    back to (and above) 1, and growth up to the target is penalty-free.  An
+    ``s <= kappa`` starts the DETERMINISTIC gate closed (the sampled gate
+    still trains); ``s <= 0`` is rejected because ``M_i = exp(log_scale_i)``
+    is strictly positive.
+
     ``experiment.fanin_prior: K*`` - the prior in-degree, in EDGES.  It sets
     ``query_norm_target = mu = sqrt(K*/N)`` (eq 3c), selects the ``capacity``
     penalty form (eq 12a, the only one whose ``lambda_query_norm`` transfers
@@ -1002,7 +1023,37 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
     exp["normalize_query"] = True
     exp["query_centroid_init"] = free_query
     exp["query_norm_learnable"] = True
-    exp["query_norm_init_scale"] = 1.0          # so mu(0) = 1 is exact
+
+    # --- init score: score_at_init sets M_i(0), never F ----------------------
+    # Default keeps M_i(0) = 1, so the centroid init realises p* exactly
+    # (mu(0) = 1 is exact).  An explicit score_at_init s lowers ONLY the
+    # starting score via M_i(0) = s / x(p*); F keeps the p* calibration.
+    score_init_raw = exp.get("score_at_init", None)
+    if score_init_raw is None:
+        m0 = 1.0
+    else:
+        s_init = float(score_init_raw)
+        if s_init <= 0.0:
+            raise ValueError(
+                f"experiment.score_at_init={score_init_raw!r} must be > 0: the "
+                "init score is realised as M_i(0) = score_at_init / x(p*) and "
+                "the multiplier M_i = exp(log_scale_i) is strictly positive.  "
+                "The lowest deterministic-gate state reachable this way is "
+                "'just closed' (score_at_init -> 0+)."
+            )
+        m0 = s_init / x
+    exp["query_norm_init_scale"] = m0
+    x_init = m0 * x
+    if x_init <= kappa(tau, gamma, zeta):
+        logger.warning(
+            "[query-norm] score_at_init puts the centroid logit x_init=%.4g at "
+            "or below the opening threshold kappa=%.4g: the DETERMINISTIC gate "
+            "starts CLOSED (z_init=0).  The sampled Hard-Concrete gate still "
+            "leaves z in the open interval with positive probability, so the "
+            "structural gradient survives and edges can be bought open; the "
+            "eval-time graph simply starts empty.",
+            x_init, kappa(tau, gamma, zeta),
+        )
     if not free_query:
         logger.warning(
             "[query-norm] free_query_embedding=false: the query is NOT initialised "
@@ -1011,8 +1062,10 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
             "indicative only."
         )
 
+    # The REALISED init diagnostics use the actual starting logit x_init
+    # (= x(p*) at the default M_i(0) = 1), not the asymptotic calibration x.
     l_init, pi_init, z_init = init_gate_at_centroid(
-        n, n, x, tau, gamma, zeta, offset)
+        n, n, x_init, tau, gamma, zeta, offset)
 
     # --- the prior (eq 3c) --------------------------------------------------
     k_star: Optional[int] = None
@@ -1078,6 +1131,9 @@ def resolve_query_norm(config: Any, n_keys: int) -> Optional[Dict[str, Any]]:
         "query_fanin_scale": float(exp["query_fanin_scale"]),
         "query_fanin_scale_explicit": fanin_explicit,
         "query_centroid_init": free_query,
+        "score_at_init": (None if score_init_raw is None
+                          else float(score_init_raw)),
+        "m0": m0,
         "l_init": l_init,
         "pi_init": pi_init,
         "z_init": z_init,
@@ -1251,6 +1307,11 @@ def format_query_norm_log(info: Dict[str, Any]) -> str:
         "             pi_init={pi:.4f} z_init={z:.4f} ({gate})".format(
             pi=info["pi_init"], z=info["z_init"], gate=gate),
     ]
+    if info.get("score_at_init") is not None:
+        lines.append(
+            "             score_at_init={s:.4f} -> M_i(0)={m:.4f} "
+            "(F and p* untouched: a fully grown M_i=1 row still gives p*)".format(
+                s=info["score_at_init"], m=info["m0"]))
     if info["fanin_prior"] is None:
         lines.append("             fanin_prior=off -> mu=1 (no in-degree prior)")
     else:

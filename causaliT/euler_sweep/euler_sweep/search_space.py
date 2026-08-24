@@ -38,7 +38,13 @@ be unit-tested without touching Optuna or a GPU:
    * ``batch_size`` - from an activation budget, so large DAGs do not OOM
      (linear in B by default; ``pairwise_hsic: true`` adds the quadratic
      N^2 x B^2 memory of the per-pair HSIC term, see ``activation_batch_size``);
-   * ``query_fanin_scale`` - ``F = n_keys * x_sat^2`` (opt-in for now).
+   * ``query_fanin_scale`` - ``F = n_keys * x_sat^2`` (opt-in for now);
+   * ``d_model_set`` - ``round(mult * n_keys)`` (rule ``width_from_nodes``), the
+     deterministic alternative to the ``adaptive_width`` Optuna search for
+     models whose capacity scales with the node count BY CONSTRUCTION (e.g.
+     per-node MLP value functionals): the width then only has to keep the
+     orthogonal structural frame feasible (``d_model >= n_keys``), so a fixed
+     multiple of the node count is a complete sizing rule.
 
 All samplers emit DOTTED config paths as the Optuna parameter names.  This is
 load-bearing: ``best_trial.yaml`` stores ``trial.params`` verbatim and the sweep
@@ -439,7 +445,8 @@ def saturating_query_fanin(config: Any, n_keys: int) -> float:
 
 
 #: Recipes usable in ``dagsweep.yaml``'s ``size_derived`` block.
-SIZE_DERIVED_RULES = ("activation_budget", "fanin_saturating")
+SIZE_DERIVED_RULES = ("activation_budget", "fanin_saturating", "width_from_nodes",
+                      "l0_from_nodes")
 
 
 def derive_size_fields(config: Any, n_keys: int,
@@ -482,6 +489,36 @@ def derive_size_fields(config: Any, n_keys: int,
             )
         elif rule == "fanin_saturating":
             value = saturating_query_fanin(config, n_keys)
+        elif rule == "width_from_nodes":
+            # Deterministic width: d_model = round(mult * n_keys), optionally
+            # ceiled to a multiple of ``align`` (value-head divisibility).
+            # This REPLACES the adaptive_width Optuna search for architectures
+            # whose capacity scales with the node count by construction (e.g.
+            # per-node MLP value functionals): the width then only has to keep
+            # the orthogonal structural frame feasible (d_model >= n_keys), so
+            # a fixed multiple of the node count is a complete sizing rule.
+            # With a single value head no alignment is needed (align=1).
+            mult = float(entry.get("mult", DEFAULT_SIZE_MULT))
+            align = int(entry.get("align", 1))
+            if align < 1:
+                raise ValueError(f"width_from_nodes: align must be >= 1, got {align}")
+            value = int(round(mult * n_keys))
+            if align > 1:
+                value = _ceil_to(value, align)
+        elif rule == "l0_from_nodes":
+            # Node-scaled L0 weight: lambda = base * (ref / n_keys)^2.
+            # The L0 penalty is the expected active-gate count, a sum over the
+            # ~n_keys^2 candidate edges of the (square) adjacency, so a FIXED
+            # lambda is relatively n^2 stronger on larger DAGs: a value
+            # calibrated at ``ref`` nodes (e.g. 1e-5 at n=10, where a full row
+            # costs ~4e-4) over-prunes at n=20+ once HSIC stalls.  Scaling by
+            # (ref / n_keys)^2 keeps the per-gate pressure constant across the
+            # sweep.  ``base``/``ref`` anchor the calibration explicitly.
+            base = float(entry["base"])
+            ref = float(entry.get("ref", 10))
+            if ref < 1:
+                raise ValueError(f"l0_from_nodes: ref must be >= 1, got {ref}")
+            value = base * (ref / float(n_keys)) ** 2
         else:
             raise ValueError(
                 f"Unknown size_derived rule '{rule}' for '{dotted}'. "

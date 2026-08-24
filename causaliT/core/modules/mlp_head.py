@@ -173,3 +173,99 @@ class MLPHead(nn.Module):
             f"n_layers={self.n_layers}, d_hidden={self.d_hidden}, "
             f"residual={self.n_layers >= 2})"
         )
+
+
+class PerNodeMLPHead(nn.Module):
+    """
+    Per-node MLP output head (DAGMA-style): one independent MLP per variable.
+
+    Each variable i has its own decoder MLP:
+        Linear(d_model -> d_hidden) -> activation -> Linear(d_hidden -> out_dim)
+
+    The forward pass receives the transformer output (B, L, d_model) and the
+    variable-ID column (B, L) and routes each token to its variable's MLP.
+    This makes the decoding function node-specific, so the only cross-node
+    mixing in the entire architecture is the structural attention itself.
+
+    Args:
+        d_model: Input dimension (transformer hidden dimension).
+        out_dim: Output dimension per token (typically 1 for scalar predictions).
+        num_variables: Number of variables (nodes) in the dataset.
+        d_hidden: Hidden width of each per-node MLP.  Default 32.
+        activation: Activation function ("relu", "gelu").  Default "relu".
+        dropout: Dropout rate between hidden layers.  Default 0.0.
+        bias: Whether to use bias in linear layers.  Default True.
+        var_id_offset: Variable IDs are 1-indexed in SCM datasets (0 = padding),
+            so the ID is shifted by this offset before indexing the MLP list.
+            Default 1.
+    """
+
+    ACTIVATIONS = {"relu": nn.ReLU, "gelu": nn.GELU}
+
+    def __init__(
+        self,
+        d_model: int,
+        out_dim: int,
+        num_variables: int,
+        d_hidden: int = 32,
+        activation: str = "relu",
+        dropout: float = 0.0,
+        bias: bool = True,
+        var_id_offset: int = 1,
+    ):
+        super().__init__()
+        assert activation in self.ACTIVATIONS, (
+            f"Invalid activation '{activation}'. Choose from {list(self.ACTIVATIONS)}."
+        )
+        self.d_model = d_model
+        self.out_dim = out_dim
+        self.num_variables = num_variables
+        self.d_hidden = d_hidden
+        self.var_id_offset = var_id_offset
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        # One independent decoder MLP per variable (node).
+        self.mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_hidden, bias=bias),
+                self.ACTIVATIONS[activation](),
+                self.dropout,
+                nn.Linear(d_hidden, out_dim, bias=bias),
+            )
+            for _ in range(num_variables)
+        ])
+
+    def forward(self, x: torch.Tensor, var_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, d_model) transformer output.
+            var_ids: (B, L) variable IDs (1-indexed; 0 = padding).
+
+        Returns:
+            (B, L, out_dim) per-node predictions.
+        """
+        B, L, _ = x.shape
+        # Shift to 0-indexed for ModuleList lookup; clamp padding to 0.
+        idx = (var_ids.long() - self.var_id_offset).clamp(min=0, max=self.num_variables - 1)
+
+        # Run every MLP on the full (B, L) batch and select the correct output
+        # per token.  Vectorised; avoids a Python loop over the batch.
+        all_outs = torch.stack(
+            [mlp(x) for mlp in self.mlps], dim=2
+        )  # (B, L, num_variables, out_dim)
+
+        # Gather the output of the MLP matching each token's variable ID.
+        out = torch.gather(
+            all_outs,
+            dim=2,
+            index=idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, self.out_dim),
+        ).squeeze(2)  # (B, L, out_dim)
+
+        return out
+
+    def __repr__(self):
+        return (
+            f"PerNodeMLPHead(d_model={self.d_model}, out_dim={self.out_dim}, "
+            f"num_variables={self.num_variables}, d_hidden={self.d_hidden})"
+        )

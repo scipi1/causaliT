@@ -511,6 +511,12 @@ adaptive_training:
   # fit.  null (or a value outside the open interval (0, 1)) disables it and
   # both phases train on the full training set (default behaviour).
   data_split_ratio: null
+  # Exchange the recon/structure subsets after EACH completed recon+structure
+  # cycle (recon_1 on split A, struct_1 on B, recon_2 on B, struct_2 on A, ...).
+  # Within every recon->struct pairing the subsets stay disjoint, so the honesty
+  # property above is preserved while each sample serves both roles across the
+  # run.  Requires data_split_ratio; ignored (with a warning) when it is null.
+  swap_splits: false
 
 
   reconstruct:

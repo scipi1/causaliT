@@ -121,6 +121,16 @@ def train_single_fold(
     Returns:
         dict: Metrics for this fold (val + test + timing).
     """
+    # CuBLAS deterministic workspace: the pl.Trainer below runs with
+    # ``deterministic=True`` (torch.use_deterministic_algorithms).  On
+    # CUDA >= 10.2 every CuBLAS GEMM (e.g. nn.Linear) then requires a fixed
+    # workspace, provided only via this env var — otherwise the first forward
+    # raises "Deterministic behavior was enabled ... you must set
+    # CUBLAS_WORKSPACE_CONFIG".  Set it here (before the first GEMM) so every
+    # caller (trainer / adaptive_trainer / calibration) is covered;
+    # setdefault respects a user-provided value.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     logger_info = logging.getLogger("logger_info")
 
     save_dir_k = join(save_dir, f"k_{fold}")

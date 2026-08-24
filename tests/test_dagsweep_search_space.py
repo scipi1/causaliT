@@ -297,6 +297,103 @@ def test_size_derived_rejects_unknown_rule():
         derive_size_fields(_full_config(), 10, {"experiment.batch_size": "magic"})
 
 
+def test_width_from_nodes_is_twice_the_node_count_by_default():
+    """d_model = round(2 * n_keys): the deterministic per-node-MLP sizing rule."""
+    for n_keys, expected in ((10, 20), (20, 40), (40, 80), (80, 160)):
+        config = _full_config()
+        written = derive_size_fields(config, n_keys, {
+            "experiment.d_model_set": {"rule": "width_from_nodes"},
+        })
+        assert config.experiment.d_model_set == expected
+        assert written == {"experiment.d_model_set": expected}
+
+
+def test_width_from_nodes_rounds_odd_sizes_and_respects_mult():
+    config = _full_config()
+    derive_size_fields(config, 15, {
+        "experiment.d_model_set": {"rule": "width_from_nodes", "mult": 2.0},
+    })
+    assert config.experiment.d_model_set == 30
+
+    config = _full_config()
+    derive_size_fields(config, 10, {
+        "experiment.d_model_set": {"rule": "width_from_nodes", "mult": 1.5},
+    })
+    assert config.experiment.d_model_set == 15
+
+
+def test_width_from_nodes_align_ceils_upwards():
+    """align > 1 (multi-head value stream) must never round BELOW round(2N)."""
+    config = _full_config()
+    derive_size_fields(config, 10, {
+        "experiment.d_model_set": {"rule": "width_from_nodes", "align": 8},
+    })
+    assert config.experiment.d_model_set == 24      # ceil(20/8)*8, not 16
+
+    with pytest.raises(ValueError):
+        derive_size_fields(_full_config(), 10, {
+            "experiment.d_model_set": {"rule": "width_from_nodes", "align": 0},
+        })
+
+
+def test_l0_from_nodes_scales_inverse_square_with_the_node_count():
+    """lambda_l0 = base * (ref / n_keys)^2: constant PER-GATE pressure.
+
+    The L0 penalty sums over ~n_keys^2 candidate gates, so a fixed lambda is
+    relatively n^2 stronger on larger DAGs.  Anchored at base=1e-5, ref=10
+    (the n=10 calibration), n=20 must get 2.5e-6 and n=80 ~1.56e-7.
+    """
+    for n_keys, expected in ((10, 1.0e-5), (20, 2.5e-6), (40, 6.25e-7),
+                             (80, 1.5625e-7)):
+        config = _full_config()
+        written = derive_size_fields(config, n_keys, {
+            "training.lambda_l0": {"rule": "l0_from_nodes", "base": 1.0e-5,
+                                   "ref": 10},
+        })
+        assert config.training.lambda_l0 == pytest.approx(expected)
+        assert written["training.lambda_l0"] == pytest.approx(expected)
+
+
+def test_l0_from_nodes_requires_base_and_a_valid_ref():
+    with pytest.raises(KeyError):
+        derive_size_fields(_full_config(), 10, {
+            "training.lambda_l0": {"rule": "l0_from_nodes"},
+        })
+    with pytest.raises(ValueError):
+        derive_size_fields(_full_config(), 10, {
+            "training.lambda_l0": {"rule": "l0_from_nodes", "base": 1e-5,
+                                   "ref": 0},
+        })
+
+
+def test_width_from_nodes_passes_validate_dimensions_untouched():
+    """
+    A single-head SVFA config sized by the rule needs NO repair.
+
+    d_model = 2N >= N (frame floor), divisible by n_heads=1, and
+    d_qk = d_qk_mult * d_model = d_model matches the removed-projection
+    requirement (n_heads_struct = 1 with shared_dag_across_heads).
+    """
+    config = OmegaConf.create({
+        "experiment": {
+            "d_model_set": 64,          # placeholder, overwritten by the rule
+            "n_heads": 1,
+            "d_qk": None,
+            "d_qk_mult": 1.0,
+            "remove_query_projection": True,
+            "remove_key_projection": True,
+            "shared_dag_across_heads": True,
+            "query_fanin_scale": "auto",
+        },
+    })
+    for n_keys in (10, 20, 40, 80):
+        derive_size_fields(config, n_keys, {
+            "experiment.d_model_set": {"rule": "width_from_nodes"},
+        })
+        assert validate_dimensions(config, n_keys, repair=False) == {}
+        assert config.experiment.d_model_set == 2 * n_keys
+
+
 def test_activation_budget_helpers():
     assert estimate_budget(24 * 1024 ** 3, dtype_bytes=4, multiplicity=12,
                            safety=0.35) > 0

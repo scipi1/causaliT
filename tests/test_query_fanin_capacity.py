@@ -620,3 +620,64 @@ def test_log_line_mentions_the_prior_state():
         _resolve(_exp_cfg(fanin_prior=9), n_keys=50))
 
 
+# ---------------------------------------------------------------------------
+# score_at_init: starting below the calibration via M_i(0) = s / x(p*)
+# ---------------------------------------------------------------------------
+
+def test_score_at_init_defaults_to_m_one():
+    cfg = _exp_cfg()
+    info = _resolve(cfg)
+    assert info["score_at_init"] is None
+    assert info["m0"] == 1.0
+    assert cfg["experiment"]["query_norm_init_scale"] == 1.0
+    # Byte-identical to the pre-key behaviour: the centroid init realises p*.
+    assert info["l_init"] == pytest.approx(X_TFREE, abs=1e-3)
+    assert info["z_init"] == pytest.approx(1.0)
+
+
+def test_score_at_init_lowers_only_the_starting_score():
+    s = 0.3
+    cfg = _exp_cfg(score_at_init=s)
+    info = _resolve(cfg)
+    x = x_of_p(P_SAT, init_edge_offset=0.0)
+    # M_i(0) = s / x(p*); F keeps the p* calibration (identical to default).
+    assert info["score_at_init"] == pytest.approx(s)
+    assert info["m0"] == pytest.approx(s / x)
+    assert cfg["experiment"]["query_norm_init_scale"] == pytest.approx(s / x)
+    assert cfg["experiment"]["query_fanin_scale"] == pytest.approx(
+        400 * X_TFREE ** 2, rel=1e-3)
+    # The realised init reflects the lowered score, not the calibration:
+    # posterior sigmoid(s) (kappa = 0), gate OPEN but unsaturated.
+    assert info["l_init"] == pytest.approx(s)
+    assert info["pi_init"] == pytest.approx(1.0 / (1.0 + math.exp(-s)))
+    z = (1.0 / (1.0 + math.exp(-s / 0.5))) * 2.2 - 1.1
+    assert info["z_init"] == pytest.approx(z)
+
+
+def test_score_at_init_approaches_a_closed_deterministic_gate():
+    # s <= kappa = 0 is not expressible (M_i > 0), but s -> 0+ is: the
+    # deterministic gate starts as good as closed (z_init ~ s/2 -> 0) and the
+    # posterior sits at the undecided point, while the sampled gate still
+    # trains.
+    cfg = _exp_cfg(score_at_init=1e-3)
+    info = _resolve(cfg)
+    assert info["l_init"] == pytest.approx(1e-3)
+    assert info["pi_init"] == pytest.approx(0.5, abs=1e-3)
+    assert info["z_init"] == pytest.approx(
+        2.2 / (1.0 + math.exp(-2e-3)) - 1.1)   # ~ 1.1e-3, i.e. closed
+    assert info["z_init"] < 0.01
+
+
+@pytest.mark.parametrize("s", [0.0, -1.0])
+def test_score_at_init_rejects_a_non_positive_score(s):
+    with pytest.raises(ValueError, match="score_at_init"):
+        resolve_query_norm(_exp_cfg(score_at_init=s), n_keys=400)
+
+
+def test_log_line_mentions_score_at_init():
+    assert "score_at_init" in format_query_norm_log(
+        _resolve(_exp_cfg(score_at_init=0.3), n_keys=50))
+    assert "score_at_init" not in format_query_norm_log(
+        _resolve(_exp_cfg(), n_keys=50))
+
+

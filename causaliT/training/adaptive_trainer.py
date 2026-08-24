@@ -77,6 +77,10 @@ Example ``config['adaptive_training']`` block::
       eval_dag: true                   # capture DAG diagnostics at each switch
       data_split_ratio: null           # cross-fit: fraction of train samples for
                                        # the reconstruct phase (null = off)
+      swap_splits: false               # exchange the recon/structure subsets after
+                                       # each completed cycle (needs data_split_ratio);
+                                       # structure always stays disjoint from the
+                                       # previous reconstruct split
       run_final_evaluations: true      # run the standard post-training evaluation
                                        # suite on <save_dir> once the fit ends
                                        # (the functions themselves are selected by
@@ -91,6 +95,17 @@ Example ``config['adaptive_training']`` block::
         plateau_patience: 5            # stop after N val epochs w/o rel. improvement
                                        # (falls back to the reconstruct values)
         plateau_min_delta: 1.0e-4      # relative improvement threshold (ditto)
+
+      # Prior-softmax gain (GainSoftmax modules; see
+      # causaliT/core/modules/gain_softmax.py).  The interpolation weight lambda
+      # ramps 0 -> gain_lambda_final DURING the alternating schedule, driven by
+      # the GLOBAL epoch (phase-agnostic): the gate's role morphs from the
+      # multiplicative weight to the softmax support while the trainer keeps
+      # alternating reconstruct <-> structure.  No separate final phase.
+      gain_lambda_start: null          # global epoch where the turn-on begins
+                                       # (null -> 0.5 * total_epoch_budget)
+      gain_lambda_ramp: 0              # epochs to ramp 0 -> final (0 = jump)
+      gain_lambda_final: 1.0           # ramp target (1.0 = full prior-softmax)
 
       reconstruct:
         max_epochs: 100                # per-phase safety cap
@@ -114,6 +129,12 @@ Example ``config['adaptive_training']`` block::
         min_epochs: 0                  # floor: suppress BOTH structure early-exits
                                        # (drop AND HSIC plateau) before N epochs
                                        # (max_epochs still wins)
+        # HSIC-progress gates: disarm a regularizer entirely once the run-best
+        # HSIC has stalled for <reg>_gate_patience consecutive structure phases
+        # (re-armed on improvement).  Both gates share the run-best HSIC
+        # progress signal but close independently at their own patience.
+        l0_gate_on_hsic: false         # gate the L0 weight lambda_l0
+        kappa_gate_on_hsic: false      # gate the NOTEARS weight kappa
 """
 
 
@@ -121,6 +142,7 @@ import copy
 import glob
 import json
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -174,6 +196,13 @@ class PhaseController(Callback):
         is measured out-of-sample w.r.t. the reconstruction fit).  This requires
         the ``pl.Trainer`` to be created with ``reload_dataloaders_every_n_epochs=1``
         so Lightning re-queries ``dm.train_dataloader()`` after each switch.
+
+        With ``swap_splits`` enabled the two subsets are additionally exchanged
+        after each completed recon+structure cycle (recon_1(I_1), struct_1(I_2),
+        recon_2(I_2), struct_2(I_1), ...).  Within every recon->struct pairing
+        the subsets stay disjoint — structure never reuses the split of the
+        reconstruction that preceded it — so the honesty property is preserved
+        while each sample serves both roles across the run.
 
     Args:
         config:          Full configuration dict (``adaptive_training`` block read).
@@ -234,6 +263,22 @@ class PhaseController(Callback):
         )
         self.eval_dag: bool = bool(ad.get("eval_dag", True))
 
+        # Cross-fit split swapping: exchange the reconstruct/structure training
+        # subsets at every completed recon+structure cycle (i.e. at each
+        # structure -> reconstruct transition).  Within every recon->struct
+        # pairing the two subsets stay disjoint, so residual-HSIC remains
+        # out-of-sample w.r.t. the reconstruction fit (DML/DARTS honesty
+        # preserved) while each sample serves both roles across the run.
+        # Requires cross-fitting; forced off (with a warning) when no split is
+        # active.
+        self.swap_splits: bool = bool(ad.get("swap_splits", False))
+        if self.swap_splits and not self.cross_fitting:
+            logger.warning(
+                "[adaptive] swap_splits=true but cross-fitting is disabled "
+                "(data_split_ratio not in (0, 1)) - ignoring swap_splits."
+            )
+            self.swap_splits = False
+
         self.recon_cfg: Dict[str, Any] = _to_plain_container(ad.get("reconstruct", {})) or {}
         self.struct_cfg: Dict[str, Any] = _to_plain_container(ad.get("structure", {})) or {}
 
@@ -271,6 +316,34 @@ class PhaseController(Callback):
         )
         self.struct_min_epochs: int = int(self.struct_cfg.get("min_epochs", 0))
 
+        # HSIC-progress gates ("regularizers trim after HSIC ranks"): an armed
+        # regularizer is applied only while the structural signal
+        # (``hsic_monitor``, lower is better) still improves at RUN level.
+        # Once ``<reg>_gate_patience`` consecutive structure phases have failed
+        # to beat the run-best HSIC by ``<reg>_gate_min_delta`` (relative), the
+        # regularizer's coefficient is applied as 0 on structure-phase entry,
+        # so it can never act as the SOLE structure force (e.g. uniform gate
+        # deflation once HSIC is exhausted, or NOTEARS driving structure into
+        # the ill region).  A later improvement re-arms it.  Both gates share
+        # the same run-best HSIC progress signal and stall counter, but close
+        # independently at their own patience.  ``<reg>_gate_on_hsic: false``
+        # (default) is a no-op (backward-compatible).
+        self.l0_gate_on_hsic: bool = bool(self.struct_cfg.get("l0_gate_on_hsic", False))
+        self.l0_gate_patience: int = int(self.struct_cfg.get("l0_gate_patience", 1))
+        self.l0_gate_min_delta: float = float(
+            self.struct_cfg.get("l0_gate_min_delta", self.struct_hsic_min_delta)
+        )
+        # NOTEARS gate: same mechanism applied to the acyclicity weight kappa.
+        self.kappa_gate_on_hsic: bool = bool(
+            self.struct_cfg.get("kappa_gate_on_hsic", False)
+        )
+        self.kappa_gate_patience: int = int(
+            self.struct_cfg.get("kappa_gate_patience", 1)
+        )
+        self.kappa_gate_min_delta: float = float(
+            self.struct_cfg.get("kappa_gate_min_delta", self.struct_hsic_min_delta)
+        )
+
         # Final reconstruction-only phase (optional, APPENDED after the
         # alternating schedule): structure stays frozen, cross-fit split OFF
         # (full training set).  Refines the predictor against the frozen,
@@ -290,6 +363,24 @@ class PhaseController(Callback):
         self.final_plateau_min_delta: float = float(
             self.final_cfg.get("plateau_min_delta", self.plateau_min_delta)
         )
+        # Prior-softmax gain schedule (GainSoftmax modules; see
+        # causaliT/core/modules/gain_softmax.py).  The interpolation weight
+        # lambda ramps 0 -> gain_lambda_final DURING the alternating schedule,
+        # driven by the GLOBAL epoch (phase-agnostic).  No-op when the model
+        # owns no gain module (``set_gain_lambda`` returns 0).
+        #   gain_lambda_start:  global epoch where the turn-on begins
+        #                       (None -> 0.5 * total_epoch_budget)
+        #   gain_lambda_ramp:   epochs to ramp 0 -> final (0 = jump)
+        #   gain_lambda_final:  ramp target (1.0 = full prior-softmax)
+        _gain_start = ad.get("gain_lambda_start", None)
+        _total_budget = ad.get("total_epoch_budget", None)
+        if _gain_start is None and _total_budget is not None:
+            _gain_start = int(0.5 * int(_total_budget))
+        self.gain_lambda_start: Optional[int] = (
+            None if _gain_start is None else int(_gain_start)
+        )
+        self.gain_lambda_ramp: int = int(ad.get("gain_lambda_ramp", 0))
+        self.gain_lambda_final: float = float(ad.get("gain_lambda_final", 1.0))
         if self.final_enabled and self.final_max_epochs <= 0:
             logger.warning(
                 "[adaptive] final_reconstruct.enabled=true but max_epochs=%d "
@@ -317,6 +408,18 @@ class PhaseController(Callback):
         self._cycle_count: int = 0       # completed structure phases
         self._phase_index: int = 0       # 0-based phase counter across the run
         self._struct_phase_count: int = 0  # STARTED structure phases (1 = first)
+        # HSIC-progress gate run state (used only when a ``*_gate_on_hsic``).
+        self._l0_base: Optional[float] = None  # configured lambda_l0 (lazy)
+        self._l0_active: bool = True
+        self._kappa_base: Optional[float] = None  # configured kappa (lazy)
+        self._kappa_active: bool = True
+        self._hsic_run_best: float = float("inf")
+        self._hsic_stall_cycles: int = 0
+        self._hsic_phase_best_gate: float = float("inf")
+        # Split key the ACTIVE phase is actually training on (may differ from
+        # the phase name when ``swap_splits`` swaps the subsets each cycle).
+        # ``None`` until the first cross-fit swap / when cross-fitting is off.
+        self._active_split_key: Optional[str] = None
 
 
 
@@ -339,9 +442,14 @@ class PhaseController(Callback):
         return struct, recon
 
     def _apply_lambdas(self, pl_module: pl.LightningModule, lambdas: Dict[str, Any]) -> None:
-        """Set loss-weight attributes on the module, translating per-arch names."""
+        """Set loss-weight attributes on the module, translating per-arch names.
+
+        Recognised keys: ``lambda_*`` plus ``kappa`` (the NOTEARS weight, the
+        only non-lambda loss coefficient) — the latter lets the structure
+        phase and the HSIC-progress gate steer NOTEARS too.
+        """
         for key, val in lambdas.items():
-            if not str(key).startswith("lambda"):
+            if not (str(key).startswith("lambda") or str(key) == "kappa"):
                 continue
             fval = float(val)
             if self.model_obj == "AttentionSelectorLayer" and key == "lambda_hsic_cross":
@@ -372,6 +480,48 @@ class PhaseController(Callback):
         "hsic_descendant_min_kept_frac",
         "hsic_descendant_ema",
     )
+
+    def _gated_struct_cfg(self, pl_module: pl.LightningModule) -> Dict[str, Any]:
+        """Structure-phase loss weights with the HSIC-progress gates applied.
+
+        "Regularizers trim after HSIC ranks": once the run-level structural
+        signal has failed to improve for ``<reg>_gate_patience`` consecutive
+        structure phases, that regularizer's coefficient is applied as 0 so it
+        never acts as the SOLE structure force.  L0 (``l0_gate_on_hsic``) and
+        NOTEARS (``kappa_gate_on_hsic``) share the same run-best HSIC progress
+        signal but close independently at their own patience.  No-op (the raw
+        ``struct_cfg``) when both gates are off.
+        """
+        if not (self.l0_gate_on_hsic or self.kappa_gate_on_hsic):
+            return self.struct_cfg
+        cfg = dict(self.struct_cfg)
+        if self.l0_gate_on_hsic:
+            if self._l0_base is None:
+                # Base = the configured structure-phase value, falling back to
+                # the module's current (training-level) lambda_l0.
+                self._l0_base = float(self.struct_cfg.get(
+                    "lambda_l0", getattr(pl_module, "lambda_l0", 0.0)))
+            cfg["lambda_l0"] = self._l0_base if self._l0_active else 0.0
+            if not self._l0_active:
+                logger.info(
+                    "[adaptive] L0 gate CLOSED (HSIC stalled for %d structure "
+                    "phase(s)): lambda_l0 applied as 0.0 (base=%.3g).",
+                    self._hsic_stall_cycles, self._l0_base,
+                )
+        if self.kappa_gate_on_hsic:
+            if self._kappa_base is None:
+                # Base = the configured structure-phase value, falling back to
+                # the module's current (training-level) kappa.
+                self._kappa_base = float(self.struct_cfg.get(
+                    "kappa", getattr(pl_module, "kappa", 0.0)))
+            cfg["kappa"] = self._kappa_base if self._kappa_active else 0.0
+            if not self._kappa_active:
+                logger.info(
+                    "[adaptive] NOTEARS gate CLOSED (HSIC stalled for %d "
+                    "structure phase(s)): kappa applied as 0.0 (base=%.3g).",
+                    self._hsic_stall_cycles, self._kappa_base,
+                )
+        return cfg
 
     def _apply_descendant_mask_cfg(
         self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
@@ -476,10 +626,59 @@ class PhaseController(Callback):
             return
         schedule.in_structure_phase = (phase == "structure")
 
+    # ------------------------------------------------------------------
+    # Prior-softmax gain schedule (GainSoftmax modules)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _set_gain_lambda(pl_module: pl.LightningModule, value: float) -> int:
+        """Set the gain interpolation weight on the model's GainSoftmax modules.
+
+        The forecaster wraps the architecture as ``pl_module.model``; the
+        architecture exposes ``set_gain_lambda`` (AttentionSelectorLayer).
+        No-op (returns 0) for models without the prior-softmax gain.
+        """
+        setter = getattr(getattr(pl_module, "model", None), "set_gain_lambda", None)
+        if setter is None:
+            return 0
+        return int(setter(value))
+
+    def _update_gain_lambda(self, trainer: pl.Trainer,
+                            pl_module: pl.LightningModule) -> None:
+        """Ramp the gain lambda over the alternating schedule (global epoch).
+
+        lambda = clamp((epoch - gain_lambda_start) / gain_lambda_ramp, 0, 1)
+                 * gain_lambda_final.
+        Before ``gain_lambda_start`` lambda is 0 (the gate-only baseline); a
+        ramp of 0 jumps to the target at the start epoch.  No-op when the
+        model owns no GainSoftmax module (``_set_gain_lambda`` returns 0) or no
+        start is configured.
+        """
+        if self.gain_lambda_start is None:
+            return
+        epoch = int(trainer.current_epoch)
+        if epoch < self.gain_lambda_start:
+            lam = 0.0
+        elif self.gain_lambda_ramp <= 0:
+            lam = self.gain_lambda_final
+        else:
+            frac = (epoch - self.gain_lambda_start) / float(self.gain_lambda_ramp)
+            lam = min(1.0, frac) * self.gain_lambda_final
+        n = self._set_gain_lambda(pl_module, lam)
+        if n > 0:
+            pl_module.log(
+                "gain_lambda", float(lam), on_step=False, on_epoch=True
+            )
+
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
         self._apply_fanin_phase(pl_module, phase)
+
+        # Nodewise query update: the gradient landscape changes at every
+        # phase switch (theta_R moved all through the recon phase), so the
+        # SNR evidence never crosses a boundary unless configured otherwise.
+        if getattr(pl_module, "nodewise_reset_every_stage", False):
+            pl_module.nodewise_reset_stats()
 
 
         if phase in ("reconstruct", "final_reconstruct"):
@@ -501,8 +700,9 @@ class PhaseController(Callback):
                 p.requires_grad_(False)
             for p in struct_params:
                 p.requires_grad_(True)
-            # Apply structure-phase loss weights (e.g. lambda_hsic_cross)
-            self._apply_lambdas(pl_module, self.struct_cfg)
+            # Apply structure-phase loss weights (e.g. lambda_hsic_cross), with
+            # lambda_l0 disarmed when the HSIC-progress gate is closed.
+            self._apply_lambdas(pl_module, self._gated_struct_cfg(pl_module))
             # ...and the structure-phase descendant-exclusion settings.
             self._struct_phase_count += 1
             self._apply_descendant_mask_cfg(pl_module, self.struct_cfg)
@@ -531,6 +731,7 @@ class PhaseController(Callback):
         self._drop_counter = 0
         self._hsic_best = float("inf")
         self._hsic_plateau_counter = 0
+        self._hsic_phase_best_gate = float("inf")
 
 
         # Always emit to the Python logger so the active stage is visible in
@@ -548,23 +749,51 @@ class PhaseController(Callback):
                   f"{trainer.current_epoch}{subset_msg}")
 
 
+    def _resolve_split_key(self, phase: str) -> str:
+        """Map a phase to its cross-fit split key, swapping per completed cycle.
+
+        With ``swap_splits`` enabled the reconstruct/structure subsets are
+        exchanged at every completed recon+structure cycle.  The parity of
+        ``_cycle_count`` (completed structure phases) equals the number of swaps
+        so far: it is incremented at the end of each structure phase, just
+        before the following reconstruct phase is applied, so an odd count makes
+        both alternating phases request the *other* subset.  Within every
+        recon->struct pairing ``_cycle_count`` is constant, so the two phases
+        always train on disjoint subsets — structure never reuses the split of
+        the reconstruction that preceded it.  ``final_reconstruct`` (full
+        training set) is never swapped.
+        """
+        if (
+            self.swap_splits
+            and phase in ("reconstruct", "structure")
+            and self._cycle_count % 2 == 1
+        ):
+            return "structure" if phase == "reconstruct" else "reconstruct"
+        return phase
+
     def _swap_train_subset(self, phase: str) -> Optional[int]:
         """
         Point the data module at ``phase``'s cross-fit training subset.
 
-        Returns the subset size (for logging), or ``None`` when cross-fitting is
-        disabled or the phase has no dedicated subset.  Validation/test indices
-        are kept constant so stage-to-stage metrics remain comparable.
+        The requested split key is resolved through :meth:`_resolve_split_key`,
+        so with ``swap_splits`` enabled a phase may be pointed at the *other*
+        phase's subset (the datamodule's static mapping itself is never
+        mutated).  Returns the subset size (for logging), or ``None`` when
+        cross-fitting is disabled or the phase has no dedicated subset.
+        Validation/test indices are kept constant so stage-to-stage metrics
+        remain comparable.
         """
         if not self.cross_fitting or self.dm is None:
             return None
+        key = self._resolve_split_key(phase)
+        self._active_split_key = key
         # Preferred path: the datamodule owns the phase→subset mapping.
         if hasattr(self.dm, "set_active_phase"):
-            return self.dm.set_active_phase(phase)
+            return self.dm.set_active_phase(key)
         # Fallback for datamodules without the stage-split API.
         if self.stage_splits is None:
             return None
-        subset = self.stage_splits.get(phase)
+        subset = self.stage_splits.get(key)
         if subset is None:
             return None
         self.dm.update_idx(
@@ -642,6 +871,10 @@ class PhaseController(Callback):
             "phase_best": (None if self._phase_best == float("inf")
                            else float(self._phase_best)),
             "checkpoint": str(ckpt_path),
+            # Cross-fit subset the ENDING phase actually trained on (equals the
+            # phase name unless swap_splits exchanged the subsets this cycle;
+            # None when cross-fitting is disabled).
+            "train_split": self._active_split_key,
             "dag_diagnostics": diag,
         }
         self.transitions.append(record)
@@ -652,6 +885,7 @@ class PhaseController(Callback):
             "global_epoch_end": trainer.current_epoch,
             "phase_epochs": record["phase_epochs"],
             f"end_{self.monitor}": float(monitor_val),
+            "train_split": self._active_split_key,
             **{f"dag_{k}": v for k, v in diag.items()
                if k not in ("phase", "phase_index", "epoch", "label")},
         })
@@ -708,6 +942,13 @@ class PhaseController(Callback):
             on_step=False, on_epoch=True,
         )
 
+        # ---------- Prior-softmax gain ramp (phase-agnostic) ----------
+        # lambda ramps 0 -> gain_lambda_final over the alternating schedule,
+        # driven by the global epoch: the gate's role morphs from the
+        # multiplicative weight to the softmax support while the trainer keeps
+        # alternating reconstruct <-> structure.  Runs in EVERY phase (and in
+        # the optional final phase), before the phase dispatch.
+        self._update_gain_lambda(trainer, pl_module)
 
         # ---------- Final reconstruction-only phase: entry trigger ----------
         # The alternating schedule owns the first ``total_epoch_budget`` epochs;
@@ -804,6 +1045,27 @@ class PhaseController(Callback):
                 on_step=False, on_epoch=True,
             )
 
+            # HSIC-progress gates: track the phase-best HSIC whenever the
+            # metric is available (the gates' progress signal), INDEPENDENT of
+            # the plateau early-exit counters (which are disabled at
+            # ``hsic_patience == 0``), and expose the gate states as CSV
+            # metrics so post-mortems can see when each regularizer was armed.
+            if (self.l0_gate_on_hsic or self.kappa_gate_on_hsic) and hsic_val is not None:
+                hsic_current = float(hsic_val)
+                if np.isfinite(hsic_current):
+                    self._hsic_phase_best_gate = min(
+                        self._hsic_phase_best_gate, hsic_current
+                    )
+            pl_module.log(
+                "adaptive_l0_active", float(self._l0_active),
+                on_step=False, on_epoch=True,
+            )
+            if self.kappa_gate_on_hsic:
+                pl_module.log(
+                    "adaptive_kappa_active", float(self._kappa_active),
+                    on_step=False, on_epoch=True,
+                )
+
             # ``min_epochs`` is a symmetric floor for the whole structure phase:
             # it suppresses BOTH early-exit triggers (the stale-predictor drop and
             # the HSIC plateau) until the phase has run at least this many epochs,
@@ -830,6 +1092,40 @@ class PhaseController(Callback):
                 else:
                     reason = "struct_budget"
                 self._cycle_count += 1
+
+                # HSIC-progress gates: score this structure phase against the
+                # RUN-best HSIC.  An improvement re-arms BOTH gates; otherwise
+                # the shared stall counter increments and each gate closes at
+                # its own patience (the regularizer is disarmed from the NEXT
+                # structure phase on, in ``_gated_struct_cfg``).  The
+                # improvement threshold is the smallest min_delta of the
+                # enabled gates (the progress signal is shared).
+                if self.l0_gate_on_hsic or self.kappa_gate_on_hsic:
+                    gate_min_delta = min(
+                        d for on, d in (
+                            (self.l0_gate_on_hsic, self.l0_gate_min_delta),
+                            (self.kappa_gate_on_hsic, self.kappa_gate_min_delta),
+                        ) if on
+                    )
+                    phase_best = self._hsic_phase_best_gate
+                    if np.isfinite(phase_best):
+                        if phase_best <= self._hsic_run_best * (1.0 - gate_min_delta):
+                            self._hsic_run_best = phase_best
+                            self._hsic_stall_cycles = 0
+                            if not self._l0_active or not self._kappa_active:
+                                logger.info(
+                                    "[adaptive] HSIC-progress gates RE-ARMED: "
+                                    "%s improved to %.6g (new run best).",
+                                    self.struct_hsic_monitor, phase_best,
+                                )
+                            self._l0_active = True
+                            self._kappa_active = True
+                        else:
+                            self._hsic_stall_cycles += 1
+                            if self._hsic_stall_cycles >= self.l0_gate_patience:
+                                self._l0_active = False
+                            if self._hsic_stall_cycles >= self.kappa_gate_patience:
+                                self._kappa_active = False
 
 
                 # Optional safety guard: stop only when an explicit max_cycles is
@@ -1013,6 +1309,14 @@ def adaptive_trainer(
         pd.DataFrame: One row per completed phase with end metrics and DAG
         diagnostics.
     """
+    # CuBLAS deterministic workspace: the main run's train_single_fold uses
+    # pl.Trainer(deterministic=True) (torch.use_deterministic_algorithms), and
+    # on CUDA >= 10.2 every CuBLAS GEMM then requires a fixed workspace via
+    # this env var.  Set it at the very top: the optional dropout-selection
+    # pre-flight below already initializes CuBLAS in this process, so the var
+    # must be present before ANY GEMM, not just before train_single_fold.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     from causaliT.training.trainer import (
         get_dataloader,
         _make_fold_splits,
@@ -1112,6 +1416,9 @@ def adaptive_trainer(
     reload_every_n = 0
     active_split_ratio: Optional[float] = None
     start_phase = str(ad_cfg.get("start_phase", "reconstruct")).lower()
+    # Exchange the recon/structure subsets after each completed cycle (the
+    # controller validates it against cross-fitting being active).
+    swap_splits = bool(ad_cfg.get("swap_splits", False))
 
     if data_split_ratio is not None and 0.0 < float(data_split_ratio) < 1.0:
         active_split_ratio = float(data_split_ratio)
@@ -1153,7 +1460,36 @@ def adaptive_trainer(
             print(
                 f"  Cross-fit data splits (ratio={data_split_ratio}): "
                 f"reconstruct={len(recon_idx)}, structure={len(struct_idx)}"
+                f"{', swapped after each cycle' if swap_splits else ''}"
             )
+
+    # --- Pre-flight dropout selection (optional) -----------------------------
+    # Selects the per-node MLP dropout by maximizing the query-perturbation
+    # sensitivity of the train HSIC after a short reconstruction-only warmup
+    # per candidate (see causaliT/training/dropout_selection.py).  The winning
+    # dropout is written into the resolved config (so the main model is built
+    # with it) and the main run warm-starts from the winner's warmup weights.
+    # Pre-flight epochs are selection overhead and do NOT count against
+    # total_epoch_budget.
+    ds_cfg = _to_plain_container(ad_cfg.get("dropout_selection", {})) or {}
+    if bool(ds_cfg.get("enabled", False)):
+        from causaliT.training.dropout_selection import (
+            run_dropout_selection,
+            _set_mlp_dropout,
+        )
+        best_dropout, winner_ckpt = run_dropout_selection(
+            config=config, data_dir=data_dir, dm=dm, save_dir=save_dir,
+            cluster=cluster, seed=seed,
+        )
+        if best_dropout is not None:
+            _set_mlp_dropout(config, best_dropout)
+            if starting_ckpt is not None:
+                logger.warning(
+                    "adaptive_trainer: dropout_selection overrides the "
+                    "configured starting_checkpoint (%s) with the winner's "
+                    "warmup weights (%s).", starting_ckpt, winner_ckpt,
+                )
+            starting_ckpt = winner_ckpt
 
     # --- Build model once ---
     seed_everything(seed)
@@ -1238,6 +1574,7 @@ def adaptive_trainer(
         "monitor": controller.monitor,
         "cross_fitting": stage_splits is not None,
         "data_split_ratio": active_split_ratio,
+        "swap_splits": controller.swap_splits,
         "n_train_reconstruct": (int(len(stage_splits["reconstruct"]))
                                 if stage_splits is not None else None),
         "n_train_structure": (int(len(stage_splits["structure"]))

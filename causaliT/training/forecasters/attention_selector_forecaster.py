@@ -139,8 +139,11 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
-from causaliT.utils.hsic_utils import hsic_cross_per_pair
-from causaliT.utils.descendant_mask import build_hsic_pair_mask
+from causaliT.utils.hsic_utils import hsic_cross_per_pair, hsic_attention_weighted
+from causaliT.utils.descendant_mask import (
+    build_hsic_pair_mask,
+    build_hsic_pair_mask_budgeted,
+)
 from causaliT.utils.query_norm import (
     FaninPriorSchedule,
     collect_query_norm_penalty,
@@ -149,6 +152,7 @@ from causaliT.utils.query_norm import (
 
 
 from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.nodewise_update import NodewiseQuerySelector
 from causaliT.training.interference_utils import (
     build_interference_blocks,
     compute_l0_hsic_interference,
@@ -266,6 +270,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # HSIC regularization (unified: HSIC over combined [S, X] source)
         # ----------------------------------------------------------------
         self.lambda_hsic = config["training"].get("lambda_hsic", 0.0)
+        # Attention-weighted HSIC: weight each (child, source) HSIC pair by the
+        # batch-mean attention weight att[child, source] instead of a plain
+        # (or descendant-masked) mean.  Mirrors SingleCausalForecaster.
+        self.use_attention_weighted_hsic = bool(
+            config["training"].get("use_attention_weighted_hsic", False)
+        )
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.hsic_adaptive_bandwidth = config["training"].get("hsic_adaptive_bandwidth", False)
         self.hsic_mode = config["training"].get("hsic_mode", "biased")
@@ -315,6 +325,30 @@ class AttentionSelectorForecaster(pl.LightningModule):
             raise ValueError(
                 f"hsic_descendant_ema must be in [0, 1), got {self.hsic_descendant_ema}"
             )
+        # Budgeted variant (see descendant_mask.build_hsic_pair_mask_budgeted):
+        # instead of hardening the posterior at ``hsic_descendant_threshold``
+        # and hoping for a DAG, rank the pairs by a SOFT descendant score (the
+        # detached posterior's fuzzy transitive closure) and exclude the top
+        # ``hsic_descendant_budget_frac`` — per child row when
+        # ``hsic_descendant_per_row`` — so the cap itself is the collapse guard
+        # and the mask triggers every step.
+        self.hsic_descendant_mode = str(
+            config["training"].get("hsic_descendant_mode", "threshold")
+        )
+        if self.hsic_descendant_mode not in ("threshold", "budget"):
+            raise ValueError(
+                f"hsic_descendant_mode must be 'threshold' or 'budget', got "
+                f"{self.hsic_descendant_mode!r}."
+            )
+        self.hsic_descendant_budget_frac = float(
+            config["training"].get("hsic_descendant_budget_frac", 0.25)
+        )
+        self.hsic_descendant_per_row = bool(
+            config["training"].get("hsic_descendant_per_row", True)
+        )
+        self.hsic_descendant_tnorm = str(
+            config["training"].get("hsic_descendant_tnorm", "min")
+        )
         # Self-attention block type: only a direction-aware posterior can tell
         # descendants from ancestors.  In homogeneous mode the single square
         # block IS the self-attention type; in split mode it drives the X→X
@@ -432,6 +466,39 @@ class AttentionSelectorForecaster(pl.LightningModule):
             raise ValueError(f"kappa must be non-negative, got {self.kappa}")
 
         # ----------------------------------------------------------------
+        # Structural-regularizer safeguard (NOTEARS / L0 <= pct * HSIC).
+        #
+        # When the train HSIC goes flat ("diluted"), a fixed kappa /
+        # lambda_l0 can dominate the structural pathway and drive structure
+        # learning on its own (the NOTEARS-driven ill region).  The
+        # safeguard caps each coefficient per step so the weighted term
+        # entering the loss never exceeds a fixed fraction of the weighted
+        # HSIC term:
+        #   kappa_eff     = min(kappa,     pct * hsic_ref / (h(A) + eps))
+        #   lambda_l0_eff = min(lambda_l0, pct * hsic_ref / (l0  + eps))
+        # with hsic_ref an EMA of hsic_reg (detached, train batches only).
+        # The rescaling is a detached per-step constant, so each regularizer
+        # keeps its gradient direction; only its magnitude is capped.  When
+        # HSIC -> 0 the capped terms fade out with it (HSIC stays the
+        # primary structural driver).  0.0 (default) disables each cap
+        # (backward compatible).
+        # ----------------------------------------------------------------
+        self.kappa_max_hsic_pct = float(
+            config["training"].get("kappa_max_hsic_pct", 0.0)
+        )
+        self.lambda_l0_max_hsic_pct = float(
+            config["training"].get("lambda_l0_max_hsic_pct", 0.0)
+        )
+        self.hsic_safeguard_ema = float(
+            config["training"].get("hsic_safeguard_ema", 0.9)
+        )
+        if not (0.0 <= self.hsic_safeguard_ema < 1.0):
+            raise ValueError(
+                f"hsic_safeguard_ema must be in [0, 1), got {self.hsic_safeguard_ema}"
+            )
+        self._hsic_reg_ema: Optional[float] = None
+
+        # ----------------------------------------------------------------
         # Gradient routing (dual optimizer: structural vs reconstruction)
         # ----------------------------------------------------------------
         self.use_gradient_routing = config["training"].get("use_gradient_routing", False)
@@ -442,6 +509,59 @@ class AttentionSelectorForecaster(pl.LightningModule):
             )
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
+
+        # ----------------------------------------------------------------
+        # Node-wise (per-query) winner-take-all structural update.  Each
+        # structural step updates only the ``topk`` query nodes whose gradient
+        # has the strongest SNR evidence (EMA t-statistic); all other query
+        # rows and their optimizer state are reverted after the step, so any
+        # optimizer works unchanged.  Requires gradient routing (a dedicated
+        # structural optimizer).  See causaliT/training/nodewise_update.py.
+        # ----------------------------------------------------------------
+        nw_cfg = config["training"].get("nodewise_update", None) or {}
+        self.nodewise_enabled = bool(nw_cfg.get("enabled", False))
+        self.nodewise_reset_every_stage = bool(
+            nw_cfg.get("reset_every_stage", True)
+        )
+        self._nodewise: Optional[NodewiseQuerySelector] = None
+        if self.nodewise_enabled:
+            if not self.use_gradient_routing:
+                raise ValueError(
+                    "training.nodewise_update.enabled requires "
+                    "use_gradient_routing=True (the nodewise gate acts on the "
+                    "structural optimizer step)."
+                )
+            query_params = [
+                t.embedding.weight
+                for t in (getattr(self.model, "query_embed_S", None),
+                          getattr(self.model, "query_embed_X", None))
+                if t is not None
+            ]
+            if not query_params:
+                raise ValueError(
+                    "training.nodewise_update.enabled requires free query "
+                    "embeddings (query_embed_S / query_embed_X)."
+                )
+            norm_params = [
+                ia.query_norm_log_scale
+                for ia in (getattr(getattr(self.model, "attention", None),
+                                   "inner_attention", None),
+                           getattr(getattr(self.model, "self_attention", None),
+                                   "inner_attention", None))
+                if getattr(ia, "query_norm_log_scale", None) is not None
+            ]
+            norm_param = norm_params[0] if norm_params else None
+            self._nodewise = NodewiseQuerySelector(
+                query_params=query_params,
+                norm_param=norm_param,
+                topk=int(nw_cfg.get("topk", 1)),
+            )
+            logger.info(
+                "Nodewise query update enabled: topk=%d over %d nodes, "
+                "reset_every_stage=%s",
+                self._nodewise.topk, self._nodewise.n_nodes,
+                self.nodewise_reset_every_stage,
+            )
 
         # ----------------------------------------------------------------
         # Parameter freezing for alternating structure/reconstruct phases
@@ -903,16 +1023,36 @@ class AttentionSelectorForecaster(pl.LightningModule):
             score_tensor
         )
 
-        hsic_value = hsic_cross_per_pair(
-            combined_source,
-            residuals,
-            sigma=self.hsic_sigma,
-            adaptive_bandwidth=self.hsic_adaptive_bandwidth,
-            mode=self.hsic_mode,
-            nhsic_epsilon=self.nhsic_epsilon,
-            source_kernel=self.hsic_kernel_source,
-            pair_mask=hsic_pair_mask,
-        )
+        if self.use_attention_weighted_hsic:
+            # Attention-weighted HSIC: weight each (child, source) pair by the
+            # batch-mean attention weight att[child, source].  The attention
+            # matrix is (B, n_targets, n_sources) — (B, N, N) in homogeneous
+            # mode, (B, L_X, L_S+L_X) in split mode — matching the HSIC pair
+            # matrix layout exactly.  Descendant masking is NOT applied here:
+            # the attention weight itself is the pair weight.
+            att_mean = attention_weights.mean(dim=0)  # (n_targets, n_sources)
+            hsic_value = hsic_attention_weighted(
+                source_values=combined_source,
+                residuals=residuals,
+                attention_weights=att_mean,
+                sigma=self.hsic_sigma,
+                exclude_diagonal=False,
+                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
+            )
+        else:
+            hsic_value = hsic_cross_per_pair(
+                combined_source,
+                residuals,
+                sigma=self.hsic_sigma,
+                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
+                pair_mask=hsic_pair_mask,
+            )
         hsic_reg = self.lambda_hsic * hsic_value
 
         if hsic_pair_mask is not None:
@@ -921,6 +1061,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         else:
             self._last_hsic_desc_kept_frac = 1.0
             self._last_hsic_desc_cyclic = False
+
+        # Safeguard reference: EMA of the weighted HSIC term (detached),
+        # updated on train batches only.  None when both caps are disabled.
+        hsic_ref = self._hsic_safeguard_ref(hsic_reg, stage)
 
         # ----------------------------------------------------------------
         # Group-L1 regularization (L2,1 norm on embedding columns)
@@ -944,8 +1088,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 if self.homogeneous_nodes
                 else score_tensor[:, self.S_seq_len:]   # (L_X, L_X)
             )
-            acyclic_reg = self.kappa * self._notears_acyclicity(A_cyc)
+            notears_raw = self._notears_acyclicity(A_cyc)
+            kappa_eff = self._cap_reg_coeff(
+                self.kappa, notears_raw, self.kappa_max_hsic_pct, hsic_ref
+            )
+            acyclic_reg = kappa_eff * notears_raw
         else:
+            kappa_eff = self.kappa
             acyclic_reg = torch.tensor(0.0, device=X.device)
 
         # ----------------------------------------------------------------
@@ -963,8 +1112,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # Non-HardConcrete attentions do not expose an L0 penalty at all.
             l0_penalty = torch.tensor(0.0, device=X.device)
         if self.lambda_l0 > 0.0:
-            l0_reg = self.lambda_l0 * l0_penalty
+            lambda_l0_eff = self._cap_reg_coeff(
+                self.lambda_l0, l0_penalty, self.lambda_l0_max_hsic_pct, hsic_ref
+            )
+            l0_reg = lambda_l0_eff * l0_penalty
         else:
+            lambda_l0_eff = self.lambda_l0
             l0_reg = torch.tensor(0.0, device=X.device)
 
         # ----------------------------------------------------------------
@@ -1075,11 +1228,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         # NOTEARS acyclicity (auto-discovered by eval_training.py via "notears" key)
         self.log(f"{stage}_notears", acyclic_reg, on_step=False, on_epoch=True)
+        # Safeguard diagnostics: the EFFECTIVE coefficients applied this step
+        # (< base value => the HSIC-relative cap is active).
+        if self.kappa_max_hsic_pct > 0.0:
+            self.log(f"{stage}_kappa_eff", float(kappa_eff), on_step=False, on_epoch=True)
 
         # L0 penalty (expected number of active edges, non-zero only for
         # HardConcreteCrossAttention; logged as 0.0 for all other attention types)
         self.log(f"{stage}_l0_penalty", l0_penalty, on_step=False, on_epoch=True)
         self.log(f"{stage}_l0_reg", l0_reg, on_step=False, on_epoch=True)
+        if self.lambda_l0_max_hsic_pct > 0.0:
+            self.log(f"{stage}_lambda_l0_eff", float(lambda_l0_eff), on_step=False, on_epoch=True)
 
         if stage == "val":
             self.log("val_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
@@ -1334,15 +1493,31 @@ class AttentionSelectorForecaster(pl.LightningModule):
             score = self._descendant_ema_score
 
         try:
-            mask, kept_frac, is_cyclic = build_hsic_pair_mask(
-                score_tensor=score,
-                s_seq_len=self.S_seq_len,
-                homogeneous_nodes=self.homogeneous_nodes,
-                threshold=self.hsic_descendant_threshold,
-                hops=self.hsic_descendant_hops,
-                exclude_self=self.hsic_descendant_exclude_self,
-                excluded_weight=self.hsic_descendant_weight,
-            )
+            if self.hsic_descendant_mode == "budget":
+                # Budgeted variant: rank the pairs by the soft descendant score
+                # and exclude the top budget_frac.  The cap IS the collapse
+                # guard, so the mask triggers every step.
+                mask, kept_frac, is_cyclic = build_hsic_pair_mask_budgeted(
+                    score_tensor=score,
+                    s_seq_len=self.S_seq_len,
+                    homogeneous_nodes=self.homogeneous_nodes,
+                    budget_frac=self.hsic_descendant_budget_frac,
+                    per_row=self.hsic_descendant_per_row,
+                    exclude_self=self.hsic_descendant_exclude_self,
+                    excluded_weight=self.hsic_descendant_weight,
+                    tnorm=self.hsic_descendant_tnorm,
+                    hops=self.hsic_descendant_hops,
+                )
+            else:
+                mask, kept_frac, is_cyclic = build_hsic_pair_mask(
+                    score_tensor=score,
+                    s_seq_len=self.S_seq_len,
+                    homogeneous_nodes=self.homogeneous_nodes,
+                    threshold=self.hsic_descendant_threshold,
+                    hops=self.hsic_descendant_hops,
+                    exclude_self=self.hsic_descendant_exclude_self,
+                    excluded_weight=self.hsic_descendant_weight,
+                )
         except ValueError as exc:
             # Shape inconsistency: never break training over a diagnostic mask.
             logger.warning(
@@ -1351,7 +1526,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             )
             return None, 1.0, False
 
-        if kept_frac < self.hsic_descendant_min_kept_frac:
+        # The collapse guard is a THRESHOLD-mode concern: in budget mode the
+        # cap itself bounds the exclusion, so the guard would fire spuriously.
+        if (
+            self.hsic_descendant_mode == "threshold"
+            and kept_frac < self.hsic_descendant_min_kept_frac
+        ):
             logger.warning(
                 "Descendant HSIC mask would keep only %.1f%% of pairs "
                 "(< min_kept_frac=%.1f%%) — the learned graph is too dense and "
@@ -1378,6 +1558,58 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """
         d = A.shape[-1]
         return torch.trace(torch.matrix_exp(A * A)) - d
+
+    # ------------------------------------------------------------------
+    # Structural-regularizer safeguard helpers
+    # ------------------------------------------------------------------
+
+    def _hsic_safeguard_ref(
+        self, hsic_reg: torch.Tensor, stage: str
+    ) -> Optional[float]:
+        """Reference value (EMA of the weighted HSIC term) for the reg caps.
+
+        Updated on train batches only (detached scalar), so the val/test
+        logging applies the same caps the training steps used.  With
+        ``hsic_safeguard_ema == 0`` the reference is the instantaneous
+        per-batch value.  Returns ``None`` when both caps are disabled.
+        """
+        if self.kappa_max_hsic_pct <= 0.0 and self.lambda_l0_max_hsic_pct <= 0.0:
+            return None
+        val = float(hsic_reg.detach())
+        if stage == "train":
+            if self._hsic_reg_ema is None:
+                self._hsic_reg_ema = val
+            else:
+                d = self.hsic_safeguard_ema
+                self._hsic_reg_ema = d * self._hsic_reg_ema + (1.0 - d) * val
+            return self._hsic_reg_ema
+        # val/test: never update.  Instantaneous mode uses the current batch;
+        # EMA mode reuses the running reference from the train batches.
+        if self.hsic_safeguard_ema == 0.0 or self._hsic_reg_ema is None:
+            return val
+        return self._hsic_reg_ema
+
+    @staticmethod
+    def _cap_reg_coeff(
+        base_coeff: float,
+        raw_term: torch.Tensor,
+        max_pct: float,
+        hsic_ref: Optional[float],
+    ) -> float:
+        """Cap a regularizer coefficient so its term stays <= max_pct * hsic_ref.
+
+        Returns a detached float, so the regularizer's gradient direction is
+        preserved and only its magnitude is capped.  No-op (returns
+        ``base_coeff``) when the cap is disabled, the base coefficient is
+        zero, the reference is unavailable, or the raw term is non-positive
+        or non-finite.
+        """
+        if max_pct <= 0.0 or base_coeff <= 0.0 or hsic_ref is None:
+            return base_coeff
+        raw = float(raw_term.detach())
+        if not math.isfinite(raw) or raw <= 0.0:
+            return base_coeff
+        return min(base_coeff, max_pct * hsic_ref / raw)
 
     # ------------------------------------------------------------------
     # Group-L1 (identical to SingleCausalForecaster implementation)
@@ -1488,9 +1720,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 if id(p) in _saved_recon_grads:
                     p.grad = _saved_recon_grads[id(p)]
 
+            # Nodewise winner-take-all: select the top-SNR query nodes, mask
+            # the other rows, and snapshot them (params + optimizer state) so
+            # the structural optimizer step can be reverted row-wise.
+            nw_snap = None
+            if self._nodewise is not None:
+                selected = self._nodewise.select()
+                if selected is not None:  # None = no structural grads (recon)
+                    self._nodewise_log_step(selected)
+                    if len(selected) < self._nodewise.n_nodes:
+                        self._nodewise.mask_grads(selected)
+                        nw_snap = self._nodewise.snapshot(opt_struct, selected)
+
             # Now step both optimizers (graph fully consumed, safe)
             opt_recon.step()
             opt_struct.step()
+
+            if nw_snap is not None:
+                NodewiseQuerySelector.restore(nw_snap)
 
             return total_loss
         else:
@@ -1501,6 +1748,40 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self._maybe_log_interference(batch_idx)
             return total_loss
 
+    # ------------------------------------------------------------------
+    # Nodewise query update: diagnostics + phase-switch reset
+    # ------------------------------------------------------------------
+    def _nodewise_log_step(self, selected):
+        """Per-step logging for the nodewise gate (epoch-mean aggregates)."""
+        nw = self._nodewise
+        if nw is None:
+            return
+        snr = nw.current_snr()
+        self.log("struct/nodewise_max_snr", float(snr.max()),
+                 on_step=False, on_epoch=True)
+        gate_fired = len(selected) == 0
+        self.log("struct/nodewise_gate_fired", float(gate_fired),
+                 on_step=False, on_epoch=True)
+
+    def nodewise_reset_stats(self):
+        """Clear the SNR evidence (called by the adaptive trainer at every
+        phase switch when ``nodewise_update.reset_every_stage`` is true)."""
+        if self._nodewise is not None:
+            self._nodewise.reset_stats()
+
+    def on_train_epoch_end(self):
+        if self._nodewise is not None:
+            nw = self._nodewise
+            if nw.n_steps > 0:
+                frac = nw.sel_counts.double() / nw.n_steps
+                self.log_dict(
+                    {f"struct/nodewise_selfrac_{i}": float(frac[i])
+                     for i in range(nw.n_nodes)},
+                    on_step=False, on_epoch=True,
+                )
+            nw.reset_epoch_diagnostics()
+        super().on_train_epoch_end()
+
     def validation_step(self, batch, batch_idx):
         total_loss, _, _ = self._step(batch, stage="val")
         return total_loss
@@ -1510,31 +1791,34 @@ class AttentionSelectorForecaster(pl.LightningModule):
         return total_loss
 
     def configure_optimizers(self):
-        lr = self.config["training"].get("lr", 1e-3)
-        weight_decay = self.config["training"].get("weight_decay", 0.01)
-        optimizer_name = self.config["training"].get("optimizer", "adamw").lower()
-        # Extra kwargs forwarded to the optimizer constructor, e.g.
-        # {momentum: 0.9, nesterov: true} for SGD.
-        optimizer_kwargs = self.config["training"].get("optimizer_kwargs", {}) or {}
+        """Configure optimizer(s) via the shared optimizer factory.
 
-        def _make_optimizer(params):
-            if optimizer_name == "adamw":
-                return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-            elif optimizer_name == "adam":
-                return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
-            elif optimizer_name == "sgd":
-                return torch.optim.SGD(
-                    params, lr=lr, weight_decay=weight_decay, **optimizer_kwargs
-                )
-            else:
-                raise ValueError(f"Unknown optimizer: {optimizer_name}")
+        With gradient routing, two optimizers are created (recon first, then
+        structural -- matches the training_step unpack).  The structural
+        optimizer is configured independently from the reconstruction one via
+        ``structural_optimizer``, ``structural_lr``, ``structural_weight_decay``
+        and ``structural_optimizer_kwargs`` (e.g. ``{momentum: 0.9,
+        nesterov: true}`` for SGD); null/missing values fall back to the
+        reconstruction settings (``optimizer``, ``lr``, ``weight_decay``,
+        ``optimizer_kwargs``).
+        """
+        from causaliT.training.optimizer_factory import (
+            make_optimizer,
+            get_recon_optimizer_config,
+            get_structural_optimizer_config,
+        )
+
+        tc = self.config["training"]
 
         if self.use_gradient_routing:
-            opt_recon = _make_optimizer(self._reconstruction_params)
-            opt_struct = _make_optimizer(self._structural_params)
-            return [opt_recon, opt_struct]   # recon first → matches training_step unpack
+            recon_cfg = get_recon_optimizer_config(tc)
+            struct_cfg = get_structural_optimizer_config(tc)
+            opt_recon = make_optimizer(self._reconstruction_params, **recon_cfg)
+            opt_struct = make_optimizer(self._structural_params, **struct_cfg)
+            return [opt_recon, opt_struct]   # recon first -> matches training_step unpack
         else:
-            return _make_optimizer(self.model.parameters())
+            recon_cfg = get_recon_optimizer_config(tc)
+            return make_optimizer(list(self.model.parameters()), **recon_cfg)
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """
@@ -1665,6 +1949,38 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "on_load_checkpoint: filled missing '%s' key from the "
                 "current model (checkpoint predates the oracle mask buffer).",
                 _om_key,
+            )
+
+        # ----------------------------------------------------------------
+        # Per-node value-MLP dropout migration.
+        #
+        # ``mlp_per_node_emb`` gained a Dropout/Identity layer after the hidden
+        # activation (dropout > 0 -> nn.Dropout, else nn.Identity), shifting
+        # the second Linear of every per-node MLP from ``mlps.<i>.2`` to
+        # ``mlps.<i>.3``.  Checkpoints written before that change carry the old
+        # ``.2.`` keys; Dropout/Identity is parameter-free, so a pure key rename
+        # is an exact migration.  Applied only when the current model expects
+        # ``.3.`` and the checkpoint still has ``.2.`` (new checkpoints are
+        # untouched).
+        # ----------------------------------------------------------------
+        rename = {}
+        for k in ckpt_keys:
+            if ".embedding.mlps." not in k:
+                continue
+            head, _, param = k.rpartition(".")
+            if param not in ("weight", "bias") or not head.endswith(".2"):
+                continue
+            new_k = head[:-2] + ".3." + param
+            if new_k in current_keys and k not in current_keys and new_k not in ckpt_keys:
+                rename[k] = new_k
+        if rename:
+            for old_k, new_k in rename.items():
+                checkpoint["state_dict"][new_k] = checkpoint["state_dict"].pop(old_k)
+            logger.warning(
+                "on_load_checkpoint: migrated %d per-node value-MLP key(s) from "
+                "mlps.*.2 to mlps.*.3 (checkpoint predates the dropout layer in "
+                "mlp_per_node_emb).",
+                len(rename),
             )
 
     def on_fit_start(self):

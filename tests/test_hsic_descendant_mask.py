@@ -29,7 +29,9 @@ import torch
 
 from causaliT.utils.descendant_mask import (
     build_hsic_pair_mask,
+    build_hsic_pair_mask_budgeted,
     harden_adjacency,
+    soft_transitive_closure,
     transitive_closure,
 )
 from causaliT.utils.hsic_utils import hsic_cross_per_pair, hsic_pair_matrix
@@ -335,6 +337,10 @@ def _mask_stub(**overrides) -> Any:
         hsic_descendant_exclude_self=True,
         hsic_descendant_weight=0.0,
         hsic_descendant_min_kept_frac=0.25,
+        hsic_descendant_mode="threshold",
+        hsic_descendant_budget_frac=0.25,
+        hsic_descendant_per_row=True,
+        hsic_descendant_tnorm="min",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -611,3 +617,128 @@ def test_apply_phase_anchors_first_structure_phase_then_serves_it(save_dir):
     assert module._descendant_warmup_anchor is None
     module.current_epoch = 260
     assert _call_builder(module, _sparse_score())[0] is not None
+
+
+# ---------------------------------------------------------------------------
+# soft_transitive_closure
+# ---------------------------------------------------------------------------
+
+def test_soft_transitive_closure_chain_is_monotone():
+    # Chain 0 -> 1 -> 2 -> 3 with confident edges (pi[i, j] = P(j -> i)).
+    pi = torch.zeros((4, 4))
+    pi[1, 0] = 0.9
+    pi[2, 1] = 0.9
+    pi[3, 2] = 0.9
+    desc = soft_transitive_closure(pi, tnorm="min")
+    # desc[i, j] = soft score that j is a descendant of i
+    assert desc[0, 1] > 0.8 and desc[0, 2] > 0.8 and desc[0, 3] > 0.8
+    assert desc[3].max() == 0.0          # a sink has no descendants
+    assert desc[0, 0] == 0.0             # acyclic: no self-reach
+
+
+def test_soft_transitive_closure_matches_boolean_on_hard_graph():
+    # On a 0/1 posterior the soft closure must equal the boolean closure.
+    adj = _chain_adjacency(5)
+    soft = soft_transitive_closure(adj.float(), tnorm="min")
+    hard = transitive_closure(adj, hops=None)
+    assert torch.equal(soft.bool(), hard)
+
+
+def test_soft_transitive_closure_rejects_non_square():
+    with pytest.raises(ValueError):
+        soft_transitive_closure(torch.zeros((2, 3)))
+
+
+# ---------------------------------------------------------------------------
+# build_hsic_pair_mask_budgeted
+# ---------------------------------------------------------------------------
+
+def test_budgeted_mask_never_collapses_on_a_dense_cyclic_graph():
+    """The collapse case of the threshold variant: the budgeted mask must NOT
+    fall back — the cap IS the guard."""
+    dense = torch.full((4, 4), 0.9)   # fully dense -> cyclic
+    mask, kept_frac, is_cyclic = build_hsic_pair_mask_budgeted(
+        score_tensor=dense, s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.25,
+    )
+    assert mask is not None
+    assert is_cyclic is True
+    # The cap holds: at most ~budget_frac of the pairs are excluded.
+    assert kept_frac >= 1.0 - 0.25 - 1e-6
+
+
+def test_budgeted_mask_excludes_top_descendant_scores_per_row():
+    """The excluded pairs are the most descendant-ish of each row."""
+    # Chain 0 -> 1 -> 2 (strong), so row 0 has a child AND a grandchild.
+    score = torch.zeros((3, 3))
+    score[1, 0] = 0.9
+    score[2, 1] = 0.9
+    mask, _, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=score, s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.34, per_row=True, exclude_self=True,
+    )
+    # Row 0: self (0,0) + descendants (0,1) and (0,2) excluded.
+    assert mask[0, 0].item() == 0.0
+    assert mask[0, 1].item() == 0.0
+    assert mask[0, 2].item() == 0.0
+    # Row 2 (a sink): only itself excluded — its ancestors are legitimate
+    # independence targets and must be kept.
+    assert mask[2, 0].item() == 1.0
+    assert mask[2, 1].item() == 1.0
+    assert mask[2, 2].item() == 0.0
+
+
+def test_budgeted_mask_is_detached():
+    score = torch.zeros((3, 3), requires_grad=True)
+    with torch.enable_grad():
+        mask, _, _ = build_hsic_pair_mask_budgeted(
+            score_tensor=score, s_seq_len=0, homogeneous_nodes=True,
+        )
+    assert mask.requires_grad is False
+    assert mask.grad_fn is None
+
+
+def test_budgeted_mask_split_mode_pins_cross_columns():
+    L_S, L_X = 2, 3
+    score = torch.zeros((L_X, L_S + L_X))
+    score[1, L_S + 0] = 0.9      # X0 -> X1
+    score[2, L_S + 1] = 0.9      # X1 -> X2
+    mask, _, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=score, s_seq_len=L_S, homogeneous_nodes=False,
+        budget_frac=0.5,
+    )
+    # S columns are exogenous: they can never be descendants of an X node.
+    assert bool((mask[:, :L_S] == 1.0).all())
+
+
+def test_budgeted_mask_rejects_bad_budget():
+    with pytest.raises(ValueError):
+        build_hsic_pair_mask_budgeted(
+            score_tensor=torch.zeros((3, 3)), s_seq_len=0,
+            homogeneous_nodes=True, budget_frac=0.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Forecaster dispatch: budget mode
+# ---------------------------------------------------------------------------
+
+def test_forecaster_budget_mode_dispatches_and_never_collapses():
+    """On a dense cyclic graph the threshold mode falls back; the budget mode
+    must return a mask (the cap is the guard)."""
+    dense = torch.full((3, 4), 0.9)
+    stub = _mask_stub(hsic_descendant_mode="budget",
+                      hsic_descendant_budget_frac=0.25)
+    mask, kept, _ = _call_builder(stub, dense)
+    assert mask is not None
+    assert kept >= 1.0 - 0.25 - 1e-6
+
+
+def test_forecaster_budget_mode_respects_warmup():
+    """The warmup guard is orthogonal to the mode: it applies in budget mode
+    too (the self-confirmation risk is bounded by the cap, not eliminated)."""
+    stub = _mask_stub(current_epoch=3, hsic_descendant_warmup_epochs=10,
+                      hsic_descendant_mode="budget")
+    assert _call_builder(stub, _sparse_score())[0] is None
+    stub.current_epoch = 10
+    assert _call_builder(stub, _sparse_score())[0] is not None
