@@ -1465,6 +1465,25 @@ class AttentionSelectorLayer(nn.Module):
             e_w = e.to(dtype=w.dtype, device=w.device)
             w[1:].copy_(e_w.unsqueeze(0).expand(w.shape[0] - 1, -1))
 
+    def enable_centroid_commit(self) -> None:
+        """Enable the centroid-commit shadow on every free query table.
+
+        After this call the embedding weights hold the COMMITTED centroids
+        (constants in the graph, written only by commit events) and each
+        table carries a persistent ``shadow`` buffer accumulating gradient
+        evidence (see causaliT/training/centroid_commit.py).
+        """
+        for t in (self.query_embed_S, self.query_embed_X):
+            if t is not None:
+                t.enable_commit_shadow()
+
+    def sync_commit_shadows(self) -> None:
+        """Re-initialise all shadows at their committed weights (called after
+        the lazy centroid init on the first training batch)."""
+        for t in (self.query_embed_S, self.query_embed_X):
+            if t is not None:
+                t.sync_shadow_to_weight()
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------

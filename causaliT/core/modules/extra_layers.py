@@ -397,6 +397,56 @@ class BatchConsistentKeyDropout(nn.Module):
         self._last_key_mask: Optional[torch.Tensor] = None
         self._last_active_queries: Optional[torch.Tensor] = None
 
+        # Phase switch (adaptive trainer): when False, forward is a no-op but
+        # the annealing clock still advances, so the p schedule follows the
+        # GLOBAL training progress while dropout is only applied in the
+        # phases that enable it (e.g. reconstruct warmup ON, structure OFF).
+        self._phase_active: bool = True
+
+    # ------------------------------------------------------------------
+    def set_schedule(
+        self,
+        p_init: float,
+        p_final: Optional[float] = None,
+        annealing_batches: Optional[int] = None,
+    ) -> None:
+        """Override the drop-probability schedule at run time.
+
+        Used by the adaptive trainer's phase controller to drive the BKD
+        curriculum from per-phase config blocks.  The annealing step counter
+        is NOT reset: the schedule re-anchors on the progress already made,
+        keeping the anneal a global, run-level clock.
+
+        Note: if annealing is enabled here but was disabled at construction,
+        ``_step_count`` remains a plain attribute (not a registered buffer),
+        so it will not be persisted in checkpoints.  This mirrors the
+        state_dict-compatibility design in ``__init__``.
+        """
+        if not (0.0 <= p_init <= 1.0):
+            raise ValueError(f"p_init must be in [0, 1], got {p_init}")
+        if p_final is not None and not (0.0 <= p_final <= 1.0):
+            raise ValueError(f"p_final must be in [0, 1], got {p_final}")
+        self.p_init = float(p_init)
+        self.p_final = float(p_final) if p_final is not None else None
+        self.annealing_batches = (
+            int(annealing_batches)
+            if annealing_batches is not None and int(annealing_batches) > 0
+            else None
+        )
+        self._use_annealing = (
+            self.p_final is not None and self.annealing_batches is not None
+        )
+        self.p = self._current_p()
+
+    def set_phase_active(self, active: bool) -> None:
+        """Enable/disable dropout application for the current training phase.
+
+        Inactive phases pass the tensor through unchanged and report
+        ``_last_key_mask = None`` (so the forecaster's HSIC gating includes
+        all variables), but the annealing step counter keeps advancing.
+        """
+        self._phase_active = bool(active)
+
     # ------------------------------------------------------------------
     def _current_p(self) -> float:
         """Return the linearly annealed drop probability at the current step."""
@@ -426,10 +476,13 @@ class BatchConsistentKeyDropout(nn.Module):
             return x
 
         # Advance step counter and recompute effective p before sampling.
+        # The counter advances even when the phase is inactive: the anneal is
+        # a GLOBAL run-level clock, while ``_phase_active`` only gates where
+        # dropout is actually applied.
         self.p = self._current_p()
         self._step_count += 1
 
-        if self.p <= 0.0:
+        if not self._phase_active or self.p <= 0.0:
             self._last_key_mask = None
             self._last_active_queries = None
             return x

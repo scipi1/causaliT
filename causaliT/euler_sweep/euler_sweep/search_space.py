@@ -129,6 +129,9 @@ RECONSTRUCTION_PROTOCOL: Dict[str, Any] = {
     "training.lambda_sparse_cross": 0.0,
     # Diagnostics that cost time and need structural grads.
     "training.log_l0_hsic_interference": False,
+    # PCGrad surgery operates on the structural backward; disabled here because
+    # gradient routing (and all structural objectives) are off.
+    "training.gradient_surgery": False,
     # Stop a trial when it stops improving, and score its BEST epoch.
     "training.early_stopping.enabled": True,
     "training.early_stopping.monitor": "val_x_mae",

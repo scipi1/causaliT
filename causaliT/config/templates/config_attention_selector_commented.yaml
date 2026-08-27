@@ -247,8 +247,16 @@ model:
 
     # Architecture
     activation: "gelu"
-    norm: "layer"
-    use_final_norm: true
+    # norm: "none" is RECOMMENDED for AttentionSelectorLayer. The shared
+    # post-attention LayerNorms are a transformer leftover: with sigmoid
+    # (Hard-Concrete) gates the attention output magnitude IS the gate-mass
+    # signal, and LayerNorm divides it away — it also attenuates the
+    # structural gradients of high-gate-mass nodes by 1/sigma_i. Old runs keep
+    # "layer" in their hparams and still load (checkpoint compatible).
+    norm: "none"
+    # Leftover of the old transformer block; the decoding head does not need a
+    # final shared norm either. Keep false.
+    use_final_norm: false
     device: "cuda"
 
     # Dimensions
@@ -527,6 +535,23 @@ adaptive_training:
                                    # (falls back to min_epochs when unset)
     plateau_patience: 5            # stop after N val epochs w/o rel. improvement
     plateau_min_delta: 1.0e-4      # relative improvement threshold
+
+    # ---- BKD warmup curriculum (per-phase batch-key dropout) ---------------
+    # Setting ``batch_key_dropout`` in ANY phase block puts the run under
+    # phase-managed BKD: reconstruct phases apply heavy key dropout so the
+    # value paths specialize on sparse key subsets (the dense readout would
+    # otherwise absorb the whole signal and leave HSIC on its flat noise
+    # floor), while structure phases default to BKD OFF (full attention).
+    # The anneal is a GLOBAL run-level clock: the step counter advances in
+    # every phase, so each successive reconstruct phase starts at a lower p.
+    #
+    # REQUIRES the model to be built with BKD modules present, i.e. set
+    # model kwargs ``batch_key_dropout`` to a non-null value (any value —
+    # the phase controller overrides the schedule).  The current p is logged
+    # as ``bkd_p``; the active flag as ``bkd_phase_active``.
+    # batch_key_dropout: 0.6         # drop prob at run start (reconstruct phases)
+    # batch_key_dropout_final: 0.0   # anneal target (reached after *_batches)
+    # batch_key_dropout_annealing_batches: null   # null = constant p
 
 
   structure:

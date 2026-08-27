@@ -17,7 +17,17 @@ This module implements a nodewise SNR gate: per structural step, only the
 non-zero* are updated; every other query row (and its optimizer state) is
 reverted after the optimizer step.
 
-Statistic (hard-coded, Option E - streaming EMA, optimizer-agnostic)
+Two selection rules (``selection`` constructor arg):
+
+* ``snr`` (default): temporal EMA t-statistic below - consistent direction
+  over ~20 steps.  Couples past updates with the current one: a consistent
+  but uninformative (e.g. radial at a symmetric init) gradient passes.
+* ``norm``: per-step greedy - the topk rows with the largest CURRENT
+  gradient norm, no memory, no gate.  With an SGD structural optimizer this
+  is the first-order greedy ranking of the expected loss decrease
+  (s_i = lr * ||g_i||^2).
+
+Statistic for ``snr`` (hard-coded, Option E - streaming EMA, optimizer-agnostic)
 --------------------------------------------------------------------
 Per node i with gradient vector g_i (d = embedding dim):
 
@@ -100,10 +110,16 @@ class NodewiseQuerySelector:
         query_params: List[torch.Tensor],
         norm_param: Optional[torch.Tensor],
         topk: int = 1,
+        selection: str = "snr",
     ):
         if topk < 1:
             raise ValueError(f"topk must be >= 1, got {topk}")
+        if selection not in ("snr", "norm"):
+            raise ValueError(
+                f"selection must be 'snr' or 'norm', got {selection!r}"
+            )
         self.topk = int(topk)
+        self.selection = selection
 
         # Node map: node i -> (param, row).  Row 0 of each table is padding.
         self.node_map: List[Tuple[torch.Tensor, int]] = []
@@ -131,6 +147,7 @@ class NodewiseQuerySelector:
         self.sel_counts = torch.zeros(self.n_nodes, dtype=torch.long)
         self.n_gate_fired = 0
         self.n_steps = 0
+        self.last_max_stat = 0.0   # max SNR ('snr') or max ||g_i|| ('norm')
 
     # ------------------------------------------------------------------
     def reset_stats(self):
@@ -176,11 +193,26 @@ class NodewiseQuerySelector:
             return None
         self.t += 1
         self.n_steps += 1
+
+        if self.selection == "norm":
+            # Per-step greedy: the topk rows with the largest CURRENT gradient
+            # norm.  No temporal memory (no EMA, no SNR, no gate): each update
+            # is confined to the current training step.  With an SGD
+            # structural optimizer this is also the first-order greedy ranking
+            # of the expected loss decrease, s_i = lr * ||g_i||^2.
+            norms = grads.pow(2).sum(dim=1).sqrt()
+            self.last_max_stat = float(norms.max())
+            selected = norms.topk(min(self.topk, self.n_nodes)).indices.tolist()
+            for i in selected:
+                self.sel_counts[i] += 1
+            return selected
+
         self.ema_mean.mul_(BETA).add_(grads, alpha=1.0 - BETA)
         self.ema_sq.mul_(BETA).add_(grads.pow(2).sum(dim=1), alpha=1.0 - BETA)
 
         snr = self.current_snr()
         best = int(snr.argmax())
+        self.last_max_stat = float(snr[best])
         if float(snr[best]) < MIN_SNR:
             self.n_gate_fired += 1
             return []

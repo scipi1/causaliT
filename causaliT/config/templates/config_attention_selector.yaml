@@ -342,8 +342,12 @@ model:
 
     # Architecture
     activation: "gelu"
-    norm: "layer"
-    use_final_norm: true
+    # "none" recommended: the shared post-attention LayerNorms are a
+    # transformer leftover; with sigmoid gates they erase the gate-mass signal
+    # and attenuate structural gradients by 1/sigma_i. "layer" still loads old
+    # checkpoints unchanged.
+    norm: "none"
+    use_final_norm: false
     device: "cuda"
 
     # Dimensions
@@ -398,6 +402,25 @@ training:
     topk: 1                    # query nodes updated per structural step
     reset_every_stage: true    # clear the SNR statistics at every phase switch
                                # (reconstruct<->structure)
+
+  # --- Centroid-commit query dynamics (quantized queries + evidence shadow) --
+  # The query embedding weights hold COMMITTED key-subset centroids (the
+  # discrete parent-set hypothesis; the forward posterior is piecewise
+  # constant).  Per structural step, per-node shadows accumulate the leaked
+  # gradient  shadow <- committed + leak*(shadow - committed) - eta * g  and a
+  # node re-commits when its shadow's exact nearest-centroid projection
+  # changes subset (on commit: weight <- centroid, shadow re-centred, commit
+  # stats reset, M_i reset).  See causaliT/training/centroid_commit.py.
+  # Requires free query embeddings; mutually exclusive with nodewise_update.
+  centroid_commit:
+    enabled: false             # master switch; off = current behaviour
+    evidence_lr: 10.0          # eta; with |g| ~ 0.005-0.075 and inter-centroid
+                               # distance ~0.2, 10 gives a cell crossing in
+                               # ~20-50 consistent steps
+    evidence_leak: 0.95        # beta: evidence half-life ~ 14 steps
+    shadow_source: hsic        # hsic | structural (which loss feeds the shadow)
+    reset_m_on_commit: one     # one | off : reset M_i to 1 on commit so the new
+                               # hypothesis opens its gates
 
   loss_fn: "mse"
   lambda_recon: 1.0

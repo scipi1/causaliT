@@ -153,10 +153,12 @@ from causaliT.utils.query_norm import (
 
 from causaliT.training.gradient_routing import classify_parameters
 from causaliT.training.nodewise_update import NodewiseQuerySelector
+from causaliT.training.centroid_commit import CentroidCommitController
 from causaliT.training.interference_utils import (
     build_interference_blocks,
     compute_l0_hsic_interference,
 )
+from causaliT.training.gradient_surgery import pcgrad_reconcile
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +513,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self._reconstruction_params = reconstruction_params
 
         # ----------------------------------------------------------------
+        # Gradient surgery (PCGrad): per-block projection of the L0 / NOTEARS
+        # gradients against the HSIC gradient, keeping only the component of
+        # each regularizer that is non-destructive for HSIC (Yu et al.,
+        # NeurIPS 2020).  Requires gradient routing (a dedicated structural
+        # backward to operate on).  See causaliT/training/gradient_surgery.py.
+        # ----------------------------------------------------------------
+        self.gradient_surgery = bool(
+            config["training"].get("gradient_surgery", False)
+        )
+        if self.gradient_surgery and not self.use_gradient_routing:
+            raise ValueError(
+                "training.gradient_surgery=True requires "
+                "training.use_gradient_routing=True (PCGrad operates on the "
+                "structural backward of the dual-optimizer path)."
+            )
+
+        # ----------------------------------------------------------------
         # Node-wise (per-query) winner-take-all structural update.  Each
         # structural step updates only the ``topk`` query nodes whose gradient
         # has the strongest SNR evidence (EMA t-statistic); all other query
@@ -555,12 +574,72 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 query_params=query_params,
                 norm_param=norm_param,
                 topk=int(nw_cfg.get("topk", 1)),
+                selection=str(nw_cfg.get("selection", "snr")),
             )
             logger.info(
                 "Nodewise query update enabled: topk=%d over %d nodes, "
-                "reset_every_stage=%s",
+                "selection=%s, reset_every_stage=%s",
                 self._nodewise.topk, self._nodewise.n_nodes,
-                self.nodewise_reset_every_stage,
+                self._nodewise.selection, self.nodewise_reset_every_stage,
+            )
+
+        # ----------------------------------------------------------------
+        # Centroid-commit query dynamics (quantized queries with an evidence
+        # shadow).  The query embedding weights hold COMMITTED key-subset
+        # centroids; per-node shadows accumulate the leaked HSIC gradient and
+        # a node re-commits when its shadow's exact nearest-centroid
+        # projection changes subset.  See causaliT/training/centroid_commit.py.
+        # ----------------------------------------------------------------
+        cc_cfg = config["training"].get("centroid_commit", None) or {}
+        self.centroid_commit_enabled = bool(cc_cfg.get("enabled", False))
+        self._commit_source = str(cc_cfg.get("shadow_source", "hsic"))
+        if self._commit_source not in ("hsic", "structural"):
+            raise ValueError(
+                f"centroid_commit.shadow_source must be 'hsic' or "
+                f"'structural', got {self._commit_source!r}"
+            )
+        self._commit: Optional[CentroidCommitController] = None
+        if self.centroid_commit_enabled:
+            if self._nodewise is not None:
+                raise ValueError(
+                    "centroid_commit and nodewise_update are alternative query "
+                    "update rules; enable only one."
+                )
+            self.model.enable_centroid_commit()
+            tables = [t for t in (self.model.query_embed_S,
+                                  self.model.query_embed_X) if t is not None]
+            # Lazy callable: the frame can be REPLACED by load_state_dict
+            # (warm start / checkpoint resume) after this constructor runs.
+            K = lambda: torch.cat([self.model.orth_embed_S.frame,
+                                   self.model.orth_embed_X.frame]).detach()
+            norm_params = [
+                ia.query_norm_log_scale
+                for ia in (getattr(getattr(self.model, "attention", None),
+                                   "inner_attention", None),
+                           getattr(getattr(self.model, "self_attention", None),
+                                   "inner_attention", None))
+                if getattr(ia, "query_norm_log_scale", None) is not None
+            ]
+            self._commit = CentroidCommitController(
+                tables=tables,
+                K=K,
+                norm_param=norm_params[0] if norm_params else None,
+                evidence_lr=float(cc_cfg.get("evidence_lr", 10.0)),
+                evidence_leak=float(cc_cfg.get("evidence_leak", 0.95)),
+                reset_m_on_commit=str(cc_cfg.get("reset_m_on_commit", "one")),
+                prior_rho=float(cc_cfg.get("prior_rho", 0.0)),
+                winner_take_all=bool(cc_cfg.get("winner_take_all", False)),
+                commit_margin=float(cc_cfg.get("commit_margin", 0.0)),
+                min_snr=float(cc_cfg.get("min_snr", 0.0)),
+            )
+            logger.info(
+                "Centroid-commit query dynamics enabled: %d nodes, "
+                "evidence_lr=%.3g, leak=%.3g, reset_m=%s, prior_rho=%.3g, "
+                "wta=%s, commit_margin=%.3g, min_snr=%.3g",
+                self._commit.n_nodes, self._commit.eta, self._commit.beta,
+                self._commit.reset_m_on_commit, self._commit.prior_rho,
+                self._commit.winner_take_all, self._commit.commit_margin,
+                self._commit.min_snr,
             )
 
         # ----------------------------------------------------------------
@@ -1175,6 +1254,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # real backward runs.
         self._last_hsic_reg = hsic_reg
         self._last_l0_reg = l0_reg
+        # Separate terms for PCGrad gradient surgery (gradient-routing path):
+        # HSIC enters loss_structural as (1 - alpha) * hsic_reg; the L0 and
+        # NOTEARS terms are projected against it per block, and everything
+        # else (struct-recon mix, score sparsity, group L1, query norm) is
+        # bundled as the untouched "rest" term.
+        self._last_acyclic_reg = acyclic_reg
+        self._last_struct_hsic_term = (1.0 - alpha) * hsic_reg
+        self._last_struct_rest = (
+            struct_recon_reg + score_sparsity_reg + group_l1_reg + qn_reg
+        )
 
         # ----------------------------------------------------------------
         # Logging
@@ -1658,6 +1747,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
         S, X = batch[0], batch[1]
         self.model.init_query_at_key_centroid(S, X)
         self._query_centroid_init_done = True
+        # Centroid-commit: the shadow starts at the same point (assignment =
+        # the full key set, the "select-all" hypothesis).
+        self.model.sync_commit_shadows()
         logger.info(
             "Initialised X query embedding at the key centroid "
             "(query_centroid_init=True; all queries start from the same point)."
@@ -1673,6 +1765,90 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.fanin_schedule.on_epoch_start(self.model)
         for name, value in self.fanin_schedule.metrics(self.model).items():
             self.log(name, value, on_step=False, on_epoch=True)
+
+    def _structural_backward(self, loss_structural: torch.Tensor) -> None:
+        """Structural backward, with optional PCGrad gradient surgery.
+
+        When ``training.gradient_surgery`` is enabled, the single fused
+        backward on ``loss_structural`` is replaced by per-term
+        ``torch.autograd.grad`` calls over the structural parameters:
+
+        * the HSIC term (``(1 - alpha) * hsic_reg``) is the reference;
+        * the L0 and NOTEARS terms are projected per block against it
+          (conflicting components removed, see
+          :func:`causaliT.training.gradient_surgery.pcgrad_reconcile`);
+        * the remaining structural terms (struct-recon mix, score sparsity,
+          group L1, query norm) are bundled untouched.
+
+        The combined gradient is written directly into ``p.grad`` of the
+        structural params, so downstream logic (nodewise WTA masking /
+        snapshot, ``opt_struct.step()``) is unaffected.  With surgery disabled
+        this is exactly the original ``manual_backward(loss_structural)``.
+        """
+        if not self.gradient_surgery:
+            self.manual_backward(loss_structural)
+            return
+
+        hsic_term = self._last_struct_hsic_term
+        targets: Dict[str, torch.Tensor] = {}
+        if self._last_l0_reg is not None and self._last_l0_reg.requires_grad:
+            targets["l0"] = self._last_l0_reg
+        if (
+            self._last_acyclic_reg is not None
+            and self._last_acyclic_reg.requires_grad
+        ):
+            targets["notears"] = self._last_acyclic_reg
+
+        if (
+            hsic_term is None
+            or not hsic_term.requires_grad
+            or not targets
+        ):
+            # Nothing to reconcile (e.g. lambda_hsic == 0 or both regs off):
+            # fall back to the plain fused structural backward.
+            self.manual_backward(loss_structural)
+            return
+
+        # Per-block grouping restricted to the structural params (the only
+        # ones the structural optimizer steps).
+        if not self._interference_blocks:
+            self._interference_blocks = build_interference_blocks(self.model)
+        struct_ids = {id(p) for p in self._structural_params}
+        blocks = {
+            name: [p for p in plist if id(p) in struct_ids]
+            for name, plist in self._interference_blocks.items()
+        }
+        blocks = {name: plist for name, plist in blocks.items() if plist}
+        all_params = [p for plist in blocks.values() for p in plist]
+
+        g_hsic = torch.autograd.grad(
+            hsic_term, all_params, retain_graph=True, allow_unused=True
+        )
+        g_targets = {
+            name: torch.autograd.grad(
+                term, all_params, retain_graph=True, allow_unused=True
+            )
+            for name, term in targets.items()
+        }
+        # Last consumer of the graph -> no retain.
+        g_rest = torch.autograd.grad(
+            self._last_struct_rest, all_params,
+            retain_graph=False, allow_unused=True,
+        )
+
+        projected, metrics = pcgrad_reconcile(g_hsic, g_targets, blocks, all_params)
+
+        for i, p in enumerate(all_params):
+            parts = [g_hsic[i], g_rest[i]]
+            parts += [projected[name][i] for name in targets]
+            parts = [g for g in parts if g is not None]
+            if parts:
+                p.grad = torch.stack([g.detach() for g in parts]).sum(dim=0)
+
+        # Always-on surgery metrics (epoch-mean aggregates).
+        for key, val in metrics.items():
+            if val == val:  # skip NaN (no valid block for that target)
+                self.log(f"surgery/{key}", val, on_step=False, on_epoch=True)
 
     def training_step(self, batch, batch_idx):
         # One-off: place every X query at the key centroid before the first step.
@@ -1712,8 +1888,31 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # Zero all gradients
             self.zero_grad()
 
-            # Backward 2: structural loss (graph consumed)
-            self.manual_backward(loss_structural)
+            # Centroid-commit: capture the HSIC-only shadow evidence BEFORE
+            # the structural backward consumes the graph, and drop any recon
+            # gradient the STE path put on the shadows.  Skipped when the
+            # structural params are frozen (reconstruct phase).
+            cc_active = (
+                self._commit is not None
+                and self.model.query_embed_X.embedding.weight.requires_grad
+            )
+            cc_grads = None
+            if cc_active:
+                for t in self._commit.tables:
+                    if t.shadow.grad is not None:
+                        t.shadow.grad = None
+                if self._commit_source == "hsic":
+                    cc_grads = torch.autograd.grad(
+                        self._last_hsic_reg,
+                        [t.shadow for t in self._commit.tables],
+                        retain_graph=True, allow_unused=True,
+                    )
+
+            # Backward 2: structural loss (graph consumed).  With
+            # training.gradient_surgery=True this applies PCGrad per block to
+            # the L0 / NOTEARS terms against the HSIC gradient instead of a
+            # fused backward.
+            self._structural_backward(loss_structural)
 
             # Restore recon grads on reconstruction params
             for p in self._reconstruction_params:
@@ -1739,6 +1938,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
             if nw_snap is not None:
                 NodewiseQuerySelector.restore(nw_snap)
 
+            # Centroid-commit: evidence update + commit checks (consumes and
+            # clears the shadow grads).
+            if cc_active:
+                n_new = self._commit.step(cc_grads)
+                self.log("struct/commit_count", float(n_new), on_step=False,
+                         on_epoch=True, reduce_fx="sum")
+                for c in self._commit.last_commits:
+                    self.log("struct/commit_margin", float(c["margin"]),
+                             on_step=False, on_epoch=True, reduce_fx="max")
+
             return total_loss
         else:
             total_loss, _, _ = self._step(batch, stage="train")
@@ -1756,9 +1965,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         nw = self._nodewise
         if nw is None:
             return
-        snr = nw.current_snr()
-        self.log("struct/nodewise_max_snr", float(snr.max()),
-                 on_step=False, on_epoch=True)
+        if nw.selection == "norm":
+            self.log("struct/nodewise_max_gnorm", float(nw.last_max_stat),
+                     on_step=False, on_epoch=True)
+        else:
+            snr = nw.current_snr()
+            self.log("struct/nodewise_max_snr", float(snr.max()),
+                     on_step=False, on_epoch=True)
         gate_fired = len(selected) == 0
         self.log("struct/nodewise_gate_fired", float(gate_fired),
                  on_step=False, on_epoch=True)
@@ -1770,6 +1983,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self._nodewise.reset_stats()
 
     def on_train_epoch_end(self):
+        if self._commit is not None:
+            sizes = self._commit.assignment_sizes().float()
+            self.log("struct/commit_mean_subset", float(sizes.mean()),
+                     on_step=False, on_epoch=True)
+            self.log_dict(
+                {f"struct/commit_subset_{i}": float(sizes[i])
+                 for i in range(self._commit.n_nodes)},
+                on_step=False, on_epoch=True,
+            )
         if self._nodewise is not None:
             nw = self._nodewise
             if nw.n_steps > 0:

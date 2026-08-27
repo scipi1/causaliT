@@ -218,6 +218,9 @@ class GatedCrossAttention(nn.Module):
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+        # Phase switch (adaptive trainer): when False, BKD is not applied but
+        # the annealing clock keeps advancing (global run-level schedule).
+        self._bkd_phase_active: bool = True
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
@@ -247,6 +250,23 @@ class GatedCrossAttention(nn.Module):
             return float(self._bkd_p0)
         frac = min(1.0, float(self._bkd_step.item()) / float(self._bkd_anneal))
         return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
+
+    def set_bkd_schedule(
+        self,
+        p0: Optional[float],
+        p1: Optional[float] = None,
+        annealing_batches: Optional[int] = None,
+    ) -> None:
+        """Override the BKD schedule at run time (adaptive-trainer phase
+        controller).  The step counter is NOT reset: the anneal stays a
+        global, run-level clock."""
+        self._bkd_p0 = p0
+        self._bkd_p1 = p1 if p1 is not None else p0
+        self._bkd_anneal = annealing_batches
+
+    def set_bkd_phase_active(self, active: bool) -> None:
+        """Enable/disable BKD application for the current training phase."""
+        self._bkd_phase_active = bool(active)
 
     # ------------------------------------------------------------------
     # Learnable query-norm over-spend penalty (structural loss term)
@@ -449,10 +469,13 @@ class GatedCrossAttention(nn.Module):
 
         # ---- Batch-consistent key dropout --------------------------------
         bkd_p = self._current_bkd_p()
-        if self.training and bkd_p is not None and bkd_p > 0.0:
-            keep = (torch.rand(S, device=A.device) >= bkd_p).to(A.dtype)  # (S,)
-            A = A * keep.view(1, 1, S)
+        if self.training and bkd_p is not None:
+            # The annealing clock advances in every training phase (global
+            # schedule); ``_bkd_phase_active`` only gates the application.
             self._bkd_step += 1
+            if self._bkd_phase_active and bkd_p > 0.0:
+                keep = (torch.rand(S, device=A.device) >= bkd_p).to(A.dtype)  # (S,)
+                A = A * keep.view(1, 1, S)
 
         # ---- Attention-weight dropout ------------------------------------
         A = self.dropout(A)

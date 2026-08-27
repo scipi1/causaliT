@@ -421,6 +421,18 @@ class PhaseController(Callback):
         # ``None`` until the first cross-fit swap / when cross-fitting is off.
         self._active_split_key: Optional[str] = None
 
+        # Per-phase batch-key dropout (BKD warmup curriculum).  Managed only
+        # when at least one phase block sets ``batch_key_dropout``: the
+        # reconstruct phases then run with (heavy, annealing) BKD while the
+        # structure phases run with BKD disabled — the value paths specialize
+        # on sparse key subsets during warmup instead of absorbing the signal
+        # into a dense readout.  When unmanaged, BKD keeps whatever schedule
+        # the model was built with (backward compatible).
+        self._bkd_managed: bool = any(
+            "batch_key_dropout" in cfg
+            for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg)
+        )
+
 
 
         # Records
@@ -430,6 +442,99 @@ class PhaseController(Callback):
     # ------------------------------------------------------------------
     # Phase application
     # ------------------------------------------------------------------
+    def _apply_bkd_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Apply the per-phase batch-key-dropout curriculum (no-op when the
+        run does not manage BKD — i.e. no phase block sets
+        ``batch_key_dropout``).
+
+        Semantics:
+          * reconstruct / final_reconstruct: if the (merged) phase block sets
+            ``batch_key_dropout``, configure the schedule (``*_final`` /
+            ``*_annealing_batches`` optional) and ACTIVATE BKD; otherwise
+            deactivate it.
+          * structure: activate only if the structure block explicitly sets
+            ``batch_key_dropout`` (off by default).
+
+        The annealing step counter is never reset, so p follows the GLOBAL
+        training progress even though dropout is applied only in the active
+        phases.  Handles both BKD implementations:
+        :class:`~causaliT.core.modules.extra_layers.BatchConsistentKeyDropout`
+        sub-modules and the inline variant in the gated attention classes.
+        """
+        if not self._bkd_managed:
+            return
+
+        if phase == "reconstruct":
+            cfg = self.recon_cfg
+        elif phase == "final_reconstruct":
+            cfg = {**self.recon_cfg, **self.final_cfg}
+        else:
+            cfg = self.struct_cfg
+        active = "batch_key_dropout" in cfg
+
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        n_mod = 0
+        for mod in pl_module.modules():
+            if isinstance(mod, BatchConsistentKeyDropout):
+                if active:
+                    mod.set_schedule(
+                        p_init=float(cfg["batch_key_dropout"]),
+                        p_final=cfg.get("batch_key_dropout_final", None),
+                        annealing_batches=cfg.get(
+                            "batch_key_dropout_annealing_batches", None
+                        ),
+                    )
+                mod.set_phase_active(active)
+                n_mod += 1
+            elif hasattr(mod, "set_bkd_phase_active"):
+                # Inline variant (GatedCrossAttention / GatedSelfAttention).
+                if active:
+                    mod.set_bkd_schedule(
+                        p0=float(cfg["batch_key_dropout"]),
+                        p1=cfg.get("batch_key_dropout_final", None),
+                        annealing_batches=cfg.get(
+                            "batch_key_dropout_annealing_batches", None
+                        ),
+                    )
+                mod.set_bkd_phase_active(active)
+                n_mod += 1
+
+        if active and n_mod == 0:
+            logger.warning(
+                "[adaptive] batch_key_dropout set in the '%s' phase config but "
+                "the model owns no BKD module — set model kwargs "
+                "batch_key_dropout to a non-null value so the modules exist.",
+                phase,
+            )
+        if n_mod > 0:
+            pl_module.log(
+                "bkd_phase_active", float(active), on_step=False, on_epoch=True
+            )
+
+    def _log_bkd_p(self, pl_module: pl.LightningModule) -> None:
+        """Log the current (annealed) BKD drop probability, run-level mean."""
+        if not self._bkd_managed:
+            return
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        ps = [
+            float(m.p)
+            for m in pl_module.modules()
+            if isinstance(m, BatchConsistentKeyDropout)
+        ]
+        ps += [
+            float(p)
+            for m in pl_module.modules()
+            if hasattr(m, "_current_bkd_p")
+            for p in [m._current_bkd_p()]
+            if p is not None
+        ]
+        if ps:
+            pl_module.log(
+                "bkd_p", float(np.mean(ps)), on_step=False, on_epoch=True
+            )
+
     def _resolve_param_groups(self, pl_module: pl.LightningModule):
         struct = getattr(pl_module, "_structural_params", None)
         recon = getattr(pl_module, "_reconstruction_params", None)
@@ -712,6 +817,10 @@ class PhaseController(Callback):
         else:
             raise ValueError(f"Unknown phase {phase!r}")
 
+        # Per-phase BKD curriculum (reconstruct: heavy annealed dropout;
+        # structure: off).  No-op unless a phase block sets batch_key_dropout.
+        self._apply_bkd_cfg(pl_module, phase)
+
         # Optionally clear stale optimizer moment estimates at the switch.
         # Optimizer.state must remain a defaultdict(dict); a plain {} would
         # break the ``self.state[p]`` access pattern inside optimizer.step().
@@ -949,6 +1058,10 @@ class PhaseController(Callback):
         # alternating reconstruct <-> structure.  Runs in EVERY phase (and in
         # the optional final phase), before the phase dispatch.
         self._update_gain_lambda(trainer, pl_module)
+
+        # BKD anneal progress (run-level mean over all BKD modules; no-op
+        # unless the run manages per-phase BKD).
+        self._log_bkd_p(pl_module)
 
         # ---------- Final reconstruction-only phase: entry trigger ----------
         # The alternating schedule owns the first ``total_epoch_budget`` epochs;

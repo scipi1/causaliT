@@ -20,6 +20,8 @@ need to be mutually orthogonal, so this embedding is left fully free
 (unconstrained) to maximise its ability to point at any key.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -61,6 +63,30 @@ class FreeQueryEmbedding(nn.Module):
             embedding_dim=d_model,
             padding_idx=0,
         )
+        # Centroid-commit shadow (see causaliT/training/centroid_commit.py).
+        # When enabled, ``embedding.weight`` holds the COMMITTED centroid (a
+        # constant in the graph; written only by commit events) and ``shadow``
+        # is a persistent buffer accumulating leaked gradient evidence.  The
+        # forward reads the committed centroid; gradients land on the shadow
+        # via a straight-through estimator.
+        self.shadow: Optional[torch.Tensor]
+        self.register_buffer("shadow", None, persistent=True)
+
+    def enable_commit_shadow(self) -> None:
+        """Register the evidence-accumulator shadow buffer (idempotent)."""
+        if self.shadow is not None:
+            return
+        # Assignment (not register_buffer): ``shadow`` is already a registered
+        # None buffer, so this keeps the persistent-buffer registration.
+        self.shadow = self.embedding.weight.detach().clone()
+        self.shadow.requires_grad_(True)
+
+    def sync_shadow_to_weight(self) -> None:
+        """Re-initialise the shadow at the committed weight (after lazy
+        centroid init and after every commit event)."""
+        if self.shadow is not None:
+            with torch.no_grad():
+                self.shadow.copy_(self.embedding.weight)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -73,7 +99,12 @@ class FreeQueryEmbedding(nn.Module):
             Query identity embeddings of shape (batch, seq_len, d_model).
         """
         var_ids = torch.nan_to_num(X[:, :, self.var_idx]).long()
-        return self.embedding(var_ids)
+        if self.shadow is None:
+            return self.embedding(var_ids)
+        # Straight-through: value = committed centroid, gradient -> shadow.
+        committed = self.embedding(var_ids).detach()
+        sh = self.shadow[var_ids]
+        return committed + sh - sh.detach()
 
     def __repr__(self):
         return (f"FreeQueryEmbedding("

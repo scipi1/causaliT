@@ -188,6 +188,9 @@ class GatedSelfAttention(nn.Module):
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+        # Phase switch (adaptive trainer): when False, BKD is not applied but
+        # the annealing clock keeps advancing (global run-level schedule).
+        self._bkd_phase_active: bool = True
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
@@ -221,6 +224,23 @@ class GatedSelfAttention(nn.Module):
             return float(self._bkd_p0)
         frac = min(1.0, float(self._bkd_step.item()) / float(self._bkd_anneal))
         return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
+
+    def set_bkd_schedule(
+        self,
+        p0: Optional[float],
+        p1: Optional[float] = None,
+        annealing_batches: Optional[int] = None,
+    ) -> None:
+        """Override the BKD schedule at run time (adaptive-trainer phase
+        controller).  The step counter is NOT reset: the anneal stays a
+        global, run-level clock."""
+        self._bkd_p0 = p0
+        self._bkd_p1 = p1 if p1 is not None else p0
+        self._bkd_anneal = annealing_batches
+
+    def set_bkd_phase_active(self, active: bool) -> None:
+        """Enable/disable BKD application for the current training phase."""
+        self._bkd_phase_active = bool(active)
 
     # ------------------------------------------------------------------
     # Noise helpers (upper-triangle draws mirrored to enforce pair-consistency)
@@ -384,8 +404,15 @@ class GatedSelfAttention(nn.Module):
         raw = self._structural_raw(
             query, key, transitive_W=transitive_W, transitive_delta=transitive_delta
         )
-        S_sym = 0.5 * (raw + raw.transpose(-1, -2))                # symmetric
-        A_anti = 0.5 * (raw - raw.transpose(-1, -2))               # antisymmetric
+        # Row-wise gradient routing: the transposed copy is DETACHED so that
+        # query q_j receives no gradient through other rows' gates.  Without
+        # this, A_anti[i, j] = (raw_ij - raw_ji)/2 lets the loss raise p_ij by
+        # pushing q_j AWAY from k_i (the 'lower p_ji' shortcut), which produces
+        # HSIC gradients against the true-parent centroid (toy-study evidence:
+        # scripts/_toy_antisym_coupling.py).  Forward values are unchanged.
+        rawT = raw.transpose(-1, -2).detach()
+        S_sym = 0.5 * (raw + rawT)                              # symmetric
+        A_anti = 0.5 * (raw - rawT)                             # antisymmetric
 
         if oracle:
             # ---- Oracle: the ground-truth DAG IS the structure gate ------
@@ -475,10 +502,13 @@ class GatedSelfAttention(nn.Module):
 
         # ---- Batch-consistent key dropout -------------------------------
         bkd_p = self._current_bkd_p()
-        if self.training and bkd_p is not None and bkd_p > 0.0:
-            keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
-            A = A * keep.view(1, 1, N)
+        if self.training and bkd_p is not None:
+            # The annealing clock advances in every training phase (global
+            # schedule); ``_bkd_phase_active`` only gates the application.
             self._bkd_step += 1
+            if self._bkd_phase_active and bkd_p > 0.0:
+                keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
+                A = A * keep.view(1, 1, N)
 
         # ---- Attention-weight dropout -----------------------------------
         A = self.dropout(A)
