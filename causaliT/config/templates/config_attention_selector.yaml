@@ -461,6 +461,9 @@ training:
   hsic_sigma: 1.0
   hsic_adaptive_bandwidth: true
   hsic_kernel_source: "rbf"
+  # Optional multi-scale RBF: positive multipliers applied to the fixed/adaptive
+  # base bandwidth (e.g. [0.5, 1.0, 2.0]).  null preserves single-bandwidth HSIC.
+  hsic_bandwidth_multipliers: null
   hsic_mode: "biased"
   nhsic_epsilon: 0.01
 
@@ -508,6 +511,20 @@ training:
                                        # than this, fall back to unmasked HSIC for the step
                                        # (otherwise the structural gradient dies silently)
   hsic_descendant_ema: 0.0             # EMA on the adjacency in [0,1) to stop mask thrashing
+
+  # --- LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md)
+  # Per-edge leave-one-out Bayes multiplier gamma, measured with masked
+  # EVAL-mode forwards (BKD inactive during measurement) and applied as a
+  # DETACHED gate on the per-pair HSIC weights: conditionally-redundant pairs
+  # are downweighted out of the marginal mean, load-bearing pairs keep full
+  # weight.  All keys are per-phase overridable via adaptive_training phase
+  # blocks (recommended: OFF during warmup/high-BKD, ON in structure phases).
+  use_loo_gamma_gate: false            # master switch (false = legacy behaviour)
+  loo_gamma_topk: null                 # null = full LOO; k = shortlist per target by P_m
+  loo_gamma_refresh: 1                 # recompute every N train steps (cached otherwise)
+  loo_gamma_permutations: 50           # permutation stats for the gamma null fit
+  loo_gamma_ema: 0.9                   # EMA momentum across refreshes
+  # Logged diagnostics: {stage}_loo_gamma_mean, {stage}_loo_gamma_min.
   # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic.
   # NOTE: with masking ON, {stage}_hsic is a MASKED mean whose normalisation set
   # drifts across epochs, so it is not comparable epoch-to-epoch.  Prefer

@@ -239,6 +239,10 @@ class GatedCrossAttention(nn.Module):
         #     thresholded at eval to obtain the recovered adjacency.
         self.score_tensor_for_sparsity: Optional[torch.Tensor] = None
         self.last_p_edge_on: Optional[torch.Tensor] = None
+        # BKD keep mask of the last forward: ``(S,)`` float (1 = key kept)
+        # when batch-consistent key dropout was applied, else None.  Read by
+        # the forecaster to exclude dropped sources from the HSIC pair set.
+        self.last_bkd_keep: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Batch-consistent key dropout probability (with optional annealing)
@@ -469,6 +473,9 @@ class GatedCrossAttention(nn.Module):
 
         # ---- Batch-consistent key dropout --------------------------------
         bkd_p = self._current_bkd_p()
+        # Reset every forward so eval / inactive phases never expose a
+        # stale mask to the HSIC dropped-key exclusion.
+        self.last_bkd_keep = None
         if self.training and bkd_p is not None:
             # The annealing clock advances in every training phase (global
             # schedule); ``_bkd_phase_active`` only gates the application.
@@ -476,6 +483,7 @@ class GatedCrossAttention(nn.Module):
             if self._bkd_phase_active and bkd_p > 0.0:
                 keep = (torch.rand(S, device=A.device) >= bkd_p).to(A.dtype)  # (S,)
                 A = A * keep.view(1, 1, S)
+                self.last_bkd_keep = keep
 
         # ---- Attention-weight dropout ------------------------------------
         A = self.dropout(A)

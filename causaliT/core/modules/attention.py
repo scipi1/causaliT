@@ -1360,6 +1360,9 @@ class AttentionLayer(nn.Module):
         init_edge_offset: float = 0.0,
         gain_tau: float = 1.0,
         dir_tau: float = DEFAULT_DIR_TAU,
+        # Additive direction-gate logit bias (GatedSelfAttention only; see
+        # that class).  0.0 = legacy coupled direction gate.
+        dir_bias: float = 0.0,
 
 
         # CommutatorSelfAttention direction-gate parametrisation (see that
@@ -1655,6 +1658,7 @@ class AttentionLayer(nn.Module):
                     gamma=init_gamma,
                     zeta=init_zeta,
                     dir_tau=dir_tau,
+                    dir_bias=dir_bias,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
                     query_norm_learnable=query_norm_learnable,

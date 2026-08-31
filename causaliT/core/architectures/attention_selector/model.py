@@ -404,6 +404,12 @@ class AttentionSelectorLayer(nn.Module):
         # ``dir_tau_self`` wins when set; both None -> DEFAULT_DIR_TAU (2/3).
         dir_tau: Optional[float] = None,
         dir_tau_self: Optional[float] = None,
+        # Additive direction-gate logit bias for the direction-aware block
+        # (GatedSelfAttention) at CONSTRUCTION (default 0.0 = legacy coupled
+        # gate).  Applies to the homogeneous single block AND the split-mode
+        # self block.  Runtime/phase control goes through set_dir_bias (the
+        # adaptive trainer phase controller, per-phase ``dir_bias`` keys).
+        dir_bias: float = 0.0,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
         # L2-normalise the STRUCTURAL query before scoring and replace the
         # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  This makes
@@ -531,6 +537,16 @@ class AttentionSelectorLayer(nn.Module):
         # at index 1 in the input tensors (production convention).
         per_node_output: bool = False,
         per_node_output_hidden: int = 32,
+        # Raw-value adjacency passthrough (NOTEARS/DAGMA-style, Arm B): when
+        # True, the value encoder / W_V / value residual stream are bypassed
+        # and the gated attention posterior acts DIRECTLY on the raw parent
+        # values: decoder MLP i receives Z_i = (A_i1*x_1, ..., A_iN*x_N) —
+        # the locally-connected first layer of NOTEARS-MLP / DAGMA-MLP.
+        # Requires per_node_output=True.  The value embeddings still run
+        # (their output feeds the now-unused attention V path) but receive no
+        # reconstruction gradient.
+        raw_value_adjacency: bool = False,
+
     ):
 
 
@@ -954,6 +970,7 @@ class AttentionSelectorLayer(nn.Module):
             # square (N, N) self attention (homogeneous mode); the cross
             # attentions ignore them.
             dir_tau=self.dir_tau,
+            dir_bias=dir_bias,
 
             direction_mode=commutator_direction_mode,
             direction_rank=commutator_direction_rank,
@@ -1054,6 +1071,7 @@ class AttentionSelectorLayer(nn.Module):
                 init_gamma=init_gamma,
                 init_zeta=init_zeta,
                 dir_tau=self.dir_tau,
+                dir_bias=dir_bias,
                 # CommutatorSelfAttention direction-gate parametrisation
                 # ("qk" or "skew_query"); ignored by GatedSelfAttention.
                 direction_mode=commutator_direction_mode,
@@ -1341,13 +1359,37 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
 
         self.per_node_output = bool(per_node_output)
+        # Raw-value adjacency passthrough (Arm B): the attention posterior IS
+        # the adjacency acting on raw values; the per-node decoder MLP input
+        # is the weighted parent vector of dim L_S + L_X (see
+        # forward_with_actual).  Requires per_node_output=True.
+        self.raw_value_adjacency = bool(raw_value_adjacency)
+        if self.raw_value_adjacency and not self.per_node_output:
+            raise ValueError(
+                "raw_value_adjacency=True requires per_node_output=True "
+                "(the adjacency-weighted raw parent vector is decoded by the "
+                "per-node MLP head)."
+            )
+        # Raw value column index per stream (fallback to the production
+        # convention: value column 0, variable-ID column 1).
+        self._raw_val_idx_S = (
+            self.embedding_S.per_node_value_embed_list[0].val_idx
+            if getattr(self.embedding_S, "per_node_value_embed_list", None)
+            else 0
+        )
+        self._raw_val_idx_X = (
+            self.embedding_X.per_node_value_embed_list[0].val_idx
+            if getattr(self.embedding_X, "per_node_value_embed_list", None)
+            else 0
+        )
+
         if self.per_node_output:
             # DAGMA-style per-node decoder: one MLP per variable.  In
             # homogeneous mode the head must cover ALL N = L_S + L_X nodes
             # (S is also reconstructed); otherwise only the X nodes.
             n_out_nodes = self.N if self.homogeneous_nodes else X_seq_len
             self.forecaster = PerNodeMLPHead(
-                d_model=d_model,
+                d_model=(S_seq_len + X_seq_len) if self.raw_value_adjacency else d_model,
                 out_dim=out_dim,
                 num_variables=n_out_nodes,
                 d_hidden=per_node_output_hidden,
@@ -2000,6 +2042,31 @@ class AttentionSelectorLayer(nn.Module):
                 "entropy": _combine(ent_sx, ent_xx),
                 "l0_penalty": _combine(l0_sx, l0_xx),
             }
+
+
+        # ---- Raw-value adjacency passthrough (NOTEARS/DAGMA-style) --------
+        # When enabled, the gated attention posterior A IS the adjacency and
+        # acts on the RAW parent values directly: the per-node decoder MLP i
+        # receives the elementwise-weighted parent vector
+        #     Z_i = (A_i1 * x_1, ..., A_iN * x_N)
+        # i.e. exactly the locally-connected first layer of NOTEARS-MLP /
+        # DAGMA-MLP.  No value encoder, no W_V, no residual/FFN value stream:
+        # the reconstruction gradient w.r.t. A_ij is proportional to the raw
+        # x_j, giving the structural parameters direct raw-value contrast.
+        if self.raw_value_adjacency:
+            s_raw = torch.nan_to_num(source_tensor[:, :, self._raw_val_idx_S])
+            x_raw = torch.nan_to_num(x_actual[:, :, self._raw_val_idx_X])
+            raw_all = torch.cat([s_raw, x_raw], dim=1)          # (B, L_S+L_X)
+            z = attention_weights * raw_all.unsqueeze(1)        # (B, L_q, L_S+L_X)
+            z = self.dropout_attn_out(z)
+            if self.homogeneous_nodes:
+                var_ids = torch.cat(
+                    [s_blanked[:, :, 1], x_blanked[:, :, 1]], dim=1
+                )
+            else:
+                var_ids = x_blanked[:, :, 1]
+            pred_x = self.forecaster(z, var_ids)
+            return pred_x, attention_weights, _aux
 
 
         # ---- Residual + Norm 1 -------------------------------------------

@@ -1,0 +1,77 @@
+"""Part 7: movement (displacement heatmaps + totals/cumulative)."""
+import nbformat as nbf
+
+md = (
+    "## 5. Which queries moved, and when\n"
+    "\n"
+    "Per-node displacement between consecutive checkpoints,\n"
+    "`||q_i(t) - q_i(t-1)||_2` (raw, non-normalized queries), plus the norm-budget\n"
+    "step `|dM_i|`. **The first interval (epoch0 -> first regular checkpoint) is\n"
+    "excluded**: it is the lazy centroid write (initialisation), not learning."
+)
+
+c1 = (
+    "# ---- Per-node query displacement between consecutive checkpoints -------------------\n"
+    "DQ = np.linalg.norm(np.diff(Q, axis=0), axis=2)       # (E-1, N) raw query step size\n"
+    "DM = np.abs(np.diff(M, axis=0))                       # (E-1, N) norm-budget step size\n"
+    "E_STEP = np.array(EPOCHS[1:])                         # epoch of the arrival checkpoint\n"
+    "DQ[0] = np.nan     # epoch0 -> first ckpt: the lazy centroid init, not learning\n"
+    "DM[0] = np.nan\n"
+    "\n"
+    "fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6))\n"
+    "im = axes[0].imshow(np.ma.masked_invalid(DQ.T), aspect=\"auto\", cmap=\"magma\",\n"
+    "                    extent=[E_STEP[0], E_STEP[-1], N - 0.5, -0.5])\n"
+    "axes[0].set_yticks(range(N), NODES)\n"
+    "axes[0].set_xlabel(\"epoch [-]\")\n"
+    "axes[0].set_ylabel(\"node i\")\n"
+    "axes[0].set_title(\"Query step size ||dq_i|| per checkpoint interval\")\n"
+    "fig.colorbar(im, ax=axes[0], label=\"L2 [-]\")\n"
+    "\n"
+    "im = axes[1].imshow(np.ma.masked_invalid(DM.T), aspect=\"auto\", cmap=\"magma\",\n"
+    "                    extent=[E_STEP[0], E_STEP[-1], N - 0.5, -0.5])\n"
+    "axes[1].set_yticks(range(N), NODES)\n"
+    "axes[1].set_xlabel(\"epoch [-]\")\n"
+    "axes[1].set_title(\"Norm-budget step |dM_i|\")\n"
+    "fig.colorbar(im, ax=axes[1], label=\"|dM| [-]\")\n"
+    "\n"
+    "fig.tight_layout()\n"
+    "save_fig(fig, \"displacement_heatmaps\")\n"
+    "plt.show()"
+)
+
+c2 = (
+    "# ---- Total movement ranking and peak-movement epochs --------------------------------\n"
+    "TOT_DQ = np.nansum(DQ, axis=0)\n"
+    "order_mv = np.argsort(-TOT_DQ)\n"
+    "\n"
+    "fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))\n"
+    "axes[0].bar(range(N), TOT_DQ[order_mv],\n"
+    "            color=[OKABE_ITO[0] if i < N_S else OKABE_ITO[1] for i in order_mv])\n"
+    "axes[0].set_xticks(range(N))\n"
+    "axes[0].set_xticklabels([NODES[i] for i in order_mv], rotation=90)\n"
+    "axes[0].set_ylabel(\"total ||dq_i|| over training [-]\")\n"
+    "axes[0].set_title(\"Total query displacement per node\")\n"
+    "\n"
+    "for j, i in enumerate(order_mv[:5]):\n"
+    "    axes[1].plot(E_STEP, np.nancumsum(DQ[:, i]),\n"
+    "                 color=OKABE_ITO[j % len(OKABE_ITO)], lw=1.3, label=NODES[i])\n"
+    "axes[1].set_xlim(0, E_MAX)\n"
+    "axes[1].set_xlabel(\"epoch [-]\")\n"
+    "axes[1].set_ylabel(\"cumulative ||dq_i|| [-]\")\n"
+    "axes[1].set_title(\"Cumulative movement, top-5 movers\")\n"
+    "axes[1].legend(fontsize=9)\n"
+    "\n"
+    "fig.tight_layout()\n"
+    "save_fig(fig, \"displacement_summary\")\n"
+    "plt.show()\n"
+    "\n"
+    "print(\"Nodes that moved the most (total query displacement; peak epoch):\")\n"
+    "for i in order_mv[:8]:\n"
+    "    pk = int(np.nanargmax(DQ[:, i]))\n"
+    "    print(f\"  {NODES[i]:>3}: total={TOT_DQ[i]:7.3f}  peak step {DQ[pk, i]:.3f} \"\n"
+    "          f\"at epoch {E_STEP[pk]}\")"
+)
+
+cells = [nbf.v4.new_markdown_cell(md)] + [nbf.v4.new_code_cell(c) for c in (c1, c2)]
+nbf.write(nbf.v4.new_notebook(cells=cells), "scripts/_nb_part7.ipynb")
+print("part7 ok")

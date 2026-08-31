@@ -1,0 +1,61 @@
+"""Part 9: uniform-epoch-grid DAG heatmaps + SHD-over-training curve."""
+import nbformat as nbf
+
+c1 = (
+    "# ---- DAG heatmaps on a uniform epoch grid (no phases in a plain run) ------------------\n"
+    "n_picks = min(8, len(EPOCHS))                # init + intermediate + final\n"
+    "picks = sorted(set(int(t) for t in np.linspace(0, len(EPOCHS) - 1, n_picks)))\n"
+    "\n"
+    "n_p = len(picks) + 1   # + GT panel\n"
+    "n_col = min(5, n_p)\n"
+    "n_row = int(np.ceil(n_p / n_col))\n"
+    "fig, axes = plt.subplots(n_row, n_col,\n"
+    "                         figsize=(3.2 * n_col, 3.0 * n_row), squeeze=False)\n"
+    "\n"
+    "axes.flat[0].imshow(GT, cmap=\"Greys\", vmin=0, vmax=1)\n"
+    "axes.flat[0].set_title(\"ground truth\")\n"
+    "for axp, t in zip(axes.flat[1:], picks):\n"
+    "    axp.imshow(PI[t], cmap=\"viridis\", vmin=0, vmax=1)\n"
+    "    s, fp, fn = SHD_ALL[t]\n"
+    "    axp.set_title(f\"epoch {EPOCHS[t]}\\nSHD={s} ({fp} extra, {fn} missing)\")\n"
+    "    mark_gt(axp)\n"
+    "for ax in axes.flat[:n_p]:\n"
+    "    tick = list(range(0, N, 5))\n"
+    "    ax.set_xticks(tick, [NODES[i] for i in tick], rotation=90)\n"
+    "    ax.set_yticks(tick, [NODES[i] for i in tick])\n"
+    "for ax in axes.flat[n_p:]:\n"
+    "    ax.axis(\"off\")\n"
+    "fig.suptitle(\"Directed edge posterior over training (vermillion frame = true edge)\",\n"
+    "             fontweight=\"bold\")\n"
+    "fig.tight_layout()\n"
+    "save_fig(fig, \"dag_heatmaps_grid\")\n"
+    "plt.show()"
+)
+
+c2 = (
+    "# ---- SHD across training -----------------------------------------------------------------\n"
+    "fig, ax = plt.subplots(figsize=(7.6, 3.8))\n"
+    "ax.plot(EPOCHS, SHD_ALL[:, 0], color=OKABE_ITO[0], lw=1.5, label=\"SHD (total)\")\n"
+    "ax.plot(EPOCHS, SHD_ALL[:, 1], color=OKABE_ITO[1], lw=1.1, ls=\"--\",\n"
+    "        label=\"false positives\")\n"
+    "ax.plot(EPOCHS, SHD_ALL[:, 2], color=OKABE_ITO[3], lw=1.1, ls=\":\",\n"
+    "        label=\"false negatives\")\n"
+    "ax.axhline(int(GT.sum()), color=\"#999999\", lw=0.8, ls=\"-.\",\n"
+    "           label=f\"GT edges ({int(GT.sum())})\")\n"
+    "ax.set_xlim(min(EPOCHS), max(EPOCHS))\n"
+    "ax.set_xlabel(\"epoch [-]\")\n"
+    "ax.set_ylabel(\"SHD [edges]\")\n"
+    "ax.set_title(\"DAG recovery across training\")\n"
+    "ax.legend(fontsize=9)\n"
+    "fig.tight_layout()\n"
+    "save_fig(fig, \"shd_over_training\")\n"
+    "plt.show()\n"
+    "\n"
+    "i_best = int(SHD_ALL[:, 0].argmin())\n"
+    "print(f\"best SHD {SHD_ALL[i_best, 0]} @ epoch {EPOCHS[i_best]} \"\n"
+    "      f\"(final {SHD_ALL[-1, 0]})\")"
+)
+
+cells = [nbf.v4.new_code_cell(c) for c in (c1, c2)]
+nbf.write(nbf.v4.new_notebook(cells=cells), "scripts/_nb_part9.ipynb")
+print("part9 ok")

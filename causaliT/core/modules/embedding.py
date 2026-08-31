@@ -8,6 +8,7 @@ import sys
 # root_path = dirname(dirname(dirname(abspath(__file__))))
 # sys.path.append(root_path)
 from causaliT.core.modules.embedding_layers import SinusoidalPosition, identity_emb, nn_embedding, linear_emb, mlp_emb, mlp_per_node_emb
+from causaliT.core.modules.embedding_layers import linear_per_node_emb
 
 
 class EmbeddingMap(nn.Module):
@@ -135,7 +136,7 @@ class ModularEmbedding(nn.Module):
                 assert role_ in ["structure", "value"], f"Invalid role '{role_}' for SVFA mode. Must be 'structure' or 'value'."
             
             # assign embedding layers
-            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","identity","linear","mlp","mlp_per_node","pass","value"], AssertionError("Invalid embedding selected!")
+            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","identity","linear","mlp","mlp_per_node","linear_per_node","pass","value"], AssertionError("Invalid embedding selected!")
             
             if embed_ == "mask":
                 self.mask_idx = idx_
@@ -162,6 +163,9 @@ class ModularEmbedding(nn.Module):
             
             if embed_ == "mlp_per_node":
                 emb_module = mlp_per_node_emb
+            if embed_ == "linear_per_node":
+                emb_module = linear_per_node_emb
+
             
             # store value index
             if embed_ == "value":
@@ -182,7 +186,7 @@ class ModularEmbedding(nn.Module):
                 
                 
             if emb_module is not None:
-                if embed_ == "mlp_per_node":
+                if embed_ in ("mlp_per_node", "linear_per_node"):
                     # Per-node value embedding needs the variable-ID column too.
                     # We store it separately and handle it in the forward pass.
                     # The variable-ID column is found from the structure role.

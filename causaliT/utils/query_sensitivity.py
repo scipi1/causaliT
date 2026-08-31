@@ -92,6 +92,9 @@ def scalar_hsic(forecaster, batches) -> float:
                     mode=forecaster.hsic_mode,
                     nhsic_epsilon=forecaster.nhsic_epsilon,
                     source_kernel=forecaster.hsic_kernel_source,
+                    bandwidth_multipliers=getattr(
+                        forecaster, "hsic_bandwidth_multipliers", None
+                    ),
                 ).item()
             )
         )

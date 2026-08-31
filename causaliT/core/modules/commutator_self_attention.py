@@ -233,6 +233,9 @@ class CommutatorSelfAttention(nn.Module):
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+        # BKD keep mask of the last forward: ``(N,)`` float (1 = key kept)
+        # when BKD was applied, else None (see GatedCrossAttention).
+        self.last_bkd_keep: Optional[torch.Tensor] = None
 
         # Diagnostics / regularisation hooks (populated in forward).
         self.score_tensor_for_sparsity: Optional[torch.Tensor] = None
@@ -441,9 +444,11 @@ class CommutatorSelfAttention(nn.Module):
 
         # ---- Batch-consistent key dropout -------------------------------
         bkd_p = self._current_bkd_p()
+        self.last_bkd_keep = None
         if self.training and bkd_p is not None and bkd_p > 0.0:
             keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
             A = A * keep.view(1, 1, N)
+            self.last_bkd_keep = keep
             self._bkd_step += 1
 
         # ---- Attention-weight dropout -----------------------------------

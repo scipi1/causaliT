@@ -553,6 +553,41 @@ adaptive_training:
     # batch_key_dropout_final: 0.0   # anneal target (reached after *_batches)
     # batch_key_dropout_annealing_batches: null   # null = constant p
 
+    # ---- HSIC dropped-key exclusion (pairs with BKD) -----------------------
+    # When BKD drops a key j this batch, HSIC(res_i, source_j) is irreducible:
+    # a parent that is not in the estimation set cannot be regressed out of
+    # the residual.  The pair term adds a p-dependent noise floor, batch
+    # variance and a biased gradient pushing KEPT correlate edges to
+    # compensate for the missing parent - with no learnable signal toward the
+    # dropped edge itself.  This flag removes dropped-source pairs from the
+    # HSIC pair set (plain / descendant-masked and attention-weighted
+    # variants alike).  Validation never applies BKD, so val_hsic stays the
+    # all-sources reference curve.  NOTE: the HSIC term magnitude drops when
+    # enabling this - re-tune lambda_hsic.  Logged as hsic_bkd_kept_frac.
+    # hsic_bkd_exclude_dropped: false
+
+    # ---- Direction-gate bias (per-phase, GatedSelfAttention) ---------------
+    # Setting ``dir_bias`` in ANY phase block puts the run under phase-managed
+    # direction bias: d = sigmoid(A_anti/dir_beta + dir_bias).  Motivation:
+    # with BKD there is no weight rescaling, and the coupled direction gate
+    # starts at E[d]=0.5 ? the X->X path enters reconstruction at HALF the
+    # per-edge magnitude of the (saturated) cross gate, plus wide
+    # Binary-Concrete sampling noise on every self edge.  A positive bias in
+    # reconstruct phases opens both directions (E[d] = sigmoid(b)) so the
+    # regression calibrates on open gates; the two directional contributions
+    # never share a circuit (row-local readouts + per-node heads), so this is
+    # NOT a two-cycle shortcut for the value path.  OMIT it in structure
+    # phases (-> 0.0, the legacy coupled gate) so direction discrimination is
+    # live while theta_S trains.  Applies to the homogeneous single block
+    # (model.attention) and the split-mode self block alike.
+    # NOTE: while dir_bias != 0 the coupling d_ij + d_ji == 1 is relaxed and
+    # thresholded DAG extraction shows both directions mid-run.
+    # Logged as ``dir_bias``.
+    # reconstruct:
+    #   dir_bias: 1.1        # E[d] ~ 0.75 during reconstruction
+    # structure:
+    #   # (omit -> 0.0)
+
 
   structure:
     max_epochs: 200                # per-phase safety cap

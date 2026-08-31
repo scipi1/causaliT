@@ -171,7 +171,8 @@ logger = logging.getLogger(__name__)
 # Numeric encoding of the active phase so it can be logged as a CSV metric
 # alongside the loss curves (strings cannot be logged via ``self.log``).
 # reconstruct -> 0, structure -> 1, final_reconstruct -> 2.
-_PHASE_CODE = {"reconstruct": 0, "structure": 1, "final_reconstruct": 2}
+_PHASE_CODE = {"reconstruct": 0, "structure": 1, "final_reconstruct": 2,
+               "warmup": 3}
 
 
 # =============================================================================
@@ -281,6 +282,19 @@ class PhaseController(Callback):
 
         self.recon_cfg: Dict[str, Any] = _to_plain_container(ad.get("reconstruct", {})) or {}
         self.struct_cfg: Dict[str, Any] = _to_plain_container(ad.get("structure", {})) or {}
+
+        # Dedicated warmup phase (Arm 1): one big reconstruction-only phase
+        # under the periodic (cosine) BKD curriculum with BKD-coupled open
+        # gates, run ONCE before the alternating schedule.  Exits purely on
+        # its epoch budget (the schedule must complete).
+        self.warmup_cfg: Dict[str, Any] = _to_plain_container(ad.get("warmup", {})) or {}
+        self.warmup_enabled: bool = bool(self.warmup_cfg.get("enabled", False))
+        self.warmup_max_epochs: int = int(self.warmup_cfg.get("max_epochs", 100))
+        if self.start_phase == "warmup" and not self.warmup_enabled:
+            raise ValueError(
+                "start_phase='warmup' requires "
+                "adaptive_training.warmup.enabled=true"
+            )
 
         # Reconstruct-phase triggers
         self.recon_max_epochs: int = int(self.recon_cfg.get("max_epochs", 100))
@@ -430,6 +444,20 @@ class PhaseController(Callback):
         # the model was built with (backward compatible).
         self._bkd_managed: bool = any(
             "batch_key_dropout" in cfg
+            for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg,
+                        self.warmup_cfg)
+        )
+
+        # Per-phase direction-gate bias (GatedSelfAttention direction gate).
+        # Managed only when at least one phase block sets ``dir_bias``:
+        # reconstruct phases then run with a positive bias (both directions
+        # open, E[d] = sigmoid(dir_bias) at the symmetric centroid init) so
+        # the X->X path is calibrated near full per-edge magnitude during the
+        # BKD warmup; structure phases should omit it (-> 0.0, the legacy
+        # coupled gate) so direction discrimination is live while theta_S
+        # trains.  Unmanaged runs keep the model default (0.0).
+        self._dir_bias_managed: bool = any(
+            "dir_bias" in cfg
             for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg)
         )
 
@@ -464,7 +492,9 @@ class PhaseController(Callback):
         if not self._bkd_managed:
             return
 
-        if phase == "reconstruct":
+        if phase == "warmup":
+            cfg = self.warmup_cfg
+        elif phase == "reconstruct":
             cfg = self.recon_cfg
         elif phase == "final_reconstruct":
             cfg = {**self.recon_cfg, **self.final_cfg}
@@ -490,12 +520,22 @@ class PhaseController(Callback):
             elif hasattr(mod, "set_bkd_phase_active"):
                 # Inline variant (GatedCrossAttention / GatedSelfAttention).
                 if active:
+                    shape_kw = {}
+                    if "bkd_schedule" in cfg:
+                        shape_kw["schedule"] = str(cfg["bkd_schedule"])
+                    if "bkd_p_base" in cfg:
+                        shape_kw["p_base"] = float(cfg["bkd_p_base"])
+                    if "bkd_amplitude" in cfg:
+                        shape_kw["amp"] = float(cfg["bkd_amplitude"])
+                    if "bkd_cycles" in cfg:
+                        shape_kw["cycles"] = float(cfg["bkd_cycles"])
                     mod.set_bkd_schedule(
                         p0=float(cfg["batch_key_dropout"]),
                         p1=cfg.get("batch_key_dropout_final", None),
                         annealing_batches=cfg.get(
                             "batch_key_dropout_annealing_batches", None
                         ),
+                        **shape_kw,
                     )
                 mod.set_bkd_phase_active(active)
                 n_mod += 1
@@ -510,6 +550,32 @@ class PhaseController(Callback):
         if n_mod > 0:
             pl_module.log(
                 "bkd_phase_active", float(active), on_step=False, on_epoch=True
+            )
+
+    def _apply_open_gate_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Toggle the BKD-coupled open-gate override (warmup phase only).
+
+        Active exactly when the phase is ``warmup`` and the warmup block sets
+        ``open_gate_bkd_coupled: true``.  The constant c_end is auto-measured
+        by the gated module on its first forward (the frozen learned-gate
+        init value), so the warmup -> structure switch is continuous.
+        """
+        active = phase == "warmup" and bool(
+            self.warmup_cfg.get("open_gate_bkd_coupled", False)
+        )
+        n_mod = 0
+        for mod in pl_module.modules():
+            if hasattr(mod, "set_open_gate_mode"):
+                mod.set_open_gate_mode(active)
+                n_mod += 1
+        if active and n_mod == 0:
+            logger.warning(
+                "[adaptive] warmup.open_gate_bkd_coupled set but no gated "
+                "attention module (GatedSelfAttention) found."
+            )
+        if n_mod:
+            pl_module.log(
+                "open_gate_active", float(active), on_step=False, on_epoch=True
             )
 
     def _log_bkd_p(self, pl_module: pl.LightningModule) -> None:
@@ -534,6 +600,39 @@ class PhaseController(Callback):
             pl_module.log(
                 "bkd_p", float(np.mean(ps)), on_step=False, on_epoch=True
             )
+
+    def _apply_dir_bias_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Apply the per-phase direction-gate bias (no-op when the run does
+        not manage it ? i.e. no phase block sets ``dir_bias``).
+
+        A phase block that omits ``dir_bias`` gets 0.0 (the legacy coupled
+        direction gate, ``d_ij + d_ji == 1``).  Applies to every module
+        exposing ``set_dir_bias`` (GatedSelfAttention ? including the
+        homogeneous single block, which lives in ``model.attention``).
+        """
+        if not self._dir_bias_managed:
+            return
+        if phase == "reconstruct":
+            cfg = self.recon_cfg
+        elif phase == "final_reconstruct":
+            cfg = {**self.recon_cfg, **self.final_cfg}
+        else:
+            cfg = self.struct_cfg
+        value = float(cfg.get("dir_bias", 0.0) or 0.0)
+
+        n_mod = 0
+        for mod in pl_module.modules():
+            if hasattr(mod, "set_dir_bias"):
+                mod.set_dir_bias(value)
+                n_mod += 1
+        if n_mod == 0:
+            logger.warning(
+                "[adaptive] dir_bias set in the '%s' phase config but the "
+                "model owns no direction-gated module (GatedSelfAttention).",
+                phase,
+            )
+        else:
+            pl_module.log("dir_bias", value, on_step=False, on_epoch=True)
 
     def _resolve_param_groups(self, pl_module: pl.LightningModule):
         struct = getattr(pl_module, "_structural_params", None)
@@ -584,6 +683,22 @@ class PhaseController(Callback):
         "hsic_descendant_warmup_epochs",
         "hsic_descendant_min_kept_frac",
         "hsic_descendant_ema",
+    )
+
+    # LOO conditional-HSIC gate knobs that may be overridden PER PHASE.
+    # See AttentionSelectorForecaster._compute_loo_gamma and
+    # docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md.  Same rationale as the
+    # descendant mask: gamma is measured against the CURRENT predictor and
+    # adjacency, so it should typically stay OFF during warmup / high-BKD
+    # phases and switch ON in later structure phases (under BKD the
+    # "redundant" twins are functionally load-bearing — see the BKD
+    # interaction discussion in the counter-proposal).
+    _LOO_GATE_KEYS = (
+        "use_loo_gamma_gate",
+        "loo_gamma_topk",
+        "loo_gamma_refresh",
+        "loo_gamma_permutations",
+        "loo_gamma_ema",
     )
 
     def _gated_struct_cfg(self, pl_module: pl.LightningModule) -> Dict[str, Any]:
@@ -671,6 +786,76 @@ class PhaseController(Callback):
             setattr(pl_module, "_descendant_ema_score", None)
 
         logger.info("[adaptive] descendant-HSIC overrides applied: %s", applied)
+
+    def _apply_loo_gate_cfg(
+        self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
+    ) -> None:
+        """Apply per-phase LOO-gamma-gate overrides (no-op when unspecified).
+
+        Mirrors :meth:`_apply_descendant_mask_cfg`.  Changing the gate
+        settings invalidates the cached EMA, so ``_loo_gamma_cache`` is reset
+        at the switch.
+        """
+        if not any(k in phase_cfg for k in self._LOO_GATE_KEYS):
+            return
+        if not hasattr(pl_module, "use_loo_gamma_gate"):
+            logger.warning(
+                "[adaptive] LOO-gamma keys present in the phase config but "
+                "the forecaster (%s) does not support them — ignoring.",
+                type(pl_module).__name__,
+            )
+            return
+
+        applied: Dict[str, Any] = {}
+        for key in self._LOO_GATE_KEYS:
+            if key not in phase_cfg:
+                continue
+            raw = phase_cfg[key]
+            if key == "use_loo_gamma_gate":
+                val: Any = bool(raw)
+            elif key == "loo_gamma_ema":
+                val = float(raw)
+            elif key == "loo_gamma_topk":
+                val = None if raw is None else int(raw)
+            else:
+                val = int(raw)
+            setattr(pl_module, key, val)
+            applied[key] = val
+
+        if hasattr(pl_module, "_loo_gamma_cache"):
+            setattr(pl_module, "_loo_gamma_cache", None)
+
+        logger.info("[adaptive] LOO-gamma overrides applied: %s", applied)
+
+    def _apply_hsic_bw_cfg(
+        self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
+    ) -> None:
+        """Per-phase HSIC bandwidth freeze (``hsic_freeze_bandwidth: true``).
+
+        Mirrors :meth:`_apply_loo_gate_cfg`.  When a phase block enables it
+        (typically ``structure``), the forecaster lazily latches the
+        per-variable median-heuristic bandwidths on the phase's first train
+        batch and runs the whole phase with them fixed (restores the
+        residual-magnitude channel of the HSIC gradient and makes the HSIC
+        metric comparable within the phase).  Entering a phase without the key
+        restores the previous (adaptive) setting.
+        """
+        if not hasattr(pl_module, "hsic_freeze_bandwidth"):
+            return
+        want = bool(phase_cfg.get("hsic_freeze_bandwidth", False))
+        current = bool(getattr(pl_module, "hsic_freeze_bandwidth", False))
+        if want == current:
+            return
+        pl_module.hsic_freeze_bandwidth = want
+        if want:
+            # Force a re-latch on this phase's first train batch.
+            pl_module._hsic_bw_frozen_sigmas = None
+            logger.info("[adaptive] HSIC bandwidth freeze ENABLED for this "
+                        "phase (latches on the first train batch).")
+        else:
+            pl_module.restore_hsic_bandwidth()
+            logger.info("[adaptive] HSIC bandwidth freeze disabled; previous "
+                        "(adaptive) bandwidth setting restored.")
 
     def _apply_descendant_warmup_anchor(
         self, trainer: pl.Trainer, pl_module: pl.LightningModule
@@ -786,7 +971,7 @@ class PhaseController(Callback):
             pl_module.nodewise_reset_stats()
 
 
-        if phase in ("reconstruct", "final_reconstruct"):
+        if phase in ("reconstruct", "final_reconstruct", "warmup"):
             for p in struct_params:
                 p.requires_grad_(False)
             for p in recon_params:
@@ -796,10 +981,12 @@ class PhaseController(Callback):
             # The final phase inherits the reconstruct block's settings and lets
             # its own block override individual keys.
             mask_cfg = (
-                self.recon_cfg if phase == "reconstruct"
+                self.recon_cfg if phase in ("reconstruct", "warmup")
                 else {**self.recon_cfg, **self.final_cfg}
             )
             self._apply_descendant_mask_cfg(pl_module, mask_cfg)
+            self._apply_loo_gate_cfg(pl_module, mask_cfg)
+            self._apply_hsic_bw_cfg(pl_module, mask_cfg)
         elif phase == "structure":
             for p in recon_params:
                 p.requires_grad_(False)
@@ -811,6 +998,8 @@ class PhaseController(Callback):
             # ...and the structure-phase descendant-exclusion settings.
             self._struct_phase_count += 1
             self._apply_descendant_mask_cfg(pl_module, self.struct_cfg)
+            self._apply_loo_gate_cfg(pl_module, self.struct_cfg)
+            self._apply_hsic_bw_cfg(pl_module, self.struct_cfg)
             # Anchor AFTER the overrides so the warmup value logged/compared is
             # the one this phase will actually use.
             self._apply_descendant_warmup_anchor(trainer, pl_module)
@@ -820,6 +1009,13 @@ class PhaseController(Callback):
         # Per-phase BKD curriculum (reconstruct: heavy annealed dropout;
         # structure: off).  No-op unless a phase block sets batch_key_dropout.
         self._apply_bkd_cfg(pl_module, phase)
+
+        # BKD-coupled open gates (dedicated warmup phase only).
+        self._apply_open_gate_cfg(pl_module, phase)
+
+        # Per-phase direction-gate bias (reconstruct: open both directions;
+        # structure: unbiased).  No-op unless a phase block sets dir_bias.
+        self._apply_dir_bias_cfg(pl_module, phase)
 
         # Optionally clear stale optimizer moment estimates at the switch.
         # Optimizer.state must remain a defaultdict(dict); a plain {} would
@@ -870,8 +1066,11 @@ class PhaseController(Callback):
         recon->struct pairing ``_cycle_count`` is constant, so the two phases
         always train on disjoint subsets — structure never reuses the split of
         the reconstruction that preceded it.  ``final_reconstruct`` (full
-        training set) is never swapped.
+        training set) is never swapped.  ``warmup`` always uses the
+        reconstruct subset (and is never swapped: it runs before cycle 1).
         """
+        if phase == "warmup":
+            return "reconstruct"
         if (
             self.swap_splits
             and phase in ("reconstruct", "structure")
@@ -1080,6 +1279,25 @@ class PhaseController(Callback):
             )
             self._phase_index += 1
             self._apply_phase(trainer, pl_module, "final_reconstruct")
+            return
+
+        # ---------- Warmup phase: fixed budget -> structure ----------------
+        # The cosine BKD curriculum must run to completion, so the ONLY exit
+        # is the epoch budget (no plateau early-exit).
+        if self.current_phase == "warmup":
+            for mod in pl_module.modules():
+                if getattr(mod, "last_open_gate_c", None) is not None:
+                    pl_module.log("open_gate_c", float(mod.last_open_gate_c),
+                                  on_step=False, on_epoch=True)
+                    break
+            if phase_epochs >= self.warmup_max_epochs:
+                self._record_transition(
+                    trainer, pl_module, "warmup_budget",
+                    from_phase="warmup", to_phase="structure",
+                    monitor_val=current,
+                )
+                self._phase_index += 1
+                self._apply_phase(trainer, pl_module, "structure")
             return
 
         # ---------------- Reconstruct phase: plateau / budget ----------------

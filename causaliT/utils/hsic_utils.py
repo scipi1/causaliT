@@ -27,9 +27,11 @@ during training, preventing the kernel matrix from collapsing to all-ones.
 Config options:
     hsic_mode: "biased" | "normalized"  (default: "biased")
     nhsic_epsilon: float  (regularization for nHSIC, default: 0.01)
+    hsic_bandwidth_multipliers: optional positive scales for multi-bandwidth RBF
+        (e.g. [0.5, 1.0, 2.0] applied to the fixed/median base bandwidth)
 """
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -85,6 +87,46 @@ def rbf_kernel(x: torch.Tensor, sigma: float) -> torch.Tensor:
     x = x.unsqueeze(1)  # (n, 1)
     dists_sq = (x - x.T) ** 2  # (n, n) pairwise squared distances
     return torch.exp(-dists_sq / (2 * sigma ** 2))
+
+
+def _validate_bandwidth_multipliers(
+    bandwidth_multipliers: Optional[Sequence[float]],
+) -> Optional[tuple]:
+    """Validate multipliers applied to the base RBF bandwidth.
+
+    ``None`` disables the multiscale path and preserves the legacy kernel.
+    An empty sequence is treated the same way, which is convenient for configs.
+    """
+    if bandwidth_multipliers is None:
+        return None
+    multipliers = tuple(float(m) for m in bandwidth_multipliers)
+    if not multipliers:
+        return None
+    if any(m <= 0.0 for m in multipliers):
+        raise ValueError(
+            "hsic bandwidth multipliers must all be positive, got "
+            f"{multipliers}"
+        )
+    return multipliers
+
+
+def rbf_multiscale_kernel(
+    x: torch.Tensor,
+    sigma: float,
+    bandwidth_multipliers: Sequence[float],
+) -> torch.Tensor:
+    """Mean of RBF kernels evaluated at several scaled bandwidths.
+
+    Each component has unit diagonal, so the averaged kernel also has unit
+    diagonal.  The multipliers scale the base bandwidth (fixed ``sigma`` or
+    the median heuristic), giving sensitivity to both narrower and broader
+    dependence structure without changing the HSIC estimator itself.
+    """
+    multipliers = _validate_bandwidth_multipliers(bandwidth_multipliers)
+    if multipliers is None:
+        return rbf_kernel(x, sigma)
+    kernels = [rbf_kernel(x, sigma * m) for m in multipliers]
+    return torch.stack(kernels, dim=0).mean(dim=0)
 
 
 def dirac_kernel(x: torch.Tensor, tolerance: float = 1e-5) -> torch.Tensor:
@@ -162,28 +204,44 @@ def _compute_kernel_matrices(
     y: torch.Tensor,
     sigma: float = 1.0,
     adaptive_bandwidth: bool = False,
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> tuple:
     """
     Compute RBF kernel matrices for x and y.
 
-    Shared helper that handles adaptive bandwidth selection.
+    Shared helper that handles adaptive bandwidth selection and the optional
+    multiscale RBF mixture.
 
     Args:
         x, y: 1D tensors of shape (n,)
         sigma: Fixed bandwidth (used when adaptive_bandwidth=False)
         adaptive_bandwidth: If True, use median heuristic per variable
+        bandwidth_multipliers: Optional positive scales applied to the base
+            bandwidth.  None/empty preserves the legacy single-bandwidth RBF.
 
     Returns:
         (K, L): Kernel matrices of shape (n, n) each
     """
+    multipliers = _validate_bandwidth_multipliers(bandwidth_multipliers)
     if adaptive_bandwidth:
         sigma_x = _median_bandwidth(x)
         sigma_y = _median_bandwidth(y)
+    elif isinstance(sigma, (list, tuple)):
+        # Frozen per-side bandwidths, e.g. latched at the start of a training
+        # stage: (sigma_source, sigma_residual).  Freezing restores the
+        # residual-magnitude channel of the HSIC gradient that the per-batch
+        # median heuristic divides out (RBF + median heuristic is exactly
+        # scale-equivariant).
+        sigma_x, sigma_y = sigma[0], sigma[1]
+    else:
+        sigma_x = sigma_y = sigma
+
+    if multipliers is None:
         K = rbf_kernel(x, sigma_x)
         L = rbf_kernel(y, sigma_y)
     else:
-        K = rbf_kernel(x, sigma)
-        L = rbf_kernel(y, sigma)
+        K = rbf_multiscale_kernel(x, sigma_x, multipliers)
+        L = rbf_multiscale_kernel(y, sigma_y, multipliers)
     return K, L
 
 
@@ -194,6 +252,7 @@ def hsic(
     adaptive_bandwidth: bool = False,
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """
     Compute differentiable HSIC (Hilbert-Schmidt Independence Criterion).
@@ -245,7 +304,9 @@ def hsic(
         >>> nhsic_val = hsic(x, y_dep, mode="normalized", adaptive_bandwidth=True)
     """
     n = len(x)
-    K, L = _compute_kernel_matrices(x, y, sigma, adaptive_bandwidth)
+    K, L = _compute_kernel_matrices(
+        x, y, sigma, adaptive_bandwidth, bandwidth_multipliers
+    )
 
     # Centering matrix H = I - (1/n) * 1*1^T
     H = torch.eye(n, device=x.device, dtype=x.dtype) - torch.ones(n, n, device=x.device, dtype=x.dtype) / n
@@ -283,6 +344,7 @@ def _compute_cross_hsic_pair(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """
     Compute HSIC for a single (source, residual) pair with kernel selection.
@@ -308,14 +370,17 @@ def _compute_cross_hsic_pair(
         K = dirac_kernel(s_i)
         if adaptive_bandwidth:
             sigma_res = _median_bandwidth(res_j)
+        elif isinstance(sigma, (list, tuple)):
+            sigma_res = sigma[1]
         else:
             sigma_res = sigma
-        L = rbf_kernel(res_j, sigma_res)
+        L = rbf_multiscale_kernel(res_j, sigma_res, bandwidth_multipliers)
         return hsic_from_kernels(K, L, mode=mode, nhsic_epsilon=nhsic_epsilon)
     else:
         # Standard: RBF for both
         return hsic(s_i, res_j, sigma=sigma, adaptive_bandwidth=adaptive_bandwidth,
-                    mode=mode, nhsic_epsilon=nhsic_epsilon)
+                    mode=mode, nhsic_epsilon=nhsic_epsilon,
+                    bandwidth_multipliers=bandwidth_multipliers)
 
 
 def hsic_pair_matrix(
@@ -326,6 +391,7 @@ def hsic_pair_matrix(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
     exclude_diagonal: bool = False,
     pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -384,15 +450,25 @@ def hsic_pair_matrix(
                 vals.append(torch.tensor(float("nan"), device=source_values.device, dtype=source_values.dtype))
                 continue
             source_i = source_values[:, i]
+            # Per-variable frozen bandwidths: sigma may be (src, res) where each
+            # side is a scalar or a 1D tensor/list indexed by variable.
+            sig = sigma
+            if isinstance(sigma, (list, tuple)) and not adaptive_bandwidth:
+                s_src, s_res = sigma
+                sig = (s_src[i] if torch.is_tensor(s_src) or isinstance(s_src, (list, tuple))
+                       else s_src,
+                       s_res[j] if torch.is_tensor(s_res) or isinstance(s_res, (list, tuple))
+                       else s_res)
             vals.append(
                 _compute_cross_hsic_pair(
                     source_i,
                     res_j,
-                    sigma=sigma,
+                    sigma=sig,
                     adaptive_bandwidth=adaptive_bandwidth,
                     mode=mode,
                     nhsic_epsilon=nhsic_epsilon,
                     source_kernel=source_kernel,
+                    bandwidth_multipliers=bandwidth_multipliers,
                 )
             )
         rows.append(torch.stack(vals))
@@ -410,6 +486,7 @@ def hsic_cross_per_pair(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
     pair_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
@@ -461,6 +538,7 @@ def hsic_cross_per_pair(
         mode=mode,
         nhsic_epsilon=nhsic_epsilon,
         source_kernel=source_kernel,
+        bandwidth_multipliers=bandwidth_multipliers,
         exclude_diagonal=False,
         pair_mask=pair_mask,
     )
@@ -491,6 +569,7 @@ def hsic_per_token(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """
     Compute HSIC between each token position in S and the mean residuals.
@@ -520,7 +599,8 @@ def hsic_per_token(
         s_token = s_values[:, i]  # (batch,)
         hsic_i = _compute_cross_hsic_pair(
             s_token, residuals, sigma=sigma, adaptive_bandwidth=adaptive_bandwidth,
-            mode=mode, nhsic_epsilon=nhsic_epsilon, source_kernel=source_kernel)
+            mode=mode, nhsic_epsilon=nhsic_epsilon, source_kernel=source_kernel,
+            bandwidth_multipliers=bandwidth_multipliers)
         hsic_values.append(hsic_i)
 
     # Return mean across all positions
@@ -534,6 +614,7 @@ def hsic_per_x_pair(
     adaptive_bandwidth: bool = False,
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """
     Compute HSIC between X values and per-X residuals for self-attention DAG validation.
@@ -569,6 +650,7 @@ def hsic_per_x_pair(
         mode=mode,
         nhsic_epsilon=nhsic_epsilon,
         source_kernel="rbf",
+        bandwidth_multipliers=bandwidth_multipliers,
         exclude_diagonal=True,
     )
 
@@ -590,6 +672,7 @@ def hsic_attention_weighted(
     mode: str = "biased",
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
 ) -> torch.Tensor:
     """
     Attention-weighted HSIC for causal structure regularization.
@@ -636,6 +719,7 @@ def hsic_attention_weighted(
         mode=mode,
         nhsic_epsilon=nhsic_epsilon,
         source_kernel=effective_source_kernel,
+        bandwidth_multipliers=bandwidth_multipliers,
         exclude_diagonal=exclude_diagonal,
     )
 
@@ -655,3 +739,123 @@ def hsic_attention_weighted(
         return weighted_hsic_sum / weight_sum
     else:
         return torch.tensor(0.0, device=source_values.device, dtype=source_values.dtype)
+
+# ---------------------------------------------------------------------------
+# Null calibration for the LOO Bayes multiplier
+# (see docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md, Section 3)
+# ---------------------------------------------------------------------------
+
+
+def hsic_null_calibration(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sigma: float = 1.0,
+    adaptive_bandwidth: bool = True,
+    n_permutations: int = 100,
+    generator: Optional[torch.Generator] = None,
+    chunk: int = 10,
+) -> dict:
+    """Biased HSIC with a permutation-calibrated gamma null.
+
+    Computes the biased HSIC statistic for ``(x, y)`` and calibrates its null
+    distribution empirically: ``y`` is permuted ``n_permutations`` times and
+    the gamma null density is moment-matched to the permutation statistics.
+    This replaces the hand-tuned ``exp(-lambda * H)`` pseudo-likelihood of the
+    original proposal with a real density under the independence model.
+
+    Only the biased estimator is supported: its permutation statistics are
+    cheap (O(n^2) per permutation after the kernel matrices are built), while
+    nHSIC would need one O(n^3) linear solve per permutation.
+
+    Args:
+        x, y: 1-D tensors of n samples (detached inside).
+        sigma: RBF bandwidth (ignored when adaptive_bandwidth=True).
+        adaptive_bandwidth: median-heuristic bandwidth (default True).
+        n_permutations: number of permutation statistics for the null.
+        generator: torch.Generator for reproducible permutations.
+        chunk: permutation batch size (memory guard: chunk x n x n tensors).
+
+    Returns:
+        Dict with detached scalars:
+        ``stat`` (HSIC value), ``p_empirical`` ((1 + #{perm >= stat}) / (S+1)),
+        ``p_gamma`` (survival of the fitted gamma at stat),
+        ``log_q0`` (log null density at stat — the "likelihood under
+        independence" for the Bayes multiplier), ``alpha``, ``beta``
+        (gamma shape / rate).
+    """
+    x = x.detach()
+    y = y.detach()
+    n = len(x)
+    K, L = _compute_kernel_matrices(x, y, sigma, adaptive_bandwidth, None)
+    H = torch.eye(n, device=x.device, dtype=x.dtype) - torch.ones(
+        n, n, device=x.device, dtype=x.dtype
+    ) / n
+    K_bar = H @ K @ H
+    L_bar = H @ L @ H
+    norm = (n - 1) ** 2
+    stat = (K_bar * L_bar.T).sum() / norm
+
+    # Permutation statistics: tr(K_bar @ pi L_bar pi^T) / norm, chunked.
+    perm_stats = []
+    remaining = n_permutations
+    while remaining > 0:
+        c = min(chunk, remaining)
+        idx = torch.stack(
+            [torch.randperm(n, generator=generator, device=x.device)
+             for _ in range(c)]
+        )  # (c, n)
+        L_perm = L_bar[idx.unsqueeze(2), idx.unsqueeze(1)]  # (c, n, n)
+        perm_stats.append((K_bar.unsqueeze(0) * L_perm).sum(dim=(-1, -2)) / norm)
+        remaining -= c
+    perm_stats = torch.cat(perm_stats)
+
+    # Moment-matched gamma fit to the permutation null.
+    mu = perm_stats.mean()
+    var = perm_stats.var(unbiased=False).clamp_min(1e-20)
+    alpha = (mu * mu / var).clamp_min(1e-6)          # shape
+    beta = (mu / var).clamp_min(1e-12)               # rate
+
+    stat_c = stat.clamp_min(1e-30)
+    log_q0 = (
+        (alpha - 1.0) * torch.log(stat_c)
+        - beta * stat
+        + alpha * torch.log(beta)
+        - torch.lgamma(alpha)
+    )
+    p_gamma = torch.special.gammaincc(alpha, beta * stat).clamp(1e-12, 1.0)
+    p_empirical = (1.0 + (perm_stats >= stat).sum()) / (n_permutations + 1.0)
+
+    return {
+        "stat": stat,
+        "p_empirical": p_empirical,
+        "p_gamma": p_gamma,
+        "log_q0": log_q0,
+        "alpha": alpha,
+        "beta": beta,
+    }
+
+
+def bayes_multiplier(
+    log_q0_plus: torch.Tensor,
+    log_q0_minus: torch.Tensor,
+    p_m: torch.Tensor,
+) -> torch.Tensor:
+    """Bayes edge multiplier gamma from calibrated null log-densities.
+
+        gamma = q0(H+) * P_m / (q0(H+) * P_m + q0(H^{-i}) * (1 - P_m))
+
+    computed in log-space (log-sum-exp).  All inputs are treated as constants
+    (detached); the result carries no gradient.  ``p_m`` is clamped away from
+    exactly 0/1 for the log transform, which leaves gamma numerically 0 resp.
+    1 at the extremes.
+
+    Semantics: gamma -> 1 when the edge is load-bearing (the masked residual
+    is dependent, so the null density at H^{-i} vanishes); gamma -> P_m when
+    the two worlds are indistinguishable (redundant edge — pruning is left to
+    the sparsity prior, NOT to this multiplier).
+    """
+    p = p_m.detach().clamp(1e-8, 1.0 - 1e-8)
+    log_num = log_q0_plus.detach() + torch.log(p)
+    log_den = torch.logaddexp(log_num, log_q0_minus.detach() + torch.log1p(-p))
+    return torch.exp(log_num - log_den).clamp(0.0, 1.0)
+

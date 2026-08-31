@@ -99,6 +99,16 @@ class GatedSelfAttention(nn.Module):
         zeta: float = DEFAULT_GATE_ZETA,         # stretch upper bound (> 1)
         # Direction-gate Binary-Concrete temperature (coupled stochastic).
         dir_tau: float = DEFAULT_DIR_TAU,        # beta_dir
+        # Additive bias on the direction-gate logit:
+        # ``d = sigmoid(A_anti / dir_beta + dir_bias)``.  0.0 (default) is the
+        # legacy coupled gate (``d_ij + d_ji == 1`` per sample).  A positive
+        # bias opens BOTH directions (``E[d] = sigmoid(dir_bias)`` at the
+        # symmetric centroid init) so the self path enters reconstruction near
+        # full magnitude during BKD warmups; the bias must be annealed to 0
+        # for structure phases (the adaptive trainer phase controller does
+        # this via :meth:`set_dir_bias`).  While nonzero the Toeplitz
+        # two-cycle-suppression coupling is relaxed.
+        dir_bias: float = 0.0,
 
         # Centroid-collapse fix (structure score only): L2-normalise the query
         # so its DIRECTION, not its norm, drives selection, and use a fixed
@@ -153,6 +163,9 @@ class GatedSelfAttention(nn.Module):
         self.gamma = float(gamma)
         self.zeta = float(zeta)
         self.dir_beta = float(dir_tau)
+        # Direction-gate logit bias (see __init__); runtime-adjustable via
+        # set_dir_bias (adaptive-trainer phase controller).
+        self.dir_bias = float(dir_bias)
 
         # Centroid-collapse fix (structure score only); see __init__ doc.
         self.normalize_query = bool(normalize_query)
@@ -191,6 +204,29 @@ class GatedSelfAttention(nn.Module):
         # Phase switch (adaptive trainer): when False, BKD is not applied but
         # the annealing clock keeps advancing (global run-level schedule).
         self._bkd_phase_active: bool = True
+        # BKD keep mask of the last forward: ``(N,)`` float (1 = key kept)
+        # when BKD was applied, else None (see GatedCrossAttention).
+        self.last_bkd_keep: Optional[torch.Tensor] = None
+
+        # BKD schedule shape: "linear" (legacy default) or "cosine" — a
+        # periodic warmup curriculum oscillating in [p_base - amp, p_base + amp]
+        # with a linearly decaying envelope, landing exactly on p1 at t = T.
+        self._bkd_schedule: str = "linear"
+        self._bkd_p_base: Optional[float] = None
+        self._bkd_amp: Optional[float] = None
+        self._bkd_cycles: Optional[float] = None
+
+        # Open-gate override (dedicated warmup phase): when active the learned
+        # structure gate is replaced by the BKD-coupled constant
+        #   c(t) = c_end + (1 - c_end) * (p(t) - p_end) / (p_max - p_end)
+        # i.e. fully open (~1) at high key dropout, equal to c_end — the value
+        # the (frozen) learned gates hold at the warmup -> structure switch —
+        # at p_end.  The constant carries no structural gradient.  c_end=None
+        # -> auto-measured from the learned gate posterior on the first forward.
+        self._open_gate_active: bool = False
+        self._open_gate_c_end: Optional[float] = None
+        self.last_open_gate_c: Optional[float] = None
+
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
@@ -223,6 +259,17 @@ class GatedSelfAttention(nn.Module):
         if self._bkd_anneal is None or self._bkd_anneal <= 0:
             return float(self._bkd_p0)
         frac = min(1.0, float(self._bkd_step.item()) / float(self._bkd_anneal))
+        if self._bkd_schedule == "cosine":
+            # Periodic warmup curriculum: oscillates in [p_base - amp,
+            # p_base + amp] under a linearly decaying envelope, landing
+            # exactly on p1 (p_end) at frac = 1.
+            p_end = float(self._bkd_p1)
+            p_base = (float(self._bkd_p_base) if self._bkd_p_base is not None
+                      else float(self._bkd_p0))
+            amp = float(self._bkd_amp) if self._bkd_amp is not None else 0.0
+            cycles = float(self._bkd_cycles) if self._bkd_cycles else 1.0
+            osc = 0.5 * (1.0 + math.cos(2.0 * math.pi * cycles * frac))
+            return p_end + (1.0 - frac) * ((p_base - p_end) + amp * osc)
         return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
 
     def set_bkd_schedule(
@@ -230,17 +277,54 @@ class GatedSelfAttention(nn.Module):
         p0: Optional[float],
         p1: Optional[float] = None,
         annealing_batches: Optional[int] = None,
+        schedule: str = "linear",
+        p_base: Optional[float] = None,
+        amp: Optional[float] = None,
+        cycles: Optional[float] = None,
     ) -> None:
         """Override the BKD schedule at run time (adaptive-trainer phase
         controller).  The step counter is NOT reset: the anneal stays a
-        global, run-level clock."""
+        global, run-level clock.
+
+        ``schedule="cosine"`` selects the periodic warmup curriculum (see
+        ``_current_bkd_p``); ``p_base``/``amp``/``cycles`` are its
+        oscillation center / amplitude / period count and ``p1`` is the
+        landing value (p_end)."""
         self._bkd_p0 = p0
         self._bkd_p1 = p1 if p1 is not None else p0
         self._bkd_anneal = annealing_batches
+        self._bkd_schedule = str(schedule)
+        self._bkd_p_base = p_base
+        self._bkd_amp = amp
+        self._bkd_cycles = cycles
 
     def set_bkd_phase_active(self, active: bool) -> None:
         """Enable/disable BKD application for the current training phase."""
         self._bkd_phase_active = bool(active)
+
+    def set_open_gate_mode(
+        self, active: bool, c_end: Optional[float] = None
+    ) -> None:
+        """Toggle the BKD-coupled open-gate override (warmup phase).
+
+        When active, forward() replaces the learned structure gate with the
+        constant ``c(t) = c_end + (1-c_end)*(p(t)-p_end)/(p_max-p_end)``
+        read live from the BKD schedule.  ``c_end=None`` auto-measures the
+        learned gate posterior (mean off-diagonal) on the first forward —
+        the gates are frozen all warmup, so this is exactly the value they
+        hold at the warmup -> structure switch (continuity by construction).
+        Deactivating restores the learned gates.
+        """
+        self._open_gate_active = bool(active)
+        if c_end is not None:
+            self._open_gate_c_end = float(c_end)
+        if not active:
+            self.last_open_gate_c = None
+
+    def set_dir_bias(self, value: float) -> None:
+        """Set the direction-gate logit bias (adaptive-trainer phase
+        controller).  0.0 restores the legacy coupled gate."""
+        self.dir_bias = float(value)
 
     # ------------------------------------------------------------------
     # Noise helpers (upper-triangle draws mirrored to enforce pair-consistency)
@@ -337,7 +421,9 @@ class GatedSelfAttention(nn.Module):
         raw = self._structural_raw(query, key)
         S_sym = 0.5 * (raw + raw.transpose(-1, -2))
         A_anti = 0.5 * (raw - raw.transpose(-1, -2))
-        pi = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(A_anti / self.dir_beta)
+        pi = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(
+            A_anti / self.dir_beta + self.dir_bias
+        )
         n = pi.shape[-1]
         pi = pi.masked_fill(
             torch.eye(n, device=pi.device, dtype=torch.bool).unsqueeze(0), 0.0
@@ -437,6 +523,41 @@ class GatedSelfAttention(nn.Module):
             p_edge_undirected = torch.full_like(S_sym, c)
             direction = torch.full_like(S_sym, 0.5)
             p_directed = torch.full_like(S_sym, c) * direction
+        elif self._open_gate_active:
+            # ---- BKD-coupled open gates (dedicated warmup phase) --------
+            p_now = self._current_bkd_p()
+            p_end = float(self._bkd_p1) if self._bkd_p1 is not None else 0.0
+            _p_base = (
+                self._bkd_p_base if self._bkd_p_base is not None else self._bkd_p0
+            )
+            p_max = (
+                float(_p_base) + float(self._bkd_amp or 0.0)
+                if _p_base is not None
+                else None
+            )
+            if self._open_gate_c_end is None:
+                # Auto-measure c_end: the learned-gate eval posterior, mean
+                # over off-diagonal entries, at the CURRENT (init) structural
+                # state.  The gates are frozen for the whole warmup, so this
+                # is exactly the value they will hold at the switch.
+                with torch.no_grad():
+                    pi0 = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(
+                        A_anti / self.dir_beta + self.dir_bias
+                    )
+                    off = ~torch.eye(N, device=pi0.device, dtype=torch.bool)
+                    self._open_gate_c_end = float(pi0[:, off].mean())
+            if p_now is None or p_max is None or p_max <= p_end:
+                c = self._open_gate_c_end
+            else:
+                c = self._open_gate_c_end + (1.0 - self._open_gate_c_end) * (
+                    p_now - p_end
+                ) / (p_max - p_end)
+            c = float(min(max(c, 0.0), 1.0))
+            self.last_open_gate_c = c
+            structure = torch.full_like(S_sym, c)
+            p_edge_undirected = torch.full_like(S_sym, c)
+            direction = torch.full_like(S_sym, 0.5)
+            p_directed = torch.full_like(S_sym, c) * direction
         else:
             # ---- Existence gate: SYMMETRIC Hard-Concrete -----------------
             if self.training:
@@ -454,9 +575,11 @@ class GatedSelfAttention(nn.Module):
                 eps_d = self._antisymmetric_noise(
                     (B, N, N), device=A_anti.device, dtype=A_anti.dtype
                 )
-                direction = torch.sigmoid((eps_d + A_anti) / self.dir_beta)
+                direction = torch.sigmoid(
+                    (eps_d + A_anti) / self.dir_beta + self.dir_bias
+                )
             else:
-                direction = torch.sigmoid(A_anti / self.dir_beta)
+                direction = torch.sigmoid(A_anti / self.dir_beta + self.dir_bias)
 
             structure = z_edge * direction                        # directed structure gate
 
@@ -502,6 +625,7 @@ class GatedSelfAttention(nn.Module):
 
         # ---- Batch-consistent key dropout -------------------------------
         bkd_p = self._current_bkd_p()
+        self.last_bkd_keep = None
         if self.training and bkd_p is not None:
             # The annealing clock advances in every training phase (global
             # schedule); ``_bkd_phase_active`` only gates the application.
@@ -509,6 +633,7 @@ class GatedSelfAttention(nn.Module):
             if self._bkd_phase_active and bkd_p > 0.0:
                 keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
                 A = A * keep.view(1, 1, N)
+                self.last_bkd_keep = keep
 
         # ---- Attention-weight dropout -----------------------------------
         A = self.dropout(A)

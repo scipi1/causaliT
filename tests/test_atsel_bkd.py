@@ -438,3 +438,185 @@ class TestBKDStageTransitionStateDict:
 
         # Strict load must succeed (step counter is reset to 0 from current model).
         model_with_bkd.load_state_dict(fake_checkpoint["state_dict"], strict=True)
+
+
+# ---------------------------------------------------------------------------
+# BKD dropped-key exclusion from the HSIC pair set
+# ---------------------------------------------------------------------------
+
+class TestBKDHsicExclusion:
+    """hsic_bkd_exclude_dropped: exclude BKD-dropped sources from HSIC."""
+
+    # -- keep-mask export, BatchConsistentKeyDropout sub-module style --------
+    def test_keep_mask_exported_submodule_bkd(self):
+        model = _make_atsel(batch_key_dropout=1.0)
+        S, X, X_blanked = _make_inputs()
+        model.train()
+        model.forward_with_actual(
+            source_tensor=S, x_blanked=X_blanked, x_actual=X
+        )
+        bkd = model.attention.inner_attention.batch_key_dropout
+        assert bkd._last_key_mask is not None
+        assert not bool(bkd._last_key_mask.any()), "p=1.0 must drop every key"
+        model.eval()
+        model.forward_with_actual(
+            source_tensor=S, x_blanked=X_blanked, x_actual=X
+        )
+        assert bkd._last_key_mask is None, "eval must not expose a keep mask"
+
+    # -- keep-mask export, inline-BKD style (GatedSelfAttention) -------------
+    def test_keep_mask_exported_inline_bkd(self):
+        model = _make_atsel(batch_key_dropout=1.0)
+        inner_self = model.self_attention.inner_attention
+        if getattr(inner_self, "_bkd_p0", None) is None:
+            pytest.skip("BKD not wired to the self-attention block here")
+        S, X, X_blanked = _make_inputs()
+        model.train()
+        model.forward_with_actual(
+            source_tensor=S, x_blanked=X_blanked, x_actual=X
+        )
+        keep = getattr(inner_self, "last_bkd_keep", None)
+        assert keep is not None, "inline BKD must export last_bkd_keep"
+        assert float(keep.sum()) == 0.0, "p=1.0 must drop every key"
+        model.eval()
+        model.forward_with_actual(
+            source_tensor=S, x_blanked=X_blanked, x_actual=X
+        )
+        assert inner_self.last_bkd_keep is None, "eval must reset the mask"
+
+    # -- forecaster: feature flag --------------------------------------------
+    def test_exclude_disabled_by_default(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        fc = AttentionSelectorForecaster(
+            _make_forecaster_config(batch_key_dropout=0.5)
+        )
+        assert fc.hsic_bkd_exclude_dropped is False
+        assert fc._build_bkd_keep_mask(3, 6, torch.device("cpu")) is None
+
+    # -- forecaster: split-mode column layout --------------------------------
+    def test_split_mode_column_layout(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=0.5)
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        # Cross-attn (S side): drop S_0 and S_2.  Self-attn (X side): drop X_1.
+        fc.model.attention.inner_attention.last_bkd_keep = torch.tensor(
+            [0.0, 1.0, 0.0]
+        )
+        fc.model.self_attention.inner_attention.last_bkd_keep = torch.tensor(
+            [1.0, 0.0, 1.0]
+        )
+        mask = fc._build_bkd_keep_mask(3, 6, torch.device("cpu"))
+        assert mask is not None and mask.shape == (3, 6)
+        expected = torch.tensor([[0.0, 1.0, 0.0, 1.0, 0.0, 1.0]]).expand(3, 6)
+        assert torch.equal(mask, expected), f"got {mask[0]}"
+
+    def test_module_without_mask_defaults_to_kept(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=0.5)
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.model.attention.inner_attention.last_bkd_keep = torch.tensor(
+            [0.0, 1.0, 1.0]
+        )
+        # self-attention keep mask is None (e.g. eval / no BKD there).
+        fc.model.self_attention.inner_attention.last_bkd_keep = None
+        mask = fc._build_bkd_keep_mask(3, 6, torch.device("cpu"))
+        assert mask is not None
+        assert torch.equal(
+            mask[0], torch.tensor([0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+        ), f"got {mask[0]}"
+
+    # -- forecaster: end-to-end _step with every key dropped -----------------
+    def test_all_dropped_batch_yields_zero_hsic(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=1.0)
+        cfg["training"]["lambda_hsic"] = 0.1
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.log = lambda *a, **k: None  # no trainer attached in tests
+        fc.train()
+        S, X, _ = _make_inputs(S_len=3, X_len=3, batch=4)
+        total_loss, _, _ = fc._step((S, X), "train")
+        assert torch.isfinite(total_loss), f"non-finite loss: {total_loss}"
+        assert fc._last_hsic_bkd_kept_frac == 0.0
+
+    # -- forecaster: no BKD application -> no exclusion ----------------------
+    def test_eval_step_not_excluded(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=1.0)
+        cfg["training"]["lambda_hsic"] = 0.1
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.log = lambda *a, **k: None
+        fc.eval()
+        S, X, _ = _make_inputs(S_len=3, X_len=3, batch=4)
+        total_loss, _, _ = fc._step((S, X), "val")
+        assert torch.isfinite(total_loss)
+        assert fc._last_hsic_bkd_kept_frac == 1.0
+
+
+
+    # -- forecaster: homogeneous-mode AND-combine ----------------------------
+    def test_homogeneous_mode_and_combines(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=0.5)
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.homogeneous_nodes = True
+        # Square layout: cross keep AND self keep (a pair is excluded only
+        # when the key was dropped in EVERY module that could route it).
+        fc.model.attention.inner_attention.last_bkd_keep = torch.tensor(
+            [0.0, 1.0, 0.0]
+        )
+        fc.model.self_attention.inner_attention.last_bkd_keep = torch.tensor(
+            [0.0, 0.0, 1.0]
+        )
+        mask = fc._build_bkd_keep_mask(3, 3, torch.device("cpu"))
+        assert mask is not None and mask.shape == (3, 3)
+        assert torch.equal(
+            mask[0], torch.tensor([0.0, 0.0, 0.0])
+        ), f"got {mask[0]}"
+
+    def test_homogeneous_mode_single_module(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=0.5)
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.homogeneous_nodes = True
+        fc.model.attention.inner_attention.last_bkd_keep = torch.tensor(
+            [1.0, 0.0, 1.0]
+        )
+        fc.model.self_attention.inner_attention.last_bkd_keep = None
+        mask = fc._build_bkd_keep_mask(3, 3, torch.device("cpu"))
+        assert mask is not None
+        assert torch.equal(mask[0], torch.tensor([1.0, 0.0, 1.0]))
+
+    # -- shape mismatch -> warn + no exclusion -------------------------------
+    def test_size_mismatch_falls_back_to_none(self):
+        from causaliT.training.forecasters.attention_selector_forecaster import (
+            AttentionSelectorForecaster,
+        )
+        cfg = _make_forecaster_config(batch_key_dropout=0.5)
+        cfg["training"]["hsic_bkd_exclude_dropped"] = True
+        fc = AttentionSelectorForecaster(cfg)
+        fc.model.attention.inner_attention.last_bkd_keep = torch.tensor(
+            [1.0, 0.0]
+        )  # wrong length for n_sources=6
+        fc.model.self_attention.inner_attention.last_bkd_keep = None
+        assert fc._build_bkd_keep_mask(3, 6, torch.device("cpu")) is None
+

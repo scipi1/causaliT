@@ -88,6 +88,88 @@ class mlp_emb(nn.Module):
         
 
 
+class linear_per_node_emb(nn.Module):
+    """
+    Per-node LINEAR value embedding: one independent linear map per variable.
+
+    Each variable j has its own map:
+        out = x_j * w_j + b_j        w_j, b_j in R^embedding_dim
+
+    i.e. the scalar value is broadcast onto a per-node direction.  Unlike
+    ``mlp_per_node_emb`` there is NO hidden nonlinearity, so the value stream
+    keeps the raw-value contrast: two variables cannot be made perceptually
+    similar by a learned encoder, and the attention weight A_ij couples
+    directly to x_j (NOTEARS/DAGMA-style first-layer behaviour, up to the
+    per-node direction).
+
+    The forward pass receives the scalar value column (B, L) and the
+    variable-ID column (B, L) and routes each token to its variable's map
+    (same interface as ``mlp_per_node_emb``).
+
+    Args:
+        input_dim: Dimension of the scalar value input (typically 1).
+        embedding_dim: Output dimension (must equal d_model for the value stream).
+        num_variables: Number of variables (nodes) in the dataset.
+        device: Torch device.
+        var_id_offset: Variable IDs are 1-indexed in SCM datasets (0 = padding),
+            so the ID is shifted by this offset before indexing.  Default 1.
+        learnable: If True (default) the per-node directions/scales are
+            learnable; if False they are frozen at the random init (pure
+            fixed random expansion of the raw value).
+        bias: If True, learn a per-node bias vector.  Default False (values
+            are assumed centred; a bias would only add a constant to the
+            attention output).
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        embedding_dim,
+        num_variables,
+        device,
+        var_id_offset=1,
+        learnable=True,
+        bias=False,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.num_variables = num_variables
+        self.var_id_offset = var_id_offset
+
+        # Per-node direction init: random unit vectors (scale ~ |x_j| at init).
+        w = torch.randn(num_variables, input_dim, embedding_dim,
+                        device=device, dtype=torch.float32)
+        w = w / w.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+        self.weight = nn.Parameter(w, requires_grad=learnable)
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(num_variables, embedding_dim,
+                            device=device, dtype=torch.float32),
+                requires_grad=learnable,
+            )
+        else:
+            self.bias = None
+
+    def forward(self, values: torch.Tensor, var_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            values: (B, L) scalar values.
+            var_ids: (B, L) variable IDs (1-indexed; 0 = padding).
+
+        Returns:
+            (B, L, embedding_dim) per-node linearly embedded values.
+        """
+        # Shift to 0-indexed for lookup; clamp padding to 0.
+        idx = (var_ids.long() - self.var_id_offset).clamp(min=0, max=self.num_variables - 1)
+
+        w = self.weight[idx]                       # (B, L, input_dim, embedding_dim)
+        out = (values.unsqueeze(-1).unsqueeze(-1) * w).sum(dim=2)  # (B, L, embedding_dim)
+        if self.bias is not None:
+            out = out + self.bias[idx]
+        return out
+
+
 class mlp_per_node_emb(nn.Module):
     """
     Per-node MLP value embedding (DAGMA-style): one independent MLP per variable.

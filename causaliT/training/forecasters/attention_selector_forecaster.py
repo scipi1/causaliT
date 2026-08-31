@@ -139,7 +139,13 @@ import torchmetrics as tm
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
-from causaliT.utils.hsic_utils import hsic_cross_per_pair, hsic_attention_weighted
+from causaliT.utils.hsic_utils import (
+    hsic_cross_per_pair,
+    hsic_attention_weighted,
+    hsic_null_calibration,
+    bayes_multiplier,
+    _median_bandwidth,
+)
 from causaliT.utils.descendant_mask import (
     build_hsic_pair_mask,
     build_hsic_pair_mask_budgeted,
@@ -283,6 +289,50 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.hsic_mode = config["training"].get("hsic_mode", "biased")
         self.nhsic_epsilon = config["training"].get("nhsic_epsilon", 0.01)
         self.hsic_kernel_source = config["training"].get("hsic_kernel_source", "rbf")
+        self.hsic_bandwidth_multipliers = config["training"].get(
+            "hsic_bandwidth_multipliers", None
+        )
+        # Per-phase bandwidth freeze (phase blocks set ``hsic_freeze_bandwidth:
+        # true``, typically structure): on the first train batch of such a
+        # phase, latch the per-variable median-heuristic bandwidths of the
+        # source and the residuals and run the phase with them FIXED.  RBF +
+        # per-batch median heuristic is exactly scale-equivariant, so the
+        # adaptive default divides the residual-magnitude channel out of both
+        # the HSIC metric (flat-looking curves) and its gradient (no pressure
+        # toward smaller residuals).  Freezing restores both; see
+        # experiments/6_INVESTIGATIONS/HSIC_OPT_2/diagnostics/frozen_bandwidth_test.py.
+        self.hsic_freeze_bandwidth = bool(
+            config["training"].get("hsic_freeze_bandwidth", False)
+        )
+        self._hsic_bw_frozen_sigmas = None   # (sig_src, sig_res) once latched
+        self._hsic_bw_saved = None           # (sigma, adaptive) before freezing
+        # BKD dropped-key exclusion: mask HSIC pairs whose source key was
+        # dropped by batch-consistent key dropout this batch.  A dropped
+        # parent cannot be regressed out of the residual, so the pair term
+        # is irreducible within the batch - a p-dependent noise floor plus
+        # a biased gradient into kept correlate edges.  Default False keeps
+        # the legacy all-sources loss.  See _step / _build_bkd_keep_mask.
+        self.hsic_bkd_exclude_dropped = bool(
+            config["training"].get("hsic_bkd_exclude_dropped", False)
+        )
+
+        # LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md):
+        # per-edge leave-one-out Bayes multiplier gamma, computed from masked
+        # EVAL-mode forward passes (BKD is gated on self.training, so it is
+        # inactive during measurement) and applied as a DETACHED multiplicative
+        # gate on the per-pair HSIC weights.  Default False keeps the legacy
+        # behaviour exactly.
+        self.use_loo_gamma_gate = bool(
+            config["training"].get("use_loo_gamma_gate", False)
+        )
+        self.loo_gamma_topk = config["training"].get("loo_gamma_topk", None)
+        if self.loo_gamma_topk is not None:
+            self.loo_gamma_topk = int(self.loo_gamma_topk)
+        self.loo_gamma_ema = float(config["training"].get("loo_gamma_ema", 0.9))
+        self.loo_gamma_refresh = int(config["training"].get("loo_gamma_refresh", 1))
+        self.loo_gamma_permutations = int(
+            config["training"].get("loo_gamma_permutations", 50)
+        )
 
         # ----------------------------------------------------------------
         # Descendant-excluding HSIC (see causaliT.utils.descendant_mask)
@@ -390,6 +440,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._descendant_ema_score: Optional[torch.Tensor] = None
         self._last_hsic_desc_kept_frac = 1.0
         self._last_hsic_desc_cyclic = False
+        self._last_hsic_bkd_kept_frac = 1.0
+        # LOO gamma gate state (detached, EMA-smoothed across refreshes).
+        self._loo_gamma_cache: Optional[torch.Tensor] = None
+        self._loo_gamma_step = 0
+        self._last_loo_gamma_mean = 1.0
+        self._last_loo_gamma_min = 1.0
 
 
         # ----------------------------------------------------------------
@@ -523,11 +579,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             config["training"].get("gradient_surgery", False)
         )
         if self.gradient_surgery and not self.use_gradient_routing:
-            raise ValueError(
-                "training.gradient_surgery=True requires "
-                "training.use_gradient_routing=True (PCGrad operates on the "
-                "structural backward of the dual-optimizer path)."
-            )
+            # Joint PCGrad: single optimizer over ALL parameters, but manual
+            # optimization so the per-term autograd.grad calls (recon / HSIC /
+            # L0 / NOTEARS / rest) can run and be reconciled before the step
+            # (see _joint_pcgrad_step).  Same decomposition as the routing
+            # path, extended beyond the structural-params partition.
+            self.automatic_optimization = False
 
         # ----------------------------------------------------------------
         # Node-wise (per-query) winner-take-all structural update.  Each
@@ -1090,6 +1147,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
             combined_source = torch.cat([s_values, x_values], dim=1)  # (B, L_S+L_X)
 
+        # --- Per-phase bandwidth freeze (lazy latch on the first train batch) --
+        if stage == "train" and self.hsic_freeze_bandwidth:
+            if self._hsic_bw_frozen_sigmas is None:
+                self.freeze_hsic_bandwidth(combined_source, residuals)
+
         # --- Descendant exclusion -------------------------------------------
         # Under an ANM the residual r_i = e_i is independent of every
         # NON-descendant of i, but NECESSARILY dependent on its descendants
@@ -1102,7 +1164,65 @@ class AttentionSelectorForecaster(pl.LightningModule):
             score_tensor
         )
 
-        if self.use_attention_weighted_hsic:
+        # --- BKD dropped-key exclusion ------------------------------------
+        # Keys dropped by batch-consistent key dropout were NOT in the
+        # estimation set, so for a dropped true parent j the pair
+        # HSIC(res_i, source_j) > 0 is irreducible within the batch (its
+        # aggregation weight AND gradient are zeroed by the keep mask).
+        # Excluding dropped pairs removes a p-dependent offset, batch
+        # variance and a shortcut-biased gradient from the structural loss.
+        # Validation runs without BKD, so ``val_hsic`` stays the
+        # all-sources reference curve.
+        bkd_keep_mask = self._build_bkd_keep_mask(
+            n_targets=residuals.shape[-1],
+            n_sources=combined_source.shape[-1],
+            device=combined_source.device,
+        )
+        if bkd_keep_mask is not None:
+            hsic_pair_mask = (
+                bkd_keep_mask
+                if hsic_pair_mask is None
+                else hsic_pair_mask * bkd_keep_mask
+            )
+        self._last_hsic_bkd_kept_frac = (
+            float(bkd_keep_mask[0].mean().item())
+            if bkd_keep_mask is not None
+            else 1.0
+        )
+
+        # --- LOO conditional-HSIC gate (counter-proposal §5, option (c)) ------
+        # Detached per-edge multiplier applied to the pair weights BEFORE the
+        # HSIC average: conditionally-redundant pairs are downweighted out of
+        # the marginal mean; load-bearing pairs keep full weight.  Same
+        # (n_targets, n_sources) layout as the pair mask / attention matrix.
+        loo_gamma = None
+        if self.use_loo_gamma_gate:
+            loo_gamma = self._maybe_update_loo_gamma(S, X, x_target, stage)
+        if loo_gamma is not None:
+            loo_gamma = loo_gamma.to(combined_source.device)
+            if self.use_attention_weighted_hsic:
+                pass  # applied to att_mean in the branch below
+            elif hsic_pair_mask is not None:
+                if hsic_pair_mask.shape == loo_gamma.shape:
+                    hsic_pair_mask = hsic_pair_mask * loo_gamma
+                else:
+                    logger.warning(
+                        "LOO gamma shape %s != pair-mask shape %s; skipping gate.",
+                        tuple(loo_gamma.shape), tuple(hsic_pair_mask.shape),
+                    )
+                    loo_gamma = None
+            else:
+                hsic_pair_mask = loo_gamma
+
+        pair_mask_empty = hsic_pair_mask is not None and not bool(
+            (hsic_pair_mask != 0).any()
+        )
+        if pair_mask_empty:
+            # Every pair excluded this batch (e.g. BKD dropped all keys):
+            # no learnable HSIC signal - contribute an exact zero rather
+            # than a NaN from the empty weighted mean.
+            hsic_value = torch.zeros((), device=combined_source.device)
+        elif self.use_attention_weighted_hsic:
             # Attention-weighted HSIC: weight each (child, source) pair by the
             # batch-mean attention weight att[child, source].  The attention
             # matrix is (B, n_targets, n_sources) — (B, N, N) in homogeneous
@@ -1110,6 +1230,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # matrix layout exactly.  Descendant masking is NOT applied here:
             # the attention weight itself is the pair weight.
             att_mean = attention_weights.mean(dim=0)  # (n_targets, n_sources)
+            if bkd_keep_mask is not None:
+                # Dropped sources get zero pair weight (pair_mask is unused
+                # by the attention-weighted variant).
+                att_mean = att_mean * bkd_keep_mask
+            if loo_gamma is not None:
+                att_mean = att_mean * loo_gamma
             hsic_value = hsic_attention_weighted(
                 source_values=combined_source,
                 residuals=residuals,
@@ -1120,6 +1246,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 mode=self.hsic_mode,
                 nhsic_epsilon=self.nhsic_epsilon,
                 source_kernel=self.hsic_kernel_source,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
             )
         else:
             hsic_value = hsic_cross_per_pair(
@@ -1130,6 +1257,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 mode=self.hsic_mode,
                 nhsic_epsilon=self.nhsic_epsilon,
                 source_kernel=self.hsic_kernel_source,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
                 pair_mask=hsic_pair_mask,
             )
         hsic_reg = self.lambda_hsic * hsic_value
@@ -1289,6 +1417,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log(
                 f"{stage}_hsic_desc_cyclic",
                 float(self._last_hsic_desc_cyclic),
+                on_step=False, on_epoch=True,
+            )
+        if self.use_loo_gamma_gate:
+            self.log(
+                f"{stage}_loo_gamma_mean",
+                float(self._last_loo_gamma_mean),
+                on_step=False, on_epoch=True,
+            )
+            self.log(
+                f"{stage}_loo_gamma_min",
+                float(self._last_loo_gamma_min),
+                on_step=False, on_epoch=True,
+            )
+        if self.hsic_bkd_exclude_dropped:
+            self.log(
+                f"{stage}_hsic_bkd_kept_frac",
+                float(self._last_hsic_bkd_kept_frac),
                 on_step=False, on_epoch=True,
             )
         # Structural-pathway reconstruction term (alpha * loss_x).  Non-zero
@@ -1525,6 +1670,243 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # descendant set would be meaningless there.
     _DIRECTED_SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
 
+    @staticmethod
+    def _module_bkd_keep(mod) -> Optional[torch.Tensor]:
+        # Per-key keep mask from either BKD implementation (None if absent).
+        # Inline-BKD modules (GatedCrossAttention / GatedSelfAttention /
+        # CommutatorSelfAttention) expose ``last_bkd_keep`` (float, 1 = kept);
+        # the CausalCrossAttention family wraps a BatchConsistentKeyDropout
+        # sub-module exposing ``_last_key_mask`` (bool, True = kept).  Both
+        # are None in eval mode / inactive phases, which propagates as
+        # "no BKD exclusion this step".
+        if mod is None:
+            return None
+        keep = getattr(mod, "last_bkd_keep", None)
+        if keep is not None:
+            return keep
+        bkd = getattr(mod, "batch_key_dropout", None)
+        if bkd is not None:
+            mask = getattr(bkd, "_last_key_mask", None)
+            if mask is not None:
+                return mask.to(torch.float32)
+        return None
+
+    def _build_bkd_keep_mask(
+        self, n_targets: int, n_sources: int, device
+    ) -> Optional[torch.Tensor]:
+        # ``(n_targets, n_sources)`` 0/1 pair mask of keys NOT dropped by BKD.
+        # Returns None when the feature is off or no attention module applied
+        # BKD this step (the HSIC pair set is then unchanged).  Split mode
+        # maps the cross-attention keep mask onto the S columns and the
+        # self-attention keep mask onto the X columns; a source whose module
+        # has no BKD defaults to kept.  Homogeneous mode AND-combines the
+        # available masks: a pair is excluded only when the key was dropped
+        # in every module that could route it into the estimate.
+        if not self.hsic_bkd_exclude_dropped:
+            return None
+        inner_cross = getattr(
+            getattr(self.model, "attention", None), "inner_attention", None
+        )
+        inner_self = getattr(
+            getattr(self.model, "self_attention", None), "inner_attention", None
+        )
+        cross_keep = self._module_bkd_keep(inner_cross)
+        self_keep = self._module_bkd_keep(inner_self)
+        if cross_keep is None and self_keep is None:
+            return None
+        if self.homogeneous_nodes:
+            keeps = [k for k in (cross_keep, self_keep) if k is not None]
+            col = keeps[0].to(device=device, dtype=torch.float32)
+            for k in keeps[1:]:
+                col = torch.minimum(col, k.to(device=device, dtype=torch.float32))
+        else:
+            L_S = int(self.S_seq_len)
+            cross_part = (
+                cross_keep.to(device=device, dtype=torch.float32)
+                if cross_keep is not None
+                else torch.ones(L_S, device=device)
+            )
+            n_x = max(int(n_sources) - L_S, 0)
+            self_part = (
+                self_keep.to(device=device, dtype=torch.float32)
+                if self_keep is not None
+                else torch.ones(n_x, device=device)
+            )
+            col = torch.cat([cross_part, self_part])
+        col = col.detach()
+        if col.numel() != n_sources:
+            logger.warning(
+                "BKD keep-mask size %d != HSIC n_sources %d; skipping BKD "
+                "dropped-key exclusion this step.",
+                col.numel(), n_sources,
+            )
+            return None
+        return col.unsqueeze(0).expand(n_targets, n_sources)
+
+    # ------------------------------------------------------------------
+    # LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _loo_measure_forward(self, S, X, mask):
+        """Eval-mode forward for LOO measurement.
+
+        BKD is gated on ``self.training``, so under ``model.eval()`` the
+        measurement passes see the full candidate set with no key dropout —
+        the two worlds (baseline vs. masked) then differ ONLY in the masked
+        edge, as the Delta contrast requires.  ``mask`` is an
+        ``(n_targets, n_sources)`` 1=allowed / 0=forbidden combined mask
+        routed to ``forward_with_actual`` as ``oracle_combined_mask`` (it is
+        intersected with the structural mask, so forbidden pairs stay
+        forbidden), or None for the baseline pass.
+        """
+        x_blanked = X.clone()
+        x_blanked[:, :, self.val_idx] = 0.0
+        s_blanked = None
+        if self.homogeneous_nodes:
+            s_blanked = S.clone()
+            s_blanked[:, :, self.val_idx] = 0.0
+        out = self.model.forward_with_actual(
+            source_tensor=S,
+            x_blanked=x_blanked,
+            x_actual=X,
+            oracle=False,
+            oracle_combined_mask=mask,
+            s_blanked=s_blanked,
+        )
+        return out[0].squeeze()  # pred_x (B, n_targets)
+
+    @torch.no_grad()
+    def _compute_loo_gamma(self, S, X, x_target):
+        """Per-edge Bayes multiplier gamma, shape (n_targets, n_sources).
+
+        For each candidate source column i, one masked forward pass yields
+        the leave-one-out residual eps^{-i}; gamma-null-calibrated HSIC of
+        (X_i, eps^{+}) and (X_i, eps^{-i}) feeds ``bayes_multiplier`` with
+        prior P_m = current (detached) score tensor.  Rows that would become
+        fully masked by dropping column i are left unmasked and keep
+        gamma = 1 (edge i is the row's only allowed key — no measurement is
+        possible there).
+
+        Cost: one kernel build per calibration call, so O(T x S) kernel
+        matrices per refresh — control with ``loo_gamma_topk`` /
+        ``loo_gamma_refresh`` / ``loo_gamma_permutations``.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            pred_plus = self._loo_measure_forward(S, X, None)
+            resid_plus = x_target.squeeze() - pred_plus          # (B, T)
+            if self.homogeneous_nodes:
+                combined = x_target.squeeze()                    # (B, N)
+            else:
+                combined = torch.cat(
+                    [S[:, :, self.val_idx], x_target.squeeze()], dim=1
+                )                                                # (B, L_S+T)
+            n_targets = resid_plus.shape[-1]
+            n_sources = combined.shape[-1]
+            device = combined.device
+
+            gamma = torch.ones(n_targets, n_sources, device=device)
+
+            # Prior P_m: current structural score tensor (detached), else 0.5.
+            p_m = torch.full((n_targets, n_sources), 0.5, device=device)
+            get_score = getattr(self.model, "get_score_tensor_for_sparsity", None)
+            if callable(get_score):
+                s = get_score()
+                if s is not None and tuple(s.shape) == (n_targets, n_sources):
+                    p_m = s.detach().clamp(0.0, 1.0)
+
+            return self._loo_gamma_loop(
+                S, X, x_target, resid_plus, combined, p_m, device
+            )
+        finally:
+            if was_training:
+                self.model.train()
+
+    @torch.no_grad()
+    def _loo_gamma_loop(self, S, X, x_target, resid_plus, combined, p_m, device):
+        """Masked-forward loop of ``_compute_loo_gamma`` (split for size)."""
+        n_targets = resid_plus.shape[-1]
+        n_sources = combined.shape[-1]
+        gamma = torch.ones(n_targets, n_sources, device=device)
+
+        # Candidate columns: top-k per row by P_m, or all (full LOO).
+        cols_per_row = None
+        if self.loo_gamma_topk is not None and self.loo_gamma_topk < n_sources:
+            cols_per_row = torch.topk(p_m, k=self.loo_gamma_topk, dim=1).indices
+
+        base_mask = torch.ones(n_targets, n_sources, device=device)
+        measured_cols = (
+            sorted(set(torch.unique(cols_per_row).tolist()))
+            if cols_per_row is not None
+            else list(range(n_sources))
+        )
+        for i in measured_cols:
+            mask = base_mask.clone()
+            mask[:, i] = 0.0
+            dead_rows = mask.sum(dim=1) == 0
+            if bool(dead_rows.any()):
+                mask[dead_rows, i] = 1.0  # no measurement possible there
+            pred_minus = self._loo_measure_forward(S, X, mask)
+            resid_minus = x_target.squeeze() - pred_minus
+            for j in range(n_targets):
+                if cols_per_row is not None and not bool(
+                    (cols_per_row[j] == i).any()
+                ):
+                    continue
+                if bool(dead_rows[j]):
+                    continue
+                cal_plus = hsic_null_calibration(
+                    combined[:, i], resid_plus[:, j],
+                    adaptive_bandwidth=True,
+                    n_permutations=self.loo_gamma_permutations,
+                )
+                cal_minus = hsic_null_calibration(
+                    combined[:, i], resid_minus[:, j],
+                    adaptive_bandwidth=True,
+                    n_permutations=self.loo_gamma_permutations,
+                )
+                gamma[j, i] = bayes_multiplier(
+                    cal_plus["log_q0"], cal_minus["log_q0"], p_m[j, i]
+                ).to(device)
+        return gamma
+
+    def _maybe_update_loo_gamma(self, S, X, x_target, stage: str):
+        """Return the detached (n_targets, n_sources) gamma gate, or None.
+
+        Recomputes on train steps every ``loo_gamma_refresh`` steps and
+        EMA-smooths; validation/test reuse the cached EMA.  Any failure is
+        logged and degrades to no gating (matching the descendant-mask
+        robustness pattern).
+        """
+        if stage == "train":
+            self._loo_gamma_step += 1
+            if self._loo_gamma_step % self.loo_gamma_refresh == 0:
+                try:
+                    new = self._compute_loo_gamma(S, X, x_target)
+                except Exception as exc:  # never break training on the gate
+                    logger.warning(
+                        "LOO gamma computation failed (%s); gating skipped "
+                        "for this refresh.", exc,
+                    )
+                    new = None
+                if new is not None:
+                    prev = self._loo_gamma_cache
+                    if prev is None or prev.shape != new.shape:
+                        self._loo_gamma_cache = new
+                    else:
+                        a = self.loo_gamma_ema
+                        self._loo_gamma_cache = (
+                            a * prev.to(new.device) + (1.0 - a) * new
+                        )
+        g = self._loo_gamma_cache
+        if g is None:
+            return None
+        self._last_loo_gamma_mean = float(g.mean())
+        self._last_loo_gamma_min = float(g.min())
+        return g
+
     def _build_hsic_descendant_mask(
         self,
         score_tensor: Optional[torch.Tensor],
@@ -1651,6 +2033,42 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
     # Structural-regularizer safeguard helpers
     # ------------------------------------------------------------------
+
+    def freeze_hsic_bandwidth(self, combined_source, residuals) -> None:
+        """Latch per-variable median-heuristic bandwidths for this phase.
+
+        Called lazily on the first train batch of a phase whose config sets
+        ``hsic_freeze_bandwidth: true``.  Saves the current
+        ``(hsic_sigma, hsic_adaptive_bandwidth)`` so
+        :meth:`restore_hsic_bandwidth` can undo the freeze at phase exit.
+        """
+        from causaliT.utils.hsic_utils import _median_bandwidth
+        with torch.no_grad():
+            sig_src = torch.stack([_median_bandwidth(combined_source[:, i].detach())
+                                   for i in range(combined_source.shape[1])])
+            sig_res = torch.stack([_median_bandwidth(residuals[:, j].detach())
+                                   for j in range(residuals.shape[1])])
+        if self._hsic_bw_saved is None:
+            self._hsic_bw_saved = (self.hsic_sigma, self.hsic_adaptive_bandwidth)
+        self.hsic_sigma = (sig_src, sig_res)
+        self.hsic_adaptive_bandwidth = False
+        self._hsic_bw_frozen_sigmas = (sig_src, sig_res)
+        self.log("struct/hsic_sigma_src_med", float(sig_src.median()),
+                 on_step=False, on_epoch=True)
+        self.log("struct/hsic_sigma_res_med", float(sig_res.median()),
+                 on_step=False, on_epoch=True)
+        logger.info(
+            "HSIC bandwidth frozen for this phase: median sigma_src=%.4g, "
+            "median sigma_res=%.4g.", float(sig_src.median()),
+            float(sig_res.median()),
+        )
+
+    def restore_hsic_bandwidth(self) -> None:
+        """Undo the per-phase bandwidth freeze (phase exit)."""
+        if self._hsic_bw_saved is not None:
+            self.hsic_sigma, self.hsic_adaptive_bandwidth = self._hsic_bw_saved
+            self._hsic_bw_saved = None
+        self._hsic_bw_frozen_sigmas = None
 
     def _hsic_safeguard_ref(
         self, hsic_reg: torch.Tensor, stage: str
@@ -1850,6 +2268,88 @@ class AttentionSelectorForecaster(pl.LightningModule):
             if val == val:  # skip NaN (no valid block for that target)
                 self.log(f"surgery/{key}", val, on_step=False, on_epoch=True)
 
+    def _joint_pcgrad_step(self) -> None:
+        """Joint-optimizer PCGrad step (``use_gradient_routing=False``).
+
+        Same per-term decomposition as :meth:`_structural_backward` but over
+        ALL trainable parameters (the single optimizer steps everything, and
+        the recon / HSIC / regularizer conflicts live in shared parameters
+        too): the gradient written into ``p.grad`` is
+
+            g_recon + g_hsic + g_rest + sum(PCGrad-projected g_reg)
+
+        with the HSIC term as the reference and L0 / NOTEARS projected per
+        interference block.  Falls back to a plain fused backward of the
+        total loss when there is nothing to reconcile (no HSIC signal or
+        both regularizers off).  NOTE: manual optimization is active here,
+        so LR schedulers / gradient clipping configured through Lightning
+        are NOT applied (this arm uses neither).
+        """
+        opt = self.optimizers()
+        loss_recon = self._last_loss_components["loss_recon"]
+        loss_structural = self._last_loss_components["loss_structural"]
+        hsic_term = self._last_struct_hsic_term
+        targets: Dict[str, torch.Tensor] = {}
+        if self._last_l0_reg is not None and self._last_l0_reg.requires_grad:
+            targets["l0"] = self._last_l0_reg
+        if (
+            self._last_acyclic_reg is not None
+            and self._last_acyclic_reg.requires_grad
+        ):
+            targets["notears"] = self._last_acyclic_reg
+
+        opt.zero_grad()
+        if hsic_term is None or not hsic_term.requires_grad or not targets:
+            # Nothing to reconcile: plain fused backward of the total loss.
+            self.manual_backward(loss_recon + loss_structural)
+            opt.step()
+            return
+
+        # Per-block grouping over ALL trainable parameters (joint mode:
+        # conflicts are not restricted to the structural partition).
+        if not self._interference_blocks:
+            self._interference_blocks = build_interference_blocks(self.model)
+        blocks = {
+            name: plist
+            for name, plist in self._interference_blocks.items()
+            if plist
+        }
+        all_params = [p for p in self.parameters() if p.requires_grad]
+
+        g_recon = torch.autograd.grad(
+            loss_recon, all_params, retain_graph=True, allow_unused=True
+        )
+        g_hsic = torch.autograd.grad(
+            hsic_term, all_params, retain_graph=True, allow_unused=True
+        )
+        g_targets = {
+            name: torch.autograd.grad(
+                term, all_params, retain_graph=True, allow_unused=True
+            )
+            for name, term in targets.items()
+        }
+        # Last consumer of the graph -> no retain.
+        g_rest = torch.autograd.grad(
+            self._last_struct_rest, all_params,
+            retain_graph=False, allow_unused=True,
+        )
+
+        projected, metrics = pcgrad_reconcile(g_hsic, g_targets, blocks, all_params)
+
+        for i, p in enumerate(all_params):
+            parts = [g_recon[i], g_hsic[i], g_rest[i]]
+            parts += [projected[name][i] for name in targets]
+            parts = [g for g in parts if g is not None]
+            if parts:
+                p.grad = torch.stack([g.detach() for g in parts]).sum(dim=0)
+
+        # Always-on surgery metrics (epoch-mean aggregates).
+        for key, val in metrics.items():
+            if val == val:  # skip NaN (no valid block for that target)
+                self.log(f"surgery/{key}", val, on_step=False, on_epoch=True)
+
+        opt.step()
+
     def training_step(self, batch, batch_idx):
         # One-off: place every X query at the key centroid before the first step.
         self._maybe_init_query_centroid(batch)
@@ -1951,10 +2451,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
             return total_loss
         else:
             total_loss, _, _ = self._step(batch, stage="train")
-            # Diagnostic: probe interference on the live graph before Lightning
-            # runs its automatic backward on total_loss (retain_graph=True in
-            # the probe keeps the graph intact for that backward).
+            # Diagnostic: probe interference on the live graph before the
+            # backward (retain_graph=True in the probe keeps the graph intact).
             self._maybe_log_interference(batch_idx)
+            if not self.gradient_surgery:
+                # Lightning runs its automatic backward on total_loss.
+                return total_loss
+            # Joint PCGrad: manual optimization (automatic_optimization was
+            # disabled in __init__), per-term grads reconciled before the step.
+            self._joint_pcgrad_step()
             return total_loss
 
     # ------------------------------------------------------------------
