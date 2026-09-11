@@ -47,7 +47,10 @@ except Exception:  # pragma: no cover
     _HAVE_OMEGACONF = False
 
 
-PHASE_NAME = {0.0: "reconstruct", 1.0: "structure"}
+# Mirrors ``causaliT.training.adaptive_trainer._PHASE_CODE`` (the numeric
+# encoding logged as the ``adaptive_phase`` CSV metric).
+PHASE_NAME = {0.0: "reconstruct", 1.0: "structure", 2.0: "final_reconstruct",
+              3.0: "warmup"}
 
 
 def _find_metrics_csv(experiment_dir: str) -> str:
@@ -118,14 +121,28 @@ def rebuild_summary(experiment_dir: str) -> dict:
     total_budget = None
     start_phase = "reconstruct"
     data_split_ratio = None
-    cfg_path = join(experiment_dir, "config_atsel.yaml")
-    if _HAVE_OMEGACONF and exists(cfg_path):
+    # The run folder holds the RESOLVED snapshot ``config.yaml`` (written by
+    # ``_save_config_snapshot``); hand-written runs may use ``config_atsel.yaml``.
+    # Trying only the latter left ``total_epoch_budget`` at None, which the
+    # evaluation notebook needs to close the last phase interval.
+    for name in ("config.yaml", "config_atsel.yaml"):
+        cfg_path = join(experiment_dir, name)
+        if not (_HAVE_OMEGACONF and exists(cfg_path)):
+            continue
         cfg = OmegaConf.load(cfg_path)
         ad = cfg.get("adaptive_training", {}) or {}
         monitor = str(ad.get("monitor", monitor))
-        total_budget = ad.get("total_epoch_budget", None)
         start_phase = str(ad.get("start_phase", start_phase)).lower()
         data_split_ratio = ad.get("data_split_ratio", None)
+        try:  # may be an unresolved interpolation in a hand-written config
+            total_budget = ad.get("total_epoch_budget", None)
+        except Exception:
+            total_budget = None
+        break
+    # Fallback: the last logged epoch is a lower bound on the budget, and is
+    # what the notebook needs to close the final (possibly interrupted) phase.
+    if total_budget is None and len(g):
+        total_budget = int(g["epoch"].max()) + 1
 
     # --- discover ordered phase-end checkpoints ---
     ckpts = sorted(glob.glob(join(experiment_dir, "stage_checkpoints", "phase_*_end.ckpt")))
@@ -146,11 +163,17 @@ def rebuild_summary(experiment_dir: str) -> dict:
         else:
             global_epoch, monitor_value, phase_best = None, None, None
 
-        # to_phase = the next checkpoint's from_phase, else the alternate phase.
+        # to_phase = the next checkpoint's from_phase.  For the LAST (still
+        # running / interrupted) phase there is no such checkpoint: read the
+        # phase actually logged in the next CSV segment - a plain alternation
+        # guess is wrong whenever a warmup phase is in play (warmup ->
+        # structure, not warmup -> reconstruct).
         if k + 1 < len(parsed):
             to_phase = parsed[k + 1][1]
+        elif k + 1 < len(segments):
+            to_phase = PHASE_NAME.get(segments[k + 1][0], "structure")
         else:
-            to_phase = "structure" if from_phase == "reconstruct" else "reconstruct"
+            to_phase = "structure" if from_phase != "structure" else "reconstruct"
 
         if from_phase == "reconstruct":
             reason = "recon_plateau"

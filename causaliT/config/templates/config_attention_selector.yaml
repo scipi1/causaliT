@@ -418,9 +418,29 @@ training:
                                # distance ~0.2, 10 gives a cell crossing in
                                # ~20-50 consistent steps
     evidence_leak: 0.95        # beta: evidence half-life ~ 14 steps
-    shadow_source: hsic        # hsic | structural (which loss feeds the shadow)
+    shadow_source: hsic        # hsic | structural | hsic_unrolled (DARTS
+                               # second-order destination-state gradient)
     reset_m_on_commit: one     # one | off : reset M_i to 1 on commit so the new
                                # hypothesis opens its gates
+    # --- Unrolled shadow (shadow_source: hsic_unrolled) ---------------------
+    unrolled:
+      inner_lr: null           # virtual refit step size; null = training.lr
+      fd_epsilon: 0.01         # finite-difference Hessian perturbation
+      every: 1                 # compute the unrolled gradient every m steps
+                               # (first-order HSIC evidence on off-steps)
+    # --- Bilevel commit gate (docs/ideas/BILEVEL_CENTROID_COMMIT.md) --------
+    # Eligible commits are DEFERRED: the candidate subset is accepted only if
+    # the node's own HSIC row drops after a PAIRED k-step reconstruction
+    # refit (incumbent vs candidate, same theta_R start, validation batches).
+    # Rejected candidates are tabooed until the shadow moves elsewhere.
+    bilevel_gate:
+      enabled: false           # off = legacy immediate commits
+      k_inner: 15              # reconstruction refit steps per probe arm
+      inner_optimizer: null    # null = inherit training.optimizer (recon arm)
+      inner_lr: null           # null = inherit training.lr
+      inner_weight_decay: null # null = inherit training.weight_decay
+      max_val_batches: 8       # cached val batches; last is eval-only
+      accept_margin: 0.0       # accept iff H_i(cand) < H_i(inc) - margin
 
   loss_fn: "mse"
   lambda_recon: 1.0

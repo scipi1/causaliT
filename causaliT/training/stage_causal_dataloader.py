@@ -67,6 +67,9 @@ class StageCausalDataModule(pl.LightningDataModule):
         self.persistent_workers = num_workers > 0
         # Cross-fit stage splits owned by the datamodule (see set_stage_splits).
         self._stage_splits = None
+        # HSIC cross-fitting folds (see set_hsic_cross_fit); None = disabled.
+        self._xfit_ds_a = None
+        self._xfit_ds_b = None
         self._stage_val_idx = None
         self._stage_test_idx = None
         
@@ -403,12 +406,77 @@ class StageCausalDataModule(pl.LightningDataModule):
         )
         return int(len(subset))
     
+    def set_hsic_cross_fit(self, ratio: float = 0.5, seed: int = 0) -> tuple:
+        """
+        Partition the CURRENT training set into two disjoint, permanent folds.
+
+        Fold A carries the reconstruction (MSE) loss, fold B the independence
+        (HSIC) statistic, so the structural signal is measured on samples the
+        regressor did not fit -- HSIC on the rows the fit just absorbed is
+        optimistically biased.
+
+        The partition is by SAMPLE IDENTITY (a fixed permutation of the training
+        subset), NOT by position within a batch: ``train_dataloader`` shuffles
+        every epoch, so a positional split would reassign samples each epoch and
+        the separation would dissolve.  Membership here is decided once and
+        survives shuffling.
+
+        Call AFTER the train/val/test indices are final (i.e. after
+        ``update_idx`` / ``setup``).  Returns ``(n_a, n_b)``.
+        """
+        if self.train_ds is None:
+            raise RuntimeError(
+                "set_hsic_cross_fit() requires train_ds; call setup() first."
+            )
+        if not 0.0 < float(ratio) < 1.0:
+            raise ValueError(f"ratio must be in (0, 1), got {ratio}.")
+
+        n = len(self.train_ds)
+        g = torch.Generator().manual_seed(int(seed))
+        perm = torch.randperm(n, generator=g)
+        n_a = int(round(float(ratio) * n))
+        n_a = max(1, min(n - 1, n_a))          # both folds non-empty
+        idx_a, idx_b = perm[:n_a], perm[n_a:]
+
+        # ``train_ds`` may be a TensorDataset or a Subset (auto_split_ds uses
+        # random_split).  Subset indexing works for both and keeps the folds
+        # views rather than copies.
+        self._xfit_ds_a = Subset(self.train_ds, idx_a.tolist())
+        self._xfit_ds_b = Subset(self.train_ds, idx_b.tolist())
+        return int(len(idx_a)), int(len(idx_b))
+
+    def hsic_cross_fit_dataloaders(self):
+        """``(loader_a, loader_b)`` over the two folds, or ``None`` if unset."""
+        if getattr(self, "_xfit_ds_a", None) is None:
+            return None
+
+        def _mk(ds):
+            return DataLoader(
+                ds,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=self.persistent_workers,
+                shuffle=True,
+            )
+        return _mk(self._xfit_ds_a), _mk(self._xfit_ds_b)
+
     def setup(self, stage) -> None:
         """Setup method called by PyTorch Lightning."""
         self.prepare_data()
         self.split_ds()
     
     def train_dataloader(self):
+        # HSIC cross-fitting: fold A is the Lightning train loader (it drives
+        # the epoch length and the MSE); fold B is pulled alongside it by the
+        # forecaster via ``hsic_cross_fit_dataloaders``.
+        if getattr(self, "_xfit_ds_a", None) is not None:
+            return DataLoader(
+                self._xfit_ds_a,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                persistent_workers=self.persistent_workers,
+                shuffle=True,
+            )
         return DataLoader(
             self.train_ds,
             batch_size=self.batch_size,

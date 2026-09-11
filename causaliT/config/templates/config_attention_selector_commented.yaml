@@ -324,6 +324,22 @@ training:
   hsic_mode: "biased"
   nhsic_epsilon: 0.01
 
+  # --- HSIC pair aggregation ---
+  #   plain            unweighted mean over pairs
+  #   attw             each pair weighted by its attention posterior
+  #                    (WARNING: degenerate att -> 0 trivial solution)
+  #   attw_descendants HYBRID: non-descendant pairs unweighted, only
+  #                    descendant pairs attention-weighted (needs the
+  #                    descendant mask machinery below)
+  #   attw_softmax     SOFTMAX COMPETITION: pair weights are the row-wise
+  #                    softmax of the gate scores, self-edge excluded
+  #                    pre-softmax.  Removes the att -> 0 trivial solution
+  #                    by construction (rows sum to 1) and REPLACES the
+  #                    descendant mask entirely: sparsity and descendant
+  #                    rejection emerge from the within-row competition.
+  #                    Parentless rows converge to the uniform spread.
+  hsic_aggregation: plain
+
   # --- Descendant-excluding HSIC (self-attention block only) --------------
   # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is
   # independent of every NON-descendant of i, but NECESSARILY dependent on

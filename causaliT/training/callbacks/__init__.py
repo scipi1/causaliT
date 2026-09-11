@@ -24,6 +24,7 @@ from .training_callbacks import (
 from .model_callbacks import (
     GradientLogger,
     MetricsAggregator,
+    PeriodicDAGMetrics,
 )
 
 # Gradient Jacobian Logger
@@ -50,6 +51,7 @@ __all__ = [
     # Model callbacks
     'GradientLogger',
     'MetricsAggregator',
+    'PeriodicDAGMetrics',
     # Gradient Jacobian
     'GradientJacobianLogger',
     # Memory report

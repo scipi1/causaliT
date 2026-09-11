@@ -141,7 +141,10 @@ from causaliT.core.architectures.attention_selector import AttentionSelectorLaye
 from causaliT.core.utils import load_dag_masks, corrupt_dag_masks
 from causaliT.utils.hsic_utils import (
     hsic_cross_per_pair,
+    hsic_row_means,
     hsic_attention_weighted,
+    hsic_attention_softmax,
+    hsic_softmax_pair_weights,
     hsic_null_calibration,
     bayes_multiplier,
     _median_bandwidth,
@@ -278,12 +281,86 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # HSIC regularization (unified: HSIC over combined [S, X] source)
         # ----------------------------------------------------------------
         self.lambda_hsic = config["training"].get("lambda_hsic", 0.0)
-        # Attention-weighted HSIC: weight each (child, source) HSIC pair by the
-        # batch-mean attention weight att[child, source] instead of a plain
-        # (or descendant-masked) mean.  Mirrors SingleCausalForecaster.
-        self.use_attention_weighted_hsic = bool(
-            config["training"].get("use_attention_weighted_hsic", False)
+        # Per-row HSIC diagnostics (bilevel commit groundwork, Phase 0 of
+        # docs/ideas/BILEVEL_CENTROID_COMMIT.md): log {stage}_hsic_row_{i},
+        # the node-responsible HSIC term mean_j HSIC(source_j, res_i).  Only
+        # supported for the plain (non attention-weighted) HSIC branch.
+        self.log_hsic_rows = bool(config["training"].get("log_hsic_rows", False))
+        self._last_hsic_row_means = None
+        # ---- HSIC aggregation selector ---------------------------------
+        #   plain            -- unweighted mean over pairs (hsic_cross_per_pair)
+        #   attw             -- every pair weighted by the attention posterior
+        #   attw_descendants -- HYBRID: non-descendant pairs UNWEIGHTED, only
+        #                       descendant pairs attention-weighted.  Removes the
+        #                       degenerate ``att -> 0`` solution by construction
+        #                       (a true parent's HSIC is paid whatever its
+        #                       weight), while leaving the escape open exactly
+        #                       where collapse is the correct answer.
+        #   attw_softmax     -- SOFTMAX COMPETITION: pair weights are the
+        #                       row-wise softmax of the gate scores (self-edge
+        #                       excluded pre-softmax).  Removes the ``att -> 0``
+        #                       trivial solution by construction (each row sums
+        #                       to 1) and REPLACES the descendant mask entirely:
+        #                       sparsity/descendant rejection emerges from the
+        #                       within-row weight competition.
+        #
+        # ``use_attention_weighted_hsic`` is the LEGACY alias, still honoured so
+        # every existing config keeps working: True -> attw, False -> plain.
+        _agg = config["training"].get("hsic_aggregation", None)
+        _legacy = config["training"].get("use_attention_weighted_hsic", None)
+        _valid_agg = ("plain", "attw", "attw_descendants", "attw_softmax")
+        if _agg is None:
+            self.hsic_aggregation = "attw" if bool(_legacy) else "plain"
+        else:
+            self.hsic_aggregation = str(_agg)
+            if self.hsic_aggregation not in _valid_agg:
+                raise ValueError(
+                    f"hsic_aggregation must be one of {_valid_agg}, "
+                    f"got {self.hsic_aggregation!r}."
+                )
+            if _legacy is not None:
+                _implied = "attw" if bool(_legacy) else "plain"
+                if _implied != self.hsic_aggregation and not (
+                    bool(_legacy) and self.hsic_aggregation in (
+                        "attw_descendants", "attw_softmax"
+                    )
+                ):
+                    raise ValueError(
+                        f"Conflicting HSIC aggregation settings: "
+                        f"hsic_aggregation={self.hsic_aggregation!r} but the legacy "
+                        f"use_attention_weighted_hsic={_legacy!r} implies "
+                        f"{_implied!r}.  Set only one of them."
+                    )
+        # All weighted variants share the attention-weighted code path.
+        self.use_attention_weighted_hsic = self.hsic_aggregation in (
+            "attw", "attw_descendants", "attw_softmax"
         )
+        self.hsic_weight_descendants_only = (
+            self.hsic_aggregation == "attw_descendants"
+        )
+        self.hsic_softmax = self.hsic_aggregation == "attw_softmax"
+        self._last_desc_weight_frac = 0.0
+
+        # ---- HSIC cross-fitting -----------------------------------------
+        # Evaluate the independence statistic on a DISJOINT, PERMANENT fold of
+        # the training set: HSIC measured on the same rows the regressor just
+        # fitted is optimistically biased (the fit absorbs sample-specific
+        # noise, so the residual looks more independent than it is).
+        #
+        # Fold membership is by sample identity (datamodule.set_hsic_cross_fit),
+        # never by position within a batch -- the train loader shuffles every
+        # epoch, so a positional split would reassign samples each epoch and the
+        # separation would dissolve entirely.
+        #
+        # Cost: a SECOND forward pass per step (fold B), i.e. ~2x compute.
+        self.hsic_cross_fit = bool(
+            config["training"].get("hsic_cross_fit", False)
+        )
+        self.hsic_cross_fit_ratio = float(
+            config["training"].get("hsic_cross_fit_ratio", 0.5)
+        )
+        self._xfit_iter = None      # fold-B iterator, refreshed on exhaustion
+        self._xfit_loader = None
         self.hsic_sigma = config["training"].get("hsic_sigma", 1.0)
         self.hsic_adaptive_bandwidth = config["training"].get("hsic_adaptive_bandwidth", False)
         self.hsic_mode = config["training"].get("hsic_mode", "biased")
@@ -510,6 +587,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Stash for the two reg tensors so training_step can probe them while
         # the autograd graph is still alive.
         self._last_hsic_reg: Optional[torch.Tensor] = None
+        # Structural pair weights (descendant x LOO, no BKD) stashed by _step
+        # for the bilevel probe and the unrolled shadow (None when unused).
+        self._last_probe_pair_mask: Optional[torch.Tensor] = None
         self._last_l0_reg: Optional[torch.Tensor] = None
 
         # ----------------------------------------------------------------
@@ -650,11 +730,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
         cc_cfg = config["training"].get("centroid_commit", None) or {}
         self.centroid_commit_enabled = bool(cc_cfg.get("enabled", False))
         self._commit_source = str(cc_cfg.get("shadow_source", "hsic"))
-        if self._commit_source not in ("hsic", "structural"):
+        if self._commit_source not in ("hsic", "structural", "hsic_unrolled"):
             raise ValueError(
-                f"centroid_commit.shadow_source must be 'hsic' or "
-                f"'structural', got {self._commit_source!r}"
+                f"centroid_commit.shadow_source must be 'hsic', "
+                f"'structural' or 'hsic_unrolled', got {self._commit_source!r}"
             )
+        # Second-order (DARTS) shadow evidence: the shadow integrates the
+        # destination-state HSIC gradient instead of the frozen-theta_R one.
+        ur = cc_cfg.get("unrolled", None) or {}
+        self._unrolled_inner_lr = ur.get("inner_lr", None)  # None -> recon lr
+        self._unrolled_fd_eps = float(ur.get("fd_epsilon", 0.01))
+        self._unrolled_every = max(1, int(ur.get("every", 1)))
+        self._unrolled_step_count = 0
         self._commit: Optional[CentroidCommitController] = None
         if self.centroid_commit_enabled:
             if self._nodewise is not None:
@@ -697,6 +784,34 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 self._commit.reset_m_on_commit, self._commit.prior_rho,
                 self._commit.winner_take_all, self._commit.commit_margin,
                 self._commit.min_snr,
+            )
+
+        # ------------------------------------------------------------------
+        # Bilevel commit gate (Phase 2, docs/ideas/BILEVEL_CENTROID_COMMIT.md)
+        # Eligible commits are DEFERRED and accepted only if the node's HSIC
+        # row drops after a paired k-step reconstruction refit on validation
+        # batches; rejected candidates are tabooed until the shadow moves on.
+        # ------------------------------------------------------------------
+        bg = cc_cfg.get("bilevel_gate", None) or {}
+        self._gate_enabled = bool(bg.get("enabled", False))
+        self._gate_k_inner = int(bg.get("k_inner", 15))
+        self._gate_inner_optimizer = bg.get("inner_optimizer", None)
+        self._gate_inner_lr = bg.get("inner_lr", None)
+        self._gate_inner_wd = bg.get("inner_weight_decay", None)
+        self._gate_margin = float(bg.get("accept_margin", 0.0))
+        self._gate_max_val = int(bg.get("max_val_batches", 8))
+        self._val_probe_cache: list = []
+        if self._gate_enabled:
+            if not self.centroid_commit_enabled:
+                raise ValueError(
+                    "centroid_commit.bilevel_gate requires "
+                    "centroid_commit.enabled: true."
+                )
+            logger.info(
+                "Bilevel commit gate enabled: k_inner=%d, inner_lr=%s, "
+                "accept_margin=%.3g, max_val_batches=%d",
+                self._gate_k_inner, self._gate_inner_lr, self._gate_margin,
+                self._gate_max_val,
             )
 
         # ----------------------------------------------------------------
@@ -1092,6 +1207,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         # Forward — returns (pred_x, attention_weights, aux_dict)
         pred_x, attention_weights, aux = self.forward(S, X)
+
+        # Soft adjacency for structure diagnostics (PeriodicDAGMetrics).
+        # THE ONLY valid source on this architecture: phi/dag_mask are
+        # deprecated and ``batch_att_mean`` is never assigned any more, so the
+        # attention posterior produced by THIS forward pass -- driven by the
+        # structural embeddings -- IS the learned graph.  Detached and stored
+        # on the module; never touched by the loss.
+        if attention_weights is not None and attention_weights.dim() == 3:
+            self._last_att_mean = attention_weights.detach().mean(dim=0)
         entropy    = aux.get("entropy")    if isinstance(aux, dict) else aux
         l0_penalty = aux.get("l0_penalty") if isinstance(aux, dict) else None
 
@@ -1132,20 +1256,41 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Unified over combined source = [S_values, X_values]
         # HSIC(source_j, res_i) for all (i, j) pairs
         # ----------------------------------------------------------------
-        residuals = x_target.squeeze() - pred_x.squeeze()    # (B, L_X)
-
-        # Candidate-parent values must be paired with the residual of every
-        # child row.  In homogeneous mode ``x_target`` ALREADY is
-        # [S_values | X_values] (all N nodes), so it is the candidate set
-        # itself; in split mode the S values must be prepended.
-        if self.homogeneous_nodes:
-            combined_source = x_target.squeeze()                    # (B, N)
+        # CROSS-FITTING: on train steps, recompute the residual on a DISJOINT
+        # fold (a second forward pass) so the independence statistic is measured
+        # on samples this step's reconstruction gradient did not fit.  Falls
+        # back silently to the in-batch residual when disabled or unavailable
+        # (e.g. validation, or the fold loader was never installed).
+        xfit = self._next_cross_fit_batch() if stage == "train" else None
+        if xfit is not None:
+            S_h, X_h = xfit[0], xfit[1]
+            x_val_h = X_h[:, :, self.val_idx]
+            if self.homogeneous_nodes:
+                x_val_h = torch.cat([S_h[:, :, self.val_idx], x_val_h], dim=1)
+            pred_h = self.forward(S_h, X_h)[0]
+            target_h = torch.nan_to_num(x_val_h)
+            residuals = target_h.squeeze() - pred_h.squeeze()
+            if self.homogeneous_nodes:
+                combined_source = target_h.squeeze()
+            else:
+                combined_source = torch.cat(
+                    [S_h[:, :, self.val_idx], target_h.squeeze()], dim=1
+                )
         else:
-            s_values = S[:, :, self.val_idx]          # (B, L_S)
-            x_values = x_target.squeeze()             # (B, L_X)
-            # Concatenate all potential parent values:
-            # [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
-            combined_source = torch.cat([s_values, x_values], dim=1)  # (B, L_S+L_X)
+            residuals = x_target.squeeze() - pred_x.squeeze()    # (B, L_X)
+
+            # Candidate-parent values must be paired with the residual of every
+            # child row.  In homogeneous mode ``x_target`` ALREADY is
+            # [S_values | X_values] (all N nodes), so it is the candidate set
+            # itself; in split mode the S values must be prepended.
+            if self.homogeneous_nodes:
+                combined_source = x_target.squeeze()                    # (B, N)
+            else:
+                s_values = S[:, :, self.val_idx]          # (B, L_S)
+                x_values = x_target.squeeze()             # (B, L_X)
+                # Concatenate all potential parent values:
+                # [S_1,...,S_{L_S}, X_1,...,X_{L_X}]
+                combined_source = torch.cat([s_values, x_values], dim=1)  # (B, L_S+L_X)
 
         # --- Per-phase bandwidth freeze (lazy latch on the first train batch) --
         if stage == "train" and self.hsic_freeze_bandwidth:
@@ -1163,6 +1308,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         hsic_pair_mask, hsic_desc_kept_frac, hsic_desc_cyclic = self._build_hsic_descendant_mask(
             score_tensor
         )
+        # Bilevel machinery: the probe/virtual-pass pair weights are the
+        # STRUCTURAL mask only (descendant x LOO) — BKD excluded, since probes
+        # run with key dropout off.  Captured before the BKD multiply below.
+        _probe_mask_base = hsic_pair_mask
 
         # --- BKD dropped-key exclusion ------------------------------------
         # Keys dropped by batch-consistent key dropout were NOT in the
@@ -1214,6 +1363,25 @@ class AttentionSelectorForecaster(pl.LightningModule):
             else:
                 hsic_pair_mask = loo_gamma
 
+        # Stash the probe/virtual-pass pair weights (descendant x LOO, no BKD)
+        # for the bilevel gate and the unrolled shadow.  Train stage only;
+        # None when the attention-weighted HSIC variant is in use (the probe
+        # then measures the plain per-pair rows, which the gate docs note).
+        if stage == "train" and (
+                self._gate_enabled or self._commit_source == "hsic_unrolled"):
+            if self.use_attention_weighted_hsic:
+                self._last_probe_pair_mask = None
+            elif loo_gamma is not None and not self.use_attention_weighted_hsic:
+                self._last_probe_pair_mask = (
+                    loo_gamma.detach() if _probe_mask_base is None
+                    else (_probe_mask_base * loo_gamma).detach()
+                )
+            else:
+                self._last_probe_pair_mask = (
+                    None if _probe_mask_base is None
+                    else _probe_mask_base.detach()
+                )
+
         pair_mask_empty = hsic_pair_mask is not None and not bool(
             (hsic_pair_mask != 0).any()
         )
@@ -1222,6 +1390,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # no learnable HSIC signal - contribute an exact zero rather
             # than a NaN from the empty weighted mean.
             hsic_value = torch.zeros((), device=combined_source.device)
+            self._last_hsic_row_means = None
         elif self.use_attention_weighted_hsic:
             # Attention-weighted HSIC: weight each (child, source) pair by the
             # batch-mean attention weight att[child, source].  The attention
@@ -1234,22 +1403,92 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 # Dropped sources get zero pair weight (pair_mask is unused
                 # by the attention-weighted variant).
                 att_mean = att_mean * bkd_keep_mask
+                if self.hsic_softmax:
+                    # Softmax treats the scores as LOGITS: a dropped source
+                    # must be -inf (weight exactly 0), not 0 (weight ~ 1/Z).
+                    att_mean = att_mean.masked_fill(
+                        bkd_keep_mask == 0, float("-inf")
+                    )
             if loo_gamma is not None:
                 att_mean = att_mean * loo_gamma
-            hsic_value = hsic_attention_weighted(
-                source_values=combined_source,
-                residuals=residuals,
-                attention_weights=att_mean,
-                sigma=self.hsic_sigma,
-                exclude_diagonal=False,
-                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
-                mode=self.hsic_mode,
-                nhsic_epsilon=self.nhsic_epsilon,
-                source_kernel=self.hsic_kernel_source,
-                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
-            )
+
+            if self.hsic_softmax:
+                # SOFTMAX COMPETITION: row-wise softmax pair weights, self-edge
+                # excluded inside the aggregation, NO descendant mask.
+                hsic_out = hsic_attention_softmax(
+                    source_values=combined_source,
+                    residuals=residuals,
+                    attention_weights=att_mean,
+                    sigma=self.hsic_sigma,
+                    adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                    mode=self.hsic_mode,
+                    nhsic_epsilon=self.nhsic_epsilon,
+                    source_kernel=self.hsic_kernel_source,
+                    bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                    return_matrix=self.log_hsic_rows,
+                    # Split mode: target i's own value sits at column
+                    # i + S_seq_len of the combined [S ; X] source matrix.
+                    diagonal_offset=(
+                        0 if self.homogeneous_nodes else self.S_seq_len
+                    ),
+                )
+                if self.log_hsic_rows:
+                    hsic_value, hsic_mat = hsic_out
+                    # Node-responsible rows with the SAME pair weights as the
+                    # scalar aggregation -- the (detached) softmax weights, so
+                    # the rows sum-decompose the logged HSIC.
+                    self._last_hsic_row_means = hsic_row_means(
+                        hsic_mat.detach(),
+                        pair_mask=hsic_softmax_pair_weights(
+                            att_mean.detach(),
+                            diagonal_offset=(
+                                0 if self.homogeneous_nodes else self.S_seq_len
+                            ),
+                        ),
+                    )
+                else:
+                    hsic_value = hsic_out
+                    self._last_hsic_row_means = None
+            else:
+                # HYBRID aggregation: weight ONLY descendant pairs.  The mask is
+                # derived from the DIRECTED score tensor (the asymmetric/skew term
+                # that carries the orientation), never from the gated posterior, and
+                # is always detached -- see _build_descendant_weight_mask.
+                desc_w_mask = None
+                if self.hsic_weight_descendants_only:
+                    desc_w_mask = self._build_descendant_weight_mask(score_tensor)
+
+                hsic_out = hsic_attention_weighted(
+                    source_values=combined_source,
+                    residuals=residuals,
+                    attention_weights=att_mean,
+                    sigma=self.hsic_sigma,
+                    # HYBRID mode MUST drop the diagonal: HSIC(X_i, r_i) is
+                    # irreducible and is NOT a descendant pair, so it would enter
+                    # unweighted as a large constant and drown the signal.
+                    exclude_diagonal=self.hsic_weight_descendants_only,
+                    adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                    mode=self.hsic_mode,
+                    nhsic_epsilon=self.nhsic_epsilon,
+                    source_kernel=self.hsic_kernel_source,
+                    bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                    return_matrix=self.log_hsic_rows,
+                    descendant_mask=desc_w_mask,
+                )
+                if self.log_hsic_rows:
+                    hsic_value, hsic_mat = hsic_out
+                    # Node-responsible rows with the SAME pair weights as the
+                    # scalar aggregation -- here the (detached) attention posterior
+                    # itself, so the rows sum-decompose the logged HSIC.  Detached:
+                    # logging only, never part of the loss.
+                    self._last_hsic_row_means = hsic_row_means(
+                        hsic_mat.detach(), pair_mask=att_mean.detach()
+                    )
+                else:
+                    hsic_value = hsic_out
+                    self._last_hsic_row_means = None
         else:
-            hsic_value = hsic_cross_per_pair(
+            hsic_out = hsic_cross_per_pair(
                 combined_source,
                 residuals,
                 sigma=self.hsic_sigma,
@@ -1259,7 +1498,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 source_kernel=self.hsic_kernel_source,
                 bandwidth_multipliers=self.hsic_bandwidth_multipliers,
                 pair_mask=hsic_pair_mask,
+                return_matrix=self.log_hsic_rows,
             )
+            if self.log_hsic_rows:
+                hsic_value, hsic_mat = hsic_out
+                # Node-responsible rows: mean_j HSIC(source_j, res_i) with the
+                # same pair weights as the scalar aggregation.  Detached:
+                # logging only, never part of the loss.
+                self._last_hsic_row_means = hsic_row_means(
+                    hsic_mat.detach(), pair_mask=hsic_pair_mask
+                )
+            else:
+                hsic_value = hsic_out
         hsic_reg = self.lambda_hsic * hsic_value
 
         if hsic_pair_mask is not None:
@@ -1365,6 +1615,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
             qn_penalty = torch.tensor(0.0, device=X.device)
         qn_reg = self.lambda_query_norm * qn_penalty
 
+        # Without gradient routing there IS no structural loss stream: the
+        # plain ``training_step`` branch back-propagates ``total_loss`` alone,
+        # so a penalty that only rides on ``loss_structural`` would be logged
+        # but contribute exactly zero gradient (the learnable query-norm budget
+        # would then be free to grow without bound).  Add it to ``total_loss``
+        # on that path only -- routed runs keep their byte-identical behaviour
+        # because they never back-propagate ``total_loss``.
+        if not self.use_gradient_routing:
+            total_loss = total_loss + qn_reg
+
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
         self._last_loss_components = {
@@ -1401,6 +1661,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_score_sparse", score_sparse_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
+        if self.hsic_weight_descendants_only:
+            # Fraction of pairs currently classed as descendants, i.e. the only
+            # pairs whose attention receives gradient.  Watch for drift: -> 0
+            # means the hybrid has degenerated to the unweighted objective,
+            # -> 1 means it has degenerated to plain attention weighting.
+            self.log(f"{stage}_desc_weight_frac",
+                     float(self._last_desc_weight_frac),
+                     on_step=False, on_epoch=True)
+        # Per-row (node-responsible) HSIC: mean over sources per target node.
+        # NaN rows (fully excluded this batch) are skipped.
+        if self.log_hsic_rows and self._last_hsic_row_means is not None:
+            for _i, _v in enumerate(self._last_hsic_row_means):
+                if not torch.isnan(_v):
+                    self.log(f"{stage}_hsic_row_{_i}", _v,
+                             on_step=False, on_epoch=True)
         # Descendant-exclusion diagnostics.  NOTE: with masking active the
         # ``{stage}_hsic`` value above is a MASKED mean, so its normalisation
         # set drifts as the learned graph changes and it is NOT comparable
@@ -1907,6 +2182,95 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_loo_gamma_min = float(g.min())
         return g
 
+    def _next_cross_fit_batch(self):
+        """Next fold-B batch (moved to the module device), or ``None``.
+
+        Fold B is an independent, permanently-disjoint subset of the training
+        set (see ``ProcessDataModule.set_hsic_cross_fit``).  Its loader is
+        cycled independently of the Lightning train loader: the two folds differ
+        in size and shuffle order, so the iterator is simply restarted whenever
+        it is exhausted rather than being tied to the epoch boundary.
+
+        Returns ``None`` (silently falling back to the in-batch residual) when
+        cross-fitting is off or no fold loader is installed -- e.g. under a
+        trainer that never called ``set_hsic_cross_fit``.
+        """
+        if not self.hsic_cross_fit:
+            return None
+
+        if self._xfit_loader is None:
+            dm = getattr(self.trainer, "datamodule", None) if self._trainer else None
+            get = getattr(dm, "hsic_cross_fit_dataloaders", None) if dm else None
+            loaders = get() if callable(get) else None
+            if loaders is None:
+                if not getattr(self, "_warned_no_xfit", False):
+                    self._warned_no_xfit = True
+                    logger.warning(
+                        "hsic_cross_fit=True but the datamodule exposes no "
+                        "cross-fit folds; falling back to the in-batch residual "
+                        "(the HSIC is then measured on the fitted samples)."
+                    )
+                return None
+            self._xfit_loader = loaders[1]      # fold B
+
+        try:
+            if self._xfit_iter is None:
+                self._xfit_iter = iter(self._xfit_loader)
+            batch = next(self._xfit_iter)
+        except StopIteration:
+            self._xfit_iter = iter(self._xfit_loader)
+            batch = next(self._xfit_iter)
+
+        return [
+            b.to(self.device) if torch.is_tensor(b) else b for b in batch
+        ]
+
+    def _build_descendant_weight_mask(
+        self,
+        score_tensor: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Detached 0/1 mask marking DESCENDANT pairs, for hybrid aggregation.
+
+        ``1`` where source ``j`` is a descendant of target ``i`` (those pairs get
+        attention-weighted), ``0`` elsewhere (those enter unweighted).  This is
+        the exact complement of ``build_hsic_pair_mask``'s "kept" set, so the
+        closure logic -- hardening, transitive closure, two-cycle resolution --
+        is shared rather than re-derived.
+
+        The source is the DIRECTED score tensor: its asymmetric (skew) term is
+        what carries edge orientation, and unlike the gated posterior it does
+        not shrink as attention collapses, so the mask cannot be dissolved by
+        the very collapse it is meant to police.
+
+        Returns ``None`` when no mask can be built (no/multi-head score tensor),
+        in which case the caller degrades to plain attention weighting.
+        """
+        if score_tensor is None or not isinstance(score_tensor, torch.Tensor):
+            return None
+        if score_tensor.dim() != 2:
+            return None
+
+        try:
+            keep_mask, kept_frac, _cyclic = build_hsic_pair_mask(
+                score_tensor=score_tensor.detach(),
+                s_seq_len=self.S_seq_len,
+                homogeneous_nodes=self.homogeneous_nodes,
+                threshold=self.hsic_descendant_threshold,
+                hops=self.hsic_descendant_hops,
+                # The diagonal is handled by ``exclude_diagonal`` in the
+                # aggregation itself; keep it out of the descendant set.
+                exclude_self=False,
+                excluded_weight=0.0,
+            )
+        except (ValueError, RuntimeError) as e:   # pragma: no cover - guard
+            logger.warning(f"hybrid descendant mask unavailable: {e}")
+            return None
+
+        # keep_mask is 1 on NON-descendants -> invert to get the descendant set.
+        desc = (1.0 - keep_mask).detach()
+        self._last_desc_weight_frac = float(1.0 - kept_frac)
+        return desc
+
     def _build_hsic_descendant_mask(
         self,
         score_tensor: Optional[torch.Tensor],
@@ -2401,12 +2765,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 for t in self._commit.tables:
                     if t.shadow.grad is not None:
                         t.shadow.grad = None
-                if self._commit_source == "hsic":
-                    cc_grads = torch.autograd.grad(
-                        self._last_hsic_reg,
-                        [t.shadow for t in self._commit.tables],
-                        retain_graph=True, allow_unused=True,
-                    )
+                if self._commit_source in ("hsic", "hsic_unrolled"):
+                    cc_grads = self._shadow_evidence(batch)
 
             # Backward 2: structural loss (graph consumed).  With
             # training.gradient_surgery=True this applies PCGrad per block to
@@ -2439,14 +2799,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 NodewiseQuerySelector.restore(nw_snap)
 
             # Centroid-commit: evidence update + commit checks (consumes and
-            # clears the shadow grads).
+            # clears the shadow grads).  With the bilevel gate, eligible
+            # commits are deferred and resolved by paired refit probes.
             if cc_active:
-                n_new = self._commit.step(cc_grads)
+                n_new = self._commit.step(cc_grads, defer=self._gate_enabled)
                 self.log("struct/commit_count", float(n_new), on_step=False,
                          on_epoch=True, reduce_fx="sum")
                 for c in self._commit.last_commits:
                     self.log("struct/commit_margin", float(c["margin"]),
                              on_step=False, on_epoch=True, reduce_fx="max")
+                if self._gate_enabled:
+                    self._run_bilevel_gate()
 
             return total_loss
         else:
@@ -2509,7 +2872,240 @@ class AttentionSelectorForecaster(pl.LightningModule):
             nw.reset_epoch_diagnostics()
         super().on_train_epoch_end()
 
+    # ------------------------------------------------------------------
+    # Second-order (DARTS) shadow evidence: hsic_unrolled
+    # ------------------------------------------------------------------
+    def _lean_pred(self, S, X, overrides=None):
+        """One forward's prediction; with ``overrides`` the reconstruction
+        params are substituted (``torch.func.functional_call``) instead of
+        mutated — the module and its version counters stay untouched."""
+        if overrides is None:
+            return self.forward(data_source=S, data_intermediate=X)[0]
+        from torch.func import functional_call
+        return functional_call(
+            self, overrides, (), {"data_source": S, "data_intermediate": X},
+        )[0]
+
+    def _lean_hsic(self, S, X, overrides=None):
+        """HSIC term of ONE grad-enabled forward, using the stashed
+        structural pair mask (descendant x LOO, no BKD) and, when latched,
+        the phase's frozen bandwidths."""
+        pred = self._lean_pred(S, X, overrides)
+        x_val = X[:, :, self.val_idx]
+        if self.homogeneous_nodes:
+            x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
+        x_target = torch.nan_to_num(x_val)
+        residuals = x_target.squeeze() - pred.squeeze()
+        combined = (x_target.squeeze() if self.homogeneous_nodes else
+                    torch.cat([S[:, :, self.val_idx], x_target.squeeze()], dim=1))
+        if self._hsic_bw_frozen_sigmas is not None:
+            sigma, adaptive = self._hsic_bw_frozen_sigmas, False
+        else:
+            sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
+        return hsic_cross_per_pair(
+            combined, residuals, sigma=sigma, adaptive_bandwidth=adaptive,
+            mode=self.hsic_mode, nhsic_epsilon=self.nhsic_epsilon,
+            source_kernel=self.hsic_kernel_source,
+            bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+            pair_mask=self._last_probe_pair_mask,
+        )
+
+    def _lean_recon(self, S, X, overrides=None):
+        """MSE of ONE grad-enabled forward (same target layout as _step)."""
+        pred = self._lean_pred(S, X, overrides)
+        x_val = X[:, :, self.val_idx]
+        if self.homogeneous_nodes:
+            x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
+        x_target = torch.nan_to_num(x_val)
+        return torch.nn.functional.mse_loss(pred.squeeze(), x_target.squeeze())
+
+    def _shadow_evidence(self, batch):
+        """Shadow gradient for the commit controller: first-order HSIC
+        (``hsic``) or the DARTS second-order destination-state gradient
+        (``hsic_unrolled``).  Must be called with the main graph alive
+        (before the structural backward).  With ``unrolled.every = m > 1``
+        the unrolled gradient is computed every m-th call and the
+        first-order term on off-steps."""
+        if self._commit_source == "hsic_unrolled":
+            self._unrolled_step_count += 1
+            if self._unrolled_step_count % self._unrolled_every == 0:
+                return self._unrolled_shadow_grads(batch)
+        return torch.autograd.grad(
+            self._last_hsic_reg,
+            [t.shadow for t in self._commit.tables],
+            retain_graph=True, allow_unused=True,
+        )
+
+    def _unrolled_shadow_grads(self, batch):
+        """DARTS second-order shadow gradient (docs/ideas/BILEVEL_CENTROID_COMMIT.md).
+
+            theta_R' = theta_R - eta * grad_{theta_R} L_recon   (virtual refit)
+            g_q = grad_shadow HSIC(theta_R')
+                - eta * [grad_shadow L_recon(theta_R + eps*v)
+                         - grad_shadow L_recon(theta_R - eps*v)] / (2*eps)
+            v = grad_{theta_R'} HSIC
+
+        ALL passes (including the theta_R gradient of step 1) use
+        ``torch.func.functional_call`` with substituted parameter dicts:
+        theta_R is NEVER mutated in place (an in-place swap would bump
+        parameter version counters and invalidate the retained main graph for
+        the structural backward that follows).  Step 1 differentiates a lean
+        pass w.r.t. detached copies rather than the main graph w.r.t. the live
+        parameters, because in the structure phase the adaptive controller
+        freezes theta_R (``requires_grad_(False)``) and autograd would raise
+        "One of the differentiated Tensors does not require grad".
+        BKD is off during the lean passes (the probe mask excludes the BKD
+        factor) and every lean pass shares one forked RNG seed, so stochastic
+        gates/dropout are paired across passes and the global training RNG
+        stream is not advanced.
+        """
+        from torch.func import functional_call
+
+        tables = self._commit.tables
+        shadows = [t.shadow for t in tables]
+        recon_params = getattr(self, "_reconstruction_params", None)
+        if recon_params is None:
+            # No gradient routing (single optimizer): classify on the fly.
+            _, recon_params = classify_parameters(self.model, verbose=False)
+        recon_ids = {id(p) for p in recon_params}
+        base = {n: p for n, p in self.named_parameters()
+                if id(p) in recon_ids}
+        names = list(base)
+        eta = (self._unrolled_inner_lr if self._unrolled_inner_lr is not None
+               else float(self.config["training"].get("lr", 1e-3)))
+        eps = self._unrolled_fd_eps
+        S, X = batch[0], batch[1]
+        device = base[names[0]].device
+
+        bkd_mods = [m for m in self.model.modules()
+                    if hasattr(m, "set_bkd_phase_active")]
+        bkd_state = [getattr(m, "_bkd_phase_active", True) for m in bkd_mods]
+
+        def _lean(fn, overrides):
+            with torch.random.fork_rng(
+                    devices=[device] if device.type == "cuda" else []):
+                torch.manual_seed(20240913)
+                return fn(S, X, overrides)
+
+        try:
+            for m in bkd_mods:
+                m.set_bkd_phase_active(False)
+
+            # 1. theta_R gradient of the recon loss.  The MAIN graph cannot
+            # be differentiated w.r.t. theta_R here: in the structure phase
+            # the phase controller freezes theta_R (requires_grad_(False)),
+            # so autograd.grad on the live parameters raises "One of the
+            # differentiated Tensors does not require grad".  Differentiate
+            # a LEAN pass w.r.t. detached, grad-enabled COPIES substituted
+            # via functional_call instead (same mechanism as the virtual /
+            # perturbed passes below): the live parameters and their version
+            # counters stay untouched, so the retained main graph used by the
+            # structural backward that follows remains valid.
+            theta = {n: base[n].detach().requires_grad_(True) for n in names}
+            g_R = torch.autograd.grad(
+                _lean(self._lean_recon, theta),
+                [theta[n] for n in names], allow_unused=True)
+            g_R = [torch.zeros_like(theta[n]) if g is None else g.detach()
+                   for g, n in zip(g_R, names)]
+
+            # 2. Virtual refit: HSIC gradient at the destination state.  The
+            # perturbed theta_R' are fresh leaves so v = grad_{theta_R'} HSIC
+            # is defined at the virtual point.
+            pert = {n: (theta[n] - eta * g).detach().requires_grad_(True)
+                    for n, g in zip(names, g_R)}
+            g_all = torch.autograd.grad(
+                _lean(self._lean_hsic, pert),
+                shadows + [pert[n] for n in names], allow_unused=True)
+            g_q = list(g_all[:len(shadows)])
+            v = [torch.zeros_like(pert[n]) if g is None else g.detach()
+                 for g, n in zip(g_all[len(shadows):], names)]
+
+            # 3. Finite-difference mixed Hessian: d/dshadow L_recon along v.
+            fd = []
+            for sign in (+1.0, -1.0):
+                fd_pert = {n: (theta[n] + sign * eps * vi).detach()
+                           for n, vi in zip(names, v)}
+                g = torch.autograd.grad(_lean(self._lean_recon, fd_pert),
+                                        shadows, allow_unused=True)
+                fd.append([None if gi is None else gi.detach() for gi in g])
+
+            out = []
+            for gq, gp, gm in zip(g_q, fd[0], fd[1]):
+                if gq is None:
+                    out.append(None)
+                    continue
+                corr = torch.zeros_like(gq) if gp is None or gm is None \
+                    else (gp - gm) * (eta / (2.0 * eps))
+                out.append(gq.detach() - corr)
+            return out
+        finally:
+            for m, s in zip(bkd_mods, bkd_state):
+                m.set_bkd_phase_active(s)
+
+    # ------------------------------------------------------------------
+    # Bilevel commit gate (Phase 2, docs/ideas/BILEVEL_CENTROID_COMMIT.md)
+    # ------------------------------------------------------------------
+    def _run_bilevel_gate(self) -> None:
+        """Probe and resolve the deferred commit candidates of this step.
+
+        Each pending candidacy is a snapshot (subset fixed at trigger time).
+        The probe compares the node's HSIC row after a paired k-step
+        reconstruction refit (incumbent vs candidate) on cached validation
+        batches; acceptance commits, rejection taboos the candidate subset.
+        Without cached val batches the candidacy is DROPPED (not tabooed) -
+        the shadow persists, so eligibility re-triggers on the next step.
+        """
+        from causaliT.training.bilevel_probe import paired_refit_probe
+        from causaliT.training.centroid_commit import centroid_of
+
+        cc = self._commit
+        pending, cc.pending = cc.pending, []
+        if not pending:
+            return
+        if not self._val_probe_cache:
+            logger.info("bilevel gate: %d candidacy(ies) dropped, no cached "
+                        "val batches yet", len(pending))
+            self.log("struct/gate_deferred", float(len(pending)),
+                     on_step=False, on_epoch=True, reduce_fx="sum")
+            return
+        for entry in pending:
+            vec = centroid_of(cc.K, entry["cand"])
+            res = paired_refit_probe(
+                self,
+                {entry["gi"]: vec},
+                self._val_probe_cache,
+                k_inner=self._gate_k_inner,
+                inner_optimizer=self._gate_inner_optimizer,
+                inner_lr=self._gate_inner_lr,
+                inner_weight_decay=self._gate_inner_wd,
+                accept_margin=self._gate_margin,
+                seed=self.global_step,
+                pair_mask=self._last_probe_pair_mask,
+            )
+            accepted = res.accepted[entry["gi"]]
+            cc.finalize(entry, accepted)
+            self.log("struct/gate_accepted", float(accepted),
+                     on_step=False, on_epoch=True, reduce_fx="sum")
+            self.log("struct/gate_rejected", float(not accepted),
+                     on_step=False, on_epoch=True, reduce_fx="sum")
+            self.log("struct/gate_delta", res.deltas[entry["gi"]],
+                     on_step=False, on_epoch=True)
+            # Constant-shift tripwire: a large MSE gain with delta ~ 0 means
+            # the move is invisible to HSIC (docs/ideas/BILEVEL_CENTROID_COMMIT.md).
+            self.log("struct/gate_dmse", res.mse_deltas[entry["gi"]],
+                     on_step=False, on_epoch=True)
+        self.log("struct/gate_taboos",
+                 float(sum(len(s) for s in cc.taboos)),
+                 on_step=False, on_epoch=True)
+
     def validation_step(self, batch, batch_idx):
+        # Bilevel gate: cache the first max_val_batches val batches (detached)
+        # for the paired refit probes.  Filled once; also covers the initial
+        # sanity-check pass so probes can fire from epoch 0.
+        if (self._gate_enabled
+                and len(self._val_probe_cache) < self._gate_max_val):
+            self._val_probe_cache.append(
+                (batch[0].detach(), batch[1].detach()))
         total_loss, _, _ = self._step(batch, stage="val")
         return total_loss
 
@@ -2547,6 +3143,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             recon_cfg = get_recon_optimizer_config(tc)
             return make_optimizer(list(self.model.parameters()), **recon_cfg)
 
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Persist the centroid-commit controller state (taboos, counters)."""
+        if self._commit is not None:
+            checkpoint["centroid_commit"] = self._commit.state_dict()
+
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """
         Strip BKD state-dict keys that don't exist in the current model.
@@ -2580,6 +3181,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """
         if "state_dict" not in checkpoint:
             return
+
+        # Restore the centroid-commit controller state (taboos, counters).
+        if "centroid_commit" in checkpoint and self._commit is not None:
+            self._commit.load_state_dict(checkpoint["centroid_commit"])
 
         # Re-arm the centroid-init latch: if the checkpoint already carries a
         # (trained) X query embedding, mark the one-off init as DONE so a warm-

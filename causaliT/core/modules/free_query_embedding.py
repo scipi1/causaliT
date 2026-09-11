@@ -88,6 +88,22 @@ class FreeQueryEmbedding(nn.Module):
             with torch.no_grad():
                 self.shadow.copy_(self.embedding.weight)
 
+    def _apply(self, fn, recurse=True):
+        """Re-leaf the shadow buffer after device/dtype moves.
+
+        ``nn.Module._apply`` (``.cuda()`` / ``.double()`` / ...) replaces
+        buffer tensors with the op result, which is a NON-leaf tensor with
+        ``requires_grad`` preserved.  A non-leaf shadow breaks ``.grad``
+        accumulation (silently starving the commit evidence) and is rejected
+        by ``deepcopy`` (cluster crash, job 12294402).  Re-detach it here.
+        """
+        out = super()._apply(fn, recurse)
+        if self._buffers.get("shadow", None) is not None:
+            self._buffers["shadow"] = (
+                self._buffers["shadow"].detach().requires_grad_(True)
+            )
+        return out
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
         Args:

@@ -478,6 +478,46 @@ def hsic_pair_matrix(
     return torch.stack(rows, dim=0)
 
 
+def hsic_row_means(
+    hsic_mat: torch.Tensor,
+    pair_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-target (row) mean of a HSIC pair matrix, respecting pair weights.
+
+    Each row ``j`` is the node-responsible HSIC term
+    ``mean_i HSIC(source_i, residual_j)`` used by the bilevel-gated commit
+    machinery (docs/ideas/BILEVEL_CENTROID_COMMIT.md).  Entries that are NaN
+    (skipped pairs) are dropped; with ``pair_mask`` given the row mean is the
+    weighted mean ``sum_i(w_ji * HSIC_ji) / sum_i(w_ji)`` over valid pairs,
+    matching the aggregation of :func:`hsic_cross_per_pair` per row.  Rows
+    whose total weight is ~0 (fully excluded) come back as NaN.
+
+    Args:
+        hsic_mat:  ``(L_target, L_source)`` pair matrix (NaN = skipped pair).
+        pair_mask: Optional ``(L_target, L_source)`` non-negative weights.
+
+    Returns:
+        ``(L_target,)`` tensor of per-row (weighted) means, NaN for empty rows.
+    """
+    if hsic_mat.ndim != 2:
+        raise ValueError(f"hsic_mat must be 2-D, got shape {tuple(hsic_mat.shape)}")
+    valid = ~torch.isnan(hsic_mat)
+    if pair_mask is not None:
+        if tuple(pair_mask.shape) != tuple(hsic_mat.shape):
+            raise ValueError(
+                f"pair_mask shape {tuple(pair_mask.shape)} does not match "
+                f"hsic_mat shape {tuple(hsic_mat.shape)}."
+            )
+        w = pair_mask.to(device=hsic_mat.device, dtype=hsic_mat.dtype)
+    else:
+        w = torch.ones_like(hsic_mat)
+    w_valid = torch.where(valid, w, torch.zeros_like(w))
+    val_valid = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
+    wsum = w_valid.sum(dim=1)
+    rows = (w_valid * val_valid).sum(dim=1) / wsum.clamp_min(1e-12)
+    return torch.where(wsum > 1e-12, rows, torch.full_like(rows, float("nan")))
+
+
 def hsic_cross_per_pair(
     s_values: torch.Tensor,
     residuals: torch.Tensor,
@@ -488,6 +528,7 @@ def hsic_cross_per_pair(
     source_kernel: str = "rbf",
     bandwidth_multipliers: Optional[Sequence[float]] = None,
     pair_mask: Optional[torch.Tensor] = None,
+    return_matrix: bool = False,
 ) -> torch.Tensor:
     """
     Compute HSIC between each S variable and each X residual (per-pair).
@@ -517,10 +558,15 @@ def hsic_cross_per_pair(
             ``causaliT.utils.descendant_mask.build_hsic_pair_mask``, which
             produces the descendant-exclusion mask.  ``None`` (default)
             reproduces the plain unweighted mean exactly.
+        return_matrix: If True, return ``(scalar, hsic_mat)`` where
+            ``hsic_mat`` is the ``(seq_len_x, seq_len_s)`` pair matrix (NaN for
+            skipped pairs).  Used for per-row (per-node) HSIC diagnostics —
+            see :func:`hsic_row_means`.
 
     Returns:
-        Mean (or ``pair_mask``-weighted mean) HSIC across all (S_i, res_j) pairs
-        (scalar)
+        Mean (or ``pair_mask``-weighted mean) HSIC across all (S_i, res_j)
+        pairs (scalar), or the ``(scalar, hsic_mat)`` tuple when
+        ``return_matrix=True``.
 
     Example:
         >>> s_values = torch.randn(100, 5)   # 5 S variables
@@ -544,10 +590,12 @@ def hsic_cross_per_pair(
     )
 
     if hsic_mat.numel() == 0:
-        return torch.tensor(0.0, device=s_values.device, dtype=s_values.dtype)
+        zero = torch.tensor(0.0, device=s_values.device, dtype=s_values.dtype)
+        return (zero, hsic_mat) if return_matrix else zero
 
     if pair_mask is None:
-        return hsic_mat.mean()
+        scalar = hsic_mat.mean()
+        return (scalar, hsic_mat) if return_matrix else scalar
 
     # Weighted mean over the pairs that were actually computed.  Skipped pairs
     # (weight == 0) come back as NaN and are dropped here, so a zero weight and
@@ -557,8 +605,10 @@ def hsic_cross_per_pair(
     weight_sum = weights[valid].sum()
     if float(weight_sum) <= 1e-12:
         # Everything excluded: no structural signal available this step.
-        return torch.zeros((), device=s_values.device, dtype=s_values.dtype)
-    return (weights[valid] * hsic_mat[valid]).sum() / weight_sum
+        zero = torch.zeros((), device=s_values.device, dtype=s_values.dtype)
+        return (zero, hsic_mat) if return_matrix else zero
+    scalar = (weights[valid] * hsic_mat[valid]).sum() / weight_sum
+    return (scalar, hsic_mat) if return_matrix else scalar
 
 
 def hsic_per_token(
@@ -673,11 +723,20 @@ def hsic_attention_weighted(
     nhsic_epsilon: float = 0.01,
     source_kernel: str = "rbf",
     bandwidth_multipliers: Optional[Sequence[float]] = None,
+    return_matrix: bool = False,
+    descendant_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Attention-weighted HSIC for causal structure regularization.
 
-    Computes: sum(att[i,j] * HSIC(source_j, residual_i)) / sum(att)
+    Computes: mean_i( sum_j att[i,j] * HSIC(source_j, residual_i) )
+
+    NOTE: this is the UNNORMALISED weighted sum (row-mean over targets).  The
+    ``/ sum(att)`` normalisation present in the original implementation was
+    removed -- it made the objective a weighted mean whose minimum is a one-hot
+    attention, and it divided parentless rows by ~0.  See the body for details.
+    Consequence: the objective can be lowered by shrinking attention globally,
+    so callers must pair it with a reconstruction term.
 
     The attention weight acts as a "confidence" factor: the model is penalized
     proportionally to how much it relies on each edge. High penalty occurs when:
@@ -706,9 +765,28 @@ def hsic_attention_weighted(
         source_kernel: "rbf" (default) or "dirac" (for discrete S in cross-attention).
             Only relevant for cross-attention (exclude_diagonal=False).
             For self-attention, X is always continuous → always uses RBF.
+        descendant_mask: Optional ``(L_target, L_source)`` DETACHED 0/1 mask,
+            ``1`` where source ``j`` is a descendant of target ``i``.  When
+            given, the aggregation becomes the HYBRID:
+
+                L_i = sum_{j not desc} H_ij + sum_{j in desc} att_ij * H_ij
+
+            i.e. non-descendant pairs enter UNWEIGHTED and only descendant pairs
+            are attention-weighted.  This removes the degenerate ``att -> 0``
+            direction by construction: under an ANM a correct fit leaves
+            ``H_ij`` at the noise floor for every non-descendant, and those
+            terms carry NO gradient w.r.t. the attention, so shrinking a true
+            parent's weight buys nothing (its ``H_ij`` is paid in full either
+            way).  Only descendant pairs -- whose dependence is irreducible and
+            whose attention SHOULD go to zero -- retain an escape.
+        return_matrix: If True, also return the raw ``(L_target, L_source)`` HSIC
+            pair matrix (NaN = skipped pair) so callers can log per-node rows
+            via :func:`hsic_row_means`.  Diagnostics only -- the scalar is
+            unchanged.
 
     Returns:
-        Normalized attention-weighted HSIC (scalar)
+        Normalized attention-weighted HSIC (scalar), or ``(scalar, hsic_mat)``
+        when ``return_matrix=True``.
     """
     effective_source_kernel = source_kernel if not exclude_diagonal else "rbf"
     hsic_mat = hsic_pair_matrix(
@@ -731,14 +809,201 @@ def hsic_attention_weighted(
             f"HSIC matrix shape {tuple(hsic_mat.shape)}"
         )
 
-    weighted_hsic_sum = (weights[valid] * hsic_mat[valid]).sum()
-    weight_sum = weights[valid].sum()
+    # UNNORMALISED sum: mean over target rows of sum_j att_ij * HSIC_ij.
+    #
+    # The original implementation divided by ``sum(att)``.  That was removed:
+    # the ratio is a WEIGHTED MEAN, so its minimum over the attention simplex is
+    # ``min_ij HSIC_ij``, attained at a VERTEX (one-hot attention).  The
+    # optimiser could therefore park all mass on whichever pair already sat at
+    # the independence floor, send every other weight to ~0, and win -- killing
+    # the fit for free.  Worse, a row with NO parents has ``sum(att) ~ 0`` there,
+    # so its contribution was either amplified by a vanishing denominator or
+    # silently dropped by the ``weight_sum > 1e-8`` guard (which returned a hard
+    # 0.0 carrying NO gradient).
+    #
+    # The plain sum is the honest "penalty proportional to reliance": a pair
+    # costs exactly the attention you put on it times its dependence, and a
+    # parentless row simply contributes ~0 instead of dividing by ~0.  It has a
+    # global-scale escape (shrink all attention), which is why the arms using
+    # this MUST carry a reconstruction term -- see the *_mse configs.
+    #
+    # Row-mean (not global sum) so the magnitude stays comparable across graphs
+    # of different size and does not scale with the number of nodes.
+    if descendant_mask is not None:
+        # HYBRID aggregation: weight ONLY the descendant pairs.  The mask must
+        # be detached (a differentiable mask would let the model relabel a pair
+        # to delete its own penalty), and the ``1.0`` on non-descendant pairs is
+        # a constant, so those terms contribute no gradient to the attention.
+        m = descendant_mask.to(device=weights.device, dtype=weights.dtype).detach()
+        if m.shape != hsic_mat.shape:
+            raise ValueError(
+                f"descendant_mask shape {tuple(m.shape)} does not match "
+                f"HSIC matrix shape {tuple(hsic_mat.shape)}"
+            )
+        weights = m * weights + (1.0 - m) * torch.ones_like(weights)
 
-    # Normalize by total attention weight (avoid division by zero)
-    if weight_sum > 1e-8:
-        return weighted_hsic_sum / weight_sum
-    else:
-        return torch.tensor(0.0, device=source_values.device, dtype=source_values.dtype)
+    w = torch.where(valid, weights, torch.zeros_like(weights))
+    h = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
+    out = (w * h).sum(dim=1).mean()
+
+    if return_matrix:
+        return out, hsic_mat
+    return out
+
+def hsic_softmax_pair_weights(
+    attention_weights: torch.Tensor,
+    diagonal_offset: int = 0,
+) -> torch.Tensor:
+    """Row-wise softmax pair weights with the self-edge removed.
+
+    The attention/gate matrix ``(L_target, L_source)`` is treated as LOGITS
+    and normalised row-wise with a softmax.  The self-edge -- position
+    ``(i, i + diagonal_offset)`` -- is excluded BEFORE the softmax (set to
+    ``-inf``), so it gets exactly weight 0 and the remaining row still sums
+    to 1.  ``diagonal_offset`` is ``0`` for square self-attention/homogeneous
+    matrices and ``S_seq_len`` for split-mode combined matrices, where the
+    X->X block starts after the S columns.  With ``diagonal_offset=0`` the
+    exclusion fires only on SQUARE matrices -- a rectangular matrix with
+    offset 0 is a pure cross-attention block with no self-edge at all
+    (mirrors the square-check convention of ``hsic_pair_matrix``).
+
+    Entries that are already ``-inf`` (e.g. sources hard-dropped by the
+    caller) receive exactly weight 0 and the row renormalises over the rest.
+
+    Returns the ``(L_target, L_source)`` weight matrix, rows summing to 1
+    (or to 0 for a fully-masked row).
+    """
+    logits = attention_weights
+    if logits.ndim != 2:
+        raise ValueError(
+            f"attention_weights must be 2-D, got shape {tuple(logits.shape)}"
+        )
+    n_tgt, n_src = logits.shape
+    masked = logits
+    self_cols = torch.arange(n_tgt, device=logits.device) + diagonal_offset
+    has_self = (self_cols >= 0) & (self_cols < n_src)
+    if diagonal_offset == 0:
+        has_self &= n_tgt == n_src   # rectangular + offset 0: no self-edge
+    if bool(has_self.any()):
+        masked = logits.clone()
+        rows = torch.arange(n_tgt, device=logits.device)[has_self]
+        masked[rows, self_cols[has_self]] = float("-inf")
+    w = torch.softmax(masked, dim=1)
+    # Fully-masked rows (every logit -inf) come back NaN from the softmax;
+    # they contribute nothing to the loss, so map them to 0.
+    return torch.nan_to_num(w, nan=0.0)
+
+
+def hsic_attention_softmax(
+    source_values: torch.Tensor,
+    residuals: torch.Tensor,
+    attention_weights: torch.Tensor,
+    sigma: float = 1.0,
+    adaptive_bandwidth: bool = False,
+    mode: str = "biased",
+    nhsic_epsilon: float = 0.01,
+    source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
+    return_matrix: bool = False,
+    diagonal_offset: int = 0,
+) -> torch.Tensor:
+    """Softmax-competition HSIC for joint structure+reconstruction training.
+
+    Computes: mean_i( sum_j softmax_j(att)[i,j] * HSIC(source_j, residual_i) )
+
+    Identical pair matrix to :func:`hsic_attention_weighted`, but the pair
+    weights are a ROW-WISE SOFTMAX over the attention/gate scores instead of
+    the raw scores.  Each row is therefore a convex combination of the node's
+    HSIC contributions whose weights sum to 1.  This removes the degenerate
+    ``att -> 0`` trivial solution of the unnormalised variant BY CONSTRUCTION:
+    the mass has to go somewhere, so "turn everything off" is not in the
+    hypothesis space, and the lazy optimum (uniform weights over poorly fitted
+    contributions) is worse than selecting the true parents, which under an
+    ANM drives the weighted contributions to the independence floor while the
+    softmax drops descendants/spurious edges through the within-row
+    competition.  No descendant mask is needed (or accepted).
+
+    For a node with NO parents all HSIC terms are equally small, the logit
+    gradient vanishes, and the minimiser is the uniform spread — the row then
+    simply carries a small constant and no structural preference.
+
+    NOTE on temperature: the attention values are posteriors in [0, 1] used
+    directly as logits, which fixes an effective temperature.  A sharper
+    competition can later be obtained by passing the raw pre-sigmoid gate
+    logits instead (same fixed point at uniform).
+
+    Args:
+        source_values: Source variable values (batch, seq_len_source).
+        residuals: Per-target residuals (batch, seq_len_target).
+        attention_weights: Attention/gate matrix (seq_len_target, seq_len_source)
+            averaged over batch, treated as logits.  ``-inf`` entries are
+            hard-excluded (weight exactly 0).
+        sigma: RBF kernel bandwidth (ignored when adaptive_bandwidth=True).
+        adaptive_bandwidth: If True, use median heuristic per variable pair.
+        mode: ``"biased"`` or ``"normalized"``.
+        nhsic_epsilon: Tikhonov regularization for normalized HSIC.
+        source_kernel: ``"rbf"`` or ``"dirac"`` (cross-attention only; the
+            square self-attention case always uses RBF).
+        bandwidth_multipliers: Optional frozen per-side bandwidth multipliers.
+        return_matrix: If True, also return the raw ``(L_target, L_source)``
+            HSIC pair matrix (NaN = skipped pair) for diagnostics.
+        diagonal_offset: Column offset of the self-edge.  ``0`` for square
+            self-attention/homogeneous matrices; ``S_seq_len`` for split-mode
+            combined matrices, where target ``i``'s own value sits at column
+            ``i + S_seq_len`` of the X->X block.  HSIC(X_i, r_i) is
+            irreducible, so the self-edge must never compete for softmax mass.
+
+    Returns:
+        Softmax-weighted HSIC (scalar), or ``(scalar, hsic_mat)`` when
+        ``return_matrix=True``.
+    """
+    square = source_values.shape[1] == residuals.shape[1] and diagonal_offset == 0
+    self_edge = square or diagonal_offset > 0
+    # Square = X->X/self (or homogeneous): X is continuous -> RBF, and the
+    # diagonal self-edge is excluded from the pair matrix (NaN) AND from the
+    # softmax (-inf logit) so it never competes for mass.
+    effective_source_kernel = source_kernel if not self_edge else "rbf"
+    # Split mode (rectangular, diagonal_offset=S_seq_len): exclude the
+    # self-edge via a zero pair_mask, which skips the kernel work entirely.
+    pair_mask = None
+    if not square and diagonal_offset > 0:
+        n_tgt, n_src = residuals.shape[1], source_values.shape[1]
+        pair_mask = torch.ones(n_tgt, n_src, device=source_values.device)
+        rows = torch.arange(n_tgt, device=source_values.device)
+        cols = rows + diagonal_offset
+        keep = cols < n_src
+        pair_mask[rows[keep], cols[keep]] = 0.0
+    hsic_mat = hsic_pair_matrix(
+        source_values=source_values,
+        residuals=residuals,
+        sigma=sigma,
+        adaptive_bandwidth=adaptive_bandwidth,
+        mode=mode,
+        nhsic_epsilon=nhsic_epsilon,
+        source_kernel=effective_source_kernel,
+        bandwidth_multipliers=bandwidth_multipliers,
+        exclude_diagonal=square,
+        pair_mask=pair_mask,
+    )
+
+    valid = ~torch.isnan(hsic_mat)
+    logits = attention_weights.to(device=source_values.device, dtype=source_values.dtype)
+    if logits.shape != hsic_mat.shape:
+        raise ValueError(
+            f"attention_weights shape {tuple(logits.shape)} does not match "
+            f"HSIC matrix shape {tuple(hsic_mat.shape)}"
+        )
+
+    w = hsic_softmax_pair_weights(logits, diagonal_offset=diagonal_offset)
+    w = torch.where(valid, w, torch.zeros_like(w))
+    h = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
+    out = (w * h).sum(dim=1).mean()
+
+    if return_matrix:
+        return out, hsic_mat
+    return out
+
+
 
 # ---------------------------------------------------------------------------
 # Null calibration for the LOO Bayes multiplier

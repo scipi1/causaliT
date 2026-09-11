@@ -28,6 +28,9 @@ This document aims to collect the project status main findings, open problems an
 - F10: very often, it was observed the emergence of horizontal/vertical blocks of variables, during their selection in structural learning. For example `experiments\5_EXPLORATORY\ADAPT_TRAIN\ADAPT_AttSel_SelfAttXX_scm3c_7046748\evaluate_experiment_run.ipynb`. From this analysis `experiments\5_EXPLORATORY\ADAPT_TRAIN\ADAPT_AttSel_SelfAttXX_scm3c_7046748\diagnose_block_dags.ipynb` it seems that the free query aligns with the key centroids and provides a high score with all keys, without deciding. This happens for dense initializations, where all nodes are participating to the prediction.
 
 
+- F11: *"Bilevel gate starved by dense proposals."* In `BILEVEL_GATE/results/gate_d20_12302718` the centroid-commit gate saw 1191 candidacies and accepted 3: with structure-phase BKD at 0.05 the decoder co-adapts to dense queries, the first-order HSIC evidence is diluted over all keys, and the ML subset readout saturates at |S| ~ 18-19/19 (dense-set bias, `docs/experimental_elaborations/CENTROID_COMMIT_SCORE.md`). The gate correctly rejected the dense/wrong proposals; the few noise-level accepts increased SHD. Countermeasure arm: `BILEVEL_GATE/gate_bkd_d20` (run-level BKD curriculum: full-range cosine warmup landing on 0.6, linear 0.6 -> 0 decay during structure; gate unchanged, probes always certify the dense adjacency).
+
+
 ## Problems
 - P1: Optimizing the structure is challenging (see F3)
 - P2: The model structure doesn't converge to the true DAG

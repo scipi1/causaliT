@@ -100,6 +100,40 @@ def best_subset(q: torch.Tensor, K: torch.Tensor,
     return order[: best + 1]
 
 
+def best_subset_excluding(q: torch.Tensor, K: torch.Tensor,
+                          exclude: Optional[int] = None,
+                          prior_rho: float = 0.0,
+                          forbidden: Optional[set] = None) -> torch.Tensor:
+    """``best_subset`` with forbidden subsets (soft taboo for rejected commits).
+
+    Exact: the optimal subset of size m is always the top-m keys by
+    alignment, so enumerating m = 0..n covers every candidate; forbidden
+    subsets (frozensets of key indices, e.g. bilevel-rejected centroids) are
+    skipped and the next-best admissible subset is returned.  The empty
+    subset is returned when every admissible subset scores <= 0.
+    """
+    forbidden = forbidden or set()
+    q = q.detach()
+    K = K.to(q.device)
+    a = K @ (q / q.norm().clamp_min(1e-12))
+    if exclude is not None:
+        a = a.clone()
+        a[exclude] = -float("inf")
+    a_sorted, order = torch.sort(a, descending=True)
+    csum = torch.cumsum(a_sorted, dim=0)
+    best_subset_t = torch.empty(0, dtype=torch.long, device=a.device)
+    best_score = 0.0                     # empty subset has score 0
+    for m in range(1, len(a) + 1):
+        cand = order[:m]
+        if frozenset(cand.tolist()) in forbidden:
+            continue
+        s = subset_score(csum, m, prior_rho)
+        if s > best_score:
+            best_score = s
+            best_subset_t = cand
+    return best_subset_t
+
+
 def subset_score_of(a: torch.Tensor, S: torch.Tensor,
                     prior_rho: float = 0.0) -> float:
     """Prior-adjusted score of an explicit subset S given alignments a."""
@@ -195,6 +229,17 @@ class CentroidCommitController:
         self.commit_counts = torch.zeros(self.n_nodes, dtype=torch.long)
         self.last_commits: List[Dict] = []   # per-step: node, margin, sizes
 
+        # Bilevel gate state (docs/ideas/BILEVEL_CENTROID_COMMIT.md).
+        # ``taboos[i]``: frozensets of key indices whose commit was REJECTED
+        # by the paired refit probe; while tabooed the node's candidacy uses
+        # the best NON-taboo subset.  A taboo lifts automatically when the
+        # shadow's raw projection is neither the committed subset nor the
+        # tabooed one (the shadow moved away; re-entry stays possible).
+        # ``pending``: eligible commits awaiting the probe (defer mode).
+        self.taboos: List[set] = [set() for _ in range(self.n_nodes)]
+        self.pending: List[Dict] = []
+        self.last_rejects: List[Dict] = []
+
     # ------------------------------------------------------------------
     def _update_snr(self, i: int, g: torch.Tensor) -> None:
         """Streaming EMA of the per-node gradient mean / second moment."""
@@ -236,8 +281,9 @@ class CentroidCommitController:
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def step(self, grad_override: Optional[list] = None) -> int:
-        """One evidence-accumulation step + commit check.  Returns #commits.
+    def step(self, grad_override: Optional[list] = None,
+             defer: bool = False) -> int:
+        """One evidence-accumulation step + commit check.  Returns #eligible.
 
         Consumes the shadow gradients and clears them.  ``grad_override``
         (list aligned to ``tables``, one (rows, d) tensor or None per table)
@@ -251,10 +297,19 @@ class CentroidCommitController:
         ``winner_take_all`` only the eligible node with the largest margin
         commits (a coordinate-wise MAP update conditioned on the committed
         state of the other nodes); otherwise all eligible nodes commit.
+
+        Bilevel gate (``defer=True``): eligible commits are NOT applied; they
+        are stored in ``self.pending`` for the caller to probe (see
+        ``causaliT.training.bilevel_probe``) and then finalised via
+        :meth:`finalize`.  Tabooed (previously rejected) subsets are skipped
+        during candidacy; a taboo lifts once the shadow's raw projection is
+        neither the committed nor the tabooed subset.
         """
         if self._key_fn is not None:
             self.K = self._key_fn().detach().double().cpu()
         self.last_commits = []
+        self.last_rejects = []
+        self.pending = []
 
         # Pass 1: evidence update for every node + candidacy evaluation.
         eligible: List[Dict] = []
@@ -271,18 +326,37 @@ class CentroidCommitController:
             w = t.embedding.weight
             evid = self.beta * (t.shadow[r] - w[r]).double() - self.eta * g.double()
             t.shadow[r] = w[r] + evid.to(t.shadow.dtype)
-            cand = best_subset(t.shadow[r].detach().double().cpu(), self.K,
-                               exclude=gi, prior_rho=self.prior_rho)
+            sh = t.shadow[r].detach().double().cpu()
             cur = best_subset(w[r].detach().double().cpu(), self.K, exclude=gi,
                               prior_rho=self.prior_rho)
+            raw = best_subset(sh, self.K, exclude=gi, prior_rho=self.prior_rho)
+
+            # Taboo maintenance: a tabooed subset stays forbidden while the
+            # shadow's RAW projection is the committed subset or the tabooed
+            # one; it lifts as soon as the shadow points elsewhere.
+            if self.taboos[i]:
+                raw_fs, cur_fs = frozenset(raw.tolist()), frozenset(cur.tolist())
+                self.taboos[i] = {T for T in self.taboos[i]
+                                  if raw_fs in (cur_fs, T)}
+
+            # Candidacy: if the raw projection is tabooed, fall back to the
+            # best admissible (non-taboo) subset.
+            if self.taboos[i] and frozenset(raw.tolist()) in self.taboos[i]:
+                cand = best_subset_excluding(sh, self.K, exclude=gi,
+                                             prior_rho=self.prior_rho,
+                                             forbidden=self.taboos[i])
+            else:
+                cand = raw
             same = (cand.numel() == cur.numel()
                     and torch.equal(cand.sort().values, cur.sort().values))
             if same:
                 continue
             # Score gain of the candidate over the committed subset, evaluated
             # on the SHADOW alignments (the evidence's own geometry).
-            sh = t.shadow[r].detach().double().cpu()
-            a = self.K @ (sh / sh.norm().clamp_min(1e-12))
+            # ``sh`` is CPU/double by construction; ``self.K`` is too when it
+            # comes from ``_key_fn``, but a caller-supplied frame may live on
+            # CUDA — align devices so the margin never raises a mismatch.
+            a = self.K.to(sh.device) @ (sh / sh.norm().clamp_min(1e-12))
             a[gi] = -float("inf")
             margin = (subset_score_of(a, cand, self.prior_rho)
                       - subset_score_of(a, cur, self.prior_rho))
@@ -297,17 +371,58 @@ class CentroidCommitController:
             eligible = [e for e in eligible
                         if float(snr[e["i"]]) >= self.min_snr]
 
-        # Pass 2: commit.
+        # Pass 2: commit (or defer to the bilevel gate).
         if self.winner_take_all and len(eligible) > 1:
             eligible = [max(eligible, key=lambda e: e["margin"])]
-        for e in eligible:
-            self._commit(e["i"], e["t"], e["r"], e["gi"], e["cand"],
-                         e["cur_size"], e["margin"])
+        if defer:
+            self.pending = eligible
+        else:
+            for e in eligible:
+                self._commit(e["i"], e["t"], e["r"], e["gi"], e["cand"],
+                             e["cur_size"], e["margin"])
 
         for t, _, _ in self.node_map:
             if t.shadow.grad is not None:
                 t.shadow.grad = None
         return len(eligible)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def finalize(self, entry: Dict, accepted: bool) -> None:
+        """Resolve one deferred (probed) candidacy from ``step(defer=True)``.
+
+        accepted=True  -> commit exactly as the ungated path would.
+        accepted=False -> the candidate subset is tabooed; the shadow is NOT
+        reset (evidence keeps accumulating, so the node can diffuse out of
+        the tabooed centroid and re-enter it later once the taboo lifts).
+        """
+        if accepted:
+            self._commit(entry["i"], entry["t"], entry["r"], entry["gi"],
+                         entry["cand"], entry["cur_size"], entry["margin"])
+        else:
+            self.taboos[entry["i"]].add(frozenset(entry["cand"].tolist()))
+            self.last_rejects.append({"node": entry["gi"],
+                                      "size": int(entry["cand"].numel())})
+            logger.info(
+                "centroid commit REJECTED by bilevel gate: node %d |S'|: %d "
+                "(tabooed; %d taboos on this node)",
+                entry["gi"], int(entry["cand"].numel()),
+                len(self.taboos[entry["i"]]),
+            )
+
+    # ------------------------------------------------------------------
+    def state_dict(self) -> Dict:
+        """Persistent controller state (taboos + counters) for checkpoints."""
+        return {
+            "taboos": [[sorted(T) for T in s] for s in self.taboos],
+            "n_commits": self.n_commits,
+            "commit_counts": self.commit_counts.clone(),
+        }
+
+    def load_state_dict(self, sd: Dict) -> None:
+        self.taboos = [{frozenset(T) for T in s} for s in sd["taboos"]]
+        self.n_commits = int(sd["n_commits"])
+        self.commit_counts = sd["commit_counts"].clone()
 
     # ------------------------------------------------------------------
     @torch.no_grad()

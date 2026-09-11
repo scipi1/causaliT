@@ -105,6 +105,24 @@ class TestStraightThrough:
         t.sync_shadow_to_weight()
         assert torch.equal(t.shadow, t.embedding.weight)
 
+    def test_apply_releafs_shadow(self):
+        """Device/dtype moves (``.double()`` here; ``.cuda()`` on the cluster)
+        replace buffers with op results — non-leaf, requires_grad preserved.
+        The _apply override must re-leaf the shadow (cluster job 12294402:
+        non-leaf shadow broke deepcopy in the bilevel probe and starved
+        shadow.grad on GPU runs)."""
+        t = self._table()
+        assert t.shadow.is_leaf
+        t = t.double()
+        assert t.shadow.is_leaf, "shadow is non-leaf after .double()"
+        assert t.shadow.requires_grad
+        assert t.shadow.dtype == torch.float64
+        # grads still accumulate on the moved shadow
+        X = torch.tensor([[[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]]],
+                         dtype=torch.float64)
+        t(X).sum().backward()
+        assert t.shadow.grad is not None
+
 
 class TestController:
     def _setup(self, n=N, d=D):

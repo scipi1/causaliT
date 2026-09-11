@@ -24,7 +24,8 @@ from causaliT.training.callbacks import (
     get_checkpoint_callback, get_early_stopping_callback, MemoryLoggerCallback,
     GradientLogger, MetricsAggregator, PerRunManifest,
     BestReconstructionCheckpoint, BestCausalCheckpoint, DataIndexTracker,
-    KFoldResultsTracker, GradientJacobianLogger, MemoryReportCallback
+    KFoldResultsTracker, GradientJacobianLogger, MemoryReportCallback,
+    PeriodicDAGMetrics,
 )
 from causaliT.training.forecasters import (
     TransformerForecaster,
@@ -68,6 +69,7 @@ def train_single_fold(
     best: bool = False,
     extra_callbacks: Optional[List] = None,
     reload_dataloaders_every_n_epochs: int = 0,
+    data_dir: Optional[str] = None,
 ) -> dict:
     """
     Execute training for a single fold and return metrics.
@@ -117,6 +119,10 @@ def train_single_fold(
                            split mid-fit (e.g. the adaptive cross-fit phase switch)
                            so Lightning re-queries ``dm.train_dataloader()`` at each
                            epoch boundary and picks up the new subset.
+        data_dir:          Root data directory.  Only required by callbacks that
+                           need the dataset's ground-truth DAG masks (currently
+                           ``PeriodicDAGMetrics``); when None that logging is
+                           skipped and everything else is unaffected.
 
     Returns:
         dict: Metrics for this fold (val + test + timing).
@@ -187,6 +193,26 @@ def train_single_fold(
             )
         )
 
+    # Periodic structure quality (SHD / TPR / FDR / soft Hamming) straight into
+    # metrics.csv.  Needed by single-phase joint runs, where the end-of-run
+    # eval alone cannot tell "found parents" from "redistributed attention".
+    if config["training"].get("log_dag_metrics", False):
+        if data_dir is None:
+            logger_info.warning(
+                "training.log_dag_metrics=True but no data_dir was passed to "
+                "train_single_fold; skipping periodic DAG metrics."
+            )
+        else:
+            callbacks_list.append(
+                PeriodicDAGMetrics(
+                    config=config,
+                    data_dir=data_dir,
+                    every_n_epochs=config["training"].get(
+                        "dag_metrics_every_n_epochs", 100
+                    ),
+                )
+            )
+
     # ---- Inject caller-supplied callbacks (gradient trackers, progress loggers…)
     if extra_callbacks:
         callbacks_list.extend(extra_callbacks)
@@ -197,6 +223,27 @@ def train_single_fold(
         val_idx=val_local_idx,
         test_idx=test_idx,
     )
+
+    # ---- HSIC cross-fitting: partition the training set into two permanent,
+    # disjoint folds (MSE on A, independence statistic on B).  Must run AFTER
+    # update_idx so it partitions THIS fold's training subset.
+    if config["training"].get("hsic_cross_fit", False):
+        setter = getattr(dm, "set_hsic_cross_fit", None)
+        if callable(setter):
+            n_a, n_b = setter(
+                ratio=config["training"].get("hsic_cross_fit_ratio", 0.5),
+                seed=config["training"].get("data_seed", 1),
+            )
+            logger_info.info(
+                f"HSIC cross-fitting: fold A (recon) n={n_a}, "
+                f"fold B (HSIC) n={n_b}"
+            )
+            print(f"HSIC cross-fitting: recon n={n_a}, HSIC n={n_b}")
+        else:
+            logger_info.warning(
+                "training.hsic_cross_fit=True but the datamodule has no "
+                "set_hsic_cross_fit(); cross-fitting is INACTIVE."
+            )
 
     # ---- Lightning Trainer ------------------------------------------------------
     # Defense-in-depth: reloading the dataloader every epoch respawns the worker
@@ -571,6 +618,7 @@ def trainer(
             experiment_tag=experiment_tag,
             debug=debug,
             best=best,
+            data_dir=data_dir,
         )
 
         metrics_dict[fold] = fold_metrics
