@@ -25,7 +25,7 @@ from causaliT.training.callbacks import (
     GradientLogger, MetricsAggregator, PerRunManifest,
     BestReconstructionCheckpoint, BestCausalCheckpoint, DataIndexTracker,
     KFoldResultsTracker, GradientJacobianLogger, MemoryReportCallback,
-    PeriodicDAGMetrics,
+    PeriodicDAGMetrics, HSICClassMetrics,
 )
 from causaliT.training.forecasters import (
     TransformerForecaster,
@@ -193,14 +193,18 @@ def train_single_fold(
             )
         )
 
-    # Periodic structure quality (SHD / TPR / FDR / soft Hamming) straight into
-    # metrics.csv.  Needed by single-phase joint runs, where the end-of-run
-    # eval alone cannot tell "found parents" from "redistributed attention".
+    # Periodic structure quality (AUROC + attention-mass partition: parents /
+    # ancestors / descendants / others) straight into metrics.csv.  Registered
+    # here -- the single point shared by trainer() and adaptive_trainer() --
+    # so both paths always emit the dag/* columns.  Epoch 0 and the final
+    # epoch are always logged regardless of cadence.
     if config["training"].get("log_dag_metrics", False):
         if data_dir is None:
             logger_info.warning(
                 "training.log_dag_metrics=True but no data_dir was passed to "
-                "train_single_fold; skipping periodic DAG metrics."
+                "train_single_fold; skipping periodic DAG metrics "
+                "(dag/auroc_*, dag/mass_on_* columns will be absent from "
+                "metrics.csv)."
             )
         else:
             callbacks_list.append(
@@ -208,7 +212,18 @@ def train_single_fold(
                     config=config,
                     data_dir=data_dir,
                     every_n_epochs=config["training"].get(
-                        "dag_metrics_every_n_epochs", 100
+                        "dag_metrics_every_n_epochs", 50
+                    ),
+                )
+            )
+            # Pre-weighting HSIC nodal contributions by causal class
+            # (parents/ancestors/descendants/others) - same cadence.
+            callbacks_list.append(
+                HSICClassMetrics(
+                    config=config,
+                    data_dir=data_dir,
+                    every_n_epochs=config["training"].get(
+                        "dag_metrics_every_n_epochs", 50
                     ),
                 )
             )

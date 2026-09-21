@@ -221,12 +221,28 @@ class TestForecasterIntegration:
         model = AttentionSelectorForecaster(_make_forecaster_config())
         assert model.gradient_surgery is False
 
-    def test_requires_gradient_routing(self):
+    def test_joint_pcgrad_without_routing(self):
+        # Joint PCGrad: routing off is supported via manual optimization over
+        # ALL parameters (per-term autograd.grad + reconcile before the step).
         cfg = _make_forecaster_config()
         cfg["training"]["gradient_surgery"] = True
         cfg["training"]["use_gradient_routing"] = False
-        with pytest.raises(ValueError, match="use_gradient_routing"):
-            AttentionSelectorForecaster(cfg)
+        model = AttentionSelectorForecaster(cfg)
+        assert model.gradient_surgery is True
+        assert model.automatic_optimization is False
+
+    def test_interference_probe_enabled_for_homogeneous_gated_self(self):
+        # Homogeneous mode: the structural block is GatedSelfAttention, which
+        # exposes aux["l0_penalty"] - the probe whitelist must include it,
+        # otherwise the L0<->HSIC cosine diagnostic silently never fires.
+        cfg = _make_forecaster_config(
+            lambda_l0=1.0, attention_type="GatedCrossAttention"
+        )
+        cfg["model"]["kwargs"]["homogeneous_nodes"] = True
+        cfg["training"]["log_l0_hsic_interference"] = True
+        model = AttentionSelectorForecaster(cfg)
+        assert model._attention_type == "GatedSelfAttention"
+        assert model._interference_enabled() is True
 
     def test_enabled_with_routing(self):
         cfg = _make_forecaster_config()

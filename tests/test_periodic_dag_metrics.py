@@ -47,8 +47,9 @@ def _module(att_cross=None, att_self=None, stash=True):
     return mod
 
 
-def _trainer(epoch, sanity=False):
-    return types.SimpleNamespace(sanity_checking=sanity, current_epoch=epoch)
+def _trainer(epoch, sanity=False, max_epochs=None):
+    return types.SimpleNamespace(sanity_checking=sanity, current_epoch=epoch,
+                                 max_epochs=max_epochs)
 
 
 class TestSourceAndCadence:
@@ -125,6 +126,46 @@ class TestMetricValues:
         assert 0.0 < mod._logged["dag/mass_on_edges_self"] < 1.0
 
 
+class TestAncestorDiagnostics:
+    # TRUE_SELF is the chain 2 -> 1 -> 0, so the only (ancestor, not parent)
+    # cell is [0, 2].
+    def test_perfect_attention_has_zero_ancestor_mass(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/mass_on_ancestors_self"] == 0.0
+        assert mod._logged["dag/parent_vs_ancestor_contrast_self"] == 1.0
+
+    def test_ancestor_shortcut_is_detected(self):
+        att = np.zeros_like(TRUE_SELF)
+        att[0, 2] = 1.0   # all mass on the transitive ancestor
+        mod = _module(TRUE_CROSS.copy(), att)
+        _cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/mass_on_ancestors_self"] == 1.0
+        assert mod._logged["dag/parent_vs_ancestor_contrast_self"] == -1.0
+
+    def test_uniform_attention_has_zero_parent_ancestor_contrast(self):
+        mod = _module(TRUE_CROSS.copy(), np.full_like(TRUE_SELF, 0.3))
+        _cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/parent_vs_ancestor_contrast_self"] == \
+            pytest.approx(0.0)
+
+    def test_no_ancestor_metrics_for_rectangular_cross_block(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert "dag/mass_on_ancestors_cross" not in mod._logged
+        assert "dag/parent_vs_ancestor_contrast_cross" not in mod._logged
+
+    def test_no_ancestor_metrics_when_true_closure_adds_nothing(self):
+        # Ancestor masks derive from the TRUE mask; a star DAG (no chains)
+        # has no (ancestor, not parent) cells, so no metrics are logged.
+        star = np.array([[0, 1, 1], [0, 0, 0], [0, 0, 0]], dtype=float)
+        cb = _cb()
+        cb._true_masks = {"cross": TRUE_CROSS, "self": star}
+        mod = _module(TRUE_CROSS.copy(), star)
+        cb.on_train_epoch_end(_trainer(epoch=0), mod)
+        assert "dag/mass_on_ancestors_self" not in mod._logged
+
+
 class TestFailureIsLoudNotSilent:
     def test_missing_posterior_warns_once_and_logs_nothing(self, caplog):
         """The exact failure that produced an empty metrics.csv."""
@@ -159,3 +200,82 @@ class TestFailureIsLoudNotSilent:
         mod = _module(TRUE_CROSS[None, ...].copy(), TRUE_SELF[None, ...].copy())
         _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
         assert mod._logged["dag/auroc_self"] == 1.0
+
+class TestFullColumnSet:
+    """Every run must emit the complete dag/* column set, including the
+    parents/ancestors/descendants/others mass partition."""
+
+    EXPECTED = [
+        "dag/auroc_{b}", "dag/contrast_{b}", "dag/mass_on_edges_{b}",
+        "dag/mass_on_parents_{b}", "dag/mass_on_others_{b}",
+    ]
+
+    def test_all_columns_logged_for_both_blocks(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        for b in ("cross", "self"):
+            for key in self.EXPECTED:
+                assert key.format(b=b) in mod._logged, key.format(b=b)
+        for key in ("dag/mass_on_ancestors_self",
+                    "dag/mass_on_descendants_self",
+                    "dag/parent_vs_ancestor_contrast_self"):
+            assert key in mod._logged, key
+
+    def test_parents_equals_edges(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        for b in ("cross", "self"):
+            assert mod._logged[f"dag/mass_on_parents_{b}"] == \
+                mod._logged[f"dag/mass_on_edges_{b}"]
+
+    def test_mass_partition_sums_to_one(self):
+        """parents + ancestors + descendants + others + diagonal = 1 (self)."""
+        rng = np.random.default_rng(0)
+        mod = _module(TRUE_CROSS.copy(), rng.random(TRUE_SELF.shape))
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        att = mod.split_attention_blocks(None)["x_to_x"].numpy()
+        diag = float(np.diag(att).sum() / att.sum())
+        total = sum(mod._logged[f"dag/mass_on_{k}_self"]
+                    for k in ("parents", "ancestors", "descendants", "others"))
+        assert total + diag == pytest.approx(1.0)
+
+    def test_others_is_non_edge_mass_for_cross_block(self):
+        rng = np.random.default_rng(1)
+        att = rng.random(TRUE_CROSS.shape)
+        mod = _module(att, TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        on = att[TRUE_CROSS > 0.5].sum() / att.sum()
+        assert mod._logged["dag/mass_on_others_cross"] == \
+            pytest.approx(1.0 - float(on))
+
+
+class TestGuaranteedCoverage:
+    """Epoch 0 and the final epoch always log, regardless of cadence."""
+
+    def test_final_epoch_logged_despite_cadence(self):
+        cb = _cb(every_n_epochs=50)
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        cb.on_train_epoch_end(_trainer(epoch=9, max_epochs=10), mod)
+        assert mod._logged, "final epoch must log even off-cadence"
+
+    def test_mid_run_off_cadence_logs_nothing(self):
+        cb = _cb(every_n_epochs=50)
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        cb.on_train_epoch_end(_trainer(epoch=7, max_epochs=10), mod)
+        assert mod._logged == {}
+
+    def test_on_train_end_fallback_after_early_stop(self):
+        cb = _cb(every_n_epochs=50)
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        cb.on_train_end(_trainer(epoch=3, max_epochs=1000), mod)
+        assert mod._logged, "on_train_end must guarantee a final log"
+
+    def test_on_train_end_does_not_double_log(self):
+        cb = _cb(every_n_epochs=1)
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        logged_rows = []
+        mod.log = lambda name, value, **kw: logged_rows.append(name)
+        cb.on_train_epoch_end(_trainer(epoch=0, max_epochs=10), mod)
+        cb.on_train_end(_trainer(epoch=0, max_epochs=10), mod)
+        names = set(logged_rows)
+        assert len(logged_rows) == len(names), "must not double-log epoch"

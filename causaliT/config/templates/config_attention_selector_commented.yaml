@@ -339,6 +339,32 @@ training:
   #                    rejection emerge from the within-row competition.
   #                    Parentless rows converge to the uniform spread.
   hsic_aggregation: plain
+  # Pair-weight construction for hsic_aggregation: attw_softmax.
+  #   posterior      (default) row-wise L1 renormalisation of the gate
+  #                  posterior (== softmax over log p): a CLOSED gate gets
+  #                  weight exactly 0, so descendant pairs drop out once the
+  #                  antisymmetric direction gate shuts.  Parentless rows
+  #                  contribute exactly 0.
+  #   softmax_logits legacy: the [0,1] posterior is used DIRECTLY as a
+  #                  logit -- a zero gate still carries weight 1/Z, so the
+  #                  within-row competition is pinned near-uniform.
+  # The entropy of the resulting pair weights is logged every epoch as
+  # {stage}_hsic_att_entropy_{mean,min,max,norm} and
+  # {stage}_hsic_att_eff_competitors (mean exp(H) -> true in-degree as the
+  # competition resolves).
+  #   evidence_max   gate prior tilted by the (detached) HSIC evidence:
+  #                  s = p * exp(-H/tau), max-normalised per row.
+  #                  NON-DILUTIVE (adding a subordinate gate only adds
+  #                  cost), descendants suppressed exp(-H/tau), H~0 pairs
+  #                  neutral so lambda_l0 removes them unopposed.  Maximum
+  #                  budget, not exact: the support converges to the
+  #                  current topk_k from below as tau anneals.
+  hsic_pair_weight_mode: posterior
+  # Tilt temperature for evidence_max: "auto" = 1.4826*MAD of the pair
+  # HSIC matrix (adapts sharpness to the noise of the HSIC estimates;
+  # large/noisy at topk_k=1, sharper as the budget grows), or a fixed
+  # positive float.
+  hsic_tilt_tau: auto
 
   # --- Descendant-excluding HSIC (self-attention block only) --------------
   # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is
@@ -568,6 +594,29 @@ adaptive_training:
     # batch_key_dropout: 0.6         # drop prob at run start (reconstruct phases)
     # batch_key_dropout_final: 0.0   # anneal target (reached after *_batches)
     # batch_key_dropout_annealing_batches: null   # null = constant p
+    #
+    # Model-kwargs BKD safeguard / sampling mode (model.kwargs.*):
+    # batch_key_dropout_min_keys: 0        # >0: never keep fewer than this many
+    #                                      # keys (random top-up). 1 = adjacency
+    #                                      # can never go completely empty.
+    # batch_key_dropout_deterministic: false  # true: keep exactly
+    #                                      # max(min_keys, round((1-p)*S)) keys as
+    #                                      # a uniform random subset (no Binomial
+    #                                      # variance) instead of per-key Bernoulli.
+    #
+    # Both keys may ALSO be set per phase (reconstruct/structure/...).  A phase
+    # that sets ONLY batch_key_dropout_min_keys activates BKD at p=1 with that
+    # key budget — a count-based curriculum: "learn from exactly k keys per
+    # batch" (exactly k kept with deterministic: true).  Example:
+    # reconstruct:
+    #   batch_key_dropout_min_keys: 1
+    #   batch_key_dropout_deterministic: true
+    #
+    # Count-based ladder alternative (adaptive_training level, mutually
+    # exclusive with bkd_ladder): rung k = key budget for cycle k, applied
+    # identically to the reconstruct AND structure phases of that cycle.
+    # Activates BKD at p=1 even when no phase block sets batch_key_dropout.
+    # bkd_min_keys_ladder: [4, 2, 1]   # 4 keys/batch in cycle 0, then 2, then 1
 
     # ---- HSIC dropped-key exclusion (pairs with BKD) -----------------------
     # When BKD drops a key j this batch, HSIC(res_i, source_j) is irreducible:

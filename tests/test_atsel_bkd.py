@@ -61,6 +61,8 @@ def _make_atsel(
     batch_key_dropout: float = None,
     batch_key_dropout_p_final: float = None,
     batch_key_dropout_annealing_batches: int = None,
+    batch_key_dropout_min_keys: int = 0,
+    batch_key_dropout_deterministic: bool = False,
 ) -> AttentionSelectorLayer:
     """Build a minimal AttentionSelectorLayer for testing."""
     return AttentionSelectorLayer(
@@ -88,10 +90,12 @@ def _make_atsel(
         d_model=d_model,
         d_qk=d_model,
         S_seq_len=S_seq_len,
-        X_seq_len=X_seq_len,
+                X_seq_len=X_seq_len,
         batch_key_dropout=batch_key_dropout,
         batch_key_dropout_p_final=batch_key_dropout_p_final,
         batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+        batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+        batch_key_dropout_deterministic=batch_key_dropout_deterministic,
     )
 
 
@@ -619,4 +623,158 @@ class TestBKDHsicExclusion:
         )  # wrong length for n_sources=6
         fc.model.self_attention.inner_attention.last_bkd_keep = None
         assert fc._build_bkd_keep_mask(3, 6, torch.device("cpu")) is None
+
+
+
+# ---------------------------------------------------------------------------
+# min_keys safeguard and deterministic sampling mode
+# ---------------------------------------------------------------------------
+
+class TestBKDMinKeysSafeguard:
+    """Tests for the non-empty-adjacency safeguard (min_keys) and the
+    deterministic active-key-count sampling mode of
+    ``BatchConsistentKeyDropout``."""
+
+    # -- module-level behaviour ---------------------------------------------
+    def test_safeguard_off_by_default(self):
+        """Legacy default (min_keys=0): p=1.0 may produce an empty mask."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=1.0)
+        assert bkd.min_keys == 0 and bkd.deterministic is False
+        bkd.train()
+        out = bkd(torch.ones(2, 3, 5))
+        assert out.sum().item() == 0.0
+        assert bkd._last_key_mask.sum().item() == 0
+
+    def test_min_keys_one_keeps_exactly_one_at_p1(self):
+        """p=1.0 + min_keys=1: exactly one (random) key survives."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=1.0, min_keys=1)
+        bkd.train()
+        kept_subsets = set()
+        for _ in range(20):
+            out = bkd(torch.ones(2, 3, 5))
+            assert int(bkd._last_key_mask.sum().item()) == 1
+            # exactly one column retains weight, same for all rows/samples
+            col_sums = out.sum(dim=(0, 1))
+            assert (col_sums > 0).sum().item() == 1
+            kept_subsets.add(tuple(bkd._last_key_mask.tolist()))
+        # the surviving key is drawn at random
+        assert len(kept_subsets) > 1
+
+    def test_min_keys_topup_partial(self):
+        """Bernoulli draw below min_keys is topped up to min_keys exactly."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=1.0, min_keys=3)
+        bkd.train()
+        for _ in range(10):
+            bkd(torch.ones(1, 2, 6))
+            assert int(bkd._last_key_mask.sum().item()) == 3
+
+    def test_min_keys_clamped_to_num_keys(self):
+        """min_keys > S keeps all keys instead of crashing."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=1.0, min_keys=99)
+        bkd.train()
+        bkd(torch.ones(1, 2, 4))
+        assert int(bkd._last_key_mask.sum().item()) == 4
+
+    def test_safeguard_inf_blanking(self):
+        """-inf blanking path: exactly min_keys columns stay finite at p=1."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(
+            p_init=1.0, min_keys=1, blanking_value=float("-inf")
+        )
+        bkd.train()
+        out = bkd(torch.zeros(2, 3, 5))
+        finite = torch.isfinite(out).sum(dim=-1)
+        assert finite.unique().tolist() == [1]
+
+    def test_negative_min_keys_raises(self):
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        with pytest.raises(ValueError):
+            BatchConsistentKeyDropout(p_init=0.5, min_keys=-1)
+
+
+    # -- deterministic mode ---------------------------------------------------
+    def test_deterministic_exact_count(self):
+        """deterministic=True keeps exactly max(min_keys, round((1-p)*S)) keys."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        S, p = 8, 0.5
+        bkd = BatchConsistentKeyDropout(p_init=p, min_keys=1, deterministic=True)
+        bkd.train()
+        expected = max(1, round((1 - p) * S))
+        subsets = set()
+        for _ in range(20):
+            bkd(torch.ones(1, 1, S))
+            assert int(bkd._last_key_mask.sum().item()) == expected
+            subsets.add(tuple(bkd._last_key_mask.tolist()))
+        # uniform random subset each forward
+        assert len(subsets) > 1
+
+    def test_deterministic_p1_respects_min_keys_floor(self):
+        """deterministic + p=1 keeps exactly min_keys keys (max_keys regime)."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=1.0, min_keys=2, deterministic=True)
+        bkd.train()
+        bkd(torch.ones(1, 1, 8))
+        assert int(bkd._last_key_mask.sum().item()) == 2
+
+    def test_deterministic_p0_is_identity(self):
+        """p=0 short-circuits (no-op) regardless of mode."""
+        from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
+
+        bkd = BatchConsistentKeyDropout(p_init=0.0, min_keys=1, deterministic=True)
+        bkd.train()
+        x = torch.randn(2, 3, 5)
+        assert torch.equal(bkd(x), x)
+        assert bkd._last_key_mask is None
+
+    # -- layer-level plumbing --------------------------------------------------
+    def test_layer_plumbs_min_keys_and_deterministic(self):
+        """AttentionSelectorLayer forwards the new kwargs to the BKD module."""
+        model = _make_atsel(
+            batch_key_dropout=0.9,
+            batch_key_dropout_min_keys=1,
+            batch_key_dropout_deterministic=True,
+        )
+        bkd = model.attention.inner_attention.batch_key_dropout
+        assert bkd is not None
+        assert bkd.min_keys == 1
+        assert bkd.deterministic is True
+
+    def test_layer_defaults_backwards_compatible(self):
+        """Default layer build keeps legacy BKD settings (0 / False)."""
+        model = _make_atsel(batch_key_dropout=0.5)
+        bkd = model.attention.inner_attention.batch_key_dropout
+        assert bkd is not None
+        assert bkd.min_keys == 0
+        assert bkd.deterministic is False
+
+    def test_layer_forward_never_empty_with_safeguard(self):
+        """Training forward at p=1 with min_keys=1 keeps one key column."""
+        model = _make_atsel(
+            S_seq_len=3,
+            X_seq_len=3,
+            batch_key_dropout=1.0,
+            batch_key_dropout_min_keys=1,
+        )
+        model.train()
+        S, X, X_blanked = _make_inputs(S_len=3, X_len=3, batch=4)
+        model.forward_with_actual(
+            source_tensor=S,
+            x_blanked=X_blanked,
+            x_actual=X,
+        )
+        bkd = model.attention.inner_attention.batch_key_dropout
+        assert bkd is not None and bkd._last_key_mask is not None
+        assert int(bkd._last_key_mask.sum().item()) == 1
 

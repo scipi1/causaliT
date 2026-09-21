@@ -65,9 +65,11 @@ from typing import Optional
 import math
 import torch
 import torch.nn as nn
+from causaliT.core.modules.extra_layers import sample_bkd_keep_mask
 import torch.nn.functional as F
 
 from causaliT.core.modules.gain_softmax import GainSoftmax
+from causaliT.core.modules.topk_gate import TopKGate
 from causaliT.utils.query_geometry import correct_query
 from causaliT.utils.query_norm import (
     DEFAULT_DIR_TAU,
@@ -133,6 +135,17 @@ class GatedSelfAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
+        # Eval-mode BKD (rung-aware validation): when True, BKD is ALSO applied
+        # in eval mode using a dedicated seeded generator (seed =
+        # ``batch_key_dropout_eval_seed`` + eval-forward counter), so validation
+        # metrics measure the SAME key-budget regime as the current training
+        # rung instead of the full-gate regime.  Deterministic across epochs
+        # for a fixed val-set ordering; does not touch the training RNG.
+        batch_key_dropout_eval: bool = False,
+        batch_key_dropout_eval_seed: int = 12345,
+
         # Constant-score capacity protocol (Optuna): when not None the STRUCTURE
         # gate (existence) is frozen at this constant on every edge.
         optuna_protocol: Optional[float] = None,
@@ -145,6 +158,15 @@ class GatedSelfAttention(nn.Module):
         use_gain_softmax: bool = False,
         gain_num_queries: Optional[int] = None,
         gain_num_keys: Optional[int] = None,
+        # Source-side top-k budget (see causaliT/core/modules/topk_gate.py).
+        # When not None, the applied gate A is blanked per query row to its
+        # top-k entries (rule selected inside the module) immediately after
+        # BKD and before the attention dropout / value aggregation.  The
+        # RETURNED posterior (second slot) stays the RAW directed posterior,
+        # so HSIC weighting / eval DAG extraction are unaffected.  Default
+        # None keeps the forward bit-identical to the dense behaviour.
+        # Construct with exclude_diagonal=True for this square block.
+        topk_gate: Optional[TopKGate] = None,
     ):
         super().__init__()
 
@@ -157,6 +179,9 @@ class GatedSelfAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
+
+        # Source-side top-k budget (None = disabled, dense behaviour).
+        self.topk_gate = topk_gate
 
         # Gate params are non-learnable constants (matching HardConcreteCrossAttention).
         self.beta = float(init_tau)
@@ -200,7 +225,16 @@ class GatedSelfAttention(nn.Module):
             else batch_key_dropout
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
+        self._bkd_min_keys = int(batch_key_dropout_min_keys)
+        self._bkd_deterministic = bool(batch_key_dropout_deterministic)
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+        # Eval-mode BKD state (see ctor docstring above): separate counter and
+        # seed so validation masks are reproducible and independent of the
+        # training RNG / annealing clock.
+        self._bkd_eval: bool = bool(batch_key_dropout_eval)
+        self._bkd_eval_seed: int = int(batch_key_dropout_eval_seed)
+        self.register_buffer("_bkd_eval_step", torch.zeros((), dtype=torch.long), persistent=False)
+
         # Phase switch (adaptive trainer): when False, BKD is not applied but
         # the annealing clock keeps advancing (global run-level schedule).
         self._bkd_phase_active: bool = True
@@ -249,6 +283,13 @@ class GatedSelfAttention(nn.Module):
         self.last_p_edge_on: Optional[torch.Tensor] = None
         self.last_p_edge_undirected: Optional[torch.Tensor] = None
         self.last_direction: Optional[torch.Tensor] = None
+        # TRUE applied weight of the last forward (B, N, N), DETACHED: the
+        # directed gate after diagonal zeroing, hard mask, gain, BKD, top-k
+        # blanking and dropout — exactly the matrix that multiplied the
+        # values.  Read by the model's per-node adjacency-context injection
+        # so the regressor context reflects the key subset actually used
+        # (BKD/top-k consistent).
+        self.last_applied_A: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Batch-consistent key dropout probability (with optional annealing)
@@ -301,6 +342,52 @@ class GatedSelfAttention(nn.Module):
     def set_bkd_phase_active(self, active: bool) -> None:
         """Enable/disable BKD application for the current training phase."""
         self._bkd_phase_active = bool(active)
+
+    def set_bkd_sampling(
+        self,
+        min_keys: Optional[int] = None,
+        deterministic: Optional[bool] = None,
+    ) -> None:
+        """Override the BKD sampling mode / min-keys floor at run time
+        (adaptive-trainer phase controller).  ``None`` leaves the
+        corresponding setting unchanged."""
+        if min_keys is not None:
+            self._bkd_min_keys = int(min_keys)
+        if deterministic is not None:
+            self._bkd_deterministic = bool(deterministic)
+    def set_bkd_eval(
+        self, enabled: bool, seed: Optional[int] = None
+    ) -> None:
+        """Toggle eval-mode BKD (rung-aware validation).  When enabled, eval
+        forward passes apply BKD with a dedicated seeded generator so
+        validation metrics reflect the current key-budget regime.  ``seed``
+        (optional) overrides the eval generator base seed."""
+        self._bkd_eval = bool(enabled)
+        if seed is not None:
+            self._bkd_eval_seed = int(seed)
+
+    def _sample_bkd_keep_eval(
+        self, num_keys: int, p: float, device: torch.device
+    ) -> torch.Tensor:
+        """Seeded, reproducible BKD keep mask for eval mode (float, 1=keep).
+
+        Uses a private ``torch.Generator`` seeded by
+        ``_bkd_eval_seed + _bkd_eval_step`` so successive val batches cycle
+        through different key subsets deterministically, without consuming
+        the training RNG stream."""
+        gen = torch.Generator(device=device)
+        gen.manual_seed(self._bkd_eval_seed + int(self._bkd_eval_step.item()))
+        keep = sample_bkd_keep_mask(
+            num_keys,
+            p,
+            self._bkd_min_keys,
+            self._bkd_deterministic,
+            device,
+            generator=gen,
+        ).to(torch.float32)
+        self._bkd_eval_step += 1
+        return keep
+
 
     def set_open_gate_mode(
         self, active: bool, c_end: Optional[float] = None
@@ -631,12 +718,38 @@ class GatedSelfAttention(nn.Module):
             # schedule); ``_bkd_phase_active`` only gates the application.
             self._bkd_step += 1
             if self._bkd_phase_active and bkd_p > 0.0:
-                keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
+                keep = sample_bkd_keep_mask(
+                    N, bkd_p, self._bkd_min_keys, self._bkd_deterministic, A.device
+                ).to(A.dtype)  # (N,)
                 A = A * keep.view(1, 1, N)
                 self.last_bkd_keep = keep
+        elif (
+            self._bkd_eval
+            and bkd_p is not None
+            and self._bkd_phase_active
+            and bkd_p > 0.0
+        ):
+            # Rung-aware validation: apply the SAME key budget in eval mode
+            # (seeded generator, no training-RNG consumption) so val metrics
+            # measure the regime the decoder is actually being trained on.
+            keep = self._sample_bkd_keep_eval(N, bkd_p, A.device).to(A.dtype)
+            A = A * keep.view(1, 1, N)
+            self.last_bkd_keep = keep
+
+
+        # ---- Source-side top-k budget -----------------------------------
+        # Blank all but the top-k gate entries per query row (after BKD, so
+        # only visible keys compete for the budget).  The returned posterior
+        # below is the RAW directed posterior - only the applied weight A is
+        # blanked.
+        if self.topk_gate is not None:
+            A = self.topk_gate(A, hard_mask=hard_mask)
 
         # ---- Attention-weight dropout -----------------------------------
         A = self.dropout(A)
+        # Expose the TRUE applied weight (detached) for the per-node
+        # adjacency-context injection.
+        self.last_applied_A = A.detach()
 
         # ---- Value aggregation ------------------------------------------
         if value.dim() == 4:

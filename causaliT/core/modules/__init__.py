@@ -18,6 +18,7 @@ from .attention import (
 )
 from .gated_cross_attention import GatedCrossAttention
 from .gated_self_attention import GatedSelfAttention
+from .topk_gate import TopKGate
 from .commutator_self_attention import CommutatorSelfAttention
 from .gain_softmax import GainSoftmax
 
@@ -39,6 +40,7 @@ __all__ = [
     'HardConcreteCrossAttention',
     'GatedCrossAttention',
     'GatedSelfAttention',
+    'TopKGate',
     'CommutatorSelfAttention',
     'GainSoftmax',
     'ToeplitzAttention',

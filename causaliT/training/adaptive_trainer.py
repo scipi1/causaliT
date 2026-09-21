@@ -442,11 +442,61 @@ class PhaseController(Callback):
         # on sparse key subsets during warmup instead of absorbing the signal
         # into a dense readout.  When unmanaged, BKD keeps whatever schedule
         # the model was built with (backward compatible).
+        # A phase block may also set ``batch_key_dropout_min_keys`` (with
+        # optional ``batch_key_dropout_deterministic``) INSTEAD of
+        # ``batch_key_dropout``: that activates BKD at p=1 with the given
+        # key budget, i.e. "learn from exactly min_keys keys per batch"
+        # (in deterministic mode the kept count is exactly min_keys; in
+        # Bernoulli mode p=1 plus the top-up safeguard gives the same).
         self._bkd_managed: bool = any(
-            "batch_key_dropout" in cfg
+            ("batch_key_dropout" in cfg) or ("batch_key_dropout_min_keys" in cfg)
             for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg,
                         self.warmup_cfg)
         )
+
+        # BKD ladder (constant within a cycle, discrete decrease per cycle).
+        # When set, rung k = ladder[min(cycle, len-1)] is applied IDENTICALLY
+        # to the reconstruct AND structure phases of cycle k (warmup = rung 0),
+        # overriding any static per-phase batch_key_dropout.  Rationale: the
+        # frozen-regressor structure phase must test independence under the
+        # SAME key-availability regime the regressor was just trained on.
+        lad = ad.get("bkd_ladder", None)
+        self._bkd_ladder: Optional[list] = (
+            [float(v) for v in lad] if lad is not None else None
+        )
+        if self._bkd_ladder is not None:
+            if not self._bkd_ladder or any(p < 0.0 or p > 1.0 for p in self._bkd_ladder):
+                raise ValueError(
+                    f"adaptive_training.bkd_ladder must be a non-empty list of "
+                    f"probabilities in [0, 1], got {self._bkd_ladder}"
+                )
+            self._bkd_managed = True
+
+        # Count-based BKD ladder (min-keys budget per cycle).  Mutually
+        # exclusive with the p-based ``bkd_ladder``: rung k sets
+        # ``batch_key_dropout_min_keys`` for cycle k (and activates BKD at
+        # p=1 when no p key is set — see _apply_bkd_cfg), so the curriculum
+        # reads "exactly k keys per batch in cycle k".  Combine with
+        # ``batch_key_dropout_deterministic: true`` in a phase block (or the
+        # model kwargs) for exact counts without Binomial noise.
+        klad = ad.get("bkd_min_keys_ladder", None)
+        self._bkd_min_keys_ladder: Optional[list] = (
+            [int(v) for v in klad] if klad is not None else None
+        )
+        if self._bkd_min_keys_ladder is not None:
+            if self._bkd_ladder is not None:
+                raise ValueError(
+                    "adaptive_training: bkd_ladder and bkd_min_keys_ladder "
+                    "are mutually exclusive — choose one curriculum axis."
+                )
+            if not self._bkd_min_keys_ladder or any(
+                k < 0 for k in self._bkd_min_keys_ladder
+            ):
+                raise ValueError(
+                    f"adaptive_training.bkd_min_keys_ladder must be a non-empty "
+                    f"list of non-negative integers, got {self._bkd_min_keys_ladder}"
+                )
+            self._bkd_managed = True
 
         # Per-phase direction-gate bias (GatedSelfAttention direction gate).
         # Managed only when at least one phase block sets ``dir_bias``:
@@ -500,7 +550,38 @@ class PhaseController(Callback):
             cfg = {**self.recon_cfg, **self.final_cfg}
         else:
             cfg = self.struct_cfg
+        if self._bkd_ladder is not None:
+            # Constant p for the whole cycle (recon + structure alike);
+            # _cycle_count counts COMPLETED structure phases, so both phases
+            # of cycle k see rung k.
+            p_rung = self._bkd_ladder[min(self._cycle_count,
+                                          len(self._bkd_ladder) - 1)]
+            cfg = {**cfg,
+                   "batch_key_dropout": p_rung,
+                   "batch_key_dropout_final": p_rung,
+                   "batch_key_dropout_annealing_batches": None}
+        if self._bkd_min_keys_ladder is not None:
+            # Constant key budget for the whole cycle (same rung semantics as
+            # the p ladder); overrides any static per-phase min_keys.  The
+            # p=1 default below activates BKD when no p key is set.
+            k_rung = self._bkd_min_keys_ladder[min(
+                self._cycle_count, len(self._bkd_min_keys_ladder) - 1)]
+            cfg = {**cfg, "batch_key_dropout_min_keys": k_rung}
+        # Count-based curriculum: a phase that sets ONLY
+        # ``batch_key_dropout_min_keys`` activates BKD at p=1 so exactly
+        # ``min_keys`` keys survive (deterministic mode) or are topped up
+        # to (Bernoulli mode).  Combine with batch_key_dropout_deterministic
+        # in the same phase block for the exact-count variant.
+        if "batch_key_dropout" not in cfg and "batch_key_dropout_min_keys" in cfg:
+            cfg = {**cfg, "batch_key_dropout": 1.0}
         active = "batch_key_dropout" in cfg
+
+        # Optional per-phase sampling overrides (min-keys floor / mode).
+        samp_kw = {}
+        if "batch_key_dropout_min_keys" in cfg:
+            samp_kw["min_keys"] = int(cfg["batch_key_dropout_min_keys"])
+        if "batch_key_dropout_deterministic" in cfg:
+            samp_kw["deterministic"] = bool(cfg["batch_key_dropout_deterministic"])
 
         from causaliT.core.modules.extra_layers import BatchConsistentKeyDropout
 
@@ -516,6 +597,8 @@ class PhaseController(Callback):
                         ),
                     )
                 mod.set_phase_active(active)
+                if samp_kw:
+                    mod.set_sampling(**samp_kw)
                 n_mod += 1
             elif hasattr(mod, "set_bkd_phase_active"):
                 # Inline variant (GatedCrossAttention / GatedSelfAttention).
@@ -538,6 +621,8 @@ class PhaseController(Callback):
                         **shape_kw,
                     )
                 mod.set_bkd_phase_active(active)
+                if samp_kw:
+                    mod.set_bkd_sampling(**samp_kw)
                 n_mod += 1
 
         if active and n_mod == 0:
@@ -599,6 +684,25 @@ class PhaseController(Callback):
         if ps:
             pl_module.log(
                 "bkd_p", float(np.mean(ps)), on_step=False, on_epoch=True
+            )
+        # Explicit min-keys ladder column: run-level mean of the current
+        # key budget over all BKD modules (submodule ``min_keys`` / inline
+        # gated ``_bkd_min_keys``).  This is THE column to watch for the
+        # count-based ladder (bkd_min_keys_ladder): it steps one rung per
+        # completed structure phase.
+        mks = [
+            float(m.min_keys)
+            for m in pl_module.modules()
+            if isinstance(m, BatchConsistentKeyDropout)
+        ]
+        mks += [
+            float(m._bkd_min_keys)
+            for m in pl_module.modules()
+            if hasattr(m, "_bkd_min_keys")
+        ]
+        if mks:
+            pl_module.log(
+                "bkd_min_keys", float(np.mean(mks)), on_step=False, on_epoch=True
             )
 
     def _apply_dir_bias_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
@@ -969,6 +1073,22 @@ class PhaseController(Callback):
         # SNR evidence never crosses a boundary unless configured otherwise.
         if getattr(pl_module, "nodewise_reset_every_stage", False):
             pl_module.nodewise_reset_stats()
+
+        # HSIC constraint: the violation regime shifts at every phase switch
+        # (new cross-fit fold, new BKD rung), so the EMA and the rho-escalation
+        # memory must not compare across regimes.  The dual variables
+        # themselves persist -- they accumulate evidence over the whole run.
+        if getattr(pl_module, "hsic_constraint_enabled", False):
+            # Pass the phase (dual-ascent gating) and the CURRENT BKD rung
+            # (low-rung pause + per-rung tolerance calibration) so the
+            # constraint logic sees the regime it is about to train in.
+            k_rung = None
+            if self._bkd_min_keys_ladder is not None:
+                k_rung = int(self._bkd_min_keys_ladder[min(
+                    self._cycle_count, len(self._bkd_min_keys_ladder) - 1)])
+            pl_module.hsic_constraint_on_phase_switch(
+                phase=phase, bkd_min_keys=k_rung
+            )
 
 
         if phase in ("reconstruct", "final_reconstruct", "warmup"):
@@ -1885,6 +2005,10 @@ def adaptive_trainer(
         best=best,
         extra_callbacks=[controller],
         reload_dataloaders_every_n_epochs=reload_every_n,
+        # data_dir is required for the PeriodicDAGMetrics callback
+        # (training.log_dag_metrics): without it the dag/auroc_* columns
+        # are silently skipped on the adaptive path.
+        data_dir=data_dir,
     )
 
     # --- Evaluation-suite artefacts --------------------------------------------

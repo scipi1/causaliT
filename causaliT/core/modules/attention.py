@@ -8,6 +8,7 @@ import numpy as np
 from causaliT.core.modules.extra_layers import UniformAttentionMask, BatchConsistentKeyDropout
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.core.modules.gated_cross_attention import GatedCrossAttention
+from causaliT.core.modules.topk_gate import TopKGate
 from causaliT.core.modules.gated_self_attention import GatedSelfAttention
 from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 
@@ -94,6 +95,8 @@ class CausalCrossAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
         optuna_protocol: Optional[float] = None,
     ):
         super(CausalCrossAttention, self).__init__()
@@ -134,6 +137,8 @@ class CausalCrossAttention(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=0.0,
             )
         else:
@@ -272,6 +277,8 @@ class SigmoidCrossAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super(SigmoidCrossAttention, self).__init__()
 
@@ -300,6 +307,8 @@ class SigmoidCrossAttention(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=0.0,
             )
         else:
@@ -471,6 +480,8 @@ class HardConcreteCrossAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super(HardConcreteCrossAttention, self).__init__()
 
@@ -510,6 +521,8 @@ class HardConcreteCrossAttention(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=0.0,
             )
         else:
@@ -711,6 +724,8 @@ class ToeplitzAttention(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super(ToeplitzAttention, self).__init__()
 
@@ -733,6 +748,8 @@ class ToeplitzAttention(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=0.0,
             )
         else:
@@ -880,6 +897,8 @@ class ScaledDotSoftmax(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super(ScaledDotSoftmax, self).__init__()
 
@@ -899,6 +918,8 @@ class ScaledDotSoftmax(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=float('-inf'),
             )
         else:
@@ -1028,6 +1049,8 @@ class ScaledDotSoftmaxNAIM(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super(ScaledDotSoftmaxNAIM, self).__init__()
 
@@ -1046,6 +1069,8 @@ class ScaledDotSoftmaxNAIM(nn.Module):
                 p_init=batch_key_dropout,
                 p_final=batch_key_dropout_p_final,
                 annealing_batches=batch_key_dropout_annealing_batches,
+                min_keys=batch_key_dropout_min_keys,
+                deterministic=batch_key_dropout_deterministic,
                 blanking_value=float('-inf'),
             )
         else:
@@ -1449,6 +1474,14 @@ class AttentionLayer(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
+        # Eval-mode BKD (GatedCrossAttention / GatedSelfAttention only):
+        # rung-aware validation — apply BKD in eval mode with a seeded
+        # generator so val metrics match the current key-budget regime.
+        batch_key_dropout_eval: bool = False,
+        batch_key_dropout_eval_seed: int = 12345,
+
         optuna_protocol: Optional[float] = None,
         # Prior-softmax reconstruction gain (GatedCrossAttention /
         # GatedSelfAttention only; see causaliT/core/modules/gain_softmax.py).
@@ -1492,6 +1525,10 @@ class AttentionLayer(nn.Module):
         # GatedSelfAttention) and ScaledDotSoftmax inner modules support the
         # additive query term.  0 (default) disables it.
         value_structure_query_dim: int = 0,
+        # Source-side top-k budget (GatedCrossAttention / GatedSelfAttention
+        # only; see causaliT/core/modules/topk_gate.py).  Passed straight
+        # through to the inner attention; None (default) = disabled.
+        topk_gate: Optional[TopKGate] = None,
     ):
         super(AttentionLayer, self).__init__()
 
@@ -1565,6 +1602,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                 )
             elif attention is HardConcreteCrossAttention:
                 # HardConcreteCrossAttention also needs gamma / zeta stretch params
@@ -1578,6 +1617,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                 )
             elif attention is GatedCrossAttention:
                 # GatedCrossAttention: HardConcrete structure gate (A = z).
@@ -1603,6 +1644,11 @@ class AttentionLayer(nn.Module):
 
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
+                    batch_key_dropout_eval=batch_key_dropout_eval,
+                    batch_key_dropout_eval_seed=batch_key_dropout_eval_seed,
+
                     # Optuna capacity-search protocol: freeze the STRUCTURE gate
                     # at a constant (0/1) while the reconstruction gain learns.
                     optuna_protocol=optuna_protocol,
@@ -1611,6 +1657,8 @@ class AttentionLayer(nn.Module):
                     use_gain_softmax=use_gain_softmax,
                     gain_num_queries=query_seq_len,
                     gain_num_keys=key_seq_len,
+                    # Source-side top-k budget (None = disabled).
+                    topk_gate=topk_gate,
                 )
 
             elif attention is CommutatorSelfAttention:
@@ -1639,6 +1687,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                     optuna_protocol=optuna_protocol,
                     direction_mode=direction_mode,
 
@@ -1668,12 +1718,19 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
+                    batch_key_dropout_eval=batch_key_dropout_eval,
+                    batch_key_dropout_eval_seed=batch_key_dropout_eval_seed,
+
                     optuna_protocol=optuna_protocol,
                     # Prior-softmax reconstruction gain (static table sized
                     # (query_seq_len, key_seq_len); inert at gain_lambda=0).
                     use_gain_softmax=use_gain_softmax,
                     gain_num_queries=query_seq_len,
                     gain_num_keys=key_seq_len,
+                    # Source-side top-k budget (None = disabled).
+                    topk_gate=topk_gate,
                 )
             elif attention is CausalCrossAttention:
 
@@ -1690,6 +1747,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                     optuna_protocol=optuna_protocol,
                 )
             elif attention in ATTENTION_WITH_TAU:
@@ -1701,6 +1760,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                 )
             else:
 
@@ -1711,6 +1772,8 @@ class AttentionLayer(nn.Module):
                     batch_key_dropout=batch_key_dropout,
                     batch_key_dropout_p_final=batch_key_dropout_p_final,
                     batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
                 )
 
             # Q and K projections.  When ``query_external`` the query arrives

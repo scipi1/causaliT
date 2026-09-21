@@ -38,6 +38,8 @@ Staged Training Integration:
 - Works with existing freeze_forecaster() / freeze_output_head() methods
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -198,6 +200,16 @@ class PerNodeMLPHead(nn.Module):
         var_id_offset: Variable IDs are 1-indexed in SCM datasets (0 = padding),
             so the ID is shifted by this offset before indexing the MLP list.
             Default 1.
+        film_context_dim: When > 0, enable FiLM conditioning on a per-token
+            context vector (e.g. the detached applied-adjacency row).  The
+            context is NOT concatenated; instead a shared conditioner MLP maps
+            it to per-channel scale/shift (gamma, beta) applied to the hidden
+            activation of every per-node decoder:
+                h = act(Linear(x));  h = gamma(c) * h + beta(c);  out = Linear(h)
+            The conditioner's last layer is zero-initialised so gamma = 1 and
+            beta = 0 at init: the head starts EXACTLY as the unconditioned
+            decoder.  ``d_model`` stays the base input width (no widening).
+            0 (default) = legacy behaviour (caller concatenates context).
     """
 
     ACTIVATIONS = {"relu": nn.ReLU, "gelu": nn.GELU}
@@ -212,6 +224,8 @@ class PerNodeMLPHead(nn.Module):
         dropout: float = 0.0,
         bias: bool = True,
         var_id_offset: int = 1,
+        film_context_dim: int = 0,
+        n_layers: int = 2,
     ):
         super().__init__()
         assert activation in self.ACTIVATIONS, (
@@ -222,38 +236,132 @@ class PerNodeMLPHead(nn.Module):
         self.num_variables = num_variables
         self.d_hidden = d_hidden
         self.var_id_offset = var_id_offset
+        self.film_context_dim = int(film_context_dim)
+        self.n_layers = int(n_layers)
+        if self.n_layers < 2:
+            raise ValueError(
+                f"PerNodeMLPHead n_layers must be >= 2, got {self.n_layers}."
+            )
+        # Number of FiLM modulation points: one per HIDDEN activation
+        # (multi-layer FiLM); the output projection is never modulated.
+        self.n_film_points = self.n_layers - 1
 
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 
-        # One independent decoder MLP per variable (node).
-        self.mlps = nn.ModuleList([
-            nn.Sequential(
+        # One independent decoder MLP per variable (node): (n_layers - 1)
+        # hidden blocks of Linear -> act -> drop, then the output projection.
+        # n_layers=2 reproduces the legacy layout exactly (submodule indices
+        # 0..3), keeping older checkpoints loadable.
+        def _build_mlp():
+            layers = [
                 nn.Linear(d_model, d_hidden, bias=bias),
                 self.ACTIVATIONS[activation](),
                 self.dropout,
-                nn.Linear(d_hidden, out_dim, bias=bias),
-            )
-            for _ in range(num_variables)
-        ])
+            ]
+            for _ in range(self.n_layers - 2):
+                layers += [
+                    nn.Linear(d_hidden, d_hidden, bias=bias),
+                    self.ACTIVATIONS[activation](),
+                    self.dropout,
+                ]
+            layers.append(nn.Linear(d_hidden, out_dim, bias=bias))
+            return nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor, var_ids: torch.Tensor) -> torch.Tensor:
+        self.mlps = nn.ModuleList([_build_mlp() for _ in range(num_variables)])
+
+        # FiLM conditioner (shared across nodes; the context row is already
+        # node-specific).  Outputs a (gamma_k, beta_k) pair for EVERY hidden
+        # activation (multi-layer FiLM, Perez et al. 2018), packed as
+        # [gamma_1..gamma_K | beta_1..beta_K].  Zero-init last layer ->
+        # gamma=1, beta=0 at init.
+        if self.film_context_dim > 0:
+            film_hidden = max(32, 2 * d_hidden)
+            self.film = nn.Sequential(
+                nn.Linear(self.film_context_dim, film_hidden),
+                nn.GELU(),
+                nn.Linear(film_hidden, 2 * d_hidden * self.n_film_points),
+            )
+            nn.init.zeros_(self.film[-1].weight)
+            nn.init.zeros_(self.film[-1].bias)
+        else:
+            self.film = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        var_ids: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x: (B, L, d_model) transformer output.
+            x: (B, L, d_model) transformer output.  When ``context`` is
+                given, ``d_model`` is the CONCATENATED width (base + ctx).
             var_ids: (B, L) variable IDs (1-indexed; 0 = padding).
+            context: Optional (B, L, d_context) per-token context (e.g. the
+                detached applied-adjacency row) concatenated onto ``x``
+                before routing.  The caller is responsible for detaching
+                it: the context must inform the decoder without leaking
+                gradient into the structural parameters.
 
         Returns:
             (B, L, out_dim) per-node predictions.
         """
+        if self.film is not None:
+            # FiLM mode: context modulates the hidden activation
+            # multiplicatively; it is NOT concatenated.
+            if context is None:
+                raise ValueError(
+                    "PerNodeMLPHead built with film_context_dim > 0 "
+                    "requires a context tensor in forward()."
+                )
+            assert context.shape[:2] == x.shape[:2], (
+                f"context (B, L) dims {tuple(context.shape[:2])} must "
+                f"match x {tuple(x.shape[:2])}."
+            )
+            assert context.size(-1) == self.film_context_dim, (
+                f"FiLM context width {context.size(-1)} != "
+                f"film_context_dim {self.film_context_dim}."
+            )
+            gb = self.film(context)
+            chunks = gb.chunk(2 * self.n_film_points, dim=-1)
+            gammas = [1.0 + c for c in chunks[: self.n_film_points]]
+            betas = list(chunks[self.n_film_points :])
+        elif context is not None:
+            assert context.shape[:2] == x.shape[:2], (
+                f"context (B, L) dims {tuple(context.shape[:2])} must "
+                f"match x {tuple(x.shape[:2])}."
+            )
+            x = torch.cat([x, context], dim=-1)
+        assert x.size(-1) == self.d_model, (
+            f"PerNodeMLPHead expected input width {self.d_model}, got "
+            f"{x.size(-1)}."
+        )
         B, L, _ = x.shape
         # Shift to 0-indexed for ModuleList lookup; clamp padding to 0.
         idx = (var_ids.long() - self.var_id_offset).clamp(min=0, max=self.num_variables - 1)
 
         # Run every MLP on the full (B, L) batch and select the correct output
         # per token.  Vectorised; avoids a Python loop over the batch.
-        all_outs = torch.stack(
-            [mlp(x) for mlp in self.mlps], dim=2
-        )  # (B, L, num_variables, out_dim)
+        if self.film is not None:
+            # Per hidden block k: Linear -> Act -> Dropout, then FiLM
+            # gamma_k * h + beta_k; the output projection is applied last.
+            # Submodule indexing keeps the legacy nn.Sequential checkpoint
+            # layout (mlps.i.0/3 when n_layers=2).
+            def _run_film(mlp, x_in):
+                h = x_in
+                for k in range(self.n_film_points):
+                    h = mlp[3 * k + 2](mlp[3 * k + 1](mlp[3 * k](h)))
+                    h = gammas[k] * h + betas[k]
+                return mlp[-1](h)
+
+            all_outs = torch.stack(
+                [_run_film(mlp, x) for mlp in self.mlps],
+                dim=2,
+            )  # (B, L, num_variables, out_dim)
+        else:
+            all_outs = torch.stack(
+                [mlp(x) for mlp in self.mlps], dim=2
+            )  # (B, L, num_variables, out_dim)
 
         # Gather the output of the MLP matching each token's variable ID.
         out = torch.gather(

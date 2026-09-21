@@ -88,6 +88,8 @@ class VarianceCausalLayer(nn.Module):
         batch_key_dropout: float = None,
         batch_key_dropout_p_final: float = None,
         batch_key_dropout_annealing_batches: int = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         super().__init__()
 
@@ -150,6 +152,8 @@ class VarianceCausalLayer(nn.Module):
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
             batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+            batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+            batch_key_dropout_deterministic=batch_key_dropout_deterministic,
         )
 
         attn_cross = dict(
@@ -250,6 +254,7 @@ class VarianceCausalLayer(nn.Module):
         shared_dag_across_heads=True,
         batch_key_dropout=None, batch_key_dropout_p_final=None,
         batch_key_dropout_annealing_batches=None,
+        batch_key_dropout_min_keys=0, batch_key_dropout_deterministic=False,
     ):
         """Build an AttentionLayer.  Always dual_value=True for dual-residual decoder."""
         assert attention_type in [
@@ -291,6 +296,8 @@ class VarianceCausalLayer(nn.Module):
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
             batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+            batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+            batch_key_dropout_deterministic=batch_key_dropout_deterministic,
         )
 
     # ------------------------------------------------------------------

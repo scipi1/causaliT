@@ -89,7 +89,7 @@ fails here (even with HSIC + sparsity), it cannot work in any downstream archite
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Dict, Optional
 
 from causaliT.core.modules import (
     CausalCrossAttention,
@@ -106,6 +106,7 @@ from causaliT.core.modules import (
     OrthogonalMaskEmbedding,
     FixedOrthonormalEmbedding,
 )
+from causaliT.core.modules.topk_gate import TopKGate
 from causaliT.core.modules.mlp_head import PerNodeMLPHead
 
 # Imported directly from the submodule so the layer does not depend on the
@@ -260,6 +261,13 @@ class AttentionSelectorLayer(nn.Module):
             which to linearly anneal the dropout probability from
             ``batch_key_dropout`` to ``batch_key_dropout_p_final``.
             ``None`` (default) disables step-counter annealing.
+        batch_key_dropout_min_keys: Minimum number of keys kept per forward
+            (safeguard against a completely empty adjacency).  ``0``
+            (default) disables the safeguard; ``1`` guarantees at least one
+            key survives even at very high drop probabilities.
+        batch_key_dropout_deterministic: If ``True``, keep a deterministic
+            number of keys ``max(min_keys, round((1 - p) * S))`` drawn as a
+            uniform random subset, instead of per-key Bernoulli sampling.
     """
 
     def __init__(
@@ -321,6 +329,15 @@ class AttentionSelectorLayer(nn.Module):
         # training batch (the forecaster calls the method), since value-modulated
         # key embeddings need real data.
         query_centroid_init: bool = True,
+        # Known-edges prior: AFTER the initialisation (centroid or default),
+        # overwrite the query of the listed nodes with the centroid of their
+        # KNOWN parents'' (projected) keys, optionally keeping those rows frozen
+        # for the whole run.  Format (GLOBAL 1-based dataset node IDs; S nodes
+        # are 1..S_seq_len, X nodes are S_seq_len+1..S_seq_len+X_seq_len):
+        #     {5: {"parents": [1, 2], "fixed": True}, ...}
+        # Requires free_query_embedding=True.  In split mode only X nodes
+        # (id > S_seq_len) are queries; S children need homogeneous_nodes.
+        query_parents_prior: Optional[Dict[int, dict]] = None,
         # Orthogonal (isometric) key projection: W_K^T W_K = I
 
         key_projection_type: str = "linear",
@@ -329,6 +346,8 @@ class AttentionSelectorLayer(nn.Module):
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
         # Optuna capacity-search protocol (constant-score override). See
         # CausalCrossAttention: None disables; 0 = residual-only floor;
         # 1 = uniform mixing (pair with heavy batch_key_dropout).
@@ -546,8 +565,45 @@ class AttentionSelectorLayer(nn.Module):
         # (their output feeds the now-unused attention V path) but receive no
         # reconstruction gradient.
         raw_value_adjacency: bool = False,
-
+        # Adjacency-context injection into the per-node decoder MLP.  Modes:
+        # False/None = off; True or "concat" = each per-node MLP input is
+        # concatenated with the DETACHED applied-adjacency row (B, L_q,
+        # L_S+L_X) — the gate weights actually used on this sample after
+        # hard mask, gain, BKD, top-k blanking and dropout — so the
+        # (nuisance) regressor knows which keys were selected, consistently
+        # with stochastic key exclusion.  "film" = FiLM conditioning: a
+        # shared conditioner MLP maps the context to per-channel scale/
+        # shift of the decoder hidden activation (zero-init => identical
+        # to the unconditioned decoder at step 0), without widening the
+        # MLP input.  Requires per_node_output=True.
+        per_node_adjacency_context: bool = False,
+        # Number of linear layers in each per-node decoder MLP (>=2).  2
+        # (default) is the legacy shallow head; deeper heads pair with FiLM
+        # conditioning at EVERY hidden activation (multi-layer FiLM, Perez
+        # et al. 2018) when per_node_adjacency_context == "film".
+        per_node_output_layers: int = 2,
+        # Eval-mode BKD (rung-aware validation): forwarded to the gated
+        # attention blocks; when True, eval forward passes apply the current
+        # BKD budget with a seeded generator so val metrics measure the same
+        # key-budget regime as training (fixes the min-keys-ladder train/eval
+        # mismatch where validation ran with the full dense gate).
+        batch_key_dropout_eval: bool = False,
+        # Source-side top-k budget (TopKGate; see
+        # causaliT/core/modules/topk_gate.py).  ``topk_k=None`` (default)
+        # disables it and keeps the dense behaviour bit-identical.  When set,
+        # one gate is built per gated block and handed to the inner attention:
+        # the square self block (and the homogeneous combined block) excludes
+        # the diagonal; the bipartite S->X cross block does not.  Supported
+        # for GatedCrossAttention / GatedSelfAttention only.
+        topk_k: Optional[int] = None,
+        topk_method: str = "noisy_hard_k",
+        topk_slack_init: Optional[int] = None,
+        topk_slack_final: int = 0,
+        topk_annealing_batches: Optional[int] = None,
+        topk_per_row_slack: bool = True,
+        batch_key_dropout_eval_seed: int = 12345,
     ):
+
 
 
 
@@ -658,6 +714,51 @@ class AttentionSelectorLayer(nn.Module):
                 "(there is no dedicated X query embedding table to initialise "
                 "at the key centroid otherwise)."
             )
+        # Known-edges query prior (applied by init_queries_from_parents on the
+        # first training batch, AFTER the centroid/default init).  Normalise to
+        # int keys and validate the GLOBAL 1-based dataset node IDs.
+        self.query_parents_prior: Optional[Dict[int, dict]] = None
+        if query_parents_prior:
+            if not free_query_embedding:
+                raise ValueError(
+                    "query_parents_prior requires free_query_embedding=True "
+                    "(there is no dedicated query embedding table to "
+                    "initialise otherwise)."
+                )
+            _L = S_seq_len + X_seq_len
+            _norm: Dict[int, dict] = {}
+            for _child, _spec in query_parents_prior.items():
+                _c = int(_child)
+                _parents = [int(p) for p in _spec.get("parents", [])]
+                _fixed = bool(_spec.get("fixed", False))
+                if not 1 <= _c <= _L:
+                    raise ValueError(
+                        f"query_parents_prior: child id {_c} out of range "
+                        f"1..{_L}."
+                    )
+                if _c <= S_seq_len and not self.homogeneous_nodes:
+                    raise ValueError(
+                        f"query_parents_prior: child id {_c} is an S node; in "
+                        "split mode only X nodes (ids > S_seq_len) have a "
+                        "query to initialise."
+                    )
+                if not _parents:
+                    raise ValueError(
+                        f"query_parents_prior: child {_c} lists no parents."
+                    )
+                for _p in _parents:
+                    if not 1 <= _p <= _L:
+                        raise ValueError(
+                            f"query_parents_prior: parent id {_p} of child "
+                            f"{_c} out of range 1..{_L}."
+                        )
+                    if _p == _c:
+                        raise ValueError(
+                            f"query_parents_prior: child {_c} cannot be its "
+                            "own parent."
+                        )
+                _norm[_c] = {"parents": _parents, "fixed": _fixed}
+            self.query_parents_prior = _norm
         # Whether the cross block is a gated attention (structure-gated).  Kept
         # for diagnostics; the reconstruction-gain stream has been removed.
         self.is_gated = (
@@ -950,6 +1051,36 @@ class AttentionSelectorLayer(nn.Module):
         else:
             main_tau = self.init_tau_act
 
+        # ---- Source-side top-k budget (TopKGate) --------------------------
+        # None (default) = disabled, dense behaviour bit-identical.  When
+        # enabled, one TopKGate per gated block: the square self block (and
+        # the homogeneous combined block, which IS square) excludes the
+        # diagonal; the bipartite S->X cross block has no diagonal.
+        topk_gate_main = None
+        topk_gate_self = None
+        if topk_k is not None:
+            _topk_common = dict(
+                k=topk_k,
+                method=topk_method,
+                slack_init=topk_slack_init,
+                slack_final=topk_slack_final,
+                annealing_batches=topk_annealing_batches,
+                per_row_slack=topk_per_row_slack,
+            )
+            if self.homogeneous_nodes:
+                topk_gate_main = TopKGate(exclude_diagonal=True, **_topk_common)
+            else:
+                topk_gate_main = TopKGate(exclude_diagonal=False, **_topk_common)
+                if self.split_xx:
+                    topk_gate_self = TopKGate(exclude_diagonal=True, **_topk_common)
+        # Plain (non-registered) references for diagnostics: the gates are
+        # OWNED by the inner attention modules (registered there, so device
+        # moves and checkpoints work); registering them again at the layer
+        # top level would duplicate the state-dict entries.
+        self.__dict__["topk_gate_main"] = topk_gate_main
+        self.__dict__["topk_gate_self"] = topk_gate_self
+
+
         self.attention = AttentionLayer(
 
             attention=att_cls,
@@ -982,6 +1113,11 @@ class AttentionSelectorLayer(nn.Module):
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
             batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+            batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+            batch_key_dropout_deterministic=batch_key_dropout_deterministic,
+            batch_key_dropout_eval=batch_key_dropout_eval,
+            batch_key_dropout_eval_seed=batch_key_dropout_eval_seed,
+
             # Optuna capacity-search protocol (constant-score override; only
             # honoured by CausalCrossAttention, ignored by other attention types).
             optuna_protocol=optuna_protocol,
@@ -1018,6 +1154,8 @@ class AttentionSelectorLayer(nn.Module):
             use_gain_softmax=use_gain_softmax,
             gain_data=gain_data,
             gain_score_dim=gain_score_dim,
+            # Source-side top-k budget (None = disabled).
+            topk_gate=topk_gate_main,
         )
 
 
@@ -1067,6 +1205,11 @@ class AttentionSelectorLayer(nn.Module):
                 batch_key_dropout=batch_key_dropout,
                 batch_key_dropout_p_final=batch_key_dropout_p_final,
                 batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                batch_key_dropout_deterministic=batch_key_dropout_deterministic,
+                batch_key_dropout_eval=batch_key_dropout_eval,
+                batch_key_dropout_eval_seed=batch_key_dropout_eval_seed,
+
                 optuna_protocol=optuna_protocol,
                 init_gamma=init_gamma,
                 init_zeta=init_zeta,
@@ -1100,6 +1243,9 @@ class AttentionSelectorLayer(nn.Module):
                 use_gain_softmax=use_gain_softmax,
                 gain_data=gain_data,
                 gain_score_dim=gain_score_dim,
+                # Source-side top-k budget (None = disabled).
+                topk_gate=topk_gate_self,
+
             )
 
             # Tie the learnable per-node query-norm multiplier across the cross
@@ -1284,6 +1430,24 @@ class AttentionSelectorLayer(nn.Module):
             self.query_embed_X = None
             self.query_embed_S = None
 
+        # Arm the frozen-row gradient hooks at construction time (no data
+        # needed): the hook zeroes gradients on prior-fixed rows from the very
+        # first step.  The snapshot is REFRESHED with the prior values by
+        # init_queries_from_parents on the first training batch.
+        if self.query_parents_prior:
+            _fixed_X = [
+                c - S_seq_len for c, s in self.query_parents_prior.items()
+                if s["fixed"] and c > S_seq_len
+            ]
+            _fixed_S = [
+                c for c, s in self.query_parents_prior.items()
+                if s["fixed"] and c <= S_seq_len
+            ]
+            if _fixed_X and self.query_embed_X is not None:
+                self.query_embed_X.freeze_rows(_fixed_X)
+            if _fixed_S and self.query_embed_S is not None:
+                self.query_embed_S.freeze_rows(_fixed_S)
+
         # ------------------------------------------------------------------
         # Value-structure injection identity tables (value_structure_injection
         # in {"separate", "learned_sum"}).  Dedicated identity tables (one per
@@ -1359,6 +1523,27 @@ class AttentionSelectorLayer(nn.Module):
         # ------------------------------------------------------------------
 
         self.per_node_output = bool(per_node_output)
+        # Adjacency-context mode: False/None -> off; True -> "concat"
+        # (legacy); "concat" / "film" select the injection mechanism.
+        _pac = per_node_adjacency_context
+        if _pac is True:
+            _pac = "concat"
+        elif _pac in (False, None):
+            _pac = None
+        _pac = str(_pac).lower() if _pac is not None else None
+        if _pac not in (None, "concat", "film"):
+            raise ValueError(
+                f"per_node_adjacency_context must be one of False / True / "
+                f"'concat' / 'film', got {per_node_adjacency_context!r}"
+            )
+        self.per_node_adjacency_context = _pac is not None
+        self._adjacency_context_mode = _pac
+        if self.per_node_adjacency_context and not self.per_node_output:
+            raise ValueError(
+                "per_node_adjacency_context=True requires "
+                "per_node_output=True (the adjacency row is concatenated "
+                "onto the per-node MLP input)."
+            )
         # Raw-value adjacency passthrough (Arm B): the attention posterior IS
         # the adjacency acting on raw values; the per-node decoder MLP input
         # is the weighted parent vector of dim L_S + L_X (see
@@ -1388,14 +1573,32 @@ class AttentionSelectorLayer(nn.Module):
             # homogeneous mode the head must cover ALL N = L_S + L_X nodes
             # (S is also reconstructed); otherwise only the X nodes.
             n_out_nodes = self.N if self.homogeneous_nodes else X_seq_len
+            # Optional adjacency context widens every per-node MLP input by
+            # the applied-adjacency row width (L_S + L_X) in "concat" mode;
+            # "film" mode keeps the base width and conditions via FiLM.
+            _ctx_dim = (
+                (S_seq_len + X_seq_len)
+                if self._adjacency_context_mode == "concat"
+                else 0
+            )
+            _film_dim = (
+                (S_seq_len + X_seq_len)
+                if self._adjacency_context_mode == "film"
+                else 0
+            )
+            _base_dim = (
+                (S_seq_len + X_seq_len) if self.raw_value_adjacency else d_model
+            )
             self.forecaster = PerNodeMLPHead(
-                d_model=(S_seq_len + X_seq_len) if self.raw_value_adjacency else d_model,
+                d_model=_base_dim + _ctx_dim,
                 out_dim=out_dim,
                 num_variables=n_out_nodes,
                 d_hidden=per_node_output_hidden,
                 activation=output_mlp_activation,
                 dropout=output_mlp_dropout,
                 bias=True,
+                film_context_dim=_film_dim,
+                n_layers=per_node_output_layers,
             )
         else:
             mlp_hidden = output_mlp_hidden if output_mlp_hidden is not None else d_ff
@@ -1506,6 +1709,82 @@ class AttentionSelectorLayer(nn.Module):
             w = table.embedding.weight
             e_w = e.to(dtype=w.dtype, device=w.device)
             w[1:].copy_(e_w.unsqueeze(0).expand(w.shape[0] - 1, -1))
+
+    @torch.no_grad()
+    def init_queries_from_parents(
+        self,
+        prior: Dict[int, dict],
+        source_tensor: torch.Tensor,
+        x_actual: torch.Tensor,
+    ) -> int:
+        """Overwrite the query of known-edges nodes with their parents'' keys.
+
+        ``prior`` maps a GLOBAL 1-based dataset node id (S nodes are
+        1..S_seq_len, X nodes S_seq_len+1..S_seq_len+X_seq_len) to
+        ``{"parents": [...], "fixed": bool}``.  For each child the query
+        embedding is placed, in the QK scoring space, at the MEAN of its
+        parents'' projected keys (inverted through W_q like
+        :meth:`init_query_at_key_centroid`).  Rows with ``fixed=True`` are
+        then re-snapshotted at the prior value and stay frozen for the rest
+        of training (see FreeQueryEmbedding.freeze_rows).
+
+        Must be called AFTER the centroid/default initialisation so the prior
+        overwrites it; nodes not listed keep their initialised query.  Returns
+        the number of frozen rows.  Requires ``free_query_embedding=True``.
+        """
+        if self.query_embed_X is None:
+            raise RuntimeError(
+                "init_queries_from_parents requires free_query_embedding=True "
+                "(no query_embed_X table to initialise)."
+            )
+
+        def _struct(raw):
+            return raw[0] if isinstance(raw, tuple) else raw
+
+        # ---- Key structural embeddings (mirror forward_with_actual) -------
+        s_struct = _struct(self.embedding_S(X=source_tensor))
+        xk_struct = _struct(self.embedding_X(X=x_actual))
+        if self.orth_embed_S is not None:
+            assert self.orth_embed_X is not None
+            s_struct = self.orth_embed_S(source_tensor)
+            xk_struct = self.orth_embed_X(x_actual)
+        sx_keys = torch.cat([s_struct, xk_struct], dim=1)   # (B, L, d_model)
+
+        # ---- Project keys into the scoring space (identity/none -> raw) ---
+        key_proj = getattr(self.attention, "key_projection", None)
+        k_proj = sx_keys if key_proj is None else key_proj(sx_keys)
+        query_proj = getattr(self.attention, "query_projection", None)
+
+        n_frozen = 0
+        for child, spec in prior.items():
+            c = int(child)
+            cols = [p - 1 for p in spec["parents"]]          # global -> 0-based
+            target = k_proj[:, cols, :].mean(dim=(0, 1))     # over batch+parents
+            e = self._query_embedding_for_target(query_proj, target)
+            if c > self.S_seq_len:
+                table, row = self.query_embed_X, c - self.S_seq_len
+            else:
+                assert self.query_embed_S is not None
+                table, row = self.query_embed_S, c
+            w = table.embedding.weight
+            w[row].copy_(e.to(dtype=w.dtype, device=w.device))
+            if spec.get("fixed", False):
+                # Re-snapshot at the PRIOR value (the construction-time
+                # snapshot captured the random init).
+                table.freeze_rows([row])
+                n_frozen += 1
+        return n_frozen
+
+    def reassert_frozen_query_rows(self) -> None:
+        """Restore prior-frozen query rows to their snapshot values.
+
+        Called by the forecaster after every structural optimizer step:
+        decoupled weight decay / structural gradient noise act even on
+        zero-gradient rows, so the hook alone is not sufficient.
+        """
+        for t in (self.query_embed_S, self.query_embed_X):
+            if t is not None:
+                t.reassert_frozen_rows()
 
     def enable_centroid_commit(self) -> None:
         """Enable the centroid-commit shadow on every free query table.
@@ -2065,7 +2344,14 @@ class AttentionSelectorLayer(nn.Module):
                 )
             else:
                 var_ids = x_blanked[:, :, 1]
-            pred_x = self.forecaster(z, var_ids)
+            # Adjacency context: the regressor input z is built from the
+            # RETURNED posterior, so the context uses the same weights.
+            _ctx = (
+                attention_weights.detach()
+                if self.per_node_adjacency_context
+                else None
+            )
+            pred_x = self.forecaster(z, var_ids, context=_ctx)
             return pred_x, attention_weights, _aux
 
 
@@ -2119,11 +2405,53 @@ class AttentionSelectorLayer(nn.Module):
                 )
             else:
                 var_ids = x_blanked[:, :, 1]
-            pred_x = self.forecaster(x, var_ids)
+            _ctx = (
+                self._adjacency_context(attention_weights)
+                if self.per_node_adjacency_context
+                else None
+            )
+            pred_x = self.forecaster(x, var_ids, context=_ctx)
         else:
             pred_x = self.forecaster(x)
 
         return pred_x, attention_weights, _aux
+
+    # ------------------------------------------------------------------
+    # Per-node adjacency context (detached applied weights)
+    # ------------------------------------------------------------------
+
+    def _adjacency_context(
+        self, attention_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Detached per-sample APPLIED adjacency rows (B, L_q, L_S+L_X).
+
+        Standard (value-stream) path only: the regressor input is built
+        from the TRUE applied weight A inside each gated block (hard mask,
+        gain, BKD, top-k blanking, dropout already applied), so the
+        context reads the stored ``last_applied_A`` of each block and
+        re-concatenates the slices into the canonical column layout.
+        Falls back to the returned posterior when the inner module does
+        not expose an applied weight (vanilla ScaledDotSoftmax cross-only
+        arm: there the returned softmax IS the applied weight).  Always
+        detached — the context informs the (nuisance) regressor without
+        leaking gradient into the structural parameters.
+        """
+        if self.homogeneous_nodes or self.cross_only:
+            a = getattr(self.attention.inner_attention, "last_applied_A", None)
+            ctx = a if a is not None else attention_weights
+        else:
+            a_cross = getattr(
+                self.attention.inner_attention, "last_applied_A", None
+            )
+            a_self = getattr(
+                self.self_attention.inner_attention, "last_applied_A", None
+            )
+            if a_cross is not None and a_self is not None:
+                ctx = torch.cat([a_cross, a_self], dim=-1)
+            else:
+                ctx = attention_weights
+        return ctx.detach()
 
     # ------------------------------------------------------------------
     # Utility: split the combined attention matrix into S→X and X→X parts

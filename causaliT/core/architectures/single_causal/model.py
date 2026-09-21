@@ -162,6 +162,8 @@ class SingleCausalLayer(nn.Module):
         batch_key_dropout: float = None,
         batch_key_dropout_p_final: float = None,
         batch_key_dropout_annealing_batches: int = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
 
         super().__init__()
@@ -237,6 +239,8 @@ class SingleCausalLayer(nn.Module):
             "batch_key_dropout": batch_key_dropout,
             "batch_key_dropout_p_final": batch_key_dropout_p_final,
             "batch_key_dropout_annealing_batches": batch_key_dropout_annealing_batches,
+            "batch_key_dropout_min_keys": batch_key_dropout_min_keys,
+            "batch_key_dropout_deterministic": batch_key_dropout_deterministic,
         }
 
         
@@ -581,6 +585,8 @@ class SingleCausalLayer(nn.Module):
         batch_key_dropout: float = None,
         batch_key_dropout_p_final: float = None,
         batch_key_dropout_annealing_batches: int = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
     ):
         """Create an attention layer with specified configuration.
 
@@ -642,6 +648,8 @@ class SingleCausalLayer(nn.Module):
             batch_key_dropout=batch_key_dropout,
             batch_key_dropout_p_final=batch_key_dropout_p_final,
             batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+            batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+            batch_key_dropout_deterministic=batch_key_dropout_deterministic,
         )
         
         return att

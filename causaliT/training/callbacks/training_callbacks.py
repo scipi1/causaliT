@@ -295,9 +295,24 @@ class BestCausalCheckpoint(Callback):
         self.checkpoint_dir = join(save_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
-    def _resolve_monitor_key(self, metric_names):
-        """Find the first available HSIC metric from the logged metrics."""
-        for key in self.HSIC_METRICS_PRIORITY:
+    def _resolve_monitor_key(self, metric_names, pl_module=None):
+        """Find the first available HSIC metric from the logged metrics.
+
+        When HSIC is not part of the loss (``lambda_hsic == 0`` and the
+        constraint machinery disabled), ``val_hsic_reg`` is identically 0
+        and monitoring it would freeze the "best causal" checkpoint at the
+        first validation epoch.  In that case fall back to the raw
+        ``val_hsic``, which is still computed and logged as a diagnostic.
+        """
+        priority = list(self.HSIC_METRICS_PRIORITY)
+        if pl_module is not None and "val_hsic_reg" in priority:
+            lambda_hsic = float(getattr(pl_module, "lambda_hsic", 0.0) or 0.0)
+            constraint_on = bool(
+                getattr(pl_module, "hsic_constraint_enabled", False)
+            )
+            if lambda_hsic == 0.0 and not constraint_on:
+                priority.remove("val_hsic_reg")
+        for key in priority:
             if key in metric_names:
                 return key
         return None
@@ -308,7 +323,9 @@ class BestCausalCheckpoint(Callback):
 
         # Lazily resolve which HSIC metric is available
         if self.monitor_key is None:
-            self.monitor_key = self._resolve_monitor_key(current_metrics.keys())
+                        self.monitor_key = self._resolve_monitor_key(
+                current_metrics.keys(), pl_module
+            )
         if self.monitor_key is None:
             return  # no HSIC metric logged — nothing to do
 

@@ -71,6 +71,21 @@ class FreeQueryEmbedding(nn.Module):
         # via a straight-through estimator.
         self.shadow: Optional[torch.Tensor]
         self.register_buffer("shadow", None, persistent=True)
+        # Frozen rows (query parents prior, ``fixed: true``).  ``frozen_rows``
+        # marks the table rows that must not move during training; a backward
+        # hook zeroes their gradients and ``frozen_snapshot`` holds their
+        # initialised values so ``reassert_frozen_rows`` can restore them after
+        # every optimizer step (decoupled weight decay / structural gradient
+        # noise would otherwise drift even zero-gradient rows).  Both buffers
+        # are persistent so the freeze survives checkpoint save/load.
+        self.register_buffer(
+            "frozen_rows",
+            torch.zeros(num_variables + var_id_offset, dtype=torch.bool),
+            persistent=True,
+        )
+        self.frozen_snapshot: Optional[torch.Tensor]
+        self.register_buffer("frozen_snapshot", None, persistent=True)
+        self._freeze_hook_handle = None
 
     def enable_commit_shadow(self) -> None:
         """Register the evidence-accumulator shadow buffer (idempotent)."""
@@ -87,6 +102,44 @@ class FreeQueryEmbedding(nn.Module):
         if self.shadow is not None:
             with torch.no_grad():
                 self.shadow.copy_(self.embedding.weight)
+
+    def freeze_rows(self, indices) -> None:
+        """Freeze the given rows for the rest of training (idempotent).
+
+        Registers (once) a backward hook that zeroes the gradients of the
+        frozen rows, and snapshots the CURRENT weight values so
+        :meth:`reassert_frozen_rows` can restore them after each optimizer
+        step.  Call again after writing new values into frozen rows (e.g. by
+        the parents-prior init) to refresh the snapshot.
+        """
+        idx = torch.as_tensor(list(indices), dtype=torch.long)
+        if idx.numel() == 0:
+            return
+        with torch.no_grad():
+            self.frozen_rows[idx] = True
+            snap = self.embedding.weight.detach().clone()
+            if self.frozen_snapshot is None:
+                self.frozen_snapshot = snap
+            else:
+                self.frozen_snapshot.copy_(snap)
+        if self._freeze_hook_handle is None:
+            def _zero_frozen(grad):
+                return grad.masked_fill(
+                    self.frozen_rows.unsqueeze(1).to(grad.device), 0.0
+                )
+            self._freeze_hook_handle = self.embedding.weight.register_hook(
+                _zero_frozen
+            )
+
+    def reassert_frozen_rows(self) -> None:
+        """Restore frozen rows to their snapshot values (call after each
+        optimizer step).  No-op when nothing is frozen."""
+        if self.frozen_snapshot is None or not bool(self.frozen_rows.any()):
+            return
+        with torch.no_grad():
+            self.embedding.weight[self.frozen_rows] = (
+                self.frozen_snapshot[self.frozen_rows]
+            )
 
     def _apply(self, fn, recurse=True):
         """Re-leaf the shadow buffer after device/dtype moves.

@@ -894,6 +894,196 @@ def hsic_softmax_pair_weights(
     return torch.nan_to_num(w, nan=0.0)
 
 
+def hsic_posterior_pair_weights(
+    attention_weights: torch.Tensor,
+    diagonal_offset: int = 0,
+) -> torch.Tensor:
+    """Row-wise L1-renormalised gate-posterior pair weights.
+
+    The attention/gate matrix ``(L_target, L_source)`` holds the gate OPEN
+    POSTERIOR ``p_ij`` (cross: ``sigmoid(la/beta - kappa)``; self:
+    ``p_exist * d`` with ``d`` the antisymmetric direction gate).  The pair
+    weights are
+
+        w_ij = p_ij / sum_k p_ik
+
+    which is exactly ``softmax_j(log p)`` -- i.e. a softmax over the log of
+    the same probability the Hard-Concrete gate produces.  Consequences:
+
+    * A CLOSED gate (p = 0) gets weight EXACTLY 0 -- unlike the legacy
+      ``hsic_softmax_pair_weights``, where the [0, 1] posterior was used
+      directly as a logit and a zero gate still received weight ``1/Z``.
+    * Descendant pairs (irreducibly positive HSIC) are pushed to zero weight
+      through the cheapest degree of freedom: in the self block that is the
+      ANTISYMMETRIC direction gate ``d`` (the symmetric existence gate is
+      shared with the true orientation and protected by reconstruction).
+    * Rows whose posterior is identically zero (parentless / fully gated-off
+      nodes) contribute an exact 0 -- no penalty without reliance.
+
+    The self-edge -- position ``(i, i + diagonal_offset)`` -- is excluded
+    BEFORE the normalisation (set to 0), mirroring the square-check
+    convention of ``hsic_softmax_pair_weights``.
+
+    Returns the ``(L_target, L_source)`` weight matrix, rows summing to 1
+    (or to 0 for a fully-closed row).
+    """
+    p = attention_weights
+    if p.ndim != 2:
+        raise ValueError(
+            f"attention_weights must be 2-D, got shape {tuple(p.shape)}"
+        )
+    p = p.clamp_min(0.0)   # posterior must be non-negative; guard float noise
+    n_tgt, n_src = p.shape
+    self_cols = torch.arange(n_tgt, device=p.device) + diagonal_offset
+    has_self = (self_cols >= 0) & (self_cols < n_src)
+    if diagonal_offset == 0:
+        has_self &= n_tgt == n_src   # rectangular + offset 0: no self-edge
+    if bool(has_self.any()):
+        p = p.clone()
+        rows = torch.arange(n_tgt, device=p.device)[has_self]
+        p[rows, self_cols[has_self]] = 0.0
+    row_sum = p.sum(dim=1, keepdim=True)
+    w = p / row_sum
+    # Fully-closed rows (row_sum == 0) come back NaN; they contribute nothing
+    # to the loss, so map them to 0.
+    return torch.nan_to_num(w, nan=0.0)
+
+
+def hsic_evidence_max_pair_weights(
+    attention_weights: torch.Tensor,
+    hsic_evidence: torch.Tensor,
+    diagonal_offset: int = 0,
+    tau: float = "auto",
+) -> torch.Tensor:
+    """Evidence-tilted, max-normalised pair weights (budget-ceiling mode).
+
+    Per target row::
+
+        s_ij = p_ij * exp(-H_ij / tau)     (gate prior x HSIC evidence)
+        w_ij = s_ij / max_l s_il           (leader = 1, non-dilutive)
+
+    with ``p`` the gate posterior and ``H`` the DETACHED pair-HSIC matrix
+    (NaN = excluded pair -> weight 0).  Properties:
+
+    * NON-DILUTIVE: adding a below-leader gate only ADDS its (small) cost
+      ``w*H`` to the row loss -- the free-dilution escape of the row-sum
+      normalisation is closed.  Overtaking the leader carries a loss
+      barrier (``H_new + H_old`` at the crossing), so usurpation must be
+      decisive.
+    * DESCENDANTS -> 0: an irreducibly-positive ``H_desc`` suppresses the
+      weight exponentially in ``H_desc / tau`` AND the gradient
+      ``dL/dp = w*H/max(s) > 0`` pushes the gate down (in the self block
+      this lands on the antisymmetric direction gate).
+    * L0-NEUTRAL FLOOR: pairs with ``H ~ 0`` (fitted parents, irrelevant
+      sources) get ``w ~ p/p_lead`` and ~zero HSIC gradient -- the sparsity
+      prior (L0) removes them unopposed.  The parent-vs-irrelevant tie is
+      settled by L0, by construction.
+    * MAXIMUM budget, not exact: nothing forces k positive entries; the
+      effective support size follows ``tau`` and L0.  Scale-invariant per
+      row, so the all-closed escape is also closed.
+    * ``tau`` adapts the sharpness to the noise of the HSIC estimates:
+      ``"auto"`` uses the robust scale ``1.4826 * MAD`` of the valid
+      entries of ``H`` (large at topk_k=1 when the parent/others
+      inequality is noisy -> soft, exploratory weights; shrinking as the
+      budget grows and the ordering denoises -> weights concentrate onto
+      the current top-k from BELOW, never pinned to it).
+
+    Self-edge excluded (zeroed) before the max, same ``diagonal_offset``
+    convention as ``hsic_posterior_pair_weights``.  Rows with no positive
+    score come back as an exact zero row (NaN-guarded).  Differentiable in
+    ``p`` except at max ties (subgradient, like ReLU).
+    """
+    p = attention_weights
+    if p.ndim != 2:
+        raise ValueError(
+            f"attention_weights must be 2-D, got shape {tuple(p.shape)}"
+        )
+    if hsic_evidence.shape != p.shape:
+        raise ValueError(
+            f"hsic_evidence shape {tuple(hsic_evidence.shape)} does not "
+            f"match attention_weights shape {tuple(p.shape)}"
+        )
+    p = p.clamp_min(0.0)   # -inf (BKD-dropped) and float noise -> 0
+    n_tgt, n_src = p.shape
+    self_cols = torch.arange(n_tgt, device=p.device) + diagonal_offset
+    has_self = (self_cols >= 0) & (self_cols < n_src)
+    if diagonal_offset == 0:
+        has_self &= n_tgt == n_src   # rectangular + offset 0: no self-edge
+    if bool(has_self.any()):
+        p = p.clone()
+        rows = torch.arange(n_tgt, device=p.device)[has_self]
+        p[rows, self_cols[has_self]] = 0.0
+
+    E = hsic_evidence.detach()
+    valid = torch.isfinite(E)
+    E = torch.where(valid, E, torch.zeros_like(E)).clamp_min(0.0)
+    if tau == "auto":
+        ev = E[valid]
+        if ev.numel() < 2:
+            tau_val = 1.0
+        else:
+            med = ev.median()
+            mad = (ev - med).abs().median()
+            tau_val = float((1.4826 * mad).clamp_min(1e-8))
+    else:
+        tau_val = float(tau)
+        if tau_val <= 0:
+            raise ValueError(f"tilt tau must be positive, got {tau_val}")
+
+    s = p * torch.exp(-E / tau_val)
+    s = torch.where(valid, s, torch.zeros_like(s))
+    m = s.amax(dim=1, keepdim=True)
+    return torch.nan_to_num(s / m, nan=0.0)
+
+
+def row_entropy_stats(weights: torch.Tensor) -> dict:
+    """Entropy statistics of row-wise pair-weight distributions (detached).
+
+    Rows are L1-RENORMALISED before the entropy, so the statistics are valid
+    for every weighting mode: row-stochastic modes (softmax_logits,
+    posterior) are unaffected; non-row-stochastic modes (evidence_max, where
+    the leader sits at 1 and the row sum IS the dilution signal) would
+    otherwise produce entropies above ln K and meaningless "effective
+    competitors".  The raw row mass is reported separately as
+    ``row_mass_mean`` (1.0 for row-stochastic modes; >= 1 under
+    max-normalisation, where it tracks how much subordinate mass survives).
+
+    For each target row with non-zero mass, H_i = -sum_j w_ij log w_ij on
+    the normalised row.
+
+    Returns a dict of floats:
+        ``mean`` / ``min`` / ``max``     -- row entropy in nats,
+        ``norm_mean``                    -- mean of H_i / ln(K_i) with K_i the
+                                            number of competing sources in row
+                                            i (1.0 = uniform spread),
+        ``eff_competitors_mean``         -- mean of exp(H_i), the effective
+                                            number of sources per row
+                                            (converges to the true in-degree
+                                            when the competition resolves),
+        ``row_mass_mean``                -- mean pre-normalisation row sum.
+    All values are 0.0 when no row has mass.
+    """
+    w = weights.detach()
+    row_mass = w.sum(dim=1)
+    live = row_mass > 0
+    if not bool(live.any()):
+        return {"mean": 0.0, "min": 0.0, "max": 0.0,
+                "norm_mean": 0.0, "eff_competitors_mean": 0.0,
+                "row_mass_mean": 0.0}
+    w_live = w[live] / row_mass[live].unsqueeze(1)   # valid for ALL modes
+    h = -(w_live * torch.log(w_live.clamp_min(1e-12))).sum(dim=1)
+    k = (w_live > 0).sum(dim=1).clamp_min(1).to(h.dtype)
+    norm = h / torch.log(k.clamp_min(2.0))  # K=1 row -> H=0; guard ln(1)=0
+    return {
+        "mean": float(h.mean()),
+        "min": float(h.min()),
+        "max": float(h.max()),
+        "norm_mean": float(norm.mean()),
+        "eff_competitors_mean": float(torch.exp(h).mean()),
+        "row_mass_mean": float(row_mass[live].mean()),
+    }
+
+
 def hsic_attention_softmax(
     source_values: torch.Tensor,
     residuals: torch.Tensor,
@@ -906,6 +1096,9 @@ def hsic_attention_softmax(
     bandwidth_multipliers: Optional[Sequence[float]] = None,
     return_matrix: bool = False,
     diagonal_offset: int = 0,
+    pair_weight_mode: str = "posterior",
+    tilt_tau="auto",
+    return_weights: bool = False,
 ) -> torch.Tensor:
     """Softmax-competition HSIC for joint structure+reconstruction training.
 
@@ -927,10 +1120,25 @@ def hsic_attention_softmax(
     gradient vanishes, and the minimiser is the uniform spread — the row then
     simply carries a small constant and no structural preference.
 
-    NOTE on temperature: the attention values are posteriors in [0, 1] used
-    directly as logits, which fixes an effective temperature.  A sharper
-    competition can later be obtained by passing the raw pre-sigmoid gate
-    logits instead (same fixed point at uniform).
+    Pair-weight modes (``pair_weight_mode``):
+
+    * ``"posterior"`` (default): ``hsic_posterior_pair_weights`` -- row-wise
+      L1 renormalisation of the gate posterior, equivalent to a softmax over
+      ``log p``.  A CLOSED gate (p = 0) gets weight exactly 0, so descendant
+      pairs are genuinely excluded once the direction gate shuts; parentless
+      rows contribute exactly 0.
+    * ``"evidence_max"``: ``hsic_evidence_max_pair_weights`` -- gate prior
+      tilted by the detached HSIC evidence, ``s = p * exp(-H/tau)``,
+      max-normalised per row.  Non-dilutive (additive for non-leaders),
+      maximum-budget (support size follows ``tau``/L0, never pinned to
+      top-k), descendants suppressed exponentially in ``H/tau``, H~0 pairs
+      neutral so L0 removes them.  ``tilt_tau`` (``"auto"`` = 1.4826*MAD of
+      the pair matrix) adapts sharpness to the HSIC noise level.
+    * ``"softmax_logits"`` (legacy): ``hsic_softmax_pair_weights`` -- the
+      [0, 1] posterior is used DIRECTLY as a logit.  This fixes an effective
+      temperature so high that even near-binary gates yield ~uniform pair
+      weights (a zero gate still carries weight 1/Z, so "closed" pairs keep
+      their share of the penalty).  Kept for backward compatibility.
 
     Args:
         source_values: Source variable values (batch, seq_len_source).
@@ -994,11 +1202,25 @@ def hsic_attention_softmax(
             f"HSIC matrix shape {tuple(hsic_mat.shape)}"
         )
 
-    w = hsic_softmax_pair_weights(logits, diagonal_offset=diagonal_offset)
+    if pair_weight_mode == "posterior":
+        w = hsic_posterior_pair_weights(logits, diagonal_offset=diagonal_offset)
+    elif pair_weight_mode == "softmax_logits":
+        w = hsic_softmax_pair_weights(logits, diagonal_offset=diagonal_offset)
+    elif pair_weight_mode == "evidence_max":
+        w = hsic_evidence_max_pair_weights(
+            logits, hsic_mat, diagonal_offset=diagonal_offset, tau=tilt_tau
+        )
+    else:
+        raise ValueError(
+            f"unknown pair_weight_mode {pair_weight_mode!r}; expected "
+            "'posterior', 'softmax_logits' or 'evidence_max'"
+        )
     w = torch.where(valid, w, torch.zeros_like(w))
     h = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
     out = (w * h).sum(dim=1).mean()
 
+    if return_weights:
+        return out, (hsic_mat if return_matrix else None), w.detach()
     if return_matrix:
         return out, hsic_mat
     return out

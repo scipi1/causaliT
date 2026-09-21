@@ -65,6 +65,7 @@ from typing import Optional
 import math
 import torch
 import torch.nn as nn
+from causaliT.core.modules.extra_layers import sample_bkd_keep_mask
 import torch.nn.functional as F
 
 from causaliT.utils.query_norm import (
@@ -146,6 +147,8 @@ class CommutatorSelfAttention(nn.Module):
 
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
+        batch_key_dropout_min_keys: int = 0,
+        batch_key_dropout_deterministic: bool = False,
         # Constant-score capacity protocol (Optuna): freeze the existence gate at
         # this constant on every edge while the gain g stays learnable.
         optuna_protocol: Optional[float] = None,
@@ -232,6 +235,8 @@ class CommutatorSelfAttention(nn.Module):
             else batch_key_dropout
         )
         self._bkd_anneal = batch_key_dropout_annealing_batches
+        self._bkd_min_keys = int(batch_key_dropout_min_keys)
+        self._bkd_deterministic = bool(batch_key_dropout_deterministic)
         self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
         # BKD keep mask of the last forward: ``(N,)`` float (1 = key kept)
         # when BKD was applied, else None (see GatedCrossAttention).
@@ -254,6 +259,19 @@ class CommutatorSelfAttention(nn.Module):
             return float(self._bkd_p0)
         frac = min(1.0, float(self._bkd_step.item()) / float(self._bkd_anneal))
         return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
+
+    def set_bkd_sampling(
+        self,
+        min_keys: Optional[int] = None,
+        deterministic: Optional[bool] = None,
+    ) -> None:
+        """Override the BKD sampling mode / min-keys floor at run time
+        (adaptive-trainer phase controller).  ``None`` leaves the
+        corresponding setting unchanged."""
+        if min_keys is not None:
+            self._bkd_min_keys = int(min_keys)
+        if deterministic is not None:
+            self._bkd_deterministic = bool(deterministic)
 
     # ------------------------------------------------------------------
     # Noise helpers
@@ -446,7 +464,9 @@ class CommutatorSelfAttention(nn.Module):
         bkd_p = self._current_bkd_p()
         self.last_bkd_keep = None
         if self.training and bkd_p is not None and bkd_p > 0.0:
-            keep = (torch.rand(N, device=A.device) >= bkd_p).to(A.dtype)  # (N,)
+            keep = sample_bkd_keep_mask(
+                N, bkd_p, self._bkd_min_keys, self._bkd_deterministic, A.device
+            ).to(A.dtype)  # (N,)
             A = A * keep.view(1, 1, N)
             self.last_bkd_keep = keep
             self._bkd_step += 1

@@ -135,6 +135,8 @@ model:
     batch_key_dropout: null
     batch_key_dropout_p_final: null
     batch_key_dropout_annealing_batches: null
+    batch_key_dropout_min_keys: 0          # >0: keep at least this many keys (1 = never-empty adjacency)
+    batch_key_dropout_deterministic: false # true: exact count max(min_keys, round((1-p)*S)), random subset
 
     # Noise-aware parameters
     init_sigma_A: 0.01

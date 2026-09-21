@@ -301,6 +301,53 @@ class MaskedBatchPowerNorm(nn.Module):
         return self.gamma * x_norm + self.beta
 
 
+def sample_bkd_keep_mask(
+    num_keys: int,
+    p: float,
+    min_keys: int = 0,
+    deterministic: bool = False,
+    device: Optional[torch.device] = None,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Draw a batch-consistent BKD keep mask over ``num_keys`` key positions.
+
+    Returns a ``(num_keys,)`` bool tensor (True = keep).
+
+    * ``deterministic=False`` — per-key Bernoulli sampling (keep prob
+      ``1 - p``), topped up to ``min_keys`` keys if fewer survive (random
+      re-activation of dropped positions).
+    * ``deterministic=True`` — exactly
+      ``n_keep = max(min_keys, round((1 - p) * num_keys))`` keys are kept,
+      chosen as a uniform random subset (no Binomial variance).
+
+    ``min_keys`` is clamped to ``num_keys``; ``0`` disables the safeguard.
+
+    ``generator`` (optional) supplies the RNG for all draws, decoupling the
+    sampling from the global torch RNG.  Used by eval-mode BKD so that
+    validation masks are reproducible and do not perturb training RNG state.
+    The generator's device must match ``device``.
+    """
+    min_keep = min(int(min_keys), num_keys)
+
+    if deterministic:
+        n_keep = max(min_keep, int(round((1.0 - p) * num_keys)))
+        n_keep = min(n_keep, num_keys)
+        keep_mask = torch.zeros(num_keys, dtype=torch.bool, device=device)
+        if n_keep > 0:
+            perm = torch.randperm(num_keys, device=device, generator=generator)[:n_keep]
+            keep_mask[perm] = True
+        return keep_mask
+
+    keep_mask = torch.rand(num_keys, device=device, generator=generator) >= p
+    n_kept = int(keep_mask.sum().item())
+    if n_kept < min_keep:
+        dropped = (~keep_mask).nonzero(as_tuple=True)[0]
+        n_add = min_keep - n_kept
+        perm = dropped[torch.randperm(dropped.numel(), device=device, generator=generator)[:n_add]]
+        keep_mask[perm] = True
+    return keep_mask
+
+
 class BatchConsistentKeyDropout(nn.Module):
     """
     Batch-consistent key (column) dropout for attention matrices.
@@ -333,6 +380,21 @@ class BatchConsistentKeyDropout(nn.Module):
       post-softmax ``att``.  After softmax, dropped positions are exactly 0 and
       the remaining probability mass renormalises automatically.
 
+    ``min_keys`` is a non-empty-adjacency safeguard applied **on top of** the
+    sampling scheme: after the keep mask is drawn, if fewer than ``min_keys``
+    keys survive, randomly re-activate dropped keys until ``min_keys`` are
+    kept.  ``min_keys=0`` (default) disables the safeguard (legacy behaviour);
+    ``min_keys=1`` guarantees the regressor always has at least one key to
+    learn from, even at very high drop probabilities.
+
+    ``deterministic`` switches the sampling scheme itself:
+
+    * ``False`` (default) — per-key Bernoulli sampling (Binomial count of
+      kept keys), optionally topped up by ``min_keys``.
+    * ``True`` — deterministic count: exactly
+      ``n_keep = max(min_keys, round((1 - p) * S))`` keys are kept, chosen as
+      a uniform random subset each forward (no Binomial variance).
+
     Attributes exposed after each training forward (``None`` in eval mode,
     ``p == 0``, or before the first forward):
 
@@ -350,6 +412,12 @@ class BatchConsistentKeyDropout(nn.Module):
         blanking_value    : Value written into dropped key positions.
                             ``0.0`` for post-activation matrices;
                             ``float('-inf')`` for pre-softmax score tensors.
+        min_keys          : Minimum number of keys kept per forward (safeguard
+                            against a completely empty adjacency).  ``0``
+                            disables the safeguard.  Clamped to ``L_S``.
+        deterministic     : If ``True``, keep a deterministic number of keys
+                            (uniform random subset) instead of per-key
+                            Bernoulli sampling.
     """
 
     def __init__(
@@ -358,6 +426,8 @@ class BatchConsistentKeyDropout(nn.Module):
         p_final: Optional[float] = None,
         annealing_batches: Optional[int] = None,
         blanking_value: float = 0.0,
+        min_keys: int = 0,
+        deterministic: bool = False,
     ):
         super().__init__()
 
@@ -365,6 +435,8 @@ class BatchConsistentKeyDropout(nn.Module):
             raise ValueError(f"p_init must be in [0, 1], got {p_init}")
         if p_final is not None and not (0.0 <= p_final <= 1.0):
             raise ValueError(f"p_final must be in [0, 1], got {p_final}")
+        if int(min_keys) < 0:
+            raise ValueError(f"min_keys must be >= 0, got {min_keys}")
 
         self.p_init = float(p_init)
         self.p_final = float(p_final) if p_final is not None else None
@@ -374,6 +446,8 @@ class BatchConsistentKeyDropout(nn.Module):
             else None
         )
         self.blanking_value = float(blanking_value)
+        self.min_keys = int(min_keys)
+        self.deterministic = bool(deterministic)
         self._use_annealing = (
             self.p_final is not None and self.annealing_batches is not None
         )
@@ -447,6 +521,25 @@ class BatchConsistentKeyDropout(nn.Module):
         """
         self._phase_active = bool(active)
 
+    def set_sampling(
+        self,
+        min_keys: Optional[int] = None,
+        deterministic: Optional[bool] = None,
+    ) -> None:
+        """Override the sampling mode / min-keys floor at run time.
+
+        Used by the adaptive trainer's phase controller to drive a
+        count-based BKD curriculum (e.g. deterministic mode with a per-phase
+        ``min_keys`` budget).  ``None`` leaves the corresponding setting
+        unchanged.  Plain attributes only — no state_dict impact.
+        """
+        if min_keys is not None:
+            if int(min_keys) < 0:
+                raise ValueError(f"min_keys must be >= 0, got {min_keys}")
+            self.min_keys = int(min_keys)
+        if deterministic is not None:
+            self.deterministic = bool(deterministic)
+
     # ------------------------------------------------------------------
     def _current_p(self) -> float:
         """Return the linearly annealed drop probability at the current step."""
@@ -489,7 +582,9 @@ class BatchConsistentKeyDropout(nn.Module):
 
         S_dim = x.shape[-1]
         # One Boolean mask for the whole batch: True = keep, False = drop.
-        keep_mask = (torch.rand(S_dim, device=x.device) >= self.p)  # (L_S,)
+        keep_mask = sample_bkd_keep_mask(
+            S_dim, self.p, self.min_keys, self.deterministic, x.device
+        )  # (L_S,)
 
         if self.blanking_value == 0.0:
             x = x * keep_mask.to(x.dtype)

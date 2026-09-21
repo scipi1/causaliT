@@ -116,6 +116,17 @@ experiment:
   #   false: no centroid init.  Motivation: the SELF_ATTENTION
   #   investigate_S3_X4_spurious_barrier study.
   query_centroid_init: true
+  # query_parents_prior - DEFAULT null (disabled).  Known-edges prior: AFTER
+  #   the initialisation (centroid or default), overwrite the query of the
+  #   listed nodes with the centroid of their KNOWN parents' keys, optionally
+  #   frozen for the whole run.  GLOBAL 1-based dataset node IDs (S nodes are
+  #   1..L_S, X nodes L_S+1..L_S+L_X).  Example (node 5 <- 1, 2, kept fixed):
+  #     query_parents_prior:
+  #       5: {parents: [1, 2], fixed: true}
+  #       6: {parents: [5], fixed: false}
+  #   Requires free_query_embedding=true; unlisted nodes keep the centroid
+  #   start.  fixed=true is incompatible with centroid_commit.
+  query_parents_prior: null
 
   # --- The two front-door keys: query_norm and fanin_prior -------------------
   # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
@@ -202,6 +213,13 @@ experiment:
   #   the structural attention the sole cross-node mixing point.
   per_node_output: false
   per_node_output_hidden: 32
+  # per_node_adjacency_context — DEFAULT false.  Option true (requires
+  #   per_node_output): concatenate the DETACHED applied-adjacency row
+  #   (the gate weights actually used on this sample, after hard mask,
+  #   gain, BKD, top-k blanking and dropout) onto each per-node decoder
+  #   MLP input, so the regressor knows which keys were selected on this
+  #   sample — consistent with stochastic key exclusion (BKD/top-k).
+  per_node_adjacency_context: false
 
 
 model:
@@ -298,6 +316,8 @@ model:
     free_query_embedding: ${experiment.free_query_embedding}
     # Initialise the free X query at the key centroid; see experiment.query_centroid_init.
     query_centroid_init: ${experiment.query_centroid_init}
+    # Known-edges query prior; see experiment.query_parents_prior.
+    query_parents_prior: ${experiment.query_parents_prior}
     # Normalised-query path (structure gate only).  These two are DERIVED at
     # data-load time by query_norm.resolve_query_norm from experiment.query_norm
     # (the front-door switch) and the node count N - the user never sets them by
@@ -368,6 +388,7 @@ model:
     # Per-node output head (DAGMA-style); see experiment.per_node_output.
     per_node_output: ${experiment.per_node_output}
     per_node_output_hidden: ${experiment.per_node_output_hidden}
+    per_node_adjacency_context: ${experiment.per_node_adjacency_context}
 
 
 training:
@@ -385,6 +406,21 @@ training:
   structural_lr: null
   structural_weight_decay: null
   structural_optimizer_kwargs: {}    # e.g. {momentum: 0.9, nesterov: true}
+
+  # --- Bi-level (DARTS second-order) structural gradient ---------------------
+  # hsic          — first-order HSIC gradient at frozen theta_R (default).
+  # hsic_unrolled — virtual reconstruction refit + HSIC at the refit point,
+  #                 minus a finite-difference mixed-Hessian correction; all
+  #                 passes on fold B when hsic_cross_fit is on.  Requires
+  #                 use_gradient_routing: true; mutually exclusive with
+  #                 gradient_surgery and hsic_constraint.
+  structural_grad: "hsic"
+  # Unrolled-step hyperparameters (also used by centroid_commit's
+  # shadow_source: hsic_unrolled; the commit block overrides these when set).
+  unrolled:
+    inner_lr: null        # virtual refit step size (null = training.lr)
+    fd_epsilon: 0.01      # finite-difference scale for the mixed Hessian
+    every: 1              # (commit shadow only) cadence of the unrolled term
 
   # --- Node-wise (per-query) winner-take-all structural update ---------------
   # Each structural step updates only the ``topk`` query nodes whose gradient
