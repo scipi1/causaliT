@@ -254,6 +254,13 @@ class GatedCrossAttention(nn.Module):
         # the annealing clock keeps advancing (global run-level schedule).
         self._bkd_phase_active: bool = True
 
+        # Dense-adjacency edge-dropout override (adaptive-trainer reconstruct
+        # phases): when active AND in training mode, the applied weight A is
+        # replaced by a fully dense {0,1} adjacency where each edge ij is
+        # KEPT with probability equal to the (detached) gate posterior p_ij
+        # (dropped w.p. 1 - p_ij).  Eval mode is unaffected (learned gates).
+        self._dense_gate_active: bool = False
+
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
         if use_gain_softmax:
@@ -309,6 +316,20 @@ class GatedCrossAttention(nn.Module):
     def set_bkd_phase_active(self, active: bool) -> None:
         """Enable/disable BKD application for the current training phase."""
         self._bkd_phase_active = bool(active)
+
+    def set_dense_gate_mode(self, active: bool) -> None:
+        """Toggle the dense-adjacency edge-dropout override (adaptive-trainer
+        reconstruct phases).
+
+        When active, training forward passes replace the applied weight A
+        with a fully dense {0,1} adjacency: every (allowed) edge ij is kept
+        with probability equal to the DETACHED gate posterior ``p_ij`` (i.e.
+        dropped with probability ``1 - p_ij``).  The posterior carries no
+        gradient, so no structural signal leaks through the reconstruction
+        loss.  Eval forward passes are unaffected (the learned gate is used).
+        Deactivating restores the learned-gate behaviour exactly.
+        """
+        self._dense_gate_active = bool(active)
 
     def set_bkd_sampling(
         self,
@@ -542,6 +563,18 @@ class GatedCrossAttention(nn.Module):
             p_edge_masked = p_edge_on * hm
         else:
             p_edge_masked = p_edge_on
+
+        # ---- Dense-adjacency edge-dropout override (reconstruct phases) ---
+        # Fully dense candidate adjacency: each edge ij is KEPT with
+        # probability equal to the DETACHED gate posterior p_ij (dropped
+        # w.p. 1 - p_ij), so the applied weight is a {0,1} sample with
+        # E[A_ij] = p_ij.  Training steps only; eval uses the learned gate.
+        # Forbidden edges stay exactly zero.  The returned posterior, the
+        # L0 penalty and all diagnostics remain gate-based, so DAG
+        # extraction is unaffected by the override.
+        if self._dense_gate_active and self.training:
+            p_keep = p_edge_masked.detach()
+            A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
 
         # ---- Prior-softmax reconstruction gain (lambda-ramped) -----------
         # Redistributes each row's gate mass within the gate's own support:

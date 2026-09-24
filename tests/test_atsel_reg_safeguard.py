@@ -427,6 +427,70 @@ class TestGradientsFlow:
         assert all(torch.isfinite(g).all() for g in grads if g is not None)
 
 
+
+# ---------------------------------------------------------------------------
+# 6. Acyclicity backend selection (training.acyclicity_fn / acyclicity_s)
+# ---------------------------------------------------------------------------
+
+class TestAcyclicityBackendSelection:
+    def test_defaults_are_backward_compatible(self):
+        model = AttentionSelectorForecaster(_make_forecaster_config())
+        assert model.acyclicity_fn == "notears"
+        assert model.acyclicity_s == "adaptive"
+
+    def test_values_stored(self):
+        cfg = _make_forecaster_config()
+        cfg["training"]["acyclicity_fn"] = "logdet"
+        cfg["training"]["acyclicity_s"] = 1.5
+        model = AttentionSelectorForecaster(cfg)
+        assert model.acyclicity_fn == "logdet"
+        assert model.acyclicity_s == pytest.approx(1.5)
+
+    @pytest.mark.parametrize("bad", ["logdett", "", "LOGDET"])
+    def test_invalid_fn_raises(self, bad):
+        cfg = _make_forecaster_config()
+        cfg["training"]["acyclicity_fn"] = bad
+        with pytest.raises(ValueError):
+            AttentionSelectorForecaster(cfg)
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, "fixed"])
+    def test_invalid_s_raises(self, bad):
+        cfg = _make_forecaster_config()
+        cfg["training"]["acyclicity_fn"] = "logdet"
+        cfg["training"]["acyclicity_s"] = bad
+        with pytest.raises(ValueError):
+            AttentionSelectorForecaster(cfg)
+
+    def test_default_dispatch_matches_legacy_notears(self):
+        """Omitting acyclicity_fn must be byte-equivalent to 'notears'."""
+        batch = _make_batch(seed=7)
+        terms = []
+        for explicit in (False, True):
+            torch.manual_seed(1234)
+            cfg = _make_forecaster_config(
+                attention_type="GatedCrossAttention", kappa=2.0
+            )
+            if explicit:
+                cfg["training"]["acyclicity_fn"] = "notears"
+            model = AttentionSelectorForecaster(cfg)
+            terms.append(_step_terms(model, batch)[1])
+        assert terms[0].item() == pytest.approx(terms[1].item(), rel=1e-6)
+
+    @pytest.mark.parametrize("fn", ["logdet", "nilpotent"])
+    def test_alternative_backends_finite_nonnegative_term(self, fn):
+        """The log-det / nilpotent backends integrate into _step: the term
+        entering the structural loss is finite and >= 0."""
+        torch.manual_seed(1234)
+        cfg = _make_forecaster_config(
+            attention_type="GatedCrossAttention", kappa=1.0
+        )
+        cfg["training"]["acyclicity_fn"] = fn
+        model = AttentionSelectorForecaster(cfg)
+        _, acyclic, _ = _step_terms(model, _make_batch(seed=7))
+        assert torch.isfinite(acyclic)
+        assert acyclic.item() >= 0.0
+
+
 if __name__ == "__main__":
     import pytest as _pytest
     _pytest.main([__file__, "-v"])

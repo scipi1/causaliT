@@ -111,6 +111,21 @@ adaptive_training:
     plateau_min_delta: 1.0e-4      # relative improvement threshold:
                                    # improved iff current <= best*(1 - min_delta)
 
+    # --- Dense-adjacency edge-dropout (reconstruction-side regularizer) -------
+    # DEFAULT false.  When true, training forward passes during this phase use
+    # a FULLY DENSE adjacency (all gates open to one) thinned by a per-edge
+    # dropout: edge ij is KEPT with probability equal to the current
+    # (detached) structural gate posterior p_ij, i.e. dropped w.p. 1 - p_ij.
+    # The applied adjacency is therefore a {0,1} sample with E[A_ij] = p_ij:
+    # the regressor trains on sparse stochastic subgraphs concentrated on the
+    # currently believed structure, without magnitude weighting, and no
+    # structural gradient leaks through the reconstruction loss.  Applies to
+    # every gated attention module (GatedCrossAttention S->X cross block and
+    # GatedSelfAttention X->X self / homogeneous block).  Training steps only:
+    # validation/eval always uses the learned gates, and all structural
+    # diagnostics (posterior, L0, DAG extraction) are unaffected.
+    dense_adjacency_edge_dropout: false
+
   # --- STRUCTURE phase ------------------------------------------------------
   structure:
     max_epochs: 200                # per-phase safety cap (struct_budget trigger)

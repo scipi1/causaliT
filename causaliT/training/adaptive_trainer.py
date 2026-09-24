@@ -663,6 +663,44 @@ class PhaseController(Callback):
                 "open_gate_active", float(active), on_step=False, on_epoch=True
             )
 
+    def _apply_dense_gate_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Toggle the dense-adjacency edge-dropout override (reconstruct).
+
+        Active exactly when the current phase block sets
+        ``dense_adjacency_edge_dropout: true`` (supported in ``reconstruct``
+        and ``final_reconstruct``; the final phase inherits the reconstruct
+        block and may override it).  While active, training forward passes
+        of every gated attention module (GatedCrossAttention /
+        GatedSelfAttention) replace the applied adjacency with a fully dense
+        {0,1} sample that keeps edge ij with probability equal to the
+        detached gate posterior p_ij.  Structure/warmup phases always
+        deactivate it.  Eval passes are unaffected (learned gates).
+        """
+        if phase == "reconstruct":
+            cfg = self.recon_cfg
+        elif phase == "final_reconstruct":
+            cfg = {**self.recon_cfg, **self.final_cfg}
+        else:
+            cfg = {}
+        active = bool(cfg.get("dense_adjacency_edge_dropout", False))
+
+        n_mod = 0
+        for mod in pl_module.modules():
+            if hasattr(mod, "set_dense_gate_mode"):
+                mod.set_dense_gate_mode(active)
+                n_mod += 1
+        if active and n_mod == 0:
+            logger.warning(
+                "[adaptive] dense_adjacency_edge_dropout set in the '%s' "
+                "phase config but no gated attention module "
+                "(GatedCrossAttention/GatedSelfAttention) found.",
+                phase,
+            )
+        if n_mod:
+            pl_module.log(
+                "dense_gate_active", float(active), on_step=False, on_epoch=True
+            )
+
     def _log_bkd_p(self, pl_module: pl.LightningModule) -> None:
         """Log the current (annealed) BKD drop probability, run-level mean."""
         if not self._bkd_managed:
@@ -1132,6 +1170,9 @@ class PhaseController(Callback):
 
         # BKD-coupled open gates (dedicated warmup phase only).
         self._apply_open_gate_cfg(pl_module, phase)
+
+        # Dense-adjacency edge-dropout (reconstruct phases only).
+        self._apply_dense_gate_cfg(pl_module, phase)
 
         # Per-phase direction-gate bias (reconstruct: open both directions;
         # structure: unbiased).  No-op unless a phase block sets dir_bias.

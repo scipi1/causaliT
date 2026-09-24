@@ -127,6 +127,54 @@ experiment:
   #   Requires free_query_embedding=true; unlisted nodes keep the centroid
   #   start.  fixed=true is incompatible with centroid_commit.
   query_parents_prior: null
+  # query_forbidden_prior - DEFAULT null (disabled).  Forbidden-parents
+  #   prior: keep the query of the listed nodes ORTHOGONAL to their forbidden
+  #   parents' fixed structural keys (e.g. parents observed in the future), so
+  #   no alignment budget is wasted on them (direct null-space projection of
+  #   the query on every forward - NOT a penalty term and NOT just a mask).
+  #   GLOBAL 1-based dataset node IDs (S nodes 1..L_S, X nodes
+  #   L_S+1..L_S+L_X).  Example (node 5 may not read nodes 1 and 2):
+  #     query_forbidden_prior:
+  #       5: {forbidden: [1, 2], mask: true}
+  #       6: {forbidden: [3], mask: false}
+  #   mask (DEFAULT true) additionally zeroes the forbidden columns of the
+  #   hard mask: a zero SCORE is not a zero POSTERIOR (sigmoid gates stay open
+  #   at logit 0), so projection + mask are complementary; mask=false is the
+  #   pure-geometry ablation arm.  Requires free_query_embedding=true,
+  #   struct_embedding_type=orthogonal_fixed and
+  #   remove_query_projection=remove_key_projection=true.
+  query_forbidden_prior: null
+  # query_source_prior - DEFAULT null (disabled).  Source-nodes prior: set the
+  #   query of the listed nodes to ZERO and freeze it, so a source can never
+  #   be a child (the self-attention equivalent of the cross-attention S/X
+  #   split).  With a zero query the node's raw score row is exactly 0, so
+  #   its antisymmetric term vanishes and ALL direction mass flows
+  #   source -> child.  GLOBAL 1-based dataset node IDs (S nodes 1..L_S,
+  #   X nodes L_S+1..L_S+L_X; S ids require homogeneous_nodes=true).
+  #   Example (nodes 1 and 2 are sources):
+  #     query_source_prior:
+  #       1: {mask: true}
+  #       2: {mask: true}
+  #   mask (DEFAULT true) additionally zeroes the source ROWS (incoming
+  #   edges) of the hard mask: a zero SCORE is not a zero POSTERIOR (the
+  #   sigmoid existence gate stays open at logit 0), so the mask makes the
+  #   no-incoming-edge constraint exact and removes the constant L0
+  #   contribution of the source rows.  mask=false is the pure-geometry
+  #   ablation arm.  Requires free_query_embedding=true; mutually exclusive
+  #   with query_parents_prior on the same node and incompatible with
+  #   centroid_commit.
+  query_source_prior: null
+
+  # query_exclude_self - DEFAULT true (template): automatically project each
+  #   childs OWN structural key direction out of its query, on top of any
+  #   query_forbidden_prior rows.  The structural hard masks already zero the
+  #   diagonal (no self-loops), so self-alignment can never be used downstream
+  #   -- excluding it stops the query from wasting alignment budget on its own
+  #   key.  Library ctor default is false (backwards compatibility); the
+  #   sanctioned orthogonal_fixed stack meets all requirements.  Requires
+  #   free_query_embedding=true, struct_embedding_type=orthogonal_fixed and
+  #   remove_query_projection=remove_key_projection=true.
+  query_exclude_self: true
 
   # --- The two front-door keys: query_norm and fanin_prior -------------------
   # See docs/experimental_elaborations/QUERY_NORM_CAPACITY_AND_FANIN_PRIOR.md.
@@ -318,6 +366,14 @@ model:
     query_centroid_init: ${experiment.query_centroid_init}
     # Known-edges query prior; see experiment.query_parents_prior.
     query_parents_prior: ${experiment.query_parents_prior}
+    # Forbidden-parents query prior; see experiment.query_forbidden_prior.
+    query_forbidden_prior: ${experiment.query_forbidden_prior}
+    # Source-nodes query prior (zero + frozen source queries); see
+    # experiment.query_source_prior.
+    query_source_prior: ${experiment.query_source_prior}
+
+    # Automatic self-key exclusion; see experiment.query_exclude_self.
+    query_exclude_self: ${experiment.query_exclude_self}
     # Normalised-query path (structure gate only).  These two are DERIVED at
     # data-load time by query_norm.resolve_query_norm from experiment.query_norm
     # (the front-door switch) and the node count N - the user never sets them by
@@ -594,6 +650,66 @@ training:
   # Expected number of active edges = sum P(z_ij > 0).  Set >0 to encourage
   # sparse hard-concrete gates.  Ignored for non-HardConcrete attention types.
   lambda_l0: 0.0
+
+  # --- Acyclicity functional (applied to the gate-posterior score matrix) ---
+  # Selects the penalty weighted by ``kappa``:
+  #   notears   (default) tr(exp(A ⊙ A)) - d        (Zheng et al., 2018)
+  #   logdet    DAGMA-style -log det(sI - A) + d*log s (Bello et al., 2022).
+  #             Counts every simple cycle ~equally (NOTEARS down-weights a
+  #             length-k cycle by k!).  No A ⊙ A squaring: the gate posterior
+  #             is already nonnegative.
+  #   nilpotent sum_{k=1..d} tr(A^k) — exact for nonnegative A (zero iff DAG).
+  acyclicity_fn: notears
+  # Shift for acyclicity_fn=logdet: "adaptive" (default) sets s to the
+  # (stop-grad) max row sum of the current score matrix, which guarantees
+  # sI - A nonsingular at every iterate (the gate posterior has entries in
+  # (0, 1), so rho(A) <= max row sum) and removes the determinant
+  # singularity of fixed-s log-det.  A positive float fixes s globally
+  # (pure DAGMA uses s = 1).  Ignored by the other backends.
+  acyclicity_s: adaptive
+
+  # --- Augmented-Lagrangian acyclicity constraint (canonical NOTEARS) ---
+  # Replaces the fixed-kappa soft penalty by the constrained protocol of
+  # Zheng et al. (2018) (vendor/notears/linear.py):
+  #   L += alpha * h(W) + (rho/2) * h(W)^2
+  # with per-epoch dual ascent on alpha and rho escalation (rho <- rho*mult
+  # whenever the EMA of h fails to shrink to <= 1/4 of its previous value).
+  # h(W) is DRIVEN to ~h_tol (the learned graph is asymptotically acyclic),
+  # unlike the fixed kappa penalty which only biases toward DAGs.
+  # Mutually exclusive with kappa > 0 and kappa_max_hsic_pct > 0.
+  # The functional h is selected by acyclicity_fn above.
+  acyclicity_constraint:
+    enabled: false
+    dual_init: 0.0      # initial Lagrange multiplier alpha
+    dual_lr: 1.0        # dual ascent step (per epoch, on the h EMA)
+    dual_max: 1.0e4     # projection cap on alpha
+    rho_init: 1.0       # initial quadratic-penalty weight (NOTEARS: 1.0)
+    rho_mult: 10.0      # escalation factor on stalled violation (NOTEARS: 10)
+    rho_max: 1.0e8
+    ema: 0.9            # EMA decay of the raw h (drives the per-epoch ascent)
+    h_tol: 1.0e-8       # convergence tolerance on h (NOTEARS: 1e-8)
+
+  # --- MSE-vs-acyclicity cap (single-optimizer DAGMA-like regime) ---
+  # Without gradient routing the plain MSE can be minimised by predicting a
+  # source from its DESCENDANTS (anti-causal edges also reduce the MSE),
+  # fighting the acyclicity term.  This cap throttles the effective
+  # reconstruction weight per step so the weighted MSE entering the loss
+  # never exceeds ``mse_max_acyclic_pct`` times the EMA of the WEIGHTED
+  # acyclic term (kappa * h, or the ALM dual form when
+  # acyclicity_constraint is enabled):
+  #   lambda_recon_eff = min(lambda_recon, pct * acy_ref / (mse + eps))
+  # The rescaling is a detached per-step constant: the MSE keeps its
+  # gradient direction, only its magnitude is capped, so the acyclic term
+  # dominates while it is violated.  The reference EMA reuses
+  # ``hsic_safeguard_ema`` as its decay.  Once the graph is (near-)acyclic
+  # the reference shrinks toward 0 and the cap would strangle the MSE;
+  # ``mse_cap_release_tol`` releases the cap (lambda_recon restored) when
+  # the acyclic EMA falls at/below the tolerance (e.g. set it to the ALM
+  # h_tol).  0.0 disables the cap (default, backward compatible).
+  # Mutually exclusive with use_gradient_routing and gradient_surgery.
+  mse_max_acyclic_pct: 0.0
+  mse_cap_release_tol: 0.0
+
 
   # --- Query-norm over-spend penalty (learnable per-node budget) ---
   # Weight on ``sum_i relu(M_i - query_norm_target)^2`` (see

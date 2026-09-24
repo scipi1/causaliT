@@ -50,11 +50,8 @@ class PeriodicDAGMetrics(Callback):
     batch-mean posterior stashed by ``_step`` (``_last_att_mean``) is the only
     valid soft adjacency -- and it is free, needing no extra forward pass.
 
-    WHY NOT SHD/TPR/FDR here: those need a hard 0.5 cut of a min-max rescaled
-    matrix, which manufactures structure out of near-uniform attention and is
-    not comparable across epochs.  The end-of-run ``eval_attention_scores``
-    already reports them properly.  This callback logs THRESHOLD-FREE
-    quantities instead:
+    This callback logs the following THRESHOLD-FREE quantities (the primary
+    signal):
 
     * ``dag/auroc_{block}``    -- ranking of attention against the true
       adjacency.  Invariant to any monotone rescaling; 0.5 = chance.  The
@@ -83,6 +80,36 @@ class PeriodicDAGMetrics(Callback):
       cells minus mean on (ancestor, not parent) cells.  Positive = the
       posterior prefers parents over their transitive proxies.
 
+    SHD AND SOURCE RECALL: in addition to the threshold-free quantities above
+    the callback also logs the THRESHOLDED metrics, using the exact
+    ``_compute_standard_shd`` convention of the end-of-run
+    ``eval_attention_scores`` (missing + extra + reversed, binarised at
+    ``evaluation.dag_threshold``, default 0.5) so training trajectories are
+    directly comparable with the final eval numbers.  Read them with care: a
+    hard cut of a near-uniform softmax posterior manufactures structure, so
+    early epochs typically read "all missing" -- the threshold-free metrics
+    remain the primary signal.
+
+    * ``dag/shd_{block}``        -- standard SHD per block (reversal counting
+      active on the square self block only).
+    * ``dag/shd_missing_{block}`` / ``dag/shd_extra_{block}`` /
+      ``dag/shd_reversed_{block}`` -- the decomposition, so a rising SHD is
+      diagnosable as missed edges vs densification vs reversals.
+    * ``dag/shd_total``          -- sum over available blocks.
+    * ``dag/shd_full``           -- HOMOGENEOUS mode only: SHD of the full
+      (N, N) posterior against the full true DAG (S->X and X->X blocks
+      combined, S->S / X->S structurally zero), reversal counting active.
+
+    * ``dag/source_recall``      -- HOMOGENEOUS mode only: in homogeneous mode
+      the S/X prior is dropped and the model must RE-DISCOVER which nodes are
+      exogenous sources.  Using the model's ``source_scores`` (per-node
+      incoming-edge mass; low => likely a source), this is recall@L_S: the
+      fraction of the true source nodes (indices 0..L_S-1) among the L_S
+      nodes with the LOWEST incoming mass.  1.0 = perfect partition
+      recovery; chance level ~ L_S/N.
+    * ``dag/source_auroc``       -- ranking of true-source labels against
+      negated source scores (threshold-free; 0.5 = chance).
+
     Enabled via ``training.log_dag_metrics: true``; cadence via
     ``training.dag_metrics_every_n_epochs`` (default 50).  Metrics are always
     logged at epoch 0 and at the final epoch (also on early stopping via
@@ -101,6 +128,13 @@ class PeriodicDAGMetrics(Callback):
         self.data_dir = data_dir
         self.every_n_epochs = max(1, int(every_n_epochs))
         self._true_masks = None   # loaded in setup() {block: ndarray | None}
+        self._true_full = None    # homogeneous mode: full (N, N) true DAG
+        self._true_full_loaded = False
+        # Binarisation threshold for the SHD metrics; same config key and
+        # default as the end-of-run eval_attention_scores.
+        self._dag_threshold = float(
+            self.config.get("evaluation", {}).get("dag_threshold", 0.5)
+        )
         self._ancestor_masks = {}  # lazily derived {block: ndarray | None}
         self._descendant_masks = {}  # lazily derived {block: ndarray | None}
         self._warned_no_att = False
@@ -214,6 +248,104 @@ class PeriodicDAGMetrics(Callback):
         return float((ranks[:pos.size].sum() - pos.size * (pos.size + 1) / 2.0)
                      / (pos.size * neg.size))
 
+    # -- thresholded metrics (SHD) ---------------------------------------
+    def _log_shd(self, pl_module: LightningModule, learned: "np.ndarray",
+                 true: "np.ndarray", tag: str, is_cross: bool) -> int:
+        """Log standard SHD + decomposition for one (block) matrix.
+
+        Uses ``_compute_standard_shd`` from the eval helpers so the numbers
+        are exactly comparable with the end-of-run ``eval_attention_scores``.
+        Returns the integer SHD (for the ``dag/shd_total`` accumulation).
+        """
+        from causaliT.evaluation.eval_funs.helpers.eval_utils import (
+            _compute_standard_shd,
+        )
+        res = _compute_standard_shd(
+            learned, true,
+            threshold=self._dag_threshold,
+            is_cross_attention=is_cross,
+        )
+        pl_module.log(f"dag/shd_{tag}", float(res["shd"]),
+                      on_step=False, on_epoch=True)
+        pl_module.log(f"dag/shd_missing_{tag}", float(res["missing"]),
+                      on_step=False, on_epoch=True)
+        pl_module.log(f"dag/shd_extra_{tag}", float(res["extra"]),
+                      on_step=False, on_epoch=True)
+        if not is_cross:
+            pl_module.log(f"dag/shd_reversed_{tag}", float(res["reversed"]),
+                          on_step=False, on_epoch=True)
+        return int(res["shd"])
+
+    def _log_homogeneous_metrics(self, pl_module: LightningModule,
+                                 att_full: "np.ndarray"):
+        """Homogeneous-mode-only metrics on the full (N, N) posterior.
+
+        * ``dag/source_recall`` / ``dag/source_auroc`` -- did the model
+          re-discover the S/X partition it was not given?  True sources are
+          the first ``S_seq_len`` nodes; a node looks like a source when its
+          incoming-edge mass (the model's ``source_scores``) is low.
+        * ``dag/shd_full`` -- SHD of the full posterior against the full true
+          DAG (S->X and X->X combined), reversal counting active.
+        """
+        import numpy as np
+        n = att_full.shape[0]
+
+        # --- source recall / auroc --------------------------------------
+        L_S = getattr(pl_module, "S_seq_len", None)
+        if L_S is not None and 0 < int(L_S) < n:
+            L_S = int(L_S)
+            try:
+                sc = pl_module.source_scores(
+                    torch.as_tensor(att_full)
+                ).detach().cpu().numpy().ravel()
+            except Exception:   # pragma: no cover - diagnostics only
+                # Fallback: incoming-edge mass is all source_scores computes.
+                sc = att_full.sum(axis=-1)
+            if sc.shape[0] == n:
+                true_src = np.zeros(n, dtype=float)
+                true_src[:L_S] = 1.0
+                # recall@L_S: fraction of true sources among the L_S nodes
+                # with the LOWEST incoming-edge mass.
+                pred_src = np.argsort(sc, kind="mergesort")[:L_S]
+                pl_module.log("dag/source_recall",
+                              float(true_src[pred_src].mean()),
+                              on_step=False, on_epoch=True)
+                pl_module.log("dag/source_auroc",
+                              self._auroc(-sc, true_src),
+                              on_step=False, on_epoch=True)
+
+        # --- full-matrix SHD --------------------------------------------
+        if not self._true_full_loaded:
+            self._true_full_loaded = True
+            dataset = self.config.get("data", {}).get("dataset")
+            try:
+                from causaliT.evaluation.eval_funs.helpers.eval_utils import (
+                    _load_full_true_dag,
+                )
+                self._true_full = _load_full_true_dag(self.data_dir, dataset)
+            except Exception as e:   # pragma: no cover - diagnostics only
+                logger.warning(
+                    f"PeriodicDAGMetrics: full true-DAG load failed "
+                    f"(dataset={dataset}): {e}"
+                )
+            if self._true_full is None:
+                logger.warning(
+                    f"PeriodicDAGMetrics: no full true DAG mask (dataset="
+                    f"{dataset!r}) - dag/shd_full will be absent from "
+                    f"metrics.csv."
+                )
+        if self._true_full is not None:
+            if self._true_full.shape == att_full.shape:
+                self._log_shd(pl_module, att_full, self._true_full,
+                              "full", is_cross=False)
+            elif "full" not in self._warned_skip:
+                self._warned_skip.add("full")
+                logger.warning(
+                    f"PeriodicDAGMetrics: shape mismatch [full] "
+                    f"{att_full.shape} vs true {self._true_full.shape}; "
+                    f"skipping dag/shd_full."
+                )
+
     # -- lifecycle -------------------------------------------------------
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule):
         if trainer.sanity_checking:
@@ -269,6 +401,8 @@ class PeriodicDAGMetrics(Callback):
             logger.warning(f"PeriodicDAGMetrics: attention split failed: {e}")
             return
 
+        shd_total = 0
+        n_shd_blocks = 0
         for block, mat in learned.items():
             true = self._true_masks.get(block)
             if mat is None or true is None:
@@ -292,6 +426,13 @@ class PeriodicDAGMetrics(Callback):
             pl_module.log(f"dag/contrast_{block}",
                           float(on.mean() - off.mean()),
                           on_step=False, on_epoch=True)
+            # Thresholded SHD (same convention as the end-of-run eval):
+            # noisy on a near-uniform posterior early in training, but
+            # directly comparable with eval_attention_scores.
+            shd_total += self._log_shd(pl_module, arr, true, block,
+                                       is_cross=(block == "cross"))
+            n_shd_blocks += 1
+
             total = float(s.sum())
             anc_mass = 0.0  # filled below; used for the mass_on_others residual
             dsc_mass = 0.0
@@ -354,6 +495,20 @@ class PeriodicDAGMetrics(Callback):
                 pl_module.log(f"dag/mass_on_others_{block}",
                               float(others / total),
                               on_step=False, on_epoch=True)
+
+        # Aggregate SHD over the blocks that produced one.
+        if n_shd_blocks:
+            pl_module.log("dag/shd_total", float(shd_total),
+                          on_step=False, on_epoch=True)
+
+        # Homogeneous mode only: full-(N, N)-matrix SHD and source recall
+        # (split mode keeps the S/X prior, so "did we learn the sources?"
+        # is only meaningful when the model had to re-discover them).
+        if bool(getattr(pl_module, "homogeneous_nodes", False)):
+            arr_full = att.detach().cpu().numpy()
+            arr_full = arr_full[0] if arr_full.ndim == 3 else arr_full
+            if arr_full.ndim == 2 and arr_full.shape[0] == arr_full.shape[1]:
+                self._log_homogeneous_metrics(pl_module, arr_full)
 
 
 class HSICClassMetrics(PeriodicDAGMetrics):

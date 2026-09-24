@@ -279,3 +279,104 @@ class TestGuaranteedCoverage:
         cb.on_train_end(_trainer(epoch=0, max_epochs=10), mod)
         names = set(logged_rows)
         assert len(logged_rows) == len(names), "must not double-log epoch"
+
+
+# ----------------------------------------------------------------------------
+# SHD (thresholded, same convention as the end-of-run eval) and source recall
+# ----------------------------------------------------------------------------
+
+TRUE_FULL = np.zeros((5, 5), dtype=float)   # (L_S=2 sources) + (L_X=3)
+TRUE_FULL[2:, :2] = TRUE_CROSS              # S -> X block
+TRUE_FULL[2:, 2:] = TRUE_SELF               # X -> X block
+
+
+def _homogeneous_module(att_full, L_S=2):
+    """Homogeneous-mode stub: square (N, N) posterior, S/X prior dropped."""
+    att = torch.as_tensor(np.asarray(att_full, dtype=float))
+    logged = {}
+    mod = types.SimpleNamespace()
+    mod.log = lambda name, value, **kw: logged.__setitem__(name, float(value))
+    mod._logged = logged
+    mod._last_att_mean = att
+    mod.homogeneous_nodes = True
+    mod.S_seq_len = L_S
+
+    def split(a):   # mirrors split_attention_blocks in homogeneous mode
+        S = L_S
+        return {"s_to_x": att[S:, :S], "x_to_x": att[S:, S:],
+                "x_to_s": att[:S, S:], "s_to_s": att[:S, :S]}
+    mod.split_attention_blocks = split
+    # No source_scores method on purpose: the callback must fall back to the
+    # incoming-edge mass of the posterior itself.
+    return mod
+
+
+def _homogeneous_cb():
+    cb = _cb(every_n_epochs=1)
+    cb._true_full = TRUE_FULL.copy()   # bypass disk, like _true_masks
+    cb._true_full_loaded = True
+    return cb
+
+
+class TestShd:
+    def test_perfect_attention_has_zero_shd(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/shd_cross"] == 0.0
+        assert mod._logged["dag/shd_self"] == 0.0
+        assert mod._logged["dag/shd_total"] == 0.0
+        assert mod._logged["dag/shd_missing_self"] == 0.0
+        assert mod._logged["dag/shd_extra_self"] == 0.0
+        assert mod._logged["dag/shd_reversed_self"] == 0.0
+
+    def test_empty_attention_counts_all_true_edges_as_missing(self):
+        mod = _module(np.zeros_like(TRUE_CROSS), np.zeros_like(TRUE_SELF))
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/shd_missing_cross"] == 4.0
+        assert mod._logged["dag/shd_missing_self"] == 2.0
+        assert mod._logged["dag/shd_extra_cross"] == 0.0
+        assert mod._logged["dag/shd_total"] == 6.0
+
+    def test_reversed_edges_are_counted_on_the_self_block(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.T.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        # Both chain edges flipped: 2 missing + 2 extra + 2 reversed.
+        assert mod._logged["dag/shd_reversed_self"] == 2.0
+        assert mod._logged["dag/shd_self"] == 6.0
+
+    def test_no_reversal_counting_on_the_cross_block(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        assert "dag/shd_reversed_cross" not in mod._logged
+
+
+class TestSourceRecall:
+    def test_perfect_partition_gives_recall_one(self):
+        mod = _homogeneous_module(TRUE_FULL.copy())
+        _homogeneous_cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/source_recall"] == 1.0
+        assert mod._logged["dag/source_auroc"] == 1.0
+
+    def test_misplaced_source_mass_lowers_recall(self):
+        # Incoming-mass profile [1, 0, 0, 1, 1]: nodes 1 and 2 look like the
+        # two sources, but only node 1 is a true source -> recall 1/2.
+        att = np.zeros((5, 5))
+        att[0, 3] = 1.0
+        att[3, 0] = 1.0
+        att[4, 0] = 1.0
+        mod = _homogeneous_module(att)
+        _homogeneous_cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/source_recall"] == pytest.approx(0.5)
+
+    def test_full_shd_logged_in_homogeneous_mode(self):
+        mod = _homogeneous_module(TRUE_FULL.copy())
+        _homogeneous_cb().on_train_epoch_end(_trainer(epoch=0), mod)
+        assert mod._logged["dag/shd_full"] == 0.0
+        assert mod._logged["dag/shd_reversed_full"] == 0.0
+
+    def test_no_source_metrics_in_split_mode(self):
+        mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
+        _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
+        assert "dag/source_recall" not in mod._logged
+        assert "dag/source_auroc" not in mod._logged
+        assert "dag/shd_full" not in mod._logged

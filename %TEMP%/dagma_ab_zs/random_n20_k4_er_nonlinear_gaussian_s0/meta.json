@@ -1,0 +1,34 @@
+{
+  "created": "2026-09-24",
+  "description": "Randomly sampled ER-4 SCM. n_nodes=20, edges=80 (target=80), sources=1 (ER expectation=2.4), inputs=19, linearity=nonlinear, noise=gaussian, seed=0.",
+  "graph_stats": {
+    "expected_er_roots": 2.3749574944834757,
+    "n_edges": 80,
+    "n_inputs": 19,
+    "n_nodes": 20,
+    "n_sources": 1,
+    "source_fraction": 0.05
+  },
+  "n_edges": 80,
+  "name": "random_n20_k4_er_nonlinear_gaussian_s0",
+  "random_scm_config": {
+    "degree": 4,
+    "linearity": "nonlinear",
+    "n_nodes": 20,
+    "name": null,
+    "noise": "gaussian",
+    "noise_scale": 1.0,
+    "nonlinear_fns": [
+      "sin",
+      "tanh"
+    ],
+    "permute_labels": true,
+    "rescale_by_indegree": false,
+    "seed": 0,
+    "source_noise": "gaussian",
+    "weight_range": [
+      0.5,
+      2.0
+    ]
+  }
+}

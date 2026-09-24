@@ -1,0 +1,14 @@
+{
+  "definition": "path-weighted order alignment over directed paths (CausalDisco order_alignment_paths; ties count 1/2)",
+  "n_samples_raw": 1000,
+  "n_samples_stored": 1000,
+  "normalize_method": null,
+  "r2_sortability": 0.21830985915492956,
+  "r2_sortability_raw": 0.21830985915492956,
+  "references": [
+    "Reisach et al. 2021 (arXiv:2102.13647) var-sortability",
+    "Reisach et al. 2023 (arXiv:2303.18211) R2-sortability"
+  ],
+  "varsortability": 0.8403755868544601,
+  "varsortability_raw": 0.8403755868544601
+}

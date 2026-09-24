@@ -261,6 +261,14 @@ class GatedSelfAttention(nn.Module):
         self._open_gate_c_end: Optional[float] = None
         self.last_open_gate_c: Optional[float] = None
 
+        # Dense-adjacency edge-dropout override (adaptive-trainer reconstruct
+        # phases): when active AND in training mode, the applied weight A is
+        # replaced by a fully dense {0,1} adjacency where each edge ij is
+        # KEPT with probability equal to the (detached) directed gate
+        # posterior p_ij (dropped w.p. 1 - p_ij).  Eval mode is unaffected
+        # (learned gates).
+        self._dense_gate_active: bool = False
+
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
@@ -407,6 +415,21 @@ class GatedSelfAttention(nn.Module):
             self._open_gate_c_end = float(c_end)
         if not active:
             self.last_open_gate_c = None
+
+    def set_dense_gate_mode(self, active: bool) -> None:
+        """Toggle the dense-adjacency edge-dropout override (adaptive-trainer
+        reconstruct phases).
+
+        When active, training forward passes replace the applied weight A
+        with a fully dense {0,1} adjacency: every (allowed, off-diagonal)
+        edge ij is kept with probability equal to the DETACHED directed gate
+        posterior ``p_ij`` (i.e. dropped with probability ``1 - p_ij``).  The
+        posterior carries no gradient, so no structural signal leaks through
+        the reconstruction loss.  Eval forward passes are unaffected (the
+        learned gate is used).  Deactivating restores the learned-gate
+        behaviour exactly.
+        """
+        self._dense_gate_active = bool(active)
 
     def set_dir_bias(self, value: float) -> None:
         """Set the direction-gate logit bias (adaptive-trainer phase
@@ -693,6 +716,19 @@ class GatedSelfAttention(nn.Module):
             p_edge_masked = p_edge_undirected * hm
         else:
             p_edge_masked = p_edge_undirected.masked_fill(diag, 0.0)
+
+        # ---- Dense-adjacency edge-dropout override (reconstruct phases) ---
+        # Fully dense candidate adjacency: each edge ij is KEPT with
+        # probability equal to the DETACHED directed gate posterior p_ij
+        # (dropped w.p. 1 - p_ij), so the applied weight is a {0,1} sample
+        # with E[A_ij] = p_ij.  Training steps only; eval uses the learned
+        # gate.  ``p_directed`` is already diagonal-zeroed and hard-masked
+        # here, so the dense sample inherits both constraints.  The returned
+        # posterior, the L0 penalty and all diagnostics remain gate-based,
+        # so DAG extraction is unaffected by the override.
+        if self._dense_gate_active and self.training:
+            p_keep = p_directed.detach()
+            A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
 
         # ---- Prior-softmax reconstruction gain (lambda-ramped) -----------
         # Redistributes each row's DIRECTED gate mass within the directed

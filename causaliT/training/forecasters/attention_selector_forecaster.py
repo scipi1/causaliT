@@ -212,6 +212,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._query_parents_prior = config["model"]["kwargs"].get(
             "query_parents_prior", None
         )
+        # Source-nodes query prior (zero + freeze the query of the listed
+        # nodes, so they can never be children).  Same lazy first-batch
+        # mechanism as the parents prior; see
+        # AttentionSelectorLayer.init_source_queries_zero.
+        self._query_source_prior = config["model"]["kwargs"].get(
+            "query_source_prior", None
+        )
+
 
         # Data indices
         self.val_idx = config["data"]["val_idx"]
@@ -221,9 +229,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         # ------------------------------------------------------------------
         # Node-topology mode (mirrors AttentionSelectorLayer).
-        #   False (default) → SPLIT: only the L_X variables are children; the
+        #   False (default) Ã¢â€ â€™ SPLIT: only the L_X variables are children; the
         #       posterior is (B, L_X, L_S+L_X) and the target is the X values.
-        #   True            → HOMOGENEOUS: the S/X prior is dropped, all
+        #   True            Ã¢â€ â€™ HOMOGENEOUS: the S/X prior is dropped, all
         #       N = L_S + L_X nodes are simultaneously blanked queries and
         #       actual-value keys.  The posterior is the square (B, N, N)
         #       directed adjacency and the target is cat([S_values, X_values]).
@@ -256,8 +264,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         #              + score_sparsity_reg + group_l1_reg + acyclic_reg + l0_reg
         #
         # alpha = lambda_struct_recon in [0, 1]:
-        #   * 0.0 → pure HSIC structural stream (original behaviour).
-        #   * >0  → re-inject a controlled dose of reconstruction signal into
+        #   * 0.0 Ã¢â€ â€™ pure HSIC structural stream (original behaviour).
+        #   * >0  Ã¢â€ â€™ re-inject a controlled dose of reconstruction signal into
         #           the STRUCTURAL parameters (Q/K, structural embeddings) that
         #           gradient routing otherwise severs.  Motivated by the
         #           observation that causal parents must also be predictive,
@@ -451,7 +459,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # on X_i itself.  Averaging those pairs into the HSIC term means the
         # TRUE DAG is not a minimiser of the structural loss: the only way to
         # shrink a descendant term is to stop having r_i = e_i, i.e. to regress
-        # X_i on its own descendants — the documented "attends to descendants"
+        # X_i on its own descendants Ã¢â‚¬â€ the documented "attends to descendants"
         # failure mode.  Excluding them restores consistency.
         #
         # The exclusion set is read off the LEARNED adjacency (the directed
@@ -490,8 +498,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # instead of hardening the posterior at ``hsic_descendant_threshold``
         # and hoping for a DAG, rank the pairs by a SOFT descendant score (the
         # detached posterior's fuzzy transitive closure) and exclude the top
-        # ``hsic_descendant_budget_frac`` — per child row when
-        # ``hsic_descendant_per_row`` — so the cap itself is the collapse guard
+        # ``hsic_descendant_budget_frac`` Ã¢â‚¬â€ per child row when
+        # ``hsic_descendant_per_row`` Ã¢â‚¬â€ so the cap itself is the collapse guard
         # and the mask triggers every step.
         self.hsic_descendant_mode = str(
             config["training"].get("hsic_descendant_mode", "threshold")
@@ -512,7 +520,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         # Self-attention block type: only a direction-aware posterior can tell
         # descendants from ancestors.  In homogeneous mode the single square
-        # block IS the self-attention type; in split mode it drives the X→X
+        # block IS the self-attention type; in split mode it drives the XÃ¢â€ â€™X
         # columns.  Anything else disables the feature (with one warning).
         self._self_attention_type = str(
             config["model"]["kwargs"].get("self_attention_type", "") or ""
@@ -524,7 +532,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             logger.warning(
                 "training.hsic_exclude_descendants=True but self_attention_type=%r "
                 "does not expose a DIRECTED edge posterior (supported: %s). "
-                "Descendant exclusion is DISABLED — without an orientation the "
+                "Descendant exclusion is DISABLED Ã¢â‚¬â€ without an orientation the "
                 "descendant set is undefined.",
                 self._self_attention_type,
                 ", ".join(self._DIRECTED_SELF_ATTENTION_TYPES),
@@ -585,13 +593,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.fanin_schedule = FaninPriorSchedule(config, n_keys=self.N)
 
         # ----------------------------------------------------------------
-        # L0 ↔ HSIC gradient-interference logging (diagnostic).
+        # L0 Ã¢â€ â€ HSIC gradient-interference logging (diagnostic).
 
         # When enabled AND the attention is HardConcreteCrossAttention AND
         # both lambda_l0 > 0 and lambda_hsic > 0, we log the per-block cosine
         # similarity between the L0 gradient and the HSIC gradient.  Negative
-        # cosine ⇒ the two objectives push the structural parameters in
-        # opposing directions (interference); positive ⇒ aligned.
+        # cosine Ã¢â€¡â€™ the two objectives push the structural parameters in
+        # opposing directions (interference); positive Ã¢â€¡â€™ aligned.
         #
         # The two objectives share the structural pathway (Q/K projections and
         # structural embeddings), because the L0 penalty is a function of
@@ -605,15 +613,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
             config["training"].get("interference_log_every_n_epochs", 1)
         )
         # Effective attention type for the interference gate.  In homogeneous
-        # mode the cross ``attention_type`` is IGNORED by the architecture — the
-        # single square block is built from ``self_attention_type`` — so that is
+        # mode the cross ``attention_type`` is IGNORED by the architecture Ã¢â‚¬â€ the
+        # single square block is built from ``self_attention_type`` Ã¢â‚¬â€ so that is
         # the type whose L0 gate the probe would see.
         self._attention_type = (
             config["model"]["kwargs"].get("self_attention_type", "")
             if self.homogeneous_nodes
             else config["model"]["kwargs"].get("attention_type", "")
         )
-        # Cached block → parameter-list mapping (built lazily on first use so
+        # Cached block Ã¢â€ â€™ parameter-list mapping (built lazily on first use so
         # it reflects any requires_grad freezing applied in on_fit_start).
         self._interference_blocks: Optional[Dict[str, list]] = None
         # Stash for the two reg tensors so training_step can probe them while
@@ -625,15 +633,124 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_l0_reg: Optional[torch.Tensor] = None
 
         # ----------------------------------------------------------------
-        # Acyclicity regularization (NOTEARS) — X→X sub-block only
+        # Acyclicity regularization (NOTEARS) Ã¢â‚¬â€ XÃ¢â€ â€™X sub-block only
         # Applied to the square (L_X, L_X) portion of the combined score
-        # tensor (columns S_seq_len:).  The S→X block is bipartite and
+        # tensor (columns S_seq_len:).  The SÃ¢â€ â€™X block is bipartite and
         # inherently acyclic, so NOTEARS is not needed there.
         # Set kappa > 0 to activate; kappa=0.0 is the default (off).
         # ----------------------------------------------------------------
         self.kappa = float(config["training"].get("kappa", 0.0))
         if self.kappa < 0.0:
             raise ValueError(f"kappa must be non-negative, got {self.kappa}")
+
+        # Acyclicity functional applied to the (nonnegative) gate-posterior
+        # score matrix.  "notears" (default, backward compatible):
+        # h(A) = tr(exp(A Ã¢Å â„¢ A)) - d (Zheng et al., 2018).  "logdet" (DAGMA-
+        # style, Bello et al., 2022): h(A) = -log det(sI - A) + d*log s.
+        # Because the gate posterior has entries in (0, 1), the adaptive
+        # scale s = max-row-sum(A) guarantees sI - A nonsingular at EVERY
+        # iterate (rho(A) <= max row sum), removing the determinant
+        # singularity that destabilises log-det on unbounded weights.
+        # "nilpotent": h(A) = sum_{k=1..d} tr(A^k) Ã¢â‚¬â€ an exact acyclicity
+        # characterisation for nonnegative A (all terms >= 0, zero iff the
+        # graph has no closed walk of any length <= d).
+        self.acyclicity_fn = str(
+            config["training"].get("acyclicity_fn", "notears")
+        )
+        if self.acyclicity_fn not in ("notears", "logdet", "nilpotent"):
+            raise ValueError(
+                f"acyclicity_fn must be one of 'notears' | 'logdet' | "
+                f"'nilpotent', got {self.acyclicity_fn!r}"
+            )
+        # DAGMA shift for the log-det backend: "adaptive" (default) uses the
+        # (stop-grad) max row sum of the current score matrix; a positive
+        # float fixes s globally (pure DAGMA uses s = 1).
+        _acy_s = config["training"].get("acyclicity_s", "adaptive")
+        if isinstance(_acy_s, str):
+            if _acy_s != "adaptive":
+                raise ValueError(
+                    f"acyclicity_s must be 'adaptive' or a positive float, "
+                    f"got {_acy_s!r}"
+                )
+            self.acyclicity_s: object = "adaptive"
+        else:
+            _acy_s = float(_acy_s)
+            if _acy_s <= 0.0:
+                raise ValueError(
+                    f"acyclicity_s must be positive, got {_acy_s}"
+                )
+            self.acyclicity_s = _acy_s
+
+        # ----------------------------------------------------------------
+        # Augmented-Lagrangian acyclicity constraint (canonical NOTEARS
+        # protocol, Zheng et al., 2018; see vendor/notears/linear.py):
+        #
+        #   L += alpha * h(W) + (rho/2) * h(W)^2
+        #
+        # with per-epoch dual ascent on alpha and NOTEARS-rule rho
+        # escalation (rho <- rho*mult whenever the EMA of h fails to shrink
+        # to <= 1/4 of its previous value).  All acyclicity backends are
+        # >= 0 by construction, so the equality constraint h(W) = 0 needs
+        # no relu.  Unlike the fixed kappa soft penalty, h(W) is DRIVEN to
+        # ~0 (h_tol): the learned graph is asymptotically acyclic rather
+        # than merely biased.  Mutually exclusive with kappa and
+        # kappa_max_hsic_pct (the dynamic dual coefficient replaces the
+        # fixed weight and its HSIC-anchored cap).
+        # ----------------------------------------------------------------
+        ac_cfg = config["training"].get("acyclicity_constraint", None) or {}
+        self.acyclicity_constraint_enabled = bool(ac_cfg.get("enabled", False))
+        if self.acyclicity_constraint_enabled:
+            conflicting = []
+            if self.kappa > 0.0:
+                conflicting.append("kappa")
+            # NOTE: kappa_max_hsic_pct is parsed LATER in __init__ (the
+            # safeguard block), so read it from the config here.
+            if float(config["training"].get("kappa_max_hsic_pct", 0.0)) > 0.0:
+                conflicting.append("kappa_max_hsic_pct")
+            if conflicting:
+                raise ValueError(
+                    "training.acyclicity_constraint.enabled=True is mutually "
+                    f"exclusive with {conflicting}: the dual ascent replaces "
+                    "the fixed kappa weight (and its HSIC-anchored cap). "
+                    "Set them to 0 in the config."
+                )
+        self.acy_dual_lr = float(ac_cfg.get("dual_lr", 1.0))
+        if self.acy_dual_lr <= 0.0:
+            raise ValueError(
+                "acyclicity_constraint.dual_lr must be > 0, got "
+                f"{self.acy_dual_lr}"
+            )
+        self.acy_dual_max = float(ac_cfg.get("dual_max", 1.0e4))
+        self.acy_rho_init = float(ac_cfg.get("rho_init", 1.0))
+        if self.acy_rho_init < 0.0:
+            raise ValueError(
+                "acyclicity_constraint.rho_init must be >= 0, got "
+                f"{self.acy_rho_init}"
+            )
+        self.acy_rho_mult = float(ac_cfg.get("rho_mult", 10.0))
+        self.acy_rho_max = float(ac_cfg.get("rho_max", 1.0e8))
+        self.acy_h_tol = float(ac_cfg.get("h_tol", 1.0e-8))
+        if self.acy_h_tol < 0.0:
+            raise ValueError(
+                "acyclicity_constraint.h_tol must be >= 0, got "
+                f"{self.acy_h_tol}"
+            )
+        self.acy_ema_decay = float(ac_cfg.get("ema", 0.9))
+        if not (0.0 <= self.acy_ema_decay < 1.0):
+            raise ValueError(
+                "acyclicity_constraint.ema must be in [0, 1), got "
+                f"{self.acy_ema_decay}"
+            )
+        # Dual state (plain floats; persisted via on_save_checkpoint).
+        self._acy_dual_lambda = float(ac_cfg.get("dual_init", 0.0))
+        if self._acy_dual_lambda < 0.0:
+            raise ValueError(
+                "acyclicity_constraint.dual_init must be >= 0, got "
+                f"{self._acy_dual_lambda}"
+            )
+        self._acy_rho = self.acy_rho_init
+        self._acy_ema: Optional[float] = None
+        self._acy_prev_violation: Optional[float] = None
 
         # ----------------------------------------------------------------
         # Structural-regularizer safeguard (NOTEARS / L0 <= pct * HSIC).
@@ -669,6 +786,81 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._hsic_reg_ema: Optional[float] = None
 
         # ----------------------------------------------------------------
+        # MSE-vs-acyclicity safeguard (single-optimizer DAGMA-like regime).
+        #
+        # Without gradient routing the plain MSE happily predicts a source
+        # from its DESCENDANTS (anti-causal edges also reduce the MSE),
+        # actively fighting the acyclicity term.  PCGrad-style surgery is
+        # not applicable here (it was built for the structural-params
+        # partition), so this cap applies the *scalar* safeguard pattern of
+        # ``kappa_max_hsic_pct`` with the roles inverted: the effective
+        # reconstruction weight is capped per step so the weighted MSE
+        # entering the loss never exceeds a fixed fraction of the EMA of
+        # the WEIGHTED acyclic term:
+        #
+        #   lambda_recon_eff = min(lambda_recon, pct * acy_ref / (mse + eps))
+        #
+        # with acy_ref an EMA of acyclic_reg (detached, train batches
+        # only).  The rescaling is a detached per-step constant, so the MSE
+        # keeps its gradient direction; only its magnitude is capped.  The
+        # cap therefore lets the acyclic term dominate while it is
+        # violated.  Because the reference shrinks with h, the cap would
+        # strangle the MSE once the graph is (near-)acyclic; the optional
+        # ``mse_cap_release_tol`` releases the cap (lambda_recon restored)
+        # once the acyclic EMA reference falls at/below the tolerance
+        # (e.g. set it to the ALM h_tol).  0.0 (default pct) disables the
+        # cap (backward compatible).  Mutually exclusive with
+        # use_gradient_routing and gradient_surgery (those paths decompose
+        # the loss into per-term backward passes and do not use the capped
+        # total_loss).
+        # ----------------------------------------------------------------
+        self.mse_max_acyclic_pct = float(
+            config["training"].get("mse_max_acyclic_pct", 0.0)
+        )
+        if self.mse_max_acyclic_pct < 0.0:
+            raise ValueError(
+                f"mse_max_acyclic_pct must be non-negative, got "
+                f"{self.mse_max_acyclic_pct}"
+            )
+        self.mse_cap_release_tol = float(
+            config["training"].get("mse_cap_release_tol", 0.0)
+        )
+        if self.mse_cap_release_tol < 0.0:
+            raise ValueError(
+                f"mse_cap_release_tol must be non-negative, got "
+                f"{self.mse_cap_release_tol}"
+            )
+        # L0-vs-acyclicity cap: same scalar-safeguard pattern as the MSE cap,
+        # applied to the HardConcrete L0 weight.  Motivation: in HSIC-free
+        # arms (lambda_hsic=0) a FIXED lambda_l0 is unopposed -- every open
+        # gate receives constant closing pressure and, integrated over a long
+        # run, the posterior collapses to the empty graph (train_l0_penalty
+        # decays monotonically to ~0).  Anchoring to the acyclic reference
+        # makes the L0 pressure fade as h -> 0, so the gates FREEZE once the
+        # graph is acyclic instead of being ground down:
+        #   lambda_l0_eff = min(lambda_l0, pct * acy_ref / (l0 + eps))
+        # sharing the SAME acy_ref (and mse_cap_release_tol release) as the
+        # MSE cap.  Mutually exclusive with the HSIC-anchored cap
+        # ``lambda_l0_max_hsic_pct`` (one anchor per coefficient).  0.0
+        # (default) disables it (backward compatible).
+        self.l0_max_acyclic_pct = float(
+            config["training"].get("l0_max_acyclic_pct", 0.0)
+        )
+        if self.l0_max_acyclic_pct < 0.0:
+            raise ValueError(
+                f"l0_max_acyclic_pct must be non-negative, got "
+                f"{self.l0_max_acyclic_pct}"
+            )
+        if self.l0_max_acyclic_pct > 0.0 and self.lambda_l0_max_hsic_pct > 0.0:
+            raise ValueError(
+                "training.l0_max_acyclic_pct and training.lambda_l0_max_hsic_pct "
+                "are mutually exclusive: both cap lambda_l0, anchored to "
+                "different references (acyclic EMA vs HSIC EMA).  Pick one."
+            )
+        self._acyclic_reg_ema: Optional[float] = None
+
+
+        # ----------------------------------------------------------------
         # Gradient routing (dual optimizer: structural vs reconstruction)
         # ----------------------------------------------------------------
         self.use_gradient_routing = config["training"].get("use_gradient_routing", False)
@@ -697,6 +889,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # (see _joint_pcgrad_step).  Same decomposition as the routing
             # path, extended beyond the structural-params partition.
             self.automatic_optimization = False
+
+        if self.mse_max_acyclic_pct > 0.0 or self.l0_max_acyclic_pct > 0.0:
+            if self.use_gradient_routing or self.gradient_surgery:
+                raise ValueError(
+                    "training.mse_max_acyclic_pct / l0_max_acyclic_pct > 0 is "
+                    "mutually exclusive with use_gradient_routing and "
+                    "gradient_surgery: the caps act on the single-optimizer "
+                    "total_loss, which those paths bypass with per-term "
+                    "backward passes."
+                )
+
 
         # ----------------------------------------------------------------
         # HSIC as a CONSTRAINT (Lagrangian / augmented Lagrangian) instead of
@@ -944,6 +1147,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "centroid_commit: commit events rewrite the query rows "
                 "outside the optimizer and would defeat the freeze."
             )
+        if self.centroid_commit_enabled and self._query_source_prior:
+            raise ValueError(
+                "query_source_prior is incompatible with centroid_commit: "
+                "commit events rewrite the query rows outside the optimizer "
+                "and would defeat the source freeze."
+            )
+
         self._commit_source = str(cc_cfg.get("shadow_source", "hsic"))
         if self._commit_source not in ("hsic", "structural", "hsic_unrolled"):
             raise ValueError(
@@ -1085,7 +1295,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # ----------------------------------------------------------------
         # Oracle mode
         # When use_oracle_attention=True the forecaster bypasses QK^T and
-        # feeds the GT DAG hard mask (combined S→X ‖ X→X) directly as the
+        # feeds the GT DAG hard mask (combined SÃ¢â€ â€™X Ã¢â‚¬â€“ XÃ¢â€ â€™X) directly as the
         # attention weight matrix so that only the value/FFN/MLP head is
         # trained from the reconstruction loss.
         # Requires use_hard_masks=True; validated below.
@@ -1106,8 +1316,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "GT DAG combined mask as the attention weight matrix."
             )
 
-        # Wrong-DAG oracle controls — same semantics as SingleCausalForecaster.
-        # seed in {None, 0} OR both SHDs == 0  →  no corruption.
+        # Wrong-DAG oracle controls Ã¢â‚¬â€ same semantics as SingleCausalForecaster.
+        # seed in {None, 0} OR both SHDs == 0  Ã¢â€ â€™  no corruption.
         self.hard_masks_corruption_seed = config["training"].get(
             "hard_masks_corruption_seed", None
         )
@@ -1199,8 +1409,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         combined (L_X, L_S+L_X) oracle mask as a Lightning buffer.
 
         The combined oracle mask concatenates:
-            dec_cross  (L_X, L_S)  — S→X GT edges
-            dec_self   (L_X, L_X)  — X→X GT edges
+            dec_cross  (L_X, L_S)  Ã¢â‚¬â€ SÃ¢â€ â€™X GT edges
+            dec_self   (L_X, L_X)  Ã¢â‚¬â€ XÃ¢â€ â€™X GT edges
         along dim=1 to produce (L_X, L_S+L_X), matching the shape of
         AttentionSelectorLayer.combined_mask.
         """
@@ -1236,17 +1446,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 preserve_sparsity=self.hard_masks_preserve_sparsity,
             )
             print(
-                f"✓ Oracle masks CORRUPTED "
+                f"Ã¢Å“â€œ Oracle masks CORRUPTED "
                 f"(seed={int(self.hard_masks_corruption_seed)}, "
                 f"cross_shd={self.cross_control_shd}, "
                 f"self_shd={self.self_control_shd}, "
                 f"preserve_sparsity={self.hard_masks_preserve_sparsity})"
-                f" — wrong-DAG oracle."
+                f" Ã¢â‚¬â€ wrong-DAG oracle."
             )
             for _name, _info in corruption_info.items():
                 cyc = _info.get("has_cycles")
                 cyc_str = (
-                    "N/A" if cyc is None else ("⚠ cycles" if cyc else "✓ acyclic")
+                    "N/A" if cyc is None else ("Ã¢Å¡Â  cycles" if cyc else "Ã¢Å“â€œ acyclic")
                 )
                 fb = " [fallback all-edges-wrong]" if _info.get("fallback_used") else ""
                 print(
@@ -1272,21 +1482,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self.homogeneous_nodes:
             # Homogeneous mode: the model expects the SQUARE (N, N) GT
             # adjacency because every node is a child.  Rows 0..L_S-1 are the
-            # S children — sources have no parents in this dataset family, so
-            # those rows are all-zero — and rows L_S..N-1 carry the X children's
+            # S children Ã¢â‚¬â€ sources have no parents in this dataset family, so
+            # those rows are all-zero Ã¢â‚¬â€ and rows L_S..N-1 carry the X children's
             # parents as [dec_cross | dec_self].
             combined = torch.zeros(self.N, self.N, dtype=cross_mask.dtype)
             combined[self.S_seq_len :, : self.S_seq_len] = cross_mask
             combined[self.S_seq_len :, self.S_seq_len :] = self_mask
         else:
-            # Split mode: concatenate [S→X part | X→X part] → (L_X, L_S + L_X)
+            # Split mode: concatenate [SÃ¢â€ â€™X part | XÃ¢â€ â€™X part] Ã¢â€ â€™ (L_X, L_S + L_X)
             combined = torch.cat([cross_mask, self_mask], dim=1)
 
         self.register_buffer("oracle_combined_mask", combined)
         self._hard_masks_loaded = True
         print(
-            f"✓ Oracle combined mask built: shape {combined.shape} "
-            f"(cross {cross_mask.shape} ‖ self {self_mask.shape}"
+            f"Ã¢Å“â€œ Oracle combined mask built: shape {combined.shape} "
+            f"(cross {cross_mask.shape} Ã¢â‚¬â€“ self {self_mask.shape}"
             f"{', homogeneous square layout' if self.homogeneous_nodes else ''})"
         )
 
@@ -1349,10 +1559,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 The value column is blanked internally for the query path.
 
         Returns:
-            pred_x:            (B, L_X, 1) predictions — (B, N, 1) when
+            pred_x:            (B, L_X, 1) predictions Ã¢â‚¬â€ (B, N, 1) when
                                ``homogeneous_nodes=True`` (S nodes are children
                                too and therefore reconstructed as well).
-            attention_weights: (B, L_X, L_S + L_X) combined attention matrix —
+            attention_weights: (B, L_X, L_S + L_X) combined attention matrix Ã¢â‚¬â€
                                square (B, N, N) when ``homogeneous_nodes=True``.
             entropy:           Attention entropy.
         """
@@ -1500,20 +1710,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def _step(self, batch, stage: str = "train"):
-        # Unpack — support (S, X) and (S, X, Y)
+        # Unpack Ã¢â‚¬â€ support (S, X) and (S, X, Y)
         S = batch[0]
         X = batch[1]
 
         x_val = X[:, :, self.val_idx]           # (B, L_X)  ground truth values
 
         # Homogeneous mode: the model reconstructs ALL N nodes, so the target
-        # is cat([S_values, X_values]) → (B, N).  Everything downstream that
+        # is cat([S_values, X_values]) Ã¢â€ â€™ (B, N).  Everything downstream that
         # consumes ``x_target`` / ``pred_x`` (MSE, metrics, HSIC residuals,
         # ANM diagnostics) then operates on N rows automatically.
         if self.homogeneous_nodes:
             x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)   # (B, N)
 
-        # Forward — returns (pred_x, attention_weights, aux_dict)
+        # Forward Ã¢â‚¬â€ returns (pred_x, attention_weights, aux_dict)
         pred_x, attention_weights, aux = self.forward(S, X)
 
         # Soft adjacency for structure diagnostics (PeriodicDAGMetrics).
@@ -1537,8 +1747,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # CausalCrossAttention exposes score_tensor_for_sparsity = attention matrix
         # ----------------------------------------------------------------
         # Unified score tensor for the sparsity / NOTEARS terms.  In split mode
-        # (self_attention_type set) this concatenates the S→X cross gate
-        # posterior with the direction-aware X→X GatedSelfAttention posterior,
+        # (self_attention_type set) this concatenates the SÃ¢â€ â€™X cross gate
+        # posterior with the direction-aware XÃ¢â€ â€™X GatedSelfAttention posterior,
         # so the (L_X, L_S+L_X) layout is identical to single mode.  Falls back
         # to the legacy inner-attention attribute for older checkpoints/models.
         get_score = getattr(self.model, "get_score_tensor_for_sparsity", None)
@@ -1617,7 +1827,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             score_tensor
         )
         # Bilevel machinery: the probe/virtual-pass pair weights are the
-        # STRUCTURAL mask only (descendant x LOO) — BKD excluded, since probes
+        # STRUCTURAL mask only (descendant x LOO) Ã¢â‚¬â€ BKD excluded, since probes
         # run with key dropout off.  Captured before the BKD multiply below.
         _probe_mask_base = hsic_pair_mask
 
@@ -1647,7 +1857,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             else 1.0
         )
 
-        # --- LOO conditional-HSIC gate (counter-proposal §5, option (c)) ------
+        # --- LOO conditional-HSIC gate (counter-proposal Ã‚Â§5, option (c)) ------
         # Detached per-edge multiplier applied to the pair weights BEFORE the
         # HSIC average: conditionally-redundant pairs are downweighted out of
         # the marginal mean; load-bearing pairs keep full weight.  Same
@@ -1702,8 +1912,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         elif self.use_attention_weighted_hsic:
             # Attention-weighted HSIC: weight each (child, source) pair by the
             # batch-mean attention weight att[child, source].  The attention
-            # matrix is (B, n_targets, n_sources) — (B, N, N) in homogeneous
-            # mode, (B, L_X, L_S+L_X) in split mode — matching the HSIC pair
+            # matrix is (B, n_targets, n_sources) Ã¢â‚¬â€ (B, N, N) in homogeneous
+            # mode, (B, L_X, L_S+L_X) in split mode Ã¢â‚¬â€ matching the HSIC pair
             # matrix layout exactly.  Descendant masking is NOT applied here:
             # the attention weight itself is the pair weight.
             att_mean = attention_weights.mean(dim=0)  # (n_targets, n_sources)
@@ -1932,7 +2142,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         group_l1_reg = self.lambda_group_l1 * group_l1_loss
 
         # ----------------------------------------------------------------
-        # Acyclicity regularization (NOTEARS) — X→X sub-block only
+        # Acyclicity regularization (NOTEARS) Ã¢â‚¬â€ XÃ¢â€ â€™X sub-block only
         # Extract the square (L_X, L_X) directed edge matrix from the
         # combined (L_X, L_S+L_X) score tensor by slicing columns S_seq_len:.
         # The score tensor is 2-D (batch-mean, head-averaged) for single-head
@@ -1941,20 +2151,54 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # In homogeneous mode the score tensor IS the square (N, N) directed
         # adjacency over all nodes, so NOTEARS applies to the FULL matrix (the
         # column slice would be a meaningless sub-block there).
-        if self.kappa > 0.0 and score_tensor is not None and score_tensor.dim() == 2:
+        acy_constrained = self.acyclicity_constraint_enabled
+        if ((self.kappa > 0.0 or acy_constrained)
+                and score_tensor is not None and score_tensor.dim() == 2):
             A_cyc = (
                 score_tensor                      # (N, N)
                 if self.homogeneous_nodes
                 else score_tensor[:, self.S_seq_len:]   # (L_X, L_X)
             )
-            notears_raw = self._notears_acyclicity(A_cyc)
-            kappa_eff = self._cap_reg_coeff(
-                self.kappa, notears_raw, self.kappa_max_hsic_pct, hsic_ref
-            )
-            acyclic_reg = kappa_eff * notears_raw
+            notears_raw = self._acyclicity_penalty(A_cyc)
+            if acy_constrained:
+                # Augmented Lagrangian: alpha * h + (rho/2) * h^2 (canonical
+                # NOTEARS protocol).  h >= 0 for every backend, so the
+                # equality constraint h = 0 needs no relu.
+                kappa_eff = self.kappa   # 0.0; kept for logging continuity
+                acyclic_reg = (
+                    self._acy_dual_lambda * notears_raw
+                    + 0.5 * self._acy_rho * notears_raw ** 2
+                )
+                # EMA of the RAW h (train batches only, detached) drives the
+                # per-epoch dual ascent in on_train_epoch_end.
+                if stage == "train":
+                    v = float(notears_raw.detach())
+                    if self._acy_ema is None:
+                        self._acy_ema = v
+                    else:
+                        dcy = self.acy_ema_decay
+                        self._acy_ema = dcy * self._acy_ema + (1.0 - dcy) * v
+            else:
+                kappa_eff = self._cap_reg_coeff(
+                    self.kappa, notears_raw, self.kappa_max_hsic_pct, hsic_ref
+                )
+                acyclic_reg = kappa_eff * notears_raw
         else:
             kappa_eff = self.kappa
             acyclic_reg = torch.tensor(0.0, device=X.device)
+
+        # MSE-vs-acyclicity cap: throttle the reconstruction weight so the
+        # weighted MSE cannot exceed mse_max_acyclic_pct * (EMA of the
+        # weighted acyclic term).  Released (lambda_recon restored) once the
+        # acyclic EMA falls at/below mse_cap_release_tol -- when the graph is
+        # (near-)acyclic there is no conflict left to arbitrate.
+        acy_ref = self._acyclic_safeguard_ref(acyclic_reg, stage)
+        if acy_ref is not None and acy_ref <= self.mse_cap_release_tol:
+            acy_ref = None  # release: acyclicity (near-)satisfied
+        lambda_recon_eff = self._cap_reg_coeff(
+            self.lambda_recon, loss_x, self.mse_max_acyclic_pct, acy_ref
+        )
+
 
         # ----------------------------------------------------------------
         # L0 regularization (non-zero only for HardConcreteCrossAttention)
@@ -1971,9 +2215,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # Non-HardConcrete attentions do not expose an L0 penalty at all.
             l0_penalty = torch.tensor(0.0, device=X.device)
         if self.lambda_l0 > 0.0:
-            lambda_l0_eff = self._cap_reg_coeff(
-                self.lambda_l0, l0_penalty, self.lambda_l0_max_hsic_pct, hsic_ref
-            )
+            if self.l0_max_acyclic_pct > 0.0:
+                # Acyclicity-anchored cap (HSIC-free arms): the L0 pressure
+                # fades as h -> 0, so the gates freeze on an acyclic graph
+                # instead of collapsing to the empty one.
+                lambda_l0_eff = self._cap_reg_coeff(
+                    self.lambda_l0, l0_penalty, self.l0_max_acyclic_pct, acy_ref
+                )
+            else:
+                lambda_l0_eff = self._cap_reg_coeff(
+                    self.lambda_l0, l0_penalty, self.lambda_l0_max_hsic_pct, hsic_ref
+                )
             l0_reg = lambda_l0_eff * l0_penalty
         else:
             lambda_l0_eff = self.lambda_l0
@@ -1983,7 +2235,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Total loss
         # ----------------------------------------------------------------
         total_loss = (
-            self.lambda_recon * loss_x
+            lambda_recon_eff * loss_x
             + score_sparsity_reg
             + hsic_reg
             + group_l1_reg
@@ -2040,7 +2292,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         }
 
         # Keep references to the individual reg terms (graph still attached) so
-        # training_step can probe L0 ↔ HSIC gradient interference before the
+        # training_step can probe L0 Ã¢â€ â€ HSIC gradient interference before the
         # real backward runs.
         self._last_hsic_reg = hsic_reg
         self._last_l0_reg = l0_reg
@@ -2143,12 +2395,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # (< base value => the HSIC-relative cap is active).
         if self.kappa_max_hsic_pct > 0.0:
             self.log(f"{stage}_kappa_eff", float(kappa_eff), on_step=False, on_epoch=True)
+        if self.mse_max_acyclic_pct > 0.0:
+            self.log(f"{stage}_lambda_recon_eff", float(lambda_recon_eff), on_step=False, on_epoch=True)
+
+
 
         # L0 penalty (expected number of active edges, non-zero only for
         # HardConcreteCrossAttention; logged as 0.0 for all other attention types)
         self.log(f"{stage}_l0_penalty", l0_penalty, on_step=False, on_epoch=True)
         self.log(f"{stage}_l0_reg", l0_reg, on_step=False, on_epoch=True)
-        if self.lambda_l0_max_hsic_pct > 0.0:
+        if self.lambda_l0_max_hsic_pct > 0.0 or self.l0_max_acyclic_pct > 0.0:
             self.log(f"{stage}_lambda_l0_eff", float(lambda_l0_eff), on_step=False, on_epoch=True)
 
         if stage == "val":
@@ -2220,12 +2476,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
 
     # ------------------------------------------------------------------
-    # L0 ↔ HSIC gradient-interference diagnostic
+    # L0 Ã¢â€ â€ HSIC gradient-interference diagnostic
     # ------------------------------------------------------------------
 
 
     # Attention types that expose a differentiable L0 penalty on the structure
-    # gate (aux["l0_penalty"]), for which the L0 ↔ HSIC interference probe is
+    # gate (aux["l0_penalty"]), for which the L0 Ã¢â€ â€ HSIC interference probe is
     # meaningful.  Both drive the Hard-Concrete gate logit off the structural
     # query/key pair, so their gradients flow to the same structural params.
     _INTERFERENCE_ATTENTION_TYPES = (
@@ -2238,7 +2494,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
     )
 
     def _interference_enabled(self) -> bool:
-        """Whether the L0 ↔ HSIC interference diagnostic should run."""
+        """Whether the L0 Ã¢â€ â€ HSIC interference diagnostic should run."""
         return (
             self.log_l0_hsic_interference
             and self._attention_type in self._INTERFERENCE_ATTENTION_TYPES
@@ -2269,7 +2525,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self._last_hsic_reg is None or self._last_l0_reg is None:
             return
 
-        # Build the block → parameter mapping lazily.  Rebuilt if it came back
+        # Build the block Ã¢â€ â€™ parameter mapping lazily.  Rebuilt if it came back
         # empty last time (e.g. structural params were frozen for this stage).
         if not self._interference_blocks:
             self._interference_blocks = build_interference_blocks(self.model)
@@ -2287,9 +2543,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
         except RuntimeError as exc:
             # Autograd may fail if the graph was already freed (e.g. a prior
             # backward without retain_graph).  Never let the diagnostic break
-            # training — just skip this step.
+            # training Ã¢â‚¬â€ just skip this step.
             logger.warning(
-                "L0↔HSIC interference probe skipped (autograd error): %s", exc
+                "L0Ã¢â€ â€HSIC interference probe skipped (autograd error): %s", exc
             )
             return
 
@@ -2297,7 +2553,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # entirely zero in that block (pure reconstruction blocks receive no
         # L0 gradient).  Logging only the non-NaN blocks auto-focuses the
         # metric set on the structural pathway (Q/K + embeddings) where the
-        # L0 ↔ HSIC interference actually happens.  We simultaneously collect
+        # L0 Ã¢â€ â€ HSIC interference actually happens.  We simultaneously collect
         # per-block cosines into a summary so the conflict is human-readable in
         # the console / log file (not just as scattered CSV columns).
         overall_cos = float("nan")
@@ -2316,8 +2572,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
             else:
                 block_cos[block_name] = float(cos)
 
-        # --- Human-readable summary of the L0 ↔ HSIC gradient conflict ---
-        # cos < 0 ⇒ the L0 (sparsity) and HSIC (independence) gradients push
+        # --- Human-readable summary of the L0 Ã¢â€ â€ HSIC gradient conflict ---
+        # cos < 0 Ã¢â€¡â€™ the L0 (sparsity) and HSIC (independence) gradients push
         # the shared structural parameters in opposing directions in that
         # block, i.e. the two objectives are in direct conflict there.
         if block_cos:
@@ -2331,7 +2587,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 f"{overall_cos:+.3f}" if not math.isnan(overall_cos) else "n/a"
             )
             logger.info(
-                "[L0↔HSIC interference] epoch=%d | overall_cos=%s | "
+                "[L0Ã¢â€ â€HSIC interference] epoch=%d | overall_cos=%s | "
                 "conflicting_blocks=%d/%d | per-block: %s",
                 int(self.current_epoch),
                 overall_str,
@@ -2433,7 +2689,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """Eval-mode forward for LOO measurement.
 
         BKD is gated on ``self.training``, so under ``model.eval()`` the
-        measurement passes see the full candidate set with no key dropout —
+        measurement passes see the full candidate set with no key dropout Ã¢â‚¬â€
         the two worlds (baseline vs. masked) then differ ONLY in the masked
         edge, as the Delta contrast requires.  ``mask`` is an
         ``(n_targets, n_sources)`` 1=allowed / 0=forbidden combined mask
@@ -2466,11 +2722,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         (X_i, eps^{+}) and (X_i, eps^{-i}) feeds ``bayes_multiplier`` with
         prior P_m = current (detached) score tensor.  Rows that would become
         fully masked by dropping column i are left unmasked and keep
-        gamma = 1 (edge i is the row's only allowed key — no measurement is
+        gamma = 1 (edge i is the row's only allowed key Ã¢â‚¬â€ no measurement is
         possible there).
 
         Cost: one kernel build per calibration call, so O(T x S) kernel
-        matrices per refresh — control with ``loo_gamma_topk`` /
+        matrices per refresh Ã¢â‚¬â€ control with ``loo_gamma_topk`` /
         ``loo_gamma_refresh`` / ``loo_gamma_permutations``.
         """
         was_training = self.model.training
@@ -2684,7 +2940,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """Build the detached HSIC pair mask that excludes ``Desc(i) U {i}``.
 
         Returns ``(mask, kept_frac, is_cyclic)``.  ``mask is None`` means "no
-        masking this step" — the HSIC term then falls back to the plain mean, so
+        masking this step" Ã¢â‚¬â€ the HSIC term then falls back to the plain mean, so
         every guard below degrades gracefully to the pre-feature behaviour.
 
         Guards, in order:
@@ -2695,7 +2951,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
              are trying to find (self-confirmation risk).  The countdown starts
              at ``self._descendant_warmup_anchor`` rather than at epoch 0, so
              the adaptive trainer can anchor it to the first epoch of the FIRST
-             structure phase — the epochs that actually train the structure —
+             structure phase Ã¢â‚¬â€ the epochs that actually train the structure Ã¢â‚¬â€
              instead of having it silently expire during the (long) reconstruct
              warmup.  ``anchor is None`` means the warmup was already served;
           4. collapse: if a dense adjacency makes the closure swallow almost
@@ -2775,7 +3031,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         ):
             logger.warning(
                 "Descendant HSIC mask would keep only %.1f%% of pairs "
-                "(< min_kept_frac=%.1f%%) — the learned graph is too dense and "
+                "(< min_kept_frac=%.1f%%) Ã¢â‚¬â€ the learned graph is too dense and "
                 "the structural signal would collapse. Falling back to unmasked "
                 "HSIC for this step.",
                 100.0 * kept_frac,
@@ -2791,14 +3047,90 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     @staticmethod
     def _notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
-        """NOTEARS acyclicity penalty h(A) = tr(exp(A ⊙ A)) - d.
+        """NOTEARS acyclicity penalty h(A) = tr(exp(A Ã¢Å â„¢ A)) - d.
 
         Zero iff A induces a directed acyclic graph (Zheng et al., 2018).
-        Applied to the X→X sub-block (square, L_X × L_X) of the combined
+        Applied to the XÃ¢â€ â€™X sub-block (square, L_X Ãƒâ€” L_X) of the combined
         score tensor.  Caller must ensure A is 2-D (shape (L_X, L_X)).
         """
         d = A.shape[-1]
         return torch.trace(torch.matrix_exp(A * A)) - d
+
+    @staticmethod
+    def _logdet_acyclicity(A: torch.Tensor, s: object = "adaptive"):
+        """DAGMA-style log-det penalty h(A) = -log det(sI - A) + d*log s
+        (Bello et al., 2022).
+
+        ``A`` is the NONNEGATIVE gate-posterior score matrix (entries in
+        (0, 1)), so no elementwise squaring is applied (in NOTEARS the
+        elementwise square only exists to make signed linear weights
+        nonnegative; on a posterior it would attenuate exactly the
+        uncertain edges).
+
+        ``s`` selects the DAGMA shift:
+
+        * ``"adaptive"``: s = max_i sum_j A_ij (STOP-GRAD) + eps.  Since
+          rho(A) <= max row sum for any matrix, sI - A is guaranteed
+          nonsingular at every iterate -- the determinant singularity /
+          NaN region of fixed-s log-det is unreachable.  With
+          h = -log det(I - A/s) and rho(A/s) < 1, h >= 0 with equality
+          iff A is nilpotent (DAG).
+        * positive float: fixed global shift (pure DAGMA uses s = 1).
+          Raises if sI - A is not positive-determinant.
+
+        Caller must ensure A is 2-D (shape (d, d)).
+        """
+        d = A.shape[-1]
+        if isinstance(s, str):
+            assert s == "adaptive"
+            # Stop-grad: s is a per-step conditioning constant, not part of
+            # the penalty landscape.  The eps margin keeps sI - A strictly
+            # nonsingular even in the (measure-zero) Perron-equality case
+            # and makes h(0) = 0 exact.
+            s_val = A.detach().sum(dim=-1).max() + 1e-4
+        else:
+            s_val = torch.as_tensor(float(s), dtype=A.dtype, device=A.device)
+        eye = torch.eye(d, dtype=A.dtype, device=A.device)
+        sign, logabsdet = torch.linalg.slogdet(s_val * eye - A)
+        sign_f = float(sign.detach())
+        if not torch.isfinite(logabsdet.detach()) or sign_f <= 0.0:
+            raise FloatingPointError(
+                f"log-det acyclicity: det(sI - A) non-positive "
+                f"(sign={sign_f}); rho(A) >= s.  Use "
+                f"acyclicity_s='adaptive' or a larger fixed shift."
+            )
+        return -logabsdet + d * torch.log(s_val)
+
+    @staticmethod
+    def _nilpotent_acyclicity(A: torch.Tensor) -> torch.Tensor:
+        """Exact nilpotency penalty h(A) = sum_{k=1..d} tr(A^k).
+
+        For NONNEGATIVE A every term is >= 0, and tr(A^k) = 0 iff the graph
+        has no closed walk of length k; a d-node graph is acyclic iff it has
+        no closed walk of any length <= d.  Hence h(A) = 0 iff A induces a
+        DAG -- an exact characterisation (no factorial down-weighting of
+        long cycles as in NOTEARS, no determinant as in log-det).  Computed
+        by explicit powers; cheap at the node counts in use.
+
+        Caller must ensure A is 2-D (shape (d, d)).
+        """
+        d = A.shape[-1]
+        h = torch.zeros((), dtype=A.dtype, device=A.device)
+        Ak = A
+        for _ in range(d):
+            h = h + torch.trace(Ak)
+            Ak = Ak @ A
+        return h
+
+    def _acyclicity_penalty(self, A: torch.Tensor) -> torch.Tensor:
+        """Dispatch to the configured acyclicity functional
+        (``training.acyclicity_fn``: notears | logdet | nilpotent)."""
+        if self.acyclicity_fn == "logdet":
+            return self._logdet_acyclicity(A, self.acyclicity_s)
+        if self.acyclicity_fn == "nilpotent":
+            return self._nilpotent_acyclicity(A)
+        return self._notears_acyclicity(A)
+
 
     # ------------------------------------------------------------------
     # Structural-regularizer safeguard helpers
@@ -2865,6 +3197,35 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self.hsic_safeguard_ema == 0.0 or self._hsic_reg_ema is None:
             return val
         return self._hsic_reg_ema
+    def _acyclic_safeguard_ref(
+        self, acyclic_reg: torch.Tensor, stage: str
+    ) -> Optional[float]:
+        """Reference value (EMA of the weighted acyclic term) for the MSE cap.
+
+        Mirrors :meth:`_hsic_safeguard_ref` with the roles inverted: the
+        acyclic term is the reference the reconstruction loss is capped
+        against.  Updated on train batches only (detached scalar), so the
+        val/test logging applies the same cap the training steps used.
+        With ``hsic_safeguard_ema == 0`` the reference is the instantaneous
+        per-batch value.  Returns ``None`` when the MSE cap is disabled.
+        """
+        if self.mse_max_acyclic_pct <= 0.0 and self.l0_max_acyclic_pct <= 0.0:
+            return None
+        val = float(acyclic_reg.detach())
+        if stage == "train":
+            if self._acyclic_reg_ema is None:
+                self._acyclic_reg_ema = val
+            else:
+                d = self.hsic_safeguard_ema
+                self._acyclic_reg_ema = d * self._acyclic_reg_ema + (1.0 - d) * val
+            return self._acyclic_reg_ema
+        # val/test: never update.  Instantaneous mode uses the current batch;
+        # EMA mode reuses the running reference from the train batches.
+        if self.hsic_safeguard_ema == 0.0 or self._acyclic_reg_ema is None:
+            return val
+        return self._acyclic_reg_ema
+
+
 
     @staticmethod
     def _cap_reg_coeff(
@@ -2993,6 +3354,46 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log("hsic/constraint_ema", self._hsic_constraint_ema,
                  on_step=False, on_epoch=True)
         self.log("hsic/constraint_violation", violation,
+                 on_step=False, on_epoch=True)
+
+    def _update_acyclicity_dual(self) -> None:
+        """Per-epoch dual ascent / rho escalation for the acyclicity ALM.
+
+        Driven by the EMA of the RAW h(W) accumulated in ``_step``:
+
+        * dual ascent: ``lam <- clip(lam + dual_lr * violation, 0, dual_max)``
+          with ``violation = ema - h_tol`` (negative violation releases the
+          accumulated pressure at the same rate, as in _update_hsic_dual);
+        * NOTEARS-style rho escalation: ``rho <- min(rho*rho_mult, rho_max)``
+          whenever the violation fails to decay to <= 1/4 of its previous
+          value (vendor/notears/linear.py: ``h_new > 0.25 * h``).
+
+        Effectively frozen once the EMA violation drops to ~0 (converged:
+        h(W) <= h_tol).
+        """
+        if self._acy_ema is None:
+            return
+        violation = self._acy_ema - self.acy_h_tol
+        self._acy_dual_lambda = min(
+            self.acy_dual_max,
+            max(0.0, self._acy_dual_lambda + self.acy_dual_lr * violation),
+        )
+        if (
+            violation > 0.0
+            and self._acy_rho > 0.0
+            and self.acy_rho_mult > 1.0
+            and self._acy_prev_violation is not None
+            and violation > 0.25 * self._acy_prev_violation
+        ):
+            self._acy_rho = min(
+                self.acy_rho_max, self._acy_rho * self.acy_rho_mult
+            )
+        self._acy_prev_violation = violation
+        self.log("acyclicity/dual_lambda", self._acy_dual_lambda,
+                 on_step=False, on_epoch=True)
+        self.log("acyclicity/rho", self._acy_rho, on_step=False, on_epoch=True)
+        self.log("acyclicity/ema", self._acy_ema, on_step=False, on_epoch=True)
+        self.log("acyclicity/violation", violation,
                  on_step=False, on_epoch=True)
 
     # ------------------------------------------------------------------
@@ -3153,15 +3554,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """Lazily initialise the free query embeddings on the first batch.
 
         Runs at most once, on the first training batch, when
-        ``query_centroid_init=True`` and/or ``query_parents_prior`` is set.
-        Deferred to the first batch because value-modulated key embeddings
-        need real data to define the key frame.  ORDER: the centroid/default
-        initialisation first, then the parents prior OVERWRITES the listed
-        nodes (and re-snapshots the fixed rows at the prior values).
+        ``query_centroid_init=True``, ``query_parents_prior`` and/or
+        ``query_source_prior`` is set.  Deferred to the first batch because
+        value-modulated key embeddings need real data to define the key
+        frame.  ORDER: the centroid/default initialisation first, then the
+        parents prior OVERWRITES the listed nodes (and re-snapshots the
+        fixed rows at the prior values), then the source prior ZEROES and
+        freezes the source rows.
         """
         if self._query_centroid_init_done:
             return
-        if not self._query_centroid_init and not self._query_parents_prior:
+        if (
+            not self._query_centroid_init
+            and not self._query_parents_prior
+            and not self._query_source_prior
+        ):
             return
         if getattr(self.model, "query_embed_X", None) is None:
             # Nothing to initialise (free_query_embedding disabled); latch off.
@@ -3185,6 +3592,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 n_fixed,
                 {int(c): s for c, s in self._query_parents_prior.items()},
             )
+        if self._query_source_prior:
+            n_frozen_src = self.model.init_source_queries_zero(
+                self._query_source_prior
+            )
+            logger.info(
+                "Applied query source prior to %d node(s) (%d frozen): %s",
+                len(self._query_source_prior),
+                n_frozen_src,
+                {int(n): s for n, s in self._query_source_prior.items()},
+            )
+
         self._query_centroid_init_done = True
         # Centroid-commit: the shadow starts at the same point (assignment =
         # the full key set, the "select-all" hypothesis).
@@ -3399,7 +3817,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             loss_recon = self._last_loss_components["loss_recon"]
             loss_structural = self._last_loss_components["loss_structural"]
 
-            # Diagnostic: probe L0 ↔ HSIC gradient interference on the live
+            # Diagnostic: probe L0 Ã¢â€ â€ HSIC gradient interference on the live
             # graph BEFORE any zero_grad / backward.  Uses autograd.grad with
             # retain_graph=True and never touches .grad, so the dual backward
             # below is unaffected.
@@ -3551,6 +3969,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
             nw.reset_epoch_diagnostics()
         if self.hsic_constraint_enabled:
             self._update_hsic_dual()
+        if self.acyclicity_constraint_enabled:
+            self._update_acyclicity_dual()
         super().on_train_epoch_end()
 
     # ------------------------------------------------------------------
@@ -3559,7 +3979,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
     def _lean_pred(self, S, X, overrides=None):
         """One forward's prediction; with ``overrides`` the reconstruction
         params are substituted (``torch.func.functional_call``) instead of
-        mutated — the module and its version counters stay untouched."""
+        mutated Ã¢â‚¬â€ the module and its version counters stay untouched."""
         if overrides is None:
             return self.forward(data_source=S, data_intermediate=X)[0]
         from torch.func import functional_call
@@ -3743,8 +4163,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
     def _bi_level_step(self, batch) -> None:
         """Structural gradient via the DARTS second-order rule, written
         directly into ``p.grad`` of the structural parameters (the HSIC part
-        from :meth:`_darts_second_order_grads` on ``batch`` — fold B when
-        cross-fitting is active — plus the non-HSIC structural terms
+        from :meth:`_darts_second_order_grads` on ``batch`` Ã¢â‚¬â€ fold B when
+        cross-fitting is active Ã¢â‚¬â€ plus the non-HSIC structural terms
         differentiated from the live main graph).
 
         Called from ``training_step`` in place of :meth:`_structural_backward`
@@ -3757,7 +4177,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         The main graph is consumed by differentiating the remaining
         structural terms (L0 / NOTEARS / struct-recon mix / sparsity / query
         norm); the HSIC branch of the graph is intentionally NOT back-
-        propagated — its gradient is replaced by the unrolled one — and its
+        propagated Ã¢â‚¬â€ its gradient is replaced by the unrolled one Ã¢â‚¬â€ and its
         buffers are released when the next ``_step`` overwrites the stashed
         tensors.
         """
@@ -3904,6 +4324,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "prev_violation": self._hsic_constraint_prev_violation,
                 "tolerance": self.hsic_tol,
             }
+        if self.acyclicity_constraint_enabled:
+            # Dual state must survive checkpoint resume: lambda and rho
+            # accumulate constraint violation over the WHOLE run.
+            checkpoint["acyclicity_constraint"] = {
+                "dual_lambda": self._acy_dual_lambda,
+                "rho": self._acy_rho,
+                "ema": self._acy_ema,
+                "prev_violation": self._acy_prev_violation,
+            }
+        if self.mse_max_acyclic_pct > 0.0 or self.l0_max_acyclic_pct > 0.0:
+            # The acyclic-reference EMA must survive checkpoint resume so the
+            # MSE/L0 caps continue from the same reference.
+            checkpoint["mse_acyclic_cap"] = {"ema": self._acyclic_reg_ema}
+
+
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """
@@ -3929,7 +4364,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         Note: the symmetric case (stage without BKD warm-starting a stage
         with BKD) produces *missing* keys for ``batch_key_dropout.*``
-        entries.  Those are benign — PyTorch initialises missing buffers
+        entries.  Those are benign Ã¢â‚¬â€ PyTorch initialises missing buffers
         from the module constructor, which is exactly what we want (the
         step counter resets to 0 at each new stage).  However PL strict
         loading would still reject them, so we also drop keys present in
@@ -3989,7 +4424,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             if "batch_key_dropout" in k
         }
         # Keys the current model has but the checkpoint doesn't
-        # (only for batch_key_dropout — handled by popping from state_dict
+        # (only for batch_key_dropout Ã¢â‚¬â€ handled by popping from state_dict
         # here so we can fill them from the constructor default below)
         missing_bkd = {
             k for k in (current_keys - ckpt_keys)
@@ -4093,6 +4528,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 # is on, so this mainly keeps resumed runs consistent).
                 self.hsic_tol = float(saved.get("tolerance", self.hsic_tol))
 
+        # Restore the acyclicity-constraint dual state (absent in checkpoints
+        # that predate the feature -> keep the freshly-initialised values).
+        if self.acyclicity_constraint_enabled:
+            saved = checkpoint.get("acyclicity_constraint", None)
+            if saved is not None:
+                self._acy_dual_lambda = float(saved.get("dual_lambda", 0.0))
+                self._acy_rho = float(saved.get("rho", self.acy_rho_init))
+                self._acy_ema = saved.get("ema", None)
+                self._acy_prev_violation = saved.get("prev_violation", None)
+
+        # Restore the MSE-cap acyclic-reference EMA (absent in checkpoints
+        # that predate the feature -> keep the freshly-initialised None).
+        if self.mse_max_acyclic_pct > 0.0 or self.l0_max_acyclic_pct > 0.0:
+            saved = checkpoint.get("mse_acyclic_cap", None)
+            if saved is not None:
+                self._acyclic_reg_ema = saved.get("ema", None)
+
     def on_fit_start(self):
         """
         Phase-level parameter freezing.
@@ -4155,15 +4607,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
         data_intermediate: torch.Tensor,
     ):
         """
-        Run forward and return split S→X and X→X attention matrices.
+        Run forward and return split SÃ¢â€ â€™X and XÃ¢â€ â€™X attention matrices.
 
         Works in BOTH node topologies: ``AttentionSelectorLayer.split_attention``
         is shape-aware, so a square homogeneous ``(B, N, N)`` posterior is first
         row-sliced to the X children before the columns are split.
 
         Returns:
-            att_sx: (B, L_X, L_S)  — S→X learned edges
-            att_xx: (B, L_X, L_X)  — X→X learned edges (diagonal = 0)
+            att_sx: (B, L_X, L_S)  Ã¢â‚¬â€ SÃ¢â€ â€™X learned edges
+            att_xx: (B, L_X, L_X)  Ã¢â‚¬â€ XÃ¢â€ â€™X learned edges (diagonal = 0)
         """
         with torch.no_grad():
             _, attention_weights, _ = self.forward(data_source, data_intermediate)
@@ -4183,7 +4635,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         return self.model.split_attention_blocks(attention)
 
     def source_scores(self, attention: torch.Tensor) -> torch.Tensor:
-        """Per-node incoming-edge mass over the ``N`` nodes (LOW ⇒ likely a source).
+        """Per-node incoming-edge mass over the ``N`` nodes (LOW Ã¢â€¡â€™ likely a source).
 
         In homogeneous mode this is the quantity that tells us whether the model
         RE-DISCOVERED the S/X partition it was not given: true exogenous sources
@@ -4196,7 +4648,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         data_source: torch.Tensor,
         data_intermediate: torch.Tensor,
     ):
-        """Convenience: one forward → (all four blocks, per-node source scores)."""
+        """Convenience: one forward Ã¢â€ â€™ (all four blocks, per-node source scores)."""
         with torch.no_grad():
             _, attention_weights, _ = self.forward(data_source, data_intermediate)
             blocks = self.model.split_attention_blocks(attention_weights)
