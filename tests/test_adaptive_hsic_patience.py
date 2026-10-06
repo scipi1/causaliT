@@ -228,7 +228,7 @@ def test_budget_cap_precedes_floor(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 6. min_epochs floor ALSO suppresses the struct_drop early-exit
+# 6. min_epochs floor ALSO suppresses the struct_recon_drift early-exit
 # ---------------------------------------------------------------------------
 
 def _run_drop(controller, events, n_epochs, x_mae_values, start_epoch=0):
@@ -247,17 +247,18 @@ def _run_drop(controller, events, n_epochs, x_mae_values, start_epoch=0):
     return None
 
 
-def test_min_epochs_floor_suppresses_struct_drop(tmp_path):
+def test_min_epochs_floor_suppresses_struct_recon_drift(tmp_path):
     controller, events = _make_controller(
         tmp_path, hsic_patience=0, drop_pct=0.20, drop_patience=2, min_epochs=8
     )
-    # Epoch 0 sets phase_best=1.0; from epoch 1 val_x_mae jumps to 2.0 (>1.2
-    # threshold), so the drop counter reaches drop_patience(2) at phase_epochs=3.
+    # Epoch 0 sets the entry snapshot to 1.0; from epoch 1 val_x_mae jumps to
+    # 2.0 (> 1.0 + 0.2*|1.0| threshold), so the drift counter reaches
+    # drop_patience(2) at phase_epochs=3.
     # Without the floor the switch fires at epoch 3; the floor holds it to 8.
     x_mae = [1.0] + [2.0] * 19
     event = _run_drop(controller, events, n_epochs=20, x_mae_values=x_mae)
     assert event is not None
-    assert event["reason"] == "struct_drop"
+    assert event["reason"] == "struct_recon_drift"
     assert event["phase_epochs"] == 8
 
 

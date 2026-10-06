@@ -337,10 +337,16 @@ def _mask_stub(**overrides) -> Any:
         hsic_descendant_exclude_self=True,
         hsic_descendant_weight=0.0,
         hsic_descendant_min_kept_frac=0.25,
+        hsic_descendant_degrade_first_order=True,
+        # Duck-typed LightningModule surface needed by PhaseController
+        # (_apply_open_gate_cfg / _apply_dense_gate_cfg iterate submodules).
+        modules=lambda: iter([]),
+        log=lambda *a, **k: None,
         hsic_descendant_mode="threshold",
         hsic_descendant_budget_frac=0.25,
         hsic_descendant_per_row=True,
         hsic_descendant_tnorm="min",
+        hsic_descendant_confident_score=None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -360,15 +366,15 @@ def _sparse_score():
 
 
 def test_forecaster_mask_disabled_by_flag():
-    mask, kept, cyc = _call_builder(_mask_stub(hsic_exclude_descendants=False),
-                                    _sparse_score())
+    mask, kept, cyc, _ = _call_builder(_mask_stub(hsic_exclude_descendants=False),
+                                       _sparse_score())
     assert mask is None and kept == 1.0 and cyc is False
 
 
 def test_forecaster_mask_disabled_when_unsupported_attention():
     """No DIRECTED posterior (e.g. non-GatedSelfAttention) => feature off."""
-    mask, kept, _ = _call_builder(_mask_stub(_descendant_mask_supported=False),
-                                  _sparse_score())
+    mask, kept, _, _ = _call_builder(_mask_stub(_descendant_mask_supported=False),
+                                     _sparse_score())
     assert mask is None and kept == 1.0
 
 
@@ -419,16 +425,17 @@ def test_forecaster_mask_skips_missing_or_multihead_score():
 def test_forecaster_mask_collapse_guard_falls_back_to_unmasked():
     """A dense graph would swallow every pair and silently kill the gradient."""
     dense = torch.full((3, 4), 0.9)
-    mask, kept, _ = _call_builder(_mask_stub(hsic_descendant_min_kept_frac=0.9),
-                                  dense)
-    assert mask is None            # fell back
+    mask, kept, _, first = _call_builder(
+        _mask_stub(hsic_descendant_min_kept_frac=0.9), dense)
+    assert mask is None            # fell back (even the first-order mask starved)
+    assert first is True           # ...after degrading to hops=1
     assert kept < 0.9              # ...but the diagnostic is still reported
 
 
 def test_forecaster_mask_shape_error_falls_back_instead_of_raising():
     """A shape inconsistency must never break training over a diagnostic mask."""
     bad = torch.zeros((3, 9))      # inconsistent with S_seq_len=1
-    mask, kept, _ = _call_builder(_mask_stub(), bad)
+    mask, kept, _, _ = _call_builder(_mask_stub(), bad)
     assert mask is None and kept == 1.0
 
 
@@ -450,7 +457,7 @@ def test_forecaster_mask_ema_smooths_the_adjacency():
 def test_forecaster_mask_is_detached_end_to_end():
     score = _sparse_score().requires_grad_(True)
     with torch.enable_grad():
-        mask, _, _ = _call_builder(_mask_stub(), score)
+        mask, _, _, _ = _call_builder(_mask_stub(), score)
     assert mask is not None
     assert mask.requires_grad is False
 
@@ -729,7 +736,7 @@ def test_forecaster_budget_mode_dispatches_and_never_collapses():
     dense = torch.full((3, 4), 0.9)
     stub = _mask_stub(hsic_descendant_mode="budget",
                       hsic_descendant_budget_frac=0.25)
-    mask, kept, _ = _call_builder(stub, dense)
+    mask, kept, _, _ = _call_builder(stub, dense)
     assert mask is not None
     assert kept >= 1.0 - 0.25 - 1e-6
 
@@ -742,3 +749,159 @@ def test_forecaster_budget_mode_respects_warmup():
     assert _call_builder(stub, _sparse_score())[0] is None
     stub.current_epoch = 10
     assert _call_builder(stub, _sparse_score())[0] is not None
+
+
+# ---------------------------------------------------------------------------
+# Confident-descendant override (budget mode)
+# ---------------------------------------------------------------------------
+
+def _chain_score():
+    # Chain 0 -> 1 -> 2 with strong edges: node 0 is a confident source.
+    score = torch.zeros((3, 3))
+    score[1, 0] = 0.9
+    score[2, 1] = 0.9
+    return score
+
+
+def test_confident_override_allows_empty_source_row():
+    """A confidently upstream node loses ALL its terms (correct for a source).
+
+    Budget alone (k = ceil(0.34 * 3) = 2 per row) could never empty row 0;
+    the override extends the exclusion to every column clearing 0.8."""
+    mask, kept_frac, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=_chain_score(), s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.34, per_row=True, exclude_self=True,
+        confident_score=0.8,
+    )
+    assert bool((mask[0] == 0.0).all())           # source row: zero terms
+    # Ancestors are legitimate independence targets and must be kept.
+    assert mask[1, 0].item() == 1.0
+    assert mask[2, 0].item() == 1.0 and mask[2, 1].item() == 1.0
+
+
+def test_confident_override_default_off_keeps_cap():
+    """confident_score=None reproduces the pure budget-cap behaviour."""
+    dense = torch.full((4, 4), 0.9)
+    mask, kept_frac, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=dense, s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.25, confident_score=None,
+    )
+    assert kept_frac >= 1.0 - 0.25 - 1e-6
+
+
+def test_confident_override_bypasses_cap_on_confident_evidence():
+    """On a dense confident posterior the override (not the cap) dominates."""
+    dense = torch.full((4, 4), 0.9)
+    mask, kept_frac, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=dense, s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.25, confident_score=0.8,
+    )
+    assert kept_frac < 1.0 - 0.25   # cap exceeded: nearly everything excluded
+
+
+def test_confident_override_never_excludes_weak_or_zero_scores():
+    """Uncertain pairs survive: the override requires score >= threshold."""
+    score = _chain_score()
+    score[1, 0] = 0.1               # weak edge: descendant score 0.1 < 0.8
+    mask, _, _ = build_hsic_pair_mask_budgeted(
+        score_tensor=score, s_seq_len=0, homogeneous_nodes=True,
+        budget_frac=0.2, per_row=True, exclude_self=True,  # k=1: diag only
+        confident_score=0.8,
+    )
+    # Row 0: (0,1) scores 0.1 (kept), (0,2) scores min(0.1, 0.9)=0.1 (kept).
+    assert mask[0, 1].item() == 1.0 and mask[0, 2].item() == 1.0
+    assert mask[0, 0].item() == 0.0   # self still excluded (budget top rank)
+
+
+def test_confident_override_rejects_bad_value():
+    for bad in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            build_hsic_pair_mask_budgeted(
+                score_tensor=torch.zeros((3, 3)), s_seq_len=0,
+                homogeneous_nodes=True, confident_score=bad,
+            )
+
+
+def test_forecaster_budget_mode_passes_confident_score():
+    """The forecaster plumbs the config key through to the mask builder."""
+    stub = _mask_stub(hsic_descendant_mode="budget",
+                      hsic_descendant_confident_score=0.8,
+                      homogeneous_nodes=True)
+    mask, kept, _, _ = _call_builder(stub, _chain_score())
+    assert mask is not None
+    assert bool((mask[0] == 0.0).all())
+
+
+# ---------------------------------------------------------------------------
+# First-order degrade (threshold mode)
+# ---------------------------------------------------------------------------
+
+def _cyclic_score():
+    # Homogeneous 3-cycle 0 -> 1 -> 2 -> 0 (score[i, j] = P(j -> i)): the full
+    # closure saturates (every node reaches every node), the first-order mask
+    # does not.
+    score = torch.zeros((3, 3))
+    score[1, 0] = 0.9
+    score[2, 1] = 0.9
+    score[0, 2] = 0.9
+    return score
+
+
+def test_threshold_mode_degrades_to_first_order_on_cycle():
+    """A cyclic hardened graph makes the full closure meaningless; instead of
+    falling back to unmasked HSIC the mask is rebuilt with hops=1."""
+    stub = _mask_stub(homogeneous_nodes=True, S_seq_len=0)
+    mask, kept, cyc, first = _call_builder(stub, _cyclic_score())
+    assert cyc is True and first is True
+    assert mask is not None
+    expected, exp_kept, _ = build_hsic_pair_mask(
+        score_tensor=_cyclic_score(), s_seq_len=0, homogeneous_nodes=True,
+        threshold=0.5, hops=1, exclude_self=True, excluded_weight=0.0,
+    )
+    assert torch.equal(mask, expected)
+    assert kept == pytest.approx(exp_kept)
+
+
+def test_threshold_mode_degrades_on_starvation_without_cycle():
+    """Starvation alone (kept_frac < min_kept_frac) also triggers the degrade."""
+    # Chain 0 -> 1 -> 2: the full closure excludes 6/9 pairs (diag + all
+    # descendants), hops=1 excludes 5/9 (diag + direct children).
+    score = torch.zeros((3, 3))
+    score[1, 0] = 0.9
+    score[2, 1] = 0.9
+    stub = _mask_stub(homogeneous_nodes=True, S_seq_len=0,
+                      hsic_descendant_min_kept_frac=0.4)
+    mask, kept, cyc, first = _call_builder(stub, score)
+    assert cyc is False and first is True
+    assert mask is not None
+    assert kept == pytest.approx(4.0 / 9.0)
+    # Ancestors are legitimate independence targets and survive the degrade.
+    assert mask[1, 0].item() == 1.0 and mask[2, 0].item() == 1.0
+
+
+def test_threshold_mode_degrade_disabled_keeps_legacy_fallback():
+    """hsic_descendant_degrade_first_order=False restores the old behaviour:
+    a starving/cyclic closure falls straight back to unmasked HSIC."""
+    stub = _mask_stub(homogeneous_nodes=True, S_seq_len=0,
+                      hsic_descendant_degrade_first_order=False)
+    mask, kept, cyc, first = _call_builder(stub, _cyclic_score())
+    assert mask is None and kept == 0.0 and cyc is True and first is False
+
+
+def test_threshold_mode_hops1_already_first_order_does_not_degrade():
+    """With hops=1 configured there is nothing to degrade to: the mask is
+    used as-is and the flag stays False."""
+    stub = _mask_stub(homogeneous_nodes=True, S_seq_len=0,
+                      hsic_descendant_hops=1)
+    mask, kept, cyc, first = _call_builder(stub, _cyclic_score())
+    assert mask is not None and first is False
+    assert kept == pytest.approx(1.0 / 3.0)
+
+
+def test_threshold_mode_first_order_still_starving_falls_back():
+    """Only when even the first-order mask starves do we drop to unmasked."""
+    stub = _mask_stub(homogeneous_nodes=True, S_seq_len=0,
+                      hsic_descendant_min_kept_frac=0.5)
+    mask, kept, cyc, first = _call_builder(stub, _cyclic_score())
+    assert mask is None and cyc is True and first is True
+    assert kept == pytest.approx(1.0 / 3.0)

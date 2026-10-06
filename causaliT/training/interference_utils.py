@@ -258,5 +258,16 @@ def compute_l0_hsic_interference(
         v_h_all = torch.cat(hsic_all_parts)
         v_z_all = torch.cat(l0_all_parts)
         results["overall"] = _cosine(v_h_all, v_z_all)
+        # Gradient-magnitude readout: ||g_reg|| / ||g_hsic|| over all blocks.
+        # >> 1 means the regularizer (constraint) pressure dominates the
+        # primal HSIC signal in the parameter update.  NaN when either
+        # gradient has (near-)zero norm.
+        n_h = float(v_h_all.norm())
+        n_z = float(v_z_all.norm())
+        results["norm_hsic_overall"] = n_h
+        results["norm_reg_overall"] = n_z
+        results["norm_ratio_overall"] = (
+            n_z / n_h if n_h > 1e-12 else float("nan")
+        )
 
     return results

@@ -1388,6 +1388,11 @@ class AttentionLayer(nn.Module):
         # Additive direction-gate logit bias (GatedSelfAttention only; see
         # that class).  0.0 = legacy coupled direction gate.
         dir_bias: float = 0.0,
+        # Transposed-score gradient routing (GatedSelfAttention only; see
+        # that class).  True (default) = legacy detached transpose; False
+        # keeps the transpose in the graph (antagonist push/pull on the
+        # direction gate).
+        detach_transpose: bool = True,
 
 
         # CommutatorSelfAttention direction-gate parametrisation (see that
@@ -1709,6 +1714,7 @@ class AttentionLayer(nn.Module):
                     zeta=init_zeta,
                     dir_tau=dir_tau,
                     dir_bias=dir_bias,
+                    detach_transpose=detach_transpose,
                     normalize_query=normalize_query,
                     query_fanin_scale=query_fanin_scale,
                     query_norm_learnable=query_norm_learnable,

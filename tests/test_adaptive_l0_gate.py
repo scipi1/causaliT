@@ -74,6 +74,9 @@ class _FakeModule:
     def log(self, *args, **kwargs):
         pass
 
+    def modules(self):
+        return iter([])
+
     def train(self):
         self.training = True
 

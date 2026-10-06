@@ -888,8 +888,13 @@ class NoiseAwareCausalForecaster(pl.LightningModule):
             opt_recon.zero_grad()
             opt_struct.zero_grad()
             
-            # Backward 1: recon loss (retain graph for second backward)
-            self.manual_backward(loss_recon, retain_graph=True)
+            # Backward 1: recon loss (retain graph for second backward).
+            # With dense_adjacency_edge_dropout the applied adjacency is
+            # DETACHED, so in the structure phase (recon params frozen)
+            # loss_recon has NO gradient path at all - it is purely a probe.
+            # Skip the backward (and the grad save) in that case.
+            if loss_recon.requires_grad:
+                self.manual_backward(loss_recon, retain_graph=True)
             
             # Save recon gradients for reconstruction params
             _saved_recon_grads = {}

@@ -256,6 +256,13 @@ experiment:
   #   hidden_dim: 32          # fixed, does NOT scale with node count
   #   num_variables: ${data.S_seq_len}   # or ${data.X_seq_len} for ds_embed_X
   #   dropout: 0.0            # optional dropout after the hidden activation
+  # The per-node LINEAR value embedding ("linear_per_node") also accepts an
+  # optional ``dropout`` kwarg (default 0.0), applied to the embedded value
+  # output.  Both dropout kwargs are expressivity controls of the regressor
+  # and are swept by the pre-flight dropout calibration
+  # (adaptive_training.dropout_selection) together with output_mlp_dropout;
+  # the calibrated value is specific to the regressor/architecture/dataset
+  # and is not expected to transfer across settings.
   # per_node_output — DEFAULT false (shared MLPHead).  Option true: replace the
   #   forecaster with a PerNodeMLPHead (one decoder MLP per variable).  Makes
   #   the structural attention the sole cross-node mixing point.
@@ -570,6 +577,17 @@ training:
   # Wrong parents (descendants/spurious): HSIC > 0 → penalized.
   # Recommended range: 0.01 to 1.0.
   lambda_hsic: 1.0
+  # Structural objective selector:
+  #   "pairwise"       (default) per-pair HSIC(source_j, res_i), aggregated
+  #                    by hsic_aggregation.
+  #   "dhsic_residual" NOTIME objective (Berrevoets et al., AISTATS 2025):
+  #                    d-variable dHSIC measuring MUTUAL independence of all
+  #                    residual columns.  No per-edge signal: pair masks,
+  #                    attention weighting and row diagnostics are disabled.
+  #                    NOTIME-mimic recipe: lambda_recon: 0,
+  #                    hsic_objective: "dhsic_residual", lambda_hsic: 1.0,
+  #                    hsic_adaptive_bandwidth: true (NOTIME median heuristic).
+  hsic_objective: "pairwise"
   hsic_sigma: 1.0
   hsic_adaptive_bandwidth: true
   hsic_kernel_source: "rbf"
@@ -578,6 +596,25 @@ training:
   hsic_bandwidth_multipliers: null
   hsic_mode: "biased"
   nhsic_epsilon: 0.01
+
+  # --- HSIC-derived key scaling (RESIT-style source prior, OPT-IN) ---------
+  # Turns the per-node HSIC contributions (row means of the pair matrix) into
+  # a DETACHED per-key multiplier on the structural keys of the self-attention
+  # block: source-like nodes (high row HSIC: residual still dependent on their
+  # descendants) keep full key magnitude; sink-like nodes (well explained by
+  # the current regressor) are shrunk, so queries align weakly onto them and
+  # the direction gate is tilted toward edges flowing OUT of sources.  The
+  # weights are max-normalised (top node = 1), so only the node ORDERING
+  # matters, not the decaying HSIC scale.  Requires the FIXED orthonormal key
+  # frame (struct_embedding_type=orthogonal_fixed + remove_key_projection=true)
+  # -- with learnable keys the optimizer would regrow ||k_j|| and cancel the
+  # prior.  Weights are updated on train batches only, after warmup_epochs.
+  hsic_key_scale:
+    enabled: false
+    ema: 0.9             # smoothing of the per-node weights (0 = no memory)
+    floor: 0.1           # minimum key scale (keys are never fully silenced)
+    warmup_epochs: 0     # arm the prior only once the dense fit is meaningful
+    exponent: 1.0        # sharpening: w = (row/max)^exponent before the floor
 
   # --- Descendant-excluding HSIC (self-attention block only) --------------
   # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is
@@ -622,6 +659,11 @@ training:
   hsic_descendant_min_kept_frac: 0.25  # collapse guard: if a dense graph would mask more
                                        # than this, fall back to unmasked HSIC for the step
                                        # (otherwise the structural gradient dies silently)
+  hsic_descendant_degrade_first_order: true
+                                       # threshold mode: when the full closure is cyclic
+                                       # or starves the objective, retry with hops=1
+                                       # (direct children) before falling back to
+                                       # unmasked HSIC; logged as {stage}_hsic_desc_first_order
   hsic_descendant_ema: 0.0             # EMA on the adjacency in [0,1) to stop mask thrashing
 
   # --- LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md)
@@ -637,7 +679,8 @@ training:
   loo_gamma_permutations: 50           # permutation stats for the gamma null fit
   loo_gamma_ema: 0.9                   # EMA momentum across refreshes
   # Logged diagnostics: {stage}_loo_gamma_mean, {stage}_loo_gamma_min.
-  # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic.
+  # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic,
+  # {stage}_hsic_desc_first_order.
   # NOTE: with masking ON, {stage}_hsic is a MASKED mean whose normalisation set
   # drifts across epochs, so it is not comparable epoch-to-epoch.  Prefer
   # kept_frac for health monitoring, and keep this in mind for

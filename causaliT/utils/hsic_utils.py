@@ -336,6 +336,136 @@ def hsic(
         return hsic_value
 
 
+def _notime_median_bandwidth(x: torch.Tensor) -> torch.Tensor:
+    """NOTIME bandwidth heuristic: sigma = sqrt(median(nonzero d2) / 2).
+
+    This is the bandwidth convention of the reference NOTIME implementation
+    (``gaussian_grammat`` in hsic_utilis.py): the median of the non-zero
+    pairwise SQUARED distances, halved and square-rooted.  Detached (no
+    gradient flows through the bandwidth), clamped away from zero.
+    """
+    x = x.detach()
+    if x.ndim == 1:
+        x = x.unsqueeze(1)
+    d2 = torch.cdist(x, x) ** 2  # (n, n) pairwise squared distances
+    nonzero = d2[d2 > 0]
+    if nonzero.numel() == 0:
+        return torch.tensor(1.0, device=x.device, dtype=x.dtype)
+    sigma = torch.sqrt(nonzero.median() * 0.5)
+    # Machine-epsilon guard against a degenerate (all-equal) column,
+    # mirroring the reference implementation.
+    return torch.clamp(sigma, min=1e-8)
+
+
+def gaussian_gram(x: torch.Tensor, sigma=None) -> torch.Tensor:
+    """Gaussian (RBF) Gram matrix, NOTIME convention.
+
+    K(i, j) = exp(-||x_i - x_j||^2 / (2 * sigma^2)).
+
+    Args:
+        x: Samples, shape (n,) or (n, p).
+        sigma: Bandwidth; ``None`` selects the NOTIME median heuristic
+            (:func:`_notime_median_bandwidth`, detached).
+
+    Returns:
+        Kernel matrix of shape (n, n), differentiable through ``x``.
+    """
+    if x.ndim == 1:
+        x = x.unsqueeze(1)
+    d2 = torch.cdist(x, x) ** 2
+    if sigma is None:
+        sigma = _notime_median_bandwidth(x)
+    return torch.exp(-0.5 * d2 / (float(sigma) ** 2 if not torch.is_tensor(sigma) else sigma ** 2))
+
+
+def dhsic_from_kernels(K_list) -> torch.Tensor:
+    """d-variable dHSIC estimator from pre-computed Gram matrices.
+
+    Port of NOTIME's ``dHSIC_calc`` (hsic_utilis.py), the estimator of
+    Pfister et al. (2018, Definition 2.6) for the JOINT mutual independence
+    of d >= 2 variables:
+
+        dHSIC = (1/n^2) * sum(prod_j K_j)
+              + prod_j (sum(K_j) / n^2)
+              - (2/n) * sum( prod_j (rowsum(K_j) / n) )
+
+    For d = 2 this equals tr(KH LH) / n^2 exactly (the HSIC estimator of
+    Gretton et al., eq. (9), with 1/n^2 instead of the 1/(n-1)^2 used by the
+    biased estimator elsewhere in this module).
+
+    Args:
+        K_list: List of d Gram matrices, each (n, n).
+
+    Returns:
+        Scalar dHSIC value (differentiable through the Gram matrices).
+    """
+    if not isinstance(K_list, (list, tuple)):
+        K_list = list(K_list)
+    if len(K_list) < 2:
+        raise ValueError("dHSIC requires at least two variables.")
+    n = K_list[0].shape[0]
+    term1 = 1.0
+    term2 = 1.0
+    term3 = 2.0 / n
+    for K_j in K_list:
+        term1 = term1 * K_j
+        term2 = term2 * K_j.sum() / (n * n)
+        term3 = term3 * K_j.sum(dim=0) / n
+    return term1.sum() / (n * n) + term2 - term3.sum()
+
+
+def dhsic_residual_independence(
+    residuals: torch.Tensor,
+    sigma=None,
+) -> torch.Tensor:
+    """NOTIME structural loss: mutual independence of the residual columns.
+
+    Given per-node residuals R = X - f(X) of shape (n, d), computes the
+    d-variable dHSIC over the d residual columns.  Under a correctly
+    specified additive-noise DAG the residuals are the exogenous noises,
+    hence mutually independent and dHSIC -> 0; a wrong structure leaves
+    cross-node dependence and dHSIC > 0.  This is the data-fitting
+    objective of NOTIME (Berrevoets et al., AISTATS 2025).
+
+    Args:
+        residuals: Tensor of shape (n, d) - n samples, d residual columns.
+        sigma: Bandwidth selection.  ``None`` (default) applies the NOTIME
+            median heuristic per column (detached).  A positive float uses
+            one fixed bandwidth for all columns; a tensor/list of length d
+            gives per-column bandwidths (e.g. phase-frozen values).
+
+    Returns:
+        Scalar dHSIC value, differentiable through ``residuals``.
+    """
+    if residuals.ndim != 2:
+        raise ValueError(
+            f"residuals must be 2-D (n, d), got shape {tuple(residuals.shape)}"
+        )
+    n, d = residuals.shape
+    if n < 2:
+        raise ValueError(f"dHSIC needs at least 2 samples, got n={n}.")
+    if d < 2:
+        raise ValueError(f"dHSIC needs at least 2 residual columns, got d={d}.")
+    if sigma is None:
+        sigmas = [None] * d
+    elif torch.is_tensor(sigma) and sigma.ndim > 0:
+        if sigma.numel() != d:
+            raise ValueError(
+                f"per-column sigma must have {d} entries, got {sigma.numel()}."
+            )
+        sigmas = [sigma[j] for j in range(d)]
+    elif isinstance(sigma, (list, tuple)):
+        if len(sigma) != d:
+            raise ValueError(
+                f"per-column sigma must have {d} entries, got {len(sigma)}."
+            )
+        sigmas = list(sigma)
+    else:
+        sigmas = [float(sigma)] * d
+    K_list = [gaussian_gram(residuals[:, j], sigmas[j]) for j in range(d)]
+    return dhsic_from_kernels(K_list)
+
+
 def _compute_cross_hsic_pair(
     s_i: torch.Tensor,
     res_j: torch.Tensor,
@@ -842,6 +972,99 @@ def hsic_attention_weighted(
             )
         weights = m * weights + (1.0 - m) * torch.ones_like(weights)
 
+    w = torch.where(valid, weights, torch.zeros_like(weights))
+    h = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
+    out = (w * h).sum(dim=1).mean()
+
+    if return_matrix:
+        return out, hsic_mat
+    return out
+
+
+def hsic_direction_weighted(
+    source_values: torch.Tensor,
+    residuals: torch.Tensor,
+    direction: torch.Tensor,
+    sigma: float = 1.0,
+    adaptive_bandwidth: bool = False,
+    mode: str = "biased",
+    nhsic_epsilon: float = 0.01,
+    source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
+    return_matrix: bool = False,
+) -> torch.Tensor:
+    """
+    Direction-weighted HSIC for causal structure regularization (self-attention).
+
+    Computes: mean_i( sum_j d[i,j] * HSIC(source_j, residual_i) )
+
+    where ``d[i, j]`` is the ANTISYMMETRIC direction gate of
+    ``GatedSelfAttention`` (``d[i,j] ~ 1`` = "j is a parent of i").
+
+    Rationale: unlike the attention-weighted variant (``f(A_ij) = A_ij``), the
+    direction gate cannot collapse globally -- the coupled Binary-Concrete
+    parametrisation enforces ``d[i,j] + d[j,i] == 1`` per unordered pair (with
+    ``dir_bias == 0``), so each pair ALWAYS pays one of its two HSIC terms in
+    full:
+
+        d[i,j] * HSIC(X_j, res_i)  +  d[j,i] * HSIC(X_i, res_j)
+
+    The optimiser can only choose WHICH node pays the pair's dependence
+    (orientation, RESIT-style: the edge flips toward whichever child's residual
+    is independent), never WHETHER it is paid.  The trivial all-zero-weight
+    solution -- and with it the need for renormalisation / extra reconstruction
+    terms -- is removed by construction.  The weight is the RAW direction gate,
+    NOT ``z_edge * d``: folding the existence gate in would let a closed gate
+    zero the pressure again.
+
+    SELF-ATTENTION ONLY: the pair matrix is square and the diagonal is always
+    excluded (``HSIC(X_i, r_i)`` is irreducible and would drown the signal).
+
+    Args:
+        source_values: X values (batch, N).
+        residuals: Per-target residuals (batch, N).
+        direction: Direction-gate matrix (N, N), ``[i, j] = d(j -> i)``.
+            Gradient-carrying (the whole point: the HSIC term must push the
+            orientation logits).
+        sigma: RBF kernel bandwidth (ignored when adaptive_bandwidth=True).
+        adaptive_bandwidth: If True, use median heuristic per variable pair.
+        mode: "biased" or "normalized".
+        nhsic_epsilon: regularization for nHSIC.
+        source_kernel: kept for signature symmetry; self-attention X is always
+            continuous, so "rbf" is always used.
+        bandwidth_multipliers: optional multi-bandwidth scales.
+        return_matrix: If True, also return the (N, N) pair HSIC matrix
+            (NaN = excluded pair).
+
+    Returns:
+        Scalar direction-weighted HSIC, or ``(scalar, hsic_mat)`` when
+        ``return_matrix``.
+    """
+    if direction.dim() != 2 or direction.shape[0] != direction.shape[1]:
+        raise ValueError(
+            f"direction must be a square (N, N) matrix, got {tuple(direction.shape)}"
+        )
+    hsic_mat = hsic_pair_matrix(
+        source_values=source_values,
+        residuals=residuals,
+        sigma=sigma,
+        adaptive_bandwidth=adaptive_bandwidth,
+        mode=mode,
+        nhsic_epsilon=nhsic_epsilon,
+        source_kernel="rbf",
+        bandwidth_multipliers=bandwidth_multipliers,
+        exclude_diagonal=True,
+    )
+    weights = direction.to(device=source_values.device, dtype=source_values.dtype)
+    if weights.shape != hsic_mat.shape:
+        raise ValueError(
+            f"direction shape {tuple(weights.shape)} does not match "
+            f"HSIC matrix shape {tuple(hsic_mat.shape)}"
+        )
+
+    # UNNORMALISED row-mean sum, same convention as hsic_attention_weighted:
+    # no / sum(d) division (a weighted mean would again have a one-hot minimum).
+    valid = ~torch.isnan(hsic_mat)
     w = torch.where(valid, weights, torch.zeros_like(weights))
     h = torch.where(valid, hsic_mat, torch.zeros_like(hsic_mat))
     out = (w * h).sum(dim=1).mean()

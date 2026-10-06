@@ -119,6 +119,9 @@ class linear_per_node_emb(nn.Module):
         bias: If True, learn a per-node bias vector.  Default False (values
             are assumed centred; a bias would only add a constant to the
             attention output).
+        dropout: Dropout rate applied to the embedded value output (train
+            mode only).  Default 0.0 (disabled; nn.Identity, no behaviour
+            change).
     """
 
     def __init__(
@@ -130,6 +133,7 @@ class linear_per_node_emb(nn.Module):
         var_id_offset=1,
         learnable=True,
         bias=False,
+        dropout=0.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -151,6 +155,10 @@ class linear_per_node_emb(nn.Module):
         else:
             self.bias = None
 
+        # Dropout on the embedded value output (stateless; Identity keeps
+        # dropout=0.0 a no-op).
+        self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
     def forward(self, values: torch.Tensor, var_ids: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -167,7 +175,7 @@ class linear_per_node_emb(nn.Module):
         out = (values.unsqueeze(-1).unsqueeze(-1) * w).sum(dim=2)  # (B, L, embedding_dim)
         if self.bias is not None:
             out = out + self.bias[idx]
-        return out
+        return self.dropout(out)
 
 
 class mlp_per_node_emb(nn.Module):

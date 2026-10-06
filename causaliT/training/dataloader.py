@@ -48,8 +48,11 @@ class ProcessDataModule(pl.LightningDataModule):
         # Cross-fit stage splits owned by the datamodule (see set_stage_splits).
         self._stage_splits = None
         # HSIC cross-fitting folds (see set_hsic_cross_fit); None = disabled.
+        # ``_xfit_cfg`` stores the (ratio, seed) so the folds are recomputed
+        # whenever ``split_ds`` rebuilds ``train_ds`` (adaptive phase switch).
         self._xfit_ds_a = None
         self._xfit_ds_b = None
+        self._xfit_cfg = None
         self._stage_val_idx = None
         self._stage_test_idx = None
         self.max_data_size = max_data_size
@@ -252,6 +255,11 @@ class ProcessDataModule(pl.LightningDataModule):
         # Create datasets from indices
         else:
             self.idx_split()
+
+        # If HSIC cross-fitting is active, the fold subsets must track the
+        # CURRENT train_ds; otherwise an adaptive phase switch would leave
+        # train_dataloader()/fold-B attached to the previous phase's data.
+        self._recompute_hsic_cross_fit()
     
     
     def update_idx(
@@ -316,30 +324,35 @@ class ProcessDataModule(pl.LightningDataModule):
     
     
     def set_hsic_cross_fit(self, ratio: float = 0.5, seed: int = 0) -> tuple:
+        """Enable HSIC cross-fitting on the CURRENT training set.
+
+        Stores ``(ratio, seed)`` so the fold partition is recomputed whenever
+        ``split_ds`` rebuilds ``train_ds`` (e.g. adaptive phase switches).
+        Returns ``(n_a, n_b)`` for the current split.
         """
-        Partition the CURRENT training set into two disjoint, permanent folds.
+        if not 0.0 < float(ratio) < 1.0:
+            raise ValueError(f"ratio must be in (0, 1), got {ratio}.")
+        self._xfit_cfg = (float(ratio), int(seed))
+        return self._recompute_hsic_cross_fit()
+
+    def _recompute_hsic_cross_fit(self):
+        """Partition the CURRENT training set into two disjoint folds.
 
         Fold A carries the reconstruction (MSE) loss, fold B the independence
         (HSIC) statistic, so the structural signal is measured on samples the
-        regressor did not fit -- HSIC on the rows the fit just absorbed is
-        optimistically biased.
+        regressor did not fit.  The partition is by SAMPLE IDENTITY (a fixed
+        seeded permutation of the current training subset), NOT by position
+        within a batch: the train loader shuffles every epoch.
 
-        The partition is by SAMPLE IDENTITY (a fixed permutation of the training
-        subset), NOT by position within a batch: the train loader shuffles every
-        epoch, so a positional split would reassign samples each epoch and the
-        separation would dissolve.  Membership here is decided once and survives
-        shuffling.
-
-        Call AFTER the train/val/test indices are final (i.e. after
-        ``update_idx`` / ``setup``).  Returns ``(n_a, n_b)``.
+        No-op when cross-fitting is disabled.  Returns ``(n_a, n_b)`` or None.
         """
+        if getattr(self, "_xfit_cfg", None) is None:
+            return None
         if self.train_ds is None:
             raise RuntimeError(
                 "set_hsic_cross_fit() requires train_ds; call setup() first."
             )
-        if not 0.0 < float(ratio) < 1.0:
-            raise ValueError(f"ratio must be in (0, 1), got {ratio}.")
-
+        ratio, seed = self._xfit_cfg
         n = len(self.train_ds)
         g = torch.Generator().manual_seed(int(seed))
         perm = torch.randperm(n, generator=g)
@@ -372,6 +385,24 @@ class ProcessDataModule(pl.LightningDataModule):
                 shuffle=True,
             )
         return _mk(self._xfit_ds_a), _mk(self._xfit_ds_b)
+
+    def hsic_cross_fit_eval_dataloader(self, fold: str = "b"):
+        """Deterministic (no-shuffle) loader over one HSIC cross-fit fold.
+
+        Used by the adaptive phase controller to measure reconstruction
+        baselines on the exact fold the structure phase optimizes on.
+        Returns None when cross-fitting is disabled.
+        """
+        ds = self._xfit_ds_b if fold == "b" else self._xfit_ds_a
+        if ds is None:
+            return None
+        return DataLoader(
+            ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
+            shuffle=False,
+        )
 
     def setup(self, stage) -> None:
 

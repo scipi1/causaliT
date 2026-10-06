@@ -111,6 +111,31 @@ class GatedSelfAttention(nn.Module):
         # this via :meth:`set_dir_bias`).  While nonzero the Toeplitz
         # two-cycle-suppression coupling is relaxed.
         dir_bias: float = 0.0,
+        # Deterministic EXISTENCE-gate offset.  The existence posterior
+        # becomes ``P(z_edge > 0) = sigmoid(S_sym - _l0_offset -
+        # edge_offset)``: raising the offset shifts the gate's opening point
+        # to the right, so a zero-score pair sits at sigmoid(-edge_offset)
+        # (< 0.5) and only actively HSIC-supported edges stay open -- a
+        # use-it-or-lose-it drift toward a sparser hypothesis space.  NOT
+        # learnable (with L0 off no force would move it); the adaptive
+        # trainer drifts it deterministically at structure-phase entries via
+        # :meth:`set_edge_offset` (``adaptive_training.structure`` keys
+        # ``edge_offset_step`` / ``edge_offset_max``).  The applied gate and
+        # the L0 penalty share the shifted logit, so the L0 objective tracks
+        # the offset automatically.  Forward-identical to legacy at the
+        # default 0.0; deliberately NOT part of the state_dict (old
+        # checkpoints stay loadable); persisted via the forecaster's
+        # on_save/on_load_checkpoint hooks.
+        init_edge_offset: float = 0.0,
+        # Transposed-score gradient routing in the Toeplitz split.  True
+        # (default, legacy): the transposed copy is DETACHED, so query q_j
+        # receives no gradient through other rows' gates -- the loss cannot
+        # raise p_ij by pushing q_j away from k_i (the 'lower p_ji'
+        # shortcut, toy-study: scripts/_toy_antisym_coupling.py).  False:
+        # the transpose stays in the graph, so a row's evidence can also
+        # PUSH the antagonist query (balanced push/pull on direction);
+        # forward values are identical either way.
+        detach_transpose: bool = True,
 
         # Centroid-collapse fix (structure score only): L2-normalise the query
         # so its DIRECTION, not its norm, drives selection, and use a fixed
@@ -191,6 +216,10 @@ class GatedSelfAttention(nn.Module):
         # Direction-gate logit bias (see __init__); runtime-adjustable via
         # set_dir_bias (adaptive-trainer phase controller).
         self.dir_bias = float(dir_bias)
+        # Deterministic existence-gate offset (plain attribute on purpose:
+        # NOT a state_dict buffer, so pre-offset checkpoints load strict).
+        self.edge_offset = float(init_edge_offset)
+        self.detach_transpose = bool(detach_transpose)
 
         # Centroid-collapse fix (structure score only); see __init__ doc.
         self.normalize_query = bool(normalize_query)
@@ -242,6 +271,16 @@ class GatedSelfAttention(nn.Module):
         # when BKD was applied, else None (see GatedCrossAttention).
         self.last_bkd_keep: Optional[torch.Tensor] = None
 
+        # HSIC-derived per-key scale (RESIT-style source/sink prior):
+        # DETACHED ``(N,)`` multiplier on the structural keys, set by the
+        # forecaster (``set_hsic_key_scale``) from the nodal HSIC
+        # contributions; None = disabled (legacy behaviour).  Source-like
+        # nodes (high row HSIC) keep full key magnitude; sink-like nodes are
+        # shrunk, weakening query alignment onto them.  Only meaningful with
+        # a FIXED key frame (orthogonal_fixed + remove_key_projection): a
+        # learnable key path could regrow ||k_j|| and cancel the prior.
+        self._hsic_key_scale: Optional[torch.Tensor] = None
+
         # BKD schedule shape: "linear" (legacy default) or "cosine" — a
         # periodic warmup curriculum oscillating in [p_base - amp, p_base + amp]
         # with a linearly decaying envelope, landing exactly on p1 at t = T.
@@ -266,8 +305,14 @@ class GatedSelfAttention(nn.Module):
         # replaced by a fully dense {0,1} adjacency where each edge ij is
         # KEPT with probability equal to the (detached) directed gate
         # posterior p_ij (dropped w.p. 1 - p_ij).  Eval mode is unaffected
-        # (learned gates).
+        # (learned gates) unless ``_dense_gate_eval`` is set (structure-phase
+        # drift probe: the val reconstruction metric is then measured under
+        # the binary-sampled adjacency too, using a seeded generator so the
+        # training RNG stream is not consumed).
         self._dense_gate_active: bool = False
+        self._dense_gate_eval: bool = False
+        self._dense_eval_seed: int = 0
+        self.register_buffer("_dense_eval_step", torch.zeros((), dtype=torch.long), persistent=False)
 
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
@@ -291,6 +336,13 @@ class GatedSelfAttention(nn.Module):
         self.last_p_edge_on: Optional[torch.Tensor] = None
         self.last_p_edge_undirected: Optional[torch.Tensor] = None
         self.last_direction: Optional[torch.Tensor] = None
+        # DETERMINISTIC direction gate sigmoid(A_anti / dir_beta + dir_bias),
+        # batch-mean, GRADIENT-CARRYING (N, N); set in the learned branch of
+        # forward.  Read by the direction-weighted HSIC aggregation
+        # (hsic_aggregation="direction"), where it is the pair weight -- the
+        # deterministic copy keeps gate noise out of the structural loss.
+        # None in oracle / constant-protocol / open-gate branches.
+        self.last_direction_deterministic: Optional[torch.Tensor] = None
         # TRUE applied weight of the last forward (B, N, N), DETACHED: the
         # directed gate after diagonal zeroing, hard mask, gain, BKD, top-k
         # blanking and dropout — exactly the matrix that multiplied the
@@ -416,25 +468,49 @@ class GatedSelfAttention(nn.Module):
         if not active:
             self.last_open_gate_c = None
 
-    def set_dense_gate_mode(self, active: bool) -> None:
+    def set_dense_gate_mode(self, active: bool, eval_mode: Optional[bool] = None) -> None:
         """Toggle the dense-adjacency edge-dropout override (adaptive-trainer
-        reconstruct phases).
+        reconstruct/structure phases).
 
         When active, training forward passes replace the applied weight A
         with a fully dense {0,1} adjacency: every (allowed, off-diagonal)
         edge ij is kept with probability equal to the DETACHED directed gate
         posterior ``p_ij`` (i.e. dropped with probability ``1 - p_ij``).  The
         posterior carries no gradient, so no structural signal leaks through
-        the reconstruction loss.  Eval forward passes are unaffected (the
-        learned gate is used).  Deactivating restores the learned-gate
+        the reconstruction loss.  Deactivating restores the learned-gate
         behaviour exactly.
+
+        ``eval_mode`` (None = leave unchanged) extends the override to eval
+        forward passes, sampled with a dedicated seeded generator.  Used by
+        the structure-phase drift probe so the validation reconstruction
+        metric is measured under the same binary-gate regime.  The eval
+        probe is INDEPENDENT of ``active``: it may run while training
+        passes use the relaxed gate.
         """
         self._dense_gate_active = bool(active)
+        if eval_mode is not None:
+            self._dense_gate_eval = bool(eval_mode)
 
     def set_dir_bias(self, value: float) -> None:
         """Set the direction-gate logit bias (adaptive-trainer phase
         controller).  0.0 restores the legacy coupled gate."""
         self.dir_bias = float(value)
+
+    def set_edge_offset(self, value: float) -> None:
+        """Set the deterministic existence-gate offset (adaptive-trainer
+        phase controller).  0.0 restores the legacy offset-free gate."""
+        self.edge_offset = float(value)
+
+    def set_hsic_key_scale(self, w: Optional[torch.Tensor]) -> None:
+        """Set the DETACHED per-key HSIC scale ``w`` of shape ``(N,)``.
+
+        Applied to the structural keys inside ``_structural_raw`` (so the
+        symmetric existence gate, the antisymmetric direction gate and the
+        ``structure_posterior`` probe all see the weighted frame).  Pass
+        ``None`` to disable.  The tensor is stored detached and never
+        carries gradient.
+        """
+        self._hsic_key_scale = None if w is None else w.detach()
 
     # ------------------------------------------------------------------
     # Noise helpers (upper-triangle draws mirrored to enforce pair-consistency)
@@ -489,6 +565,18 @@ class GatedSelfAttention(nn.Module):
         the subsequent re-normalisation.  ``transitive_W`` is detached, so the
         correction biases the geometry without giving the loss a shortcut.
         """
+        if self._hsic_key_scale is not None:
+            w = self._hsic_key_scale
+            if w.dim() != 1 or w.shape[0] != key.shape[1]:
+                raise ValueError(
+                    f"hsic_key_scale shape {tuple(w.shape)} does not match "
+                    f"the key count {key.shape[1]}."
+                )
+            # Detached per-key source/sink prior: scales column j of the raw
+            # score by w_j (pair symmetry of S_sym is preserved; the
+            # antisymmetric direction part is tilted toward edges flowing OUT
+            # of high-weight, source-like keys).
+            key = key * w.view(1, -1, 1).to(device=key.device, dtype=key.dtype)
         E_s = query.shape[-1]
         q_s = query
         if transitive_W is not None:
@@ -531,7 +619,9 @@ class GatedSelfAttention(nn.Module):
         raw = self._structural_raw(query, key)
         S_sym = 0.5 * (raw + raw.transpose(-1, -2))
         A_anti = 0.5 * (raw - raw.transpose(-1, -2))
-        pi = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(
+        pi = torch.sigmoid(
+            S_sym - self._l0_offset - self.edge_offset
+        ) * torch.sigmoid(
             A_anti / self.dir_beta + self.dir_bias
         )
         n = pi.shape[-1]
@@ -593,6 +683,10 @@ class GatedSelfAttention(nn.Module):
 
         N = L
 
+        # Default: only the learned branch below produces a deterministic
+        # direction gate (see last_direction_deterministic doc).
+        self.last_direction_deterministic = None
+
         # ---- Structural score, Toeplitz-decomposed ----------------------
         # Centroid-collapse fix (unit-normalised query + sqrt(fanin) scale) and
         # the optional transitive correction both live in ``_structural_raw``,
@@ -600,13 +694,17 @@ class GatedSelfAttention(nn.Module):
         raw = self._structural_raw(
             query, key, transitive_W=transitive_W, transitive_delta=transitive_delta
         )
-        # Row-wise gradient routing: the transposed copy is DETACHED so that
-        # query q_j receives no gradient through other rows' gates.  Without
-        # this, A_anti[i, j] = (raw_ij - raw_ji)/2 lets the loss raise p_ij by
-        # pushing q_j AWAY from k_i (the 'lower p_ji' shortcut), which produces
-        # HSIC gradients against the true-parent centroid (toy-study evidence:
-        # scripts/_toy_antisym_coupling.py).  Forward values are unchanged.
-        rawT = raw.transpose(-1, -2).detach()
+        # Row-wise gradient routing: when ``detach_transpose`` is set the
+        # transposed copy is DETACHED so that query q_j receives no gradient
+        # through other rows' gates.  Without the detach, A_anti[i, j] =
+        # (raw_ij - raw_ji)/2 additionally lets a row's loss PUSH the
+        # antagonist query q_j away from k_i (balanced push/pull on
+        # direction) -- at the cost of re-enabling the 'lower p_ji'
+        # shortcut (toy-study: scripts/_toy_antisym_coupling.py).  Forward
+        # values are unchanged either way.
+        rawT = raw.transpose(-1, -2)
+        if self.detach_transpose:
+            rawT = rawT.detach()
         S_sym = 0.5 * (raw + rawT)                              # symmetric
         A_anti = 0.5 * (raw - rawT)                             # antisymmetric
 
@@ -651,7 +749,9 @@ class GatedSelfAttention(nn.Module):
                 # state.  The gates are frozen for the whole warmup, so this
                 # is exactly the value they will hold at the switch.
                 with torch.no_grad():
-                    pi0 = torch.sigmoid(S_sym - self._l0_offset) * torch.sigmoid(
+                    pi0 = torch.sigmoid(
+                        S_sym - self._l0_offset - self.edge_offset
+                    ) * torch.sigmoid(
                         A_anti / self.dir_beta + self.dir_bias
                     )
                     off = ~torch.eye(N, device=pi0.device, dtype=torch.bool)
@@ -670,13 +770,21 @@ class GatedSelfAttention(nn.Module):
             p_directed = torch.full_like(S_sym, c) * direction
         else:
             # ---- Existence gate: SYMMETRIC Hard-Concrete -----------------
+            # The deterministic edge_offset shifts the location logit: the
+            # opening probability becomes
+            # sigmoid(S_sym - edge_offset - _l0_offset), so a drifting
+            # positive offset re-baselines the gate toward sparser
+            # hypotheses (the L0 penalty below, built from the same shifted
+            # logit, tracks it automatically).
             if self.training:
                 eps_e = self._symmetric_noise(
                     (B, N, N), device=S_sym.device, dtype=S_sym.dtype
                 )
-                s_e = torch.sigmoid((eps_e + S_sym) / self.beta)
+                s_e = torch.sigmoid(
+                    (eps_e + S_sym - self.edge_offset) / self.beta
+                )
             else:
-                s_e = torch.sigmoid(S_sym / self.beta)
+                s_e = torch.sigmoid((S_sym - self.edge_offset) / self.beta)
             s_bar = s_e * (self.zeta - self.gamma) + self.gamma
             z_edge = s_bar.clamp(0.0, 1.0)                         # (B, N, N), symmetric
 
@@ -693,8 +801,19 @@ class GatedSelfAttention(nn.Module):
 
             structure = z_edge * direction                        # directed structure gate
 
+            # Deterministic direction copy for the direction-weighted HSIC
+            # aggregation (no gate noise; batch-mean; keeps the gradient so
+            # the HSIC term pushes the orientation logits).
+            self.last_direction_deterministic = torch.sigmoid(
+                A_anti / self.dir_beta + self.dir_bias
+            ).mean(dim=0)
+
             # Posterior that the (undirected) edge exists: P(z_edge > 0).
-            p_edge_undirected = torch.sigmoid(S_sym - self._l0_offset)
+            # Carries the deterministic offset, so the L0 penalty (strict
+            # upper triangle of this tensor) tracks the offset drift.
+            p_edge_undirected = torch.sigmoid(
+                S_sym - self._l0_offset - self.edge_offset
+            )
             p_directed = p_edge_undirected * direction
 
         # ---- Final attention weight: the directed structure gate ---------
@@ -721,14 +840,31 @@ class GatedSelfAttention(nn.Module):
         # Fully dense candidate adjacency: each edge ij is KEPT with
         # probability equal to the DETACHED directed gate posterior p_ij
         # (dropped w.p. 1 - p_ij), so the applied weight is a {0,1} sample
-        # with E[A_ij] = p_ij.  Training steps only; eval uses the learned
-        # gate.  ``p_directed`` is already diagonal-zeroed and hard-masked
+        # with E[A_ij] = p_ij.  Training steps always; eval only when
+        # ``_dense_gate_eval`` is set (structure-phase drift probe), using a
+        # seeded generator so the training RNG stream is untouched.
+        # ``p_directed`` is already diagonal-zeroed and hard-masked
         # here, so the dense sample inherits both constraints.  The returned
         # posterior, the L0 penalty and all diagnostics remain gate-based,
         # so DAG extraction is unaffected by the override.
-        if self._dense_gate_active and self.training:
+        # Train override and eval probe are INDEPENDENT: the structure phase
+        # of the adaptive schedule trains on the relaxed gate (keep the HSIC
+        # explain-away gradient through the residual) while still validating
+        # under the binary sample (drift probe in the recon regime).
+        if ((self._dense_gate_active and self.training)
+                or (self._dense_gate_eval and not self.training)):
             p_keep = p_directed.detach()
-            A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
+            if self.training:
+                A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
+            else:
+                gen = torch.Generator(device=p_keep.device)
+                gen.manual_seed(self._dense_eval_seed + int(self._dense_eval_step.item()))
+                self._dense_eval_step += 1
+                u = torch.rand(
+                    p_keep.shape, generator=gen,
+                    device=p_keep.device, dtype=p_keep.dtype,
+                )
+                A = (u < p_keep).to(A.dtype)
 
         # ---- Prior-softmax reconstruction gain (lambda-ramped) -----------
         # Redistributes each row's DIRECTED gate mass within the directed

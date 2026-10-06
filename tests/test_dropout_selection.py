@@ -17,8 +17,9 @@ Guarantees under test
 1. Sensitivity utility: finite, non-negative, deterministic given the seed,
    and the query weights are restored exactly after the call.
 2. Guard: no free query embeddings -> ValueError.
-3. ``_set_mlp_dropout``: writes exactly the two per-node MLP dropouts and the
-   output head, leaves every other dropout untouched.
+3. ``_set_regressor_dropout`` (alias ``_set_mlp_dropout``): writes exactly the
+   per-node value-embedding dropouts and the output head, leaves every other
+   dropout untouched.
 4. Selection loop (stubbed warmup + sensitivity): argmax picked, winner
    checkpoint + JSON report written, config override applied by the caller.
 5. Selection guards: <2 candidates or free_query_embedding off -> (None, None).

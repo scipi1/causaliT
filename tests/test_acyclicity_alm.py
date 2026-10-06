@@ -209,6 +209,48 @@ class TestBackwardCompatAndGradients:
         assert all(torch.isfinite(g).all() for g in grads if g is not None)
 
 
+class TestPhaseGating:
+    # Dual ascent / rho escalation only run while the structural parameters
+    # are trainable (structure phase of the adaptive schedule).  Against
+    # FROZEN gates (warmup/reconstruct) the violation is constant and rho
+    # would escalate to rho_max before structure learning even starts
+    # (runaway ALM regression).  Non-routed forecasters (no
+    # _structural_params) keep the legacy every-epoch behaviour.
+
+    def _model_with_frozen_structure(self, frozen):
+        m = AttentionSelectorForecaster(_alm_config(dual_lr=2.0))
+        p = torch.nn.Parameter(torch.randn(2))
+        p.requires_grad_(not frozen)
+        m._structural_params = [p]
+        return m
+
+    def test_frozen_structure_skips_dual_update(self):
+        m = self._model_with_frozen_structure(frozen=True)
+        m._acy_ema = 20.0            # large constant violation (warmup regime)
+        m._acy_prev_violation = 20.0
+        lam0, rho0 = m._acy_dual_lambda, m._acy_rho
+        m.on_train_epoch_end()
+        assert m._acy_dual_lambda == pytest.approx(lam0)
+        assert m._acy_rho == pytest.approx(rho0)
+
+    def test_trainable_structure_runs_dual_update(self):
+        m = self._model_with_frozen_structure(frozen=False)
+        m._acy_ema = 20.0
+        m._acy_prev_violation = 20.0
+        m.on_train_epoch_end()
+        assert m._acy_dual_lambda > 0.0          # ascent happened
+        assert m._acy_rho == pytest.approx(10.0)  # 1/4 rule escalation
+
+    def test_no_routing_groups_keeps_legacy_behaviour(self):
+        m = AttentionSelectorForecaster(_alm_config(dual_lr=2.0))
+        if hasattr(m, "_structural_params"):
+            delattr(m, "_structural_params")
+        m._acy_ema = 20.0
+        m._acy_prev_violation = 20.0
+        m.on_train_epoch_end()
+        assert m._acy_dual_lambda > 0.0
+
+
 class TestCheckpointRoundtrip:
     def test_dual_state_survives_save_load(self):
         torch.manual_seed(0)
@@ -232,4 +274,58 @@ class TestCheckpointRoundtrip:
         fresh = AttentionSelectorForecaster(_alm_config(dual_init=0.25))
         fresh.on_load_checkpoint({"state_dict": fresh.state_dict()})
         assert fresh._acy_dual_lambda == pytest.approx(0.25)
+
+
+class TestRoleReversal:
+    """H_CONSTRAINT regime: HSIC (+L0) primal, acyclicity h(W)=0 constraint."""
+
+    def test_hsic_constraint_conflict_raises(self):
+        """Both constraint blocks ON = opposite assignments -> ValueError."""
+        cfg = _make_forecaster_config(kappa=0.0, lambda_hsic=0.0)
+        cfg["training"]["acyclicity_constraint"] = {"enabled": True}
+        cfg["training"]["hsic_constraint"] = {"enabled": True}
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AttentionSelectorForecaster(cfg)
+
+    def test_no_primal_objective_warns(self, caplog):
+        """acy-ALM with lambda_hsic == lambda_l0 == 0 -> warning, no raise."""
+        cfg = _make_forecaster_config(kappa=0.0, lambda_hsic=0.0,
+                                      lambda_l0=0.0)
+        cfg["training"]["acyclicity_constraint"] = {"enabled": True}
+        import logging
+        with caplog.at_level(logging.WARNING):
+            model = AttentionSelectorForecaster(cfg)
+        assert model.acyclicity_constraint_enabled is True
+        assert any("NO primal objective" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_phase_switch_resets_ema_keeps_dual(self):
+        """The reset hook clears per-regime memory but the dual variables
+        (lambda, rho) persist across the boundary."""
+        m = AttentionSelectorForecaster(
+            _alm_config(dual_init=2.0, rho_init=5.0)
+        )
+        m._acy_dual_lambda = 3.5
+        m._acy_rho = 50.0
+        m._acy_ema = 0.7
+        m._acy_prev_violation = 0.6
+        m.acyclicity_constraint_on_phase_switch(phase="structure",
+                                                bkd_min_keys=4)
+        assert m._acy_ema is None
+        assert m._acy_prev_violation is None
+        assert m._acy_dual_lambda == pytest.approx(3.5)
+        assert m._acy_rho == pytest.approx(50.0)
+
+    def test_reversed_regime_constructs_and_steps(self):
+        """HSIC primal (lambda_hsic=1) + acy-ALM constraint: loss contains
+        both terms and gradients flow."""
+        torch.manual_seed(11)
+        cfg = _alm_config(dual_init=1.0, rho_init=1.0)  # lambda_hsic=1.0
+        model = AttentionSelectorForecaster(cfg)
+        assert model.hsic_constraint_enabled is False
+        model.train()
+        model._step(_make_batch(seed=5), stage="train")
+        comp = model._last_loss_components["loss_structural"]
+        assert torch.isfinite(comp)
+
 

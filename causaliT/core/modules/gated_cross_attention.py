@@ -258,8 +258,15 @@ class GatedCrossAttention(nn.Module):
         # phases): when active AND in training mode, the applied weight A is
         # replaced by a fully dense {0,1} adjacency where each edge ij is
         # KEPT with probability equal to the (detached) gate posterior p_ij
-        # (dropped w.p. 1 - p_ij).  Eval mode is unaffected (learned gates).
+        # (dropped w.p. 1 - p_ij).  Eval mode is unaffected (learned gates)
+        # unless ``_dense_gate_eval`` is set (structure-phase probe: the val
+        # reconstruction metric is then measured under the binary-sampled
+        # adjacency too, using a seeded generator so the training RNG stream
+        # is not consumed).
         self._dense_gate_active: bool = False
+        self._dense_gate_eval: bool = False
+        self._dense_eval_seed: int = 0
+        self.register_buffer("_dense_eval_step", torch.zeros((), dtype=torch.long), persistent=False)
 
         # Prior-softmax reconstruction gain (inert at lambda=0, the default).
         self.gain_softmax: Optional[GainSoftmax] = None
@@ -317,19 +324,27 @@ class GatedCrossAttention(nn.Module):
         """Enable/disable BKD application for the current training phase."""
         self._bkd_phase_active = bool(active)
 
-    def set_dense_gate_mode(self, active: bool) -> None:
+    def set_dense_gate_mode(self, active: bool, eval_mode: Optional[bool] = None) -> None:
         """Toggle the dense-adjacency edge-dropout override (adaptive-trainer
-        reconstruct phases).
+        reconstruct/structure phases).
 
         When active, training forward passes replace the applied weight A
         with a fully dense {0,1} adjacency: every (allowed) edge ij is kept
         with probability equal to the DETACHED gate posterior ``p_ij`` (i.e.
         dropped with probability ``1 - p_ij``).  The posterior carries no
         gradient, so no structural signal leaks through the reconstruction
-        loss.  Eval forward passes are unaffected (the learned gate is used).
-        Deactivating restores the learned-gate behaviour exactly.
+        loss.  Deactivating restores the learned-gate behaviour exactly.
+
+        ``eval_mode`` (None = leave unchanged) extends the override to eval
+        forward passes, sampled with a dedicated seeded generator.  Used by
+        the structure-phase drift probe so the validation reconstruction
+        metric is measured under the same binary-gate regime.  The eval
+        probe is INDEPENDENT of ``active``: it may run while training
+        passes use the relaxed gate.
         """
         self._dense_gate_active = bool(active)
+        if eval_mode is not None:
+            self._dense_gate_eval = bool(eval_mode)
 
     def set_bkd_sampling(
         self,
@@ -568,13 +583,30 @@ class GatedCrossAttention(nn.Module):
         # Fully dense candidate adjacency: each edge ij is KEPT with
         # probability equal to the DETACHED gate posterior p_ij (dropped
         # w.p. 1 - p_ij), so the applied weight is a {0,1} sample with
-        # E[A_ij] = p_ij.  Training steps only; eval uses the learned gate.
+        # E[A_ij] = p_ij.  Training steps always; eval only when
+        # ``_dense_gate_eval`` is set (structure-phase drift probe), using a
+        # seeded generator so the training RNG stream is untouched.
         # Forbidden edges stay exactly zero.  The returned posterior, the
         # L0 penalty and all diagnostics remain gate-based, so DAG
         # extraction is unaffected by the override.
-        if self._dense_gate_active and self.training:
+        # Train override and eval probe are INDEPENDENT: the structure phase
+        # of the adaptive schedule trains on the relaxed gate (keep the HSIC
+        # explain-away gradient through the residual) while still validating
+        # under the binary sample (drift probe in the recon regime).
+        if ((self._dense_gate_active and self.training)
+                or (self._dense_gate_eval and not self.training)):
             p_keep = p_edge_masked.detach()
-            A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
+            if self.training:
+                A = (torch.rand_like(p_keep) < p_keep).to(A.dtype)
+            else:
+                gen = torch.Generator(device=p_keep.device)
+                gen.manual_seed(self._dense_eval_seed + int(self._dense_eval_step.item()))
+                self._dense_eval_step += 1
+                u = torch.rand(
+                    p_keep.shape, generator=gen,
+                    device=p_keep.device, dtype=p_keep.dtype,
+                )
+                A = (u < p_keep).to(A.dtype)
 
         # ---- Prior-softmax reconstruction gain (lambda-ramped) -----------
         # Redistributes each row's gate mass within the gate's own support:

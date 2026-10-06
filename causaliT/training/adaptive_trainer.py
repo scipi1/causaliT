@@ -26,9 +26,10 @@ This module implements an **adaptive, in-memory** alternative:
 
     * **structure** — train ``_structural_params`` only (reconstruction frozen).
       Keeps learning structure against a *frozen, currently-good* predictor.  As
-      structure drifts, the frozen predictor goes stale and ``val_x_mae`` rises.
-      Stops when ``val_x_mae`` exceeds the per-phase best by a configurable
-      fraction (default 20%) sustained for ``drop_patience`` validation epochs;
+      structure drifts, the frozen predictor goes stale and the reconstruction
+      monitor rises.  Stops when the monitor exceeds its STRUCTURE-PHASE-ENTRY
+      value by a configurable fraction (default 20%) sustained for
+      ``drop_patience`` validation epochs (``struct_recon_drift``);
       OR when the structural signal itself (``val_hsic``) stops improving for
       ``hsic_patience`` validation epochs (an early switch that frees budget for
       an earlier reconstruction update instead of wasting epochs on a stalled
@@ -120,7 +121,7 @@ Example ``config['adaptive_training']`` block::
         max_epochs: 200                # per-phase safety cap
         lambda_hsic_cross: 0.1
         lambda_hsic_self: 0.0
-        drop_pct: 0.20                 # switch when monitor rises 20% over phase best
+        drop_pct: 0.20                 # switch when monitor rises 20% over its phase-entry value
         drop_patience: 5
         hsic_monitor: val_hsic         # structural signal watched for a plateau
         hsic_patience: 0               # switch after N val epochs w/o HSIC improvement
@@ -145,7 +146,7 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -154,6 +155,7 @@ import torch
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from pytorch_lightning.callbacks import Callback
+from torch.utils.data import DataLoader
 
 from causaliT.training.callbacks import KFoldResultsTracker
 
@@ -317,10 +319,7 @@ class PhaseController(Callback):
         self.drop_patience: int = int(self.struct_cfg.get("drop_patience", 5))
         # HSIC-plateau early switch: watch the structural signal (``hsic_monitor``,
         # lower is better) and switch back to reconstruct when it stops improving.
-        # ``hsic_patience == 0`` disables it entirely (no behaviour change).  A
-        # ``min_epochs`` floor suppresses the early exit for the first N epochs of
-        # every structure phase; the ``max_epochs`` safety cap still takes
-        # precedence over the floor.
+        # ``hsic_patience == 0`` disables it entirely (no behaviour change).
         self.struct_hsic_monitor: str = str(
             self.struct_cfg.get("hsic_monitor", "val_hsic")
         )
@@ -328,7 +327,31 @@ class PhaseController(Callback):
         self.struct_hsic_min_delta: float = float(
             self.struct_cfg.get("hsic_min_delta", 1e-4)
         )
+        # Shared floor (legacy) and per-trigger overrides.  ``drift_min_epochs``
+        # gates the reconstruction-drift exit, ``hsic_min_epochs`` gates the
+        # HSIC-plateau exit; both fall back to ``min_epochs``.  The
+        # ``max_epochs`` safety cap always takes precedence over the floors.
         self.struct_min_epochs: int = int(self.struct_cfg.get("min_epochs", 0))
+        self.struct_drift_min_epochs: int = int(
+            self.struct_cfg.get("drift_min_epochs", self.struct_min_epochs)
+        )
+        self.struct_hsic_min_epochs: int = int(
+            self.struct_cfg.get("hsic_min_epochs", self.struct_min_epochs)
+        )
+
+        # Null-distribution estimation of the structural objective at
+        # structure-phase entry (Monte Carlo permutation null, H0: "residuals
+        # independent of the sources").  Diagnostic only: the estimated
+        # mean/std are logged to CSV; training is unaffected.
+        null_cfg: Dict[str, Any] = (
+            _to_plain_container(self.struct_cfg.get("null_estimation", {})) or {}
+        )
+        self.null_est_enabled: bool = bool(null_cfg.get("run_bool", False))
+        self.null_est_num_samples: int = int(null_cfg.get("num_samples", 100))
+        self.null_est_distribution: str = str(
+            null_cfg.get("distribution", "gaussian")
+        )
+        self.null_est_seed: int = int(null_cfg.get("seed", 20240817))
 
         # HSIC-progress gates ("regularizers trim after HSIC ranks"): an armed
         # regularizer is applied only while the structural signal
@@ -415,6 +438,9 @@ class PhaseController(Callback):
         self.current_phase: str = self.start_phase
         self._phase_start_epoch: int = 0
         self._phase_best: float = float("inf")
+        # Structure-phase drift probe: monitor value at structure-phase entry
+        # (the recon quality the regressor had when structure learning began).
+        self._phase_entry_monitor: Optional[float] = None
         self._plateau_counter: int = 0   # consecutive no-improve epochs (recon)
         self._drop_counter: int = 0      # consecutive over-threshold epochs (struct)
         self._hsic_best: float = float("inf")   # best (lowest) HSIC this struct phase
@@ -510,6 +536,20 @@ class PhaseController(Callback):
             "dir_bias" in cfg
             for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg)
         )
+
+        # Deterministic existence-gate offset drift (GatedSelfAttention).
+        # Managed only when the STRUCTURE block sets ``edge_offset_step``:
+        # at every structure-phase entry the offset grows by that step
+        # (capped at ``edge_offset_max``), starting from the module's init
+        # value.  Reconstruct phases leave it untouched: the predictor
+        # re-fits under the current budget.
+        self._edge_offset_managed: bool = "edge_offset_step" in self.struct_cfg
+        if self._edge_offset_managed and "edge_offset_max" not in self.struct_cfg:
+            raise ValueError(
+                "adaptive_training.structure.edge_offset_max is required when "
+                "edge_offset_step is set (the drift must be capped so closed "
+                "gates stay within gradient reach)."
+            )
 
 
 
@@ -663,31 +703,45 @@ class PhaseController(Callback):
                 "open_gate_active", float(active), on_step=False, on_epoch=True
             )
 
-    def _apply_dense_gate_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
-        """Toggle the dense-adjacency edge-dropout override (reconstruct).
+    def _dense_gate_expected(self, phase: str) -> Tuple[bool, bool]:
+        """Expected ``(train_dense, eval_dense)`` gate flags for a phase.
 
-        Active exactly when the current phase block sets
-        ``dense_adjacency_edge_dropout: true`` (supported in ``reconstruct``
-        and ``final_reconstruct``; the final phase inherits the reconstruct
-        block and may override it).  While active, training forward passes
-        of every gated attention module (GatedCrossAttention /
-        GatedSelfAttention) replace the applied adjacency with a fully dense
-        {0,1} sample that keeps edge ij with probability equal to the
-        detached gate posterior p_ij.  Structure/warmup phases always
-        deactivate it.  Eval passes are unaffected (learned gates).
+        Structure phases default the EVAL probe to True independently of the
+        train flag; all other phases default it to False.  A phase block may
+        override either explicitly with ``dense_adjacency_edge_dropout`` /
+        ``dense_gate_eval``.
         """
         if phase == "reconstruct":
             cfg = self.recon_cfg
+            eval_default = False
         elif phase == "final_reconstruct":
             cfg = {**self.recon_cfg, **self.final_cfg}
+            eval_default = False
+        elif phase == "structure":
+            cfg = self.struct_cfg
+            eval_default = True
+        elif phase == "warmup":
+            cfg = self.warmup_cfg
+            eval_default = False
         else:
             cfg = {}
+            eval_default = False
         active = bool(cfg.get("dense_adjacency_edge_dropout", False))
+        eval_mode = bool(cfg.get("dense_gate_eval", eval_default))
+        return active, eval_mode
+
+    def _apply_dense_gate_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Apply the per-phase dense-gate flags from ``_dense_gate_expected``.
+
+        Train override and eval probe are independent: a structure phase may
+        train on the relaxed gate while validating under the binary sample.
+        """
+        active, eval_mode = self._dense_gate_expected(phase)
 
         n_mod = 0
         for mod in pl_module.modules():
             if hasattr(mod, "set_dense_gate_mode"):
-                mod.set_dense_gate_mode(active)
+                mod.set_dense_gate_mode(active, eval_mode=eval_mode)
                 n_mod += 1
         if active and n_mod == 0:
             logger.warning(
@@ -776,6 +830,38 @@ class PhaseController(Callback):
         else:
             pl_module.log("dir_bias", value, on_step=False, on_epoch=True)
 
+    def _apply_edge_offset_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Drift the deterministic existence-gate offset at structure entries.
+
+        No-op unless the structure block sets ``edge_offset_step``.  The
+        current value is read back from the module (so a resumed run
+        continues the accumulated drift instead of restarting it), increased
+        by ``edge_offset_step`` at every structure-phase entry and capped at
+        ``edge_offset_max``.  Applies to every module exposing
+        ``set_edge_offset`` (GatedSelfAttention; the homogeneous single
+        block lives in ``model.attention``).
+        """
+        if not self._edge_offset_managed or phase != "structure":
+            return
+        step = float(self.struct_cfg.get("edge_offset_step") or 0.0)
+        vmax = float(self.struct_cfg.get("edge_offset_max"))
+
+        n_mod = 0
+        value = None
+        for mod in pl_module.modules():
+            if hasattr(mod, "set_edge_offset"):
+                value = min(float(mod.edge_offset) + step, vmax)
+                mod.set_edge_offset(value)
+                n_mod += 1
+        if n_mod == 0:
+            logger.warning(
+                "[adaptive] edge_offset_step set in the structure phase "
+                "config but the model owns no existence-gated module "
+                "(GatedSelfAttention)."
+            )
+        else:
+            pl_module.log("edge_offset", value, on_step=False, on_epoch=True)
+
     def _resolve_param_groups(self, pl_module: pl.LightningModule):
         struct = getattr(pl_module, "_structural_params", None)
         recon = getattr(pl_module, "_reconstruction_params", None)
@@ -825,6 +911,7 @@ class PhaseController(Callback):
         "hsic_descendant_warmup_epochs",
         "hsic_descendant_min_kept_frac",
         "hsic_descendant_ema",
+        "hsic_descendant_confident_score",
     )
 
     # LOO conditional-HSIC gate knobs that may be overridden PER PHASE.
@@ -915,6 +1002,8 @@ class PhaseController(Callback):
             raw = phase_cfg[key]
             if key == "hsic_descendant_hops":
                 val: Any = None if raw is None else int(raw)
+            elif key == "hsic_descendant_confident_score":
+                val = None if raw is None else float(raw)
             elif key in ("hsic_exclude_descendants", "hsic_descendant_exclude_self"):
                 val = bool(raw)
             else:
@@ -1104,6 +1193,26 @@ class PhaseController(Callback):
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
+
+        # 1. Split selection FIRST: with cross-fitting the phase must not
+        # start before the datamodule points at the correct subset.  The
+        # Trainer reloads the train dataloader at the next epoch boundary.
+        split_key = self._resolve_split_key(phase)
+        n_subset = self._swap_train_subset(phase)
+
+        # 2. Phase monitors/logging state: reset before any measurement or
+        # model-stage setting so nothing stale crosses the boundary.
+        self.current_phase = phase
+        self._phase_start_epoch = trainer.current_epoch
+        self._phase_best = float("inf")
+        self._phase_entry_monitor: Optional[float] = None
+        self._plateau_counter = 0
+        self._drop_counter = 0
+        self._hsic_best = float("inf")
+        self._hsic_plateau_counter = 0
+        self._hsic_phase_best_gate = float("inf")
+
+        # 3. Model stage settings.
         self._apply_fanin_phase(pl_module, phase)
 
         # Nodewise query update: the gradient landscape changes at every
@@ -1127,6 +1236,12 @@ class PhaseController(Callback):
             pl_module.hsic_constraint_on_phase_switch(
                 phase=phase, bkd_min_keys=k_rung
             )
+
+        # Acyclicity constraint (reversed H_CONSTRAINT regime): same reset
+        # rationale -- the h(W) regime shifts with the phase / BKD rung, so
+        # the EMA and rho-escalation memory must not compare across regimes.
+        if getattr(pl_module, "acyclicity_constraint_enabled", False):
+            pl_module.acyclicity_constraint_on_phase_switch(phase=phase)
 
 
         if phase in ("reconstruct", "final_reconstruct", "warmup"):
@@ -1178,6 +1293,10 @@ class PhaseController(Callback):
         # structure: unbiased).  No-op unless a phase block sets dir_bias.
         self._apply_dir_bias_cfg(pl_module, phase)
 
+        # Existence-gate offset drift (structure-phase entries only).  No-op
+        # unless the structure block sets edge_offset_step.
+        self._apply_edge_offset_cfg(pl_module, phase)
+
         # Optionally clear stale optimizer moment estimates at the switch.
         # Optimizer.state must remain a defaultdict(dict); a plain {} would
         # break the ``self.state[p]`` access pattern inside optimizer.step().
@@ -1185,20 +1304,46 @@ class PhaseController(Callback):
             for opt in trainer.optimizers:
                 opt.state = defaultdict(dict)
 
-        # Cross-fit: point the data module at this phase's training subset.
-        # The pl.Trainer is created with reload_dataloaders_every_n_epochs=1, so
-        # the next epoch re-queries dm.train_dataloader() and picks it up.
-        n_subset = self._swap_train_subset(phase)
+        # 4. Structure drift baseline: relaxed-gate reconstruction on the same
+        # split the structure phase optimizes, measured BEFORE any structural
+        # update of this phase.  No backward, so the stage freeze settings are
+        # already safe to keep.
+        if phase == "structure":
+            baseline = self._measure_structure_monitor(pl_module)
+            if baseline is not None:
+                self._phase_entry_monitor = baseline
+                pl_module.log(
+                    "adaptive_phase_entry_monitor", float(baseline),
+                    on_step=False, on_epoch=True,
+                )
 
-        self.current_phase = phase
-        self._phase_start_epoch = trainer.current_epoch
-        self._phase_best = float("inf")
-        self._plateau_counter = 0
-        self._drop_counter = 0
-        self._hsic_best = float("inf")
-        self._hsic_plateau_counter = 0
-        self._hsic_phase_best_gate = float("inf")
+        # 4b. Null distribution of the structural objective (permutation null:
+        # "residuals independent of the sources"), estimated by Monte Carlo
+        # BEFORE any structural update of this phase (eval forward passes, no
+        # gradient).  Diagnostic only: the estimated mean/std are logged to
+        # CSV; training is unaffected.  No-op unless
+        # adaptive_training.structure.null_estimation.run_bool is true and the
+        # forecaster implements ``estimate_structural_null``.
+        if phase == "structure" and self.null_est_enabled:
+            estimate = getattr(pl_module, "estimate_structural_null", None)
+            loader = self._structure_monitor_loader()
+            if not callable(estimate) or loader is None:
+                logger.warning(
+                    "[adaptive] null_estimation requested but unavailable "
+                    "(forecaster hook or structure loader missing) - skipped."
+                )
+            else:
+                estimate(
+                    loader,
+                    num_samples=self.null_est_num_samples,
+                    distribution=self.null_est_distribution,
+                    seed=self.null_est_seed,
+                )
 
+        # 5. Hard readiness contract: the phase must not start half-configured.
+        self._verify_phase_contract(
+            pl_module, phase, split_key, struct_params, recon_params
+        )
 
         # Always emit to the Python logger so the active stage is visible in
         # cluster log files (where console ``print`` is suppressed).
@@ -1272,6 +1417,121 @@ class PhaseController(Callback):
         )
         return int(len(subset))
 
+
+    # ------------------------------------------------------------------
+    # Structure-phase reconstruction monitor (same split, relaxed gates)
+    # ------------------------------------------------------------------
+    def _structure_monitor_loader(self):
+        """Deterministic loader over the split the structure phase optimizes.
+
+        With HSIC cross-fitting this is fold B of the ACTIVE structure split
+        (the fold the HSIC residual is measured on); otherwise it is the
+        active training split itself.  Returns None when no datamodule is
+        attached (unit tests) or the split is unavailable.
+        """
+        if self.dm is None:
+            return None
+        eval_loader = getattr(self.dm, "hsic_cross_fit_eval_dataloader", None)
+        if callable(eval_loader):
+            loader = eval_loader("b")
+            if loader is not None:
+                return loader
+        train_ds = getattr(self.dm, "train_ds", None)
+        if train_ds is None:
+            return None
+        return DataLoader(
+            train_ds,
+            batch_size=getattr(self.dm, "batch_size", 1024),
+            num_workers=getattr(self.dm, "num_workers", 0),
+            persistent_workers=getattr(self.dm, "persistent_workers", False),
+            shuffle=False,
+        )
+
+    def _measure_structure_monitor(self, pl_module: pl.LightningModule) -> Optional[float]:
+        """Relaxed-gate reconstruction MSE on the structure-optimization split.
+
+        Returns None when the probe cannot run (no datamodule, or the
+        forecaster predates ``reconstruction_mse``); callers then fall back to
+        the global validation monitor.
+        """
+        measure = getattr(pl_module, "reconstruction_mse", None)
+        if not callable(measure):
+            return None
+        loader = self._structure_monitor_loader()
+        if loader is None:
+            return None
+        value = float(measure(loader, gate_mode="relaxed"))
+        return value if np.isfinite(value) else None
+
+    def _verify_phase_contract(
+        self,
+        pl_module: pl.LightningModule,
+        phase: str,
+        split_key: Optional[str],
+        struct_params: List[torch.nn.Parameter],
+        recon_params: List[torch.nn.Parameter],
+    ) -> None:
+        """Hard readiness check: the phase must not start half-configured."""
+        # 1. Split selection happened and matches the request.
+        if self.cross_fitting and phase in ("reconstruct", "structure"):
+            if split_key is None or self.stage_splits.get(split_key) is None:
+                raise RuntimeError(
+                    f"[adaptive] phase '{phase}' requires cross-fit split "
+                    f"'{split_key}', but it is not registered."
+                )
+            if self._active_split_key != split_key:
+                raise RuntimeError(
+                    f"[adaptive] datamodule split mismatch for phase '{phase}': "
+                    f"expected '{split_key}', active '{self._active_split_key}'."
+                )
+            if hasattr(self.dm, "active_phase"):
+                dm_active = getattr(self.dm, "active_phase")
+                if dm_active != split_key:
+                    raise RuntimeError(
+                        f"[adaptive] datamodule active split mismatch for phase "
+                        f"'{phase}': expected '{split_key}', datamodule reports "
+                        f"'{dm_active}'."
+                    )
+            xfit_a = getattr(self.dm, "_xfit_ds_a", None)
+            if xfit_a is not None and getattr(xfit_a, "dataset", None) is not getattr(self.dm, "train_ds", None):
+                raise RuntimeError(
+                    "[adaptive] HSIC cross-fit folds are stale: they do not "
+                    "belong to the active train_ds.  The datamodule must "
+                    "recompute them on split changes."
+                )
+
+        # 2. Parameter-group trainability matches the phase.
+        want_struct = phase == "structure"
+        want_recon = phase in ("warmup", "reconstruct", "final_reconstruct")
+        if any(p.requires_grad != want_struct for p in struct_params):
+            raise RuntimeError(
+                f"[adaptive] structural params trainability mismatch at '{phase}' entry."
+            )
+        if any(p.requires_grad != want_recon for p in recon_params):
+            raise RuntimeError(
+                f"[adaptive] reconstruction params trainability mismatch at '{phase}' entry."
+            )
+
+        # 3. Gate mode matches the phase spec on every gated module.
+        want_dense, want_eval = self._dense_gate_expected(phase)
+        for mod in pl_module.modules():
+            if hasattr(mod, "set_dense_gate_mode"):
+                if (bool(getattr(mod, "_dense_gate_active", False)) != want_dense
+                        or bool(getattr(mod, "_dense_gate_eval", False)) != want_eval):
+                    raise RuntimeError(
+                        f"[adaptive] dense-gate mismatch at '{phase}' entry: "
+                        f"expected (train={want_dense}, eval={want_eval}), got "
+                        f"({getattr(mod, '_dense_gate_active', None)}, "
+                        f"{getattr(mod, '_dense_gate_eval', None)})."
+                    )
+
+        # 4. Structure drift baseline exists when the probe is available.
+        if phase == "structure" and self.dm is not None and hasattr(pl_module, "reconstruction_mse"):
+            if self._phase_entry_monitor is None or not np.isfinite(self._phase_entry_monitor):
+                raise RuntimeError(
+                    "[adaptive] structure phase requires a finite relaxed-gate "
+                    "reconstruction baseline before training starts."
+                )
 
 
 
@@ -1463,8 +1723,13 @@ class PhaseController(Callback):
 
         # ---------------- Reconstruct phase: plateau / budget ----------------
         if self.current_phase == "reconstruct":
-            # Relative improvement check
-            if current <= self._phase_best * (1.0 - self.plateau_min_delta):
+            # Relative improvement check (sign-safe additive form: identical
+            # to ``best * (1 - min_delta)`` for positive metrics, correct for
+            # negative ones such as NLL).  The first epoch (best == inf)
+            # always counts as an improvement.
+            if not np.isfinite(self._phase_best) or (
+                current <= self._phase_best - self.plateau_min_delta * abs(self._phase_best)
+            ):
                 self._phase_best = current
                 self._plateau_counter = 0
             else:
@@ -1501,13 +1766,31 @@ class PhaseController(Callback):
                 self._phase_index += 1
                 self._apply_phase(trainer, pl_module, "structure")
 
-        # ---------- Structure phase: drop / HSIC plateau / budget ----------
+        # ---------- Structure phase: drift / HSIC plateau / budget ----------
         elif self.current_phase == "structure":
-            if current < self._phase_best:
-                self._phase_best = current
-
-            threshold = self._phase_best * (1.0 + self.drop_pct)
-            if current > threshold:
+            # Reconstruction-drift probe.  Preferred measurement: relaxed-gate
+            # reconstruction MSE on the SAME split the structure phase
+            # optimizes (fold B under HSIC cross-fitting), anchored to the
+            # pre-update baseline measured at phase entry.  Fallback (unit
+            # tests / no datamodule): the global validation monitor with a
+            # lazy first-validation anchor.  The additive form is sign-safe
+            # (correct for negative metrics such as NLL; identical to the
+            # multiplicative form for positive ones such as MSE/MAE).
+            probe = self._measure_structure_monitor(pl_module)
+            if probe is not None:
+                current = probe
+                pl_module.log(
+                    "adaptive/struct_recon_mse_relaxed", float(current),
+                    on_step=False, on_epoch=True,
+                )
+            if self._phase_entry_monitor is None:
+                self._phase_entry_monitor = current
+            entry = self._phase_entry_monitor
+            pl_module.log(
+                "adaptive_phase_entry_monitor", float(entry),
+                on_step=False, on_epoch=True,
+            )
+            if current - entry > self.drop_pct * abs(entry):
                 self._drop_counter += 1
             else:
                 self._drop_counter = 0
@@ -1558,27 +1841,27 @@ class PhaseController(Callback):
                     on_step=False, on_epoch=True,
                 )
 
-            # ``min_epochs`` is a symmetric floor for the whole structure phase:
-            # it suppresses BOTH early-exit triggers (the stale-predictor drop and
-            # the HSIC plateau) until the phase has run at least this many epochs,
-            # so early structure-learning latency does not cause a premature
-            # switch.  The counters keep accumulating during the floor window, so
-            # a pending exit fires the moment the floor clears.  The ``max_epochs``
-            # safety cap always takes precedence over the floor.
-            min_epochs_reached = phase_epochs >= self.struct_min_epochs
+            # Per-trigger floors: drift and HSIC-plateau exits can have
+            # different minimum runtimes.  The counters keep accumulating
+            # during the floor window, so a pending exit fires the moment its
+            # floor clears.  The ``max_epochs`` safety cap always takes
+            # precedence over the floors.
+            drift_min_reached = phase_epochs >= self.struct_drift_min_epochs
+            hsic_min_reached = phase_epochs >= self.struct_hsic_min_epochs
 
             dropped = (
-                self._drop_counter >= self.drop_patience and min_epochs_reached
+                self._drop_counter >= self.drop_patience and drift_min_reached
             )
-            hsic_plateaued = hsic_counter_ready and min_epochs_reached
+            hsic_plateaued = hsic_counter_ready and hsic_min_reached
             budget_hit = phase_epochs >= self.struct_max_epochs
 
 
             if dropped or hsic_plateaued or budget_hit:
-                # Reason precedence: a stale predictor (drop) first, then a
-                # stalled structural signal (HSIC plateau), then the safety cap.
+                # Reason precedence: a stale predictor (recon drift) first,
+                # then a stalled structural signal (HSIC plateau), then the
+                # safety cap.
                 if dropped:
-                    reason = "struct_drop"
+                    reason = "struct_recon_drift"
                 elif hsic_plateaued:
                     reason = "struct_hsic_plateau"
                 else:
@@ -1671,7 +1954,9 @@ class PhaseController(Callback):
             # with the final block's own patience / min_delta (which fall back
             # to the reconstruct values) and its own min-epoch floor.  The
             # ``max_epochs`` cap always takes precedence over the floor.
-            if current <= self._phase_best * (1.0 - self.final_plateau_min_delta):
+            if not np.isfinite(self._phase_best) or (
+                current <= self._phase_best - self.final_plateau_min_delta * abs(self._phase_best)
+            ):
                 self._phase_best = current
                 self._plateau_counter = 0
             else:
@@ -1956,7 +2241,8 @@ def adaptive_trainer(
             )
 
     # --- Pre-flight dropout selection (optional) -----------------------------
-    # Selects the per-node MLP dropout by maximizing the query-perturbation
+    # Selects the regressor dropout (expressivity control of the neural
+    # regressor, whatever its form) by maximizing the query-perturbation
     # sensitivity of the train HSIC after a short reconstruction-only warmup
     # per candidate (see causaliT/training/dropout_selection.py).  The winning
     # dropout is written into the resolved config (so the main model is built
@@ -1967,14 +2253,15 @@ def adaptive_trainer(
     if bool(ds_cfg.get("enabled", False)):
         from causaliT.training.dropout_selection import (
             run_dropout_selection,
-            _set_mlp_dropout,
+            _set_regressor_dropout,
         )
+
         best_dropout, winner_ckpt = run_dropout_selection(
             config=config, data_dir=data_dir, dm=dm, save_dir=save_dir,
             cluster=cluster, seed=seed,
         )
         if best_dropout is not None:
-            _set_mlp_dropout(config, best_dropout)
+            _set_regressor_dropout(config, best_dropout)
             if starting_ckpt is not None:
                 logger.warning(
                     "adaptive_trainer: dropout_selection overrides the "
@@ -2005,8 +2292,9 @@ def adaptive_trainer(
         print(f"  monitor            : {controller.monitor}")
         print(f"  structure trigger  : +{controller.drop_pct:.0%} for "
               f"{controller.drop_patience} epochs (cap {controller.struct_max_epochs})")
-        print(f"  structure floor    : min_epochs {controller.struct_min_epochs} "
-              f"(suppresses drop + HSIC early-exits)")
+        print(f"  structure floors   : drift_min_epochs {controller.struct_drift_min_epochs}, "
+              f"hsic_min_epochs {controller.struct_hsic_min_epochs} "
+              f"(per-trigger early-exit floors)")
         if controller.struct_hsic_patience > 0:
             print(f"  structure HSIC exit: {controller.struct_hsic_monitor} "
                   f"plateau patience {controller.struct_hsic_patience}")

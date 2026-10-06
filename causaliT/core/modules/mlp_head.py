@@ -273,12 +273,17 @@ class PerNodeMLPHead(nn.Module):
         # node-specific).  Outputs a (gamma_k, beta_k) pair for EVERY hidden
         # activation (multi-layer FiLM, Perez et al. 2018), packed as
         # [gamma_1..gamma_K | beta_1..beta_K].  Zero-init last layer ->
-        # gamma=1, beta=0 at init.
+        # gamma=1, beta=0 at init.  The SAME ``dropout`` knob used inside the
+        # per-node decoders is applied to the conditioner hidden activation:
+        # one expressivity control for the whole regressor.  The conditioner
+        # is reconstruction-side (its context input is detached), so no
+        # stochasticity reaches the structural parameters.
         if self.film_context_dim > 0:
             film_hidden = max(32, 2 * d_hidden)
             self.film = nn.Sequential(
                 nn.Linear(self.film_context_dim, film_hidden),
                 nn.GELU(),
+                self.dropout,
                 nn.Linear(film_hidden, 2 * d_hidden * self.n_film_points),
             )
             nn.init.zeros_(self.film[-1].weight)

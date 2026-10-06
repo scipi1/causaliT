@@ -491,6 +491,12 @@ class AttentionSelectorLayer(nn.Module):
         # self block.  Runtime/phase control goes through set_dir_bias (the
         # adaptive trainer phase controller, per-phase ``dir_bias`` keys).
         dir_bias: float = 0.0,
+        # Transposed-score gradient routing in the Toeplitz split
+        # (GatedSelfAttention only).  True (default) = legacy detached
+        # transpose (no cross-row query gradient); False keeps the transpose
+        # in the graph, so a row's loss can also PUSH the antagonist query
+        # (balanced push/pull on the direction gate).
+        detach_transpose: bool = True,
         # Centroid-collapse fix (GatedCrossAttention / GatedSelfAttention only):
         # L2-normalise the STRUCTURAL query before scoring and replace the
         # 1/sqrt(E) score scale with a fixed sqrt(query_fanin_scale).  This makes
@@ -1289,6 +1295,7 @@ class AttentionSelectorLayer(nn.Module):
             # attentions ignore them.
             dir_tau=self.dir_tau,
             dir_bias=dir_bias,
+            detach_transpose=detach_transpose,
 
             direction_mode=commutator_direction_mode,
             direction_rank=commutator_direction_rank,
@@ -1402,6 +1409,7 @@ class AttentionSelectorLayer(nn.Module):
                 init_zeta=init_zeta,
                 dir_tau=self.dir_tau,
                 dir_bias=dir_bias,
+                detach_transpose=detach_transpose,
                 # CommutatorSelfAttention direction-gate parametrisation
                 # ("qk" or "skew_query"); ignored by GatedSelfAttention.
                 direction_mode=commutator_direction_mode,

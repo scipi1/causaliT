@@ -1,13 +1,30 @@
-"""Pre-flight MLP-dropout selection by query-perturbation sensitivity.
+"""Pre-flight regressor-dropout selection by query-perturbation sensitivity.
 
 Motivation
 ----------
 The n=20 investigation (experiments/6_INVESTIGATIONS/LARGER_DAGS/README.md)
 found that the train-HSIC sensitivity to query perturbations is bow-shaped in
-the per-node MLP dropout: a maximum at the sweet spot between overfit (all
+the regressor dropout: a maximum at the sweet spot between overfit (all
 residuals similar and small) and underfit (all similar and large).  The
 optimal dropout can therefore be SELECTED by maximizing that sensitivity after
 the initial reconstruction phase, instead of hand-picking it.
+
+Semantics
+---------
+``dropout`` here is the EXPRESSIVITY CONTROL of the neural-network regressor,
+whatever form that regressor takes: it is written into every
+reconstruction-side location that supports it — the per-node value embeddings
+(``mlp_per_node`` and ``linear_per_node`` in ``ds_embed_S`` / ``ds_embed_X``)
+and the output head (``output_mlp_dropout``, covering both the per-node
+decoder MLPs and, when FiLM conditioning is active, the FiLM conditioner MLP).
+Structural components (queries, keys, gates, adjacency computation) are never
+touched.
+
+Because different regressors (depth, width, FiLM on/off, per-node vs shared)
+have different capacity at the same dropout rate, the calibrated value is
+SPECIFIC to the architecture, dataset and noise level of the run: it is not
+expected to transfer across settings — which is exactly why it is calibrated
+per run.
 
 This module implements the selection as a pre-flight stage of the adaptive
 trainer: for each candidate dropout, a fresh model runs a short
@@ -17,11 +34,8 @@ half when cross-fitting is active).  The argmax candidate wins; the main
 adaptive run is then built with the winning dropout and warm-started from the
 winner's warmup weights.
 
-Only the two per-node MLP dropouts (value embedding ``mlp_per_node`` in
-``ds_embed_S`` / ``ds_embed_X``) and the output-head dropout
-(``output_mlp_dropout``) are swept — mirroring the dropout-sweep isolation;
-every other dropout stays at its configured value.  The pre-flight epochs are
-selection overhead and do NOT count against ``total_epoch_budget``.
+The pre-flight epochs are selection overhead and do NOT count against
+``total_epoch_budget``.
 """
 
 import copy
@@ -44,21 +58,38 @@ logger = logging.getLogger(__name__)
 # Config helpers
 # ---------------------------------------------------------------------------
 
-def _set_mlp_dropout(config: Dict[str, Any], p: float) -> None:
-    """Write dropout ``p`` into the swept locations of a (resolved) config.
+def _set_regressor_dropout(config: Dict[str, Any], p: float) -> List[str]:
+    """Write dropout ``p`` into every regressor location of a (resolved) config.
 
-    Targets exactly the per-node value-MLP embeddings (``embed:
-    mlp_per_node``) in ``ds_embed_S`` / ``ds_embed_X`` and the output head
-    (``output_mlp_dropout``); all other dropout knobs are left untouched.
-    Plain-item assignment works for both dict and OmegaConf containers and
-    overrides any interpolation (e.g. ``${experiment.dropout}``).
+    Targets exactly the reconstruction-side expressivity knobs that exist in
+    the config: the per-node value embeddings supporting dropout
+    (``mlp_per_node`` and ``linear_per_node``) in ``ds_embed_S`` /
+    ``ds_embed_X`` and the output head (``output_mlp_dropout`` — which also
+    feeds the FiLM conditioner when active).  All other dropout knobs are
+    left untouched.  Plain-item assignment works for both dict and OmegaConf
+    containers and overrides any interpolation (e.g. ``${experiment.dropout}``).
+
+    Returns the list of config paths actually written (for logging).  An
+    empty list means the sweep would be a no-op for this regressor.
     """
+    written: List[str] = []
     kwargs = config["model"]["kwargs"]
     for embed_key in ("ds_embed_S", "ds_embed_X"):
-        for mod in kwargs[embed_key]["modules"]:
-            if mod.get("embed") == "mlp_per_node":
+        for i, mod in enumerate(kwargs[embed_key]["modules"]):
+            if mod.get("embed") in ("mlp_per_node", "linear_per_node"):
+                mod.setdefault("kwargs", {})
                 mod["kwargs"]["dropout"] = p
+                written.append(
+                    f"model.kwargs.{embed_key}.modules[{i}].kwargs.dropout"
+                )
     kwargs["output_mlp_dropout"] = p
+    written.append("model.kwargs.output_mlp_dropout")
+    return written
+
+
+# Backward-compatible alias (old name referenced only the MLP locations).
+def _set_mlp_dropout(config: Dict[str, Any], p: float) -> List[str]:
+    return _set_regressor_dropout(config, p)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +184,15 @@ def run_dropout_selection(
     out_dir = Path(save_dir) / "stage_checkpoints"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Which regressor locations the sweep actually controls (logged once so
+    # the selection report is unambiguous about what ``dropout`` means for
+    # this particular regressor).
+    written_paths = _set_regressor_dropout(copy.deepcopy(config), 0.0)
+    logger.info(
+        "[dropout_selection] sweeping the regressor dropout over: %s",
+        ", ".join(written_paths),
+    )
+
     results: Dict[float, Dict[str, float]] = {}
     best_p: Optional[float] = None
     best_sens = -np.inf
@@ -160,7 +200,7 @@ def run_dropout_selection(
 
     for p in candidates:
         cfg_p = copy.deepcopy(config)
-        _set_mlp_dropout(cfg_p, p)
+        _set_regressor_dropout(cfg_p, p)
         # Identical init across candidates: same seed -> same weights.
         seed_everything(seed)
         model = create_model_instance(cfg_p, data_dir)
@@ -212,6 +252,7 @@ def run_dropout_selection(
 
     report = {
         "candidates": candidates,
+        "swept_locations": written_paths,
         "warmup_epochs": warmup_epochs,
         "n_pert": n_pert,
         "n_batches": n_batches,

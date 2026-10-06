@@ -335,6 +335,7 @@ def build_hsic_pair_mask_budgeted(
     excluded_weight: float = 0.0,
     tnorm: str = "min",
     hops: Optional[int] = None,
+    confident_score: Optional[float] = None,
 ) -> Tuple[torch.Tensor, float, bool]:
     """Budgeted descendant-excluding HSIC pair mask: the cap IS the guard.
 
@@ -368,6 +369,13 @@ def build_hsic_pair_mask_budgeted(
         excluded_weight: Weight GIVEN TO excluded pairs (0.0 = drop entirely).
         tnorm: T-norm for the soft closure (``"min"`` default, ``"prod"``).
         hops: Maximum path length for the closure; ``None`` = full.
+        confident_score: Optional CONFIDENT-DESCENDANT override.  When set,
+            any pair whose soft descendant score is >= ``confident_score`` is
+            excluded EVEN BEYOND the ``budget_frac`` cap, so a confidently
+            identified source row (all nodes downstream) empties completely --
+            the row then contributes no term to the masked mean, which is the
+            correct semantics for a parentless node.  ``None`` (default)
+            keeps the pure budget-cap behaviour.
 
     Returns:
         ``(mask, kept_frac, is_cyclic)`` mirroring :func:`build_hsic_pair_mask`:
@@ -383,6 +391,11 @@ def build_hsic_pair_mask_budgeted(
         )
     if not (0.0 < float(budget_frac) <= 1.0):
         raise ValueError(f"budget_frac must be in (0, 1], got {budget_frac!r}.")
+
+    if confident_score is not None and not (0.0 < float(confident_score) <= 1.0):
+        raise ValueError(
+            f"confident_score must be in (0, 1] or None, got {confident_score!r}."
+        )
 
     score = score_tensor.detach()
     L_target, L_source = score.shape
@@ -437,6 +450,12 @@ def build_hsic_pair_mask_budgeted(
         k = max(1, int(math.ceil(budget_frac * flat.numel())))
         thr = flat.sort(descending=True).values[k - 1]
         excluded = (excluded_score >= thr) & (excluded_score > 0)
+
+    if confident_score is not None:
+        # Confident-descendant override: scores this high carry orientation
+        # evidence regardless of the rank budget, so a true source row (every
+        # column downstream) is allowed to empty entirely.
+        excluded = excluded | (excluded_score >= float(confident_score))
 
     mask = torch.where(
         excluded,

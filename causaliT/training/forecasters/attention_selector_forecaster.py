@@ -144,9 +144,11 @@ from causaliT.utils.hsic_utils import (
     hsic_row_means,
     hsic_attention_weighted,
     hsic_attention_softmax,
+    hsic_direction_weighted,
     row_entropy_stats,
     hsic_null_calibration,
     bayes_multiplier,
+    dhsic_residual_independence,
     _median_bandwidth,
 )
 from causaliT.utils.descendant_mask import (
@@ -305,6 +307,55 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # stashed every step when log_hsic_rows materialises it.  Read by the
         # HSICClassMetrics callback (hsic_class/* diagnostics).
         self._last_hsic_pair_mat = None
+        # ---- HSIC-derived key scaling (RESIT-style source prior) ---------
+        # Per-node weights from the nodal HSIC contributions (row means of
+        # the pair matrix): high row = source-like (residual still dependent
+        # on its descendants) -> key keeps full magnitude; low row =
+        # sink-like -> key is shrunk, weakening query alignment onto it.  The
+        # weights are max-normalised (top node = 1, so only the ORDERING
+        # matters, not the decaying HSIC scale), floored, EMA-smoothed, fully
+        # DETACHED, and pushed into the gated self-attention modules
+        # (``GatedSelfAttention.set_hsic_key_scale``).
+        _hks = config["training"].get("hsic_key_scale", None) or {}
+        self.hsic_key_scale_enabled = bool(_hks.get("enabled", False))
+        self.hsic_key_scale_ema = float(_hks.get("ema", 0.9))
+        self.hsic_key_scale_floor = float(_hks.get("floor", 0.1))
+        self.hsic_key_scale_warmup_epochs = int(_hks.get("warmup_epochs", 0))
+        self.hsic_key_scale_exponent = float(_hks.get("exponent", 1.0))
+        self._hsic_key_scale_state: Optional[torch.Tensor] = None
+        if self.hsic_key_scale_enabled:
+            if not (0.0 <= self.hsic_key_scale_ema < 1.0):
+                raise ValueError(
+                    f"hsic_key_scale.ema must be in [0, 1), got "
+                    f"{self.hsic_key_scale_ema}."
+                )
+            if not (0.0 <= self.hsic_key_scale_floor <= 1.0):
+                raise ValueError(
+                    f"hsic_key_scale.floor must be in [0, 1], got "
+                    f"{self.hsic_key_scale_floor}."
+                )
+            if self.hsic_key_scale_exponent <= 0.0:
+                raise ValueError(
+                    f"hsic_key_scale.exponent must be > 0, got "
+                    f"{self.hsic_key_scale_exponent}."
+                )
+            if str(config["training"].get("hsic_objective", "pairwise")) != "pairwise":
+                raise ValueError(
+                    "hsic_key_scale requires hsic_objective='pairwise' "
+                    "(there is no pair matrix under 'dhsic_residual')."
+                )
+            _mk = config["model"]["kwargs"]
+            if (
+                str(_mk.get("struct_embedding_type", "orthogonal_fixed"))
+                != "orthogonal_fixed"
+                or not bool(_mk.get("remove_key_projection", False))
+            ):
+                raise ValueError(
+                    "hsic_key_scale requires the FIXED orthonormal key frame "
+                    "(struct_embedding_type='orthogonal_fixed' with "
+                    "remove_key_projection=True): with a learnable key path "
+                    "the optimizer regrows ||k_j|| and cancels the prior."
+                )
         # ---- HSIC aggregation selector ---------------------------------
         #   plain            -- unweighted mean over pairs (hsic_cross_per_pair)
         #   attw             -- every pair weighted by the attention posterior
@@ -321,12 +372,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
         #                       to 1) and REPLACES the descendant mask entirely:
         #                       sparsity/descendant rejection emerges from the
         #                       within-row weight competition.
+        #   direction        -- DIRECTION-WEIGHTED: pair (i, j) is weighted by
+        #                       the deterministic antisymmetric direction gate
+        #                       d[i, j] of GatedSelfAttention (NOT z_edge * d).
+        #                       Since d[i,j] + d[j,i] == 1 (dir_bias == 0), every
+        #                       pair always pays one of its two HSIC terms in
+        #                       full: the optimiser can only choose orientation,
+        #                       never delete the pair's pressure.  Removes the
+        #                       trivial all-zero-weight solution (and the need
+        #                       for renormalisation / extra reconstruction
+        #                       terms) by construction.  Self-attention only:
+        #                       requires homogeneous_nodes=True.
         #
         # ``use_attention_weighted_hsic`` is the LEGACY alias, still honoured so
         # every existing config keeps working: True -> attw, False -> plain.
         _agg = config["training"].get("hsic_aggregation", None)
         _legacy = config["training"].get("use_attention_weighted_hsic", None)
-        _valid_agg = ("plain", "attw", "attw_descendants", "attw_softmax")
+        _valid_agg = ("plain", "attw", "attw_descendants", "attw_softmax",
+                      "direction")
         if _agg is None:
             self.hsic_aggregation = "attw" if bool(_legacy) else "plain"
         else:
@@ -338,11 +401,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 )
             if _legacy is not None:
                 _implied = "attw" if bool(_legacy) else "plain"
-                if _implied != self.hsic_aggregation and not (
+                _compat = self.hsic_aggregation == "direction" or (
                     bool(_legacy) and self.hsic_aggregation in (
                         "attw_descendants", "attw_softmax"
                     )
-                ):
+                )
+                if _implied != self.hsic_aggregation and not _compat:
                     raise ValueError(
                         f"Conflicting HSIC aggregation settings: "
                         f"hsic_aggregation={self.hsic_aggregation!r} but the legacy "
@@ -351,12 +415,29 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     )
         # All weighted variants share the attention-weighted code path.
         self.use_attention_weighted_hsic = self.hsic_aggregation in (
-            "attw", "attw_descendants", "attw_softmax"
+            "attw", "attw_descendants", "attw_softmax", "direction"
         )
         self.hsic_weight_descendants_only = (
             self.hsic_aggregation == "attw_descendants"
         )
         self.hsic_softmax = self.hsic_aggregation == "attw_softmax"
+        self.hsic_direction = self.hsic_aggregation == "direction"
+        self._dir_bias_warned = False
+        if self.hsic_direction:
+            if not self.homogeneous_nodes:
+                raise ValueError(
+                    "hsic_aggregation='direction' requires "
+                    "homogeneous_nodes=True (self-attention-only node set): "
+                    "the direction gate lives on the square self-attention "
+                    "block, so the HSIC pair matrix must be (N, N)."
+                )
+            _inner_self = self._direction_gate_module()
+            if _inner_self is None:
+                raise ValueError(
+                    "hsic_aggregation='direction' requires the self-attention "
+                    "inner module to expose last_direction_deterministic "
+                    "(GatedSelfAttention)."
+                )
         # Pair-weight construction for the softmax-competition aggregation:
         # "posterior" (default) renormalises the gate posterior row-wise
         # (softmax over log p: a CLOSED gate gets weight exactly 0 and
@@ -380,6 +461,29 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # positive float.
         self.hsic_tilt_tau = config["training"].get("hsic_tilt_tau", "auto")
         self._last_desc_weight_frac = 0.0
+
+        # ---- Structural objective selector ------------------------------
+        #   pairwise       -- (default) per-pair HSIC(source_j, res_i) over the
+        #                     combined [S, X] source, aggregated by
+        #                     ``hsic_aggregation``.
+        #   dhsic_residual -- NOTIME objective (Berrevoets et al., AISTATS
+        #                     2025): the d-variable dHSIC measuring MUTUAL
+        #                     independence of ALL residual columns.  There is
+        #                     no per-edge signal, so pair masks, attention
+        #                     weighting, descendant exclusion and the row
+        #                     diagnostics do not apply; everything downstream
+        #                     (lambda_hsic / ALM constraint, permutation-null
+        #                     calibration, logging, gradient routing) is
+        #                     unchanged.  With ``lambda_recon: 0`` this mimics
+        #                     NOTIME's sole fitting objective.
+        self.hsic_objective = str(
+            config["training"].get("hsic_objective", "pairwise")
+        )
+        if self.hsic_objective not in ("pairwise", "dhsic_residual"):
+            raise ValueError(
+                "training.hsic_objective must be 'pairwise' or "
+                f"'dhsic_residual', got {self.hsic_objective!r}."
+            )
 
         # ---- HSIC cross-fitting -----------------------------------------
         # Evaluate the independence statistic on a DISJOINT, PERMANENT fold of
@@ -487,6 +591,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.hsic_descendant_min_kept_frac = float(
             config["training"].get("hsic_descendant_min_kept_frac", 0.25)
         )
+        # Graded fallback (threshold mode only): when the full transitive
+        # closure is unresolvable -- the hardened graph is cyclic, so
+        # "descendant" is transitively meaningless, or the closure starves
+        # the objective -- rebuild the mask with hops=1 (direct children
+        # only).  First-order exclusion cannot explode (<= out-degree per
+        # row) and still removes the strongest irreducible terms, which
+        # attenuate per hop.  Only when even the first-order mask starves
+        # do we fall back to unmasked HSIC.
+        self.hsic_descendant_degrade_first_order = bool(
+            config["training"].get("hsic_descendant_degrade_first_order", True)
+        )
         self.hsic_descendant_ema = float(
             config["training"].get("hsic_descendant_ema", 0.0)
         )
@@ -517,6 +632,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         self.hsic_descendant_tnorm = str(
             config["training"].get("hsic_descendant_tnorm", "min")
+        )
+        # Confident-descendant override (budget mode only): pairs whose
+        # soft descendant score clears this threshold are excluded EVEN BEYOND
+        # the per-row budget cap, so a confidently identified source row (all
+        # nodes downstream) may empty completely.  None = pure budget cap.
+        _cs = config["training"].get("hsic_descendant_confident_score", None)
+        self.hsic_descendant_confident_score = (
+            None if _cs is None else float(_cs)
         )
         # Self-attention block type: only a direction-aware posterior can tell
         # descendants from ancestors.  In homogeneous mode the single square
@@ -557,6 +680,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._descendant_ema_score: Optional[torch.Tensor] = None
         self._last_hsic_desc_kept_frac = 1.0
         self._last_hsic_desc_cyclic = False
+        self._last_hsic_desc_first_order = False
         self._last_hsic_bkd_kept_frac = 1.0
         # LOO gamma gate state (detached, EMA-smoothed across refreshes).
         self._loo_gamma_cache: Optional[torch.Tensor] = None
@@ -741,6 +865,38 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "acyclicity_constraint.ema must be in [0, 1), got "
                 f"{self.acy_ema_decay}"
             )
+        # Soft threshold on the gate posterior BEFORE the acyclicity
+        # functional: A <- relu(A - threshold).  The posterior is a product
+        # of sigmoids, strictly in (0, 1), so without a threshold h(W) = 0
+        # is unreachable and at small p h ~ sum p^2 acts as indiscriminate
+        # L2 shrinkage on ALL edges.  With threshold > 0 sub-threshold
+        # edges are EXACT zeros: h = 0 iff the supra-threshold support is
+        # acyclic (ALM satisfiable), and the acyclicity gradient
+        # concentrates on the strong edges that actually close cycles.
+        # 0.0 (default) is backward compatible (no thresholding).
+        self.acy_threshold = float(ac_cfg.get("threshold", 0.0))
+        if not (0.0 <= self.acy_threshold < 1.0):
+            raise ValueError(
+                "acyclicity_constraint.threshold must be in [0, 1), got "
+                f"{self.acy_threshold}"
+            )
+        # Rho-escalation patience: the NOTEARS 1/4-rule fires only after
+        # this many CONSECUTIVE stalled epochs.  Canonical NOTEARS
+        # escalates rho only once the inner (primal) problem is solved;
+        # with per-epoch SGD updates the inner problem is never solved in
+        # one epoch, so patience=1 (the legacy behaviour) escalates rho
+        # x10 every epoch and the quadratic penalty drowns the HSIC
+        # gradient.  A patience > 1 approximates "escalate only when the
+        # primal has stalled at the current rho".
+        self.acy_rho_escalation_patience = int(
+            ac_cfg.get("rho_escalation_patience", 1)
+        )
+        if self.acy_rho_escalation_patience < 1:
+            raise ValueError(
+                "acyclicity_constraint.rho_escalation_patience must be >= 1, "
+                f"got {self.acy_rho_escalation_patience}"
+            )
+        self._acy_stall_epochs = 0
         # Dual state (plain floats; persisted via on_save_checkpoint).
         self._acy_dual_lambda = float(ac_cfg.get("dual_init", 0.0))
         if self._acy_dual_lambda < 0.0:
@@ -921,6 +1077,41 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # opposite regime (PCGrad ``gradient_surgery``, the HSIC-relative
         # caps ``*_max_hsic_pct``, and a fixed ``lambda_hsic > 0`` weight).
         # ----------------------------------------------------------------
+        # ----------------------------------------------------------------
+        # Role reversal (H_CONSTRAINT regime): HSIC (+L0) as the PRIMAL
+        # objective, acyclicity as the augmented-Lagrangian constraint
+        # h(W) = 0.  The two constraint blocks implement OPPOSITE constraint
+        # assignments and must never be active together; and with the
+        # acyclicity ALM active there must be a primal structural objective
+        # left to optimize (otherwise the structural loss is pure
+        # constraint and collapses to "any DAG").
+        # ----------------------------------------------------------------
+        if self.acyclicity_constraint_enabled:
+            _hc_enabled = bool(
+                (config["training"].get("hsic_constraint", None) or {})
+                .get("enabled", False)
+            )
+            if _hc_enabled:
+                raise ValueError(
+                    "training.acyclicity_constraint.enabled=True is mutually "
+                    "exclusive with training.hsic_constraint.enabled=True: "
+                    "they are the two opposite constraint assignments "
+                    "(HSIC-constrained vs acyclicity-constrained).  Enable "
+                    "exactly one."
+                )
+            if (
+                float(self.lambda_hsic) <= 0.0
+                and float(self.lambda_l0) <= 0.0
+            ):
+                logger.warning(
+                    "acyclicity_constraint is enabled but both lambda_hsic "
+                    "and lambda_l0 are 0: the structural stream has NO primal "
+                    "objective left -- the loss reduces to the h(W)=0 "
+                    "constraint alone (any DAG satisfies it).  Set "
+                    "lambda_hsic > 0 (and/or lambda_l0 > 0) for the reversed "
+                    "H_CONSTRAINT regime."
+                )
+
         hc_cfg = config["training"].get("hsic_constraint", None) or {}
         self.hsic_constraint_enabled = bool(hc_cfg.get("enabled", False))
         self.hsic_constraint_source = str(hc_cfg.get("source", "hsic"))
@@ -1823,7 +2014,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # drop them from the average.  The mask is derived from the learned
         # adjacency and is always DETACHED (a differentiable mask would let the
         # model create an edge purely to delete its own penalty term).
-        hsic_pair_mask, hsic_desc_kept_frac, hsic_desc_cyclic = self._build_hsic_descendant_mask(
+        (hsic_pair_mask, hsic_desc_kept_frac, hsic_desc_cyclic,
+         hsic_desc_first_order) = self._build_hsic_descendant_mask(
             score_tensor
         )
         # Bilevel machinery: the probe/virtual-pass pair weights are the
@@ -1903,12 +2095,76 @@ class AttentionSelectorForecaster(pl.LightningModule):
         pair_mask_empty = hsic_pair_mask is not None and not bool(
             (hsic_pair_mask != 0).any()
         )
-        if pair_mask_empty:
+        if self.hsic_objective == "dhsic_residual":
+            # NOTIME objective: dHSIC over the residual columns only.  No
+            # pair structure exists, so the descendant/BKD/LOO masks and the
+            # attention-weighted aggregations above do not apply; the pair
+            # diagnostics are explicitly empty in this mode.
+            hsic_value = self._dhsic_residual_hsic(residuals)
+            self._last_hsic_pair_mat = None
+            self._last_hsic_row_means = None
+        elif pair_mask_empty:
             # Every pair excluded this batch (e.g. BKD dropped all keys):
             # no learnable HSIC signal - contribute an exact zero rather
             # than a NaN from the empty weighted mean.
             hsic_value = torch.zeros((), device=combined_source.device)
             self._last_hsic_row_means = None
+        elif self.hsic_direction:
+            # Direction-weighted HSIC: pair (i, j) weighted by the
+            # DETERMINISTIC antisymmetric direction gate d[i, j] of the
+            # GatedSelfAttention block (gradient-carrying, gate-noise free).
+            # The weight is the RAW direction gate, NOT z_edge * d: since
+            # d[i,j] + d[j,i] == 1 (dir_bias == 0), every pair pays one of its
+            # two HSIC terms in full -- no trivial all-zero-weight solution.
+            # No descendant mask and no LOO gamma: the direction weighting
+            # replaces both (it IS a soft, learnable descendant assignment).
+            inner_self = self._direction_gate_module()
+            dir_w = getattr(inner_self, "last_direction_deterministic", None)
+            if dir_w is None:
+                raise RuntimeError(
+                    "hsic_aggregation='direction' but the self-attention "
+                    "module did not stash last_direction_deterministic "
+                    "(oracle / constant-protocol / open-gate branch active?)."
+                )
+            if not self._dir_bias_warned and float(
+                    getattr(inner_self, "dir_bias", 0.0)) != 0.0:
+                logger.warning(
+                    "hsic_aggregation='direction' with dir_bias=%.4f != 0: "
+                    "d[i,j] + d[j,i] == 1 is relaxed, so the no-collapse "
+                    "guarantee of the direction weighting is suspended. "
+                    "Anneal dir_bias to 0 for structure phases.",
+                    float(getattr(inner_self, "dir_bias", 0.0)),
+                )
+                self._dir_bias_warned = True
+            if bkd_keep_mask is not None:
+                # Keys dropped by BKD were not in the estimation set: their
+                # residual dependence is irreducible within the batch and the
+                # gate gradient is zeroed, so the pair pays nothing this step
+                # (same convention as the attention-weighted variant).
+                dir_w = dir_w * bkd_keep_mask
+            hsic_value, hsic_mat = hsic_direction_weighted(
+                source_values=combined_source,
+                residuals=residuals,
+                direction=dir_w,
+                sigma=self.hsic_sigma,
+                adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                return_matrix=True,   # pair matrix is computed anyway;
+                # stashed detached for the hsic_class/* diagnostics
+            )
+            self._last_hsic_pair_mat = hsic_mat.detach()
+            self._update_hsic_key_scale(hsic_mat, dir_w.detach(), stage)
+            if self.log_hsic_rows:
+                # Node-responsible rows with the SAME pair weights as the
+                # scalar aggregation -- the (detached) direction gate itself,
+                # so the rows sum-decompose the logged HSIC.
+                self._last_hsic_row_means = hsic_row_means(
+                    hsic_mat.detach(), pair_mask=dir_w.detach()
+                )
+            else:
+                self._last_hsic_row_means = None
         elif self.use_attention_weighted_hsic:
             # Attention-weighted HSIC: weight each (child, source) pair by the
             # batch-mean attention weight att[child, source].  The attention
@@ -1959,6 +2215,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 self._last_hsic_pair_mat = (
                     hsic_mat.detach() if hsic_mat is not None else None
                 )
+                self._update_hsic_key_scale(hsic_mat, pair_w, stage)
                 # Entropy of the ACTUAL pair weights used by the aggregation
                 # (detached): H ~ ln(K) = near-uniform competition (legacy
                 # [0,1]-logit mode is pinned there by construction); falling
@@ -2021,6 +2278,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 )
                 hsic_value, hsic_mat = hsic_out
                 self._last_hsic_pair_mat = hsic_mat.detach()
+                self._update_hsic_key_scale(hsic_mat, att_mean.detach(), stage)
                 if self.log_hsic_rows:
                     # Node-responsible rows with the SAME pair weights as the
                     # scalar aggregation -- here the (detached) attention posterior
@@ -2042,16 +2300,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 source_kernel=self.hsic_kernel_source,
                 bandwidth_multipliers=self.hsic_bandwidth_multipliers,
                 pair_mask=hsic_pair_mask,
-                return_matrix=self.log_hsic_rows,
+                return_matrix=(self.log_hsic_rows or self.hsic_key_scale_enabled),
             )
-            if self.log_hsic_rows:
+            if self.log_hsic_rows or self.hsic_key_scale_enabled:
                 hsic_value, hsic_mat = hsic_out
-                # Node-responsible rows: mean_j HSIC(source_j, res_i) with the
-                # same pair weights as the scalar aggregation.  Detached:
-                # logging only, never part of the loss.
-                self._last_hsic_row_means = hsic_row_means(
-                    hsic_mat.detach(), pair_mask=hsic_pair_mask
-                )
+                if self.log_hsic_rows:
+                    # Node-responsible rows: mean_j HSIC(source_j, res_i) with the
+                    # same pair weights as the scalar aggregation.  Detached:
+                    # logging only, never part of the loss.
+                    self._last_hsic_row_means = hsic_row_means(
+                        hsic_mat.detach(), pair_mask=hsic_pair_mask
+                    )
+                self._update_hsic_key_scale(hsic_mat, hsic_pair_mask, stage)
             else:
                 hsic_value = hsic_out
         # Constraint source switch: the monitored quantity is the HSIC
@@ -2127,9 +2387,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if hsic_pair_mask is not None:
             self._last_hsic_desc_kept_frac = hsic_desc_kept_frac
             self._last_hsic_desc_cyclic = hsic_desc_cyclic
+            self._last_hsic_desc_first_order = hsic_desc_first_order
         else:
             self._last_hsic_desc_kept_frac = 1.0
             self._last_hsic_desc_cyclic = False
+            self._last_hsic_desc_first_order = hsic_desc_first_order
 
         # Safeguard reference: EMA of the weighted HSIC term (detached),
         # updated on train batches only.  None when both caps are disabled.
@@ -2159,6 +2421,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 if self.homogeneous_nodes
                 else score_tensor[:, self.S_seq_len:]   # (L_X, L_X)
             )
+            if acy_constrained and self.acy_threshold > 0.0:
+                # Log the RAW h (detached) so the metrics show how much
+                # acyclicity mass sits below the threshold, then pass the
+                # thresholded matrix to the penalty: relu(A - threshold)
+                # zeroes sub-threshold edges exactly (h = 0 reachable).
+                with torch.no_grad():
+                    self.log(
+                        f"{stage}_h_raw",
+                        float(self._acyclicity_penalty(A_cyc.detach())),
+                        on_step=False, on_epoch=True,
+                    )
+                A_cyc = torch.relu(A_cyc - self.acy_threshold)
             notears_raw = self._acyclicity_penalty(A_cyc)
             if acy_constrained:
                 # Augmented Lagrangian: alpha * h + (rho/2) * h^2 (canonical
@@ -2169,6 +2443,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     self._acy_dual_lambda * notears_raw
                     + 0.5 * self._acy_rho * notears_raw ** 2
                 )
+                # Split ALM diagnostics: the linear vs quadratic contribution
+                # and the effective penalty multiplier m = alpha + rho*h,
+                # directly comparable to lambda_hsic (the primal weight).
+                with torch.no_grad():
+                    h_det = float(notears_raw.detach())
+                    self.log(
+                        f"{stage}_acy_linear_term",
+                        self._acy_dual_lambda * h_det,
+                        on_step=False, on_epoch=True,
+                    )
+                    self.log(
+                        f"{stage}_acy_quadratic_term",
+                        0.5 * self._acy_rho * h_det ** 2,
+                        on_step=False, on_epoch=True,
+                    )
+                    self.log(
+                        f"{stage}_acy_mult",
+                        self._acy_dual_lambda + self._acy_rho * h_det,
+                        on_step=False, on_epoch=True,
+                    )
                 # EMA of the RAW h (train batches only, detached) drives the
                 # per-epoch dual ascent in on_train_epoch_end.
                 if stage == "train":
@@ -2348,6 +2642,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 float(self._last_hsic_desc_cyclic),
                 on_step=False, on_epoch=True,
             )
+            self.log(
+                f"{stage}_hsic_desc_first_order",
+                float(self._last_hsic_desc_first_order),
+                on_step=False, on_epoch=True,
+            )
         if self.use_loo_gamma_gate:
             self.log(
                 f"{stage}_loo_gamma_mean",
@@ -2495,11 +2794,19 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     def _interference_enabled(self) -> bool:
         """Whether the L0 Ã¢â€ â€ HSIC interference diagnostic should run."""
-        return (
+        if not (
             self.log_l0_hsic_interference
             and self._attention_type in self._INTERFERENCE_ATTENTION_TYPES
-            and float(self.lambda_l0) > 0.0
             and float(self.lambda_hsic) > 0.0
+        ):
+            return False
+        # The probed regularizer is L0 when lambda_l0 > 0; otherwise, in the
+        # reversed H_CONSTRAINT regime, the acyclicity ALM term.  Both drive
+        # the same gate logits as HSIC, so the cosine / norm-ratio readout
+        # is meaningful for either pairing.
+        return (
+            float(self.lambda_l0) > 0.0
+            or self.acyclicity_constraint_enabled
         )
 
 
@@ -2522,7 +2829,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         every = max(1, int(self.interference_log_every_n_epochs))
         if (self.current_epoch % every) != 0:
             return
-        if self._last_hsic_reg is None or self._last_l0_reg is None:
+        if self._last_hsic_reg is None:
+            return
+        # Regularizer under probe: L0 when active, otherwise the acyclicity
+        # ALM term (reversed H_CONSTRAINT regime).
+        if float(self.lambda_l0) > 0.0:
+            reg = self._last_l0_reg
+            reg_label = "l0"
+        else:
+            reg = self._last_acyclic_reg
+            reg_label = "acy"
+        if reg is None or not reg.requires_grad:
             return
 
         # Build the block Ã¢â€ â€™ parameter mapping lazily.  Rebuilt if it came back
@@ -2537,7 +2854,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             cos_by_block = compute_l0_hsic_interference(
                 model=self.model,
                 hsic_reg=self._last_hsic_reg,
-                l0_reg=self._last_l0_reg,
+                l0_reg=reg,
                 blocks=blocks,
             )
         except RuntimeError as exc:
@@ -2548,6 +2865,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "L0Ã¢â€ â€HSIC interference probe skipped (autograd error): %s", exc
             )
             return
+
+        # Gradient-norm readout: how large is the regularizer's gradient
+        # compared to the primal (HSIC) signal?  norm_ratio >> 1 means the
+        # constraint pressure dominates the update (the H_CONSTRAINT stall).
+        for key in ("norm_hsic_overall", "norm_reg_overall",
+                    "norm_ratio_overall"):
+            v = cos_by_block.pop(key, None)
+            if v is not None and not math.isnan(v):
+                self.log(
+                    f"train_interf_{key}_{reg_label}",
+                    float(v),
+                    on_step=False,
+                    on_epoch=True,
+                )
 
         # Skip NaN blocks: a NaN cosine means one objective's gradient is
         # entirely zero in that block (pure reconstruction blocks receive no
@@ -2606,6 +2937,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # defined.  Symmetric / undirected scores cannot orient an edge, so the
     # descendant set would be meaningless there.
     _DIRECTED_SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
+
+    def _direction_gate_module(self):
+        """Inner self-attention module exposing the direction gate.
+
+        In split mode the X->X block lives in ``model.self_attention``; in
+        homogeneous mode the single combined block (built from
+        ``self_attention_type``) lives in ``model.attention``.  Returns the
+        first inner module exposing ``last_direction_deterministic``, else
+        None.
+        """
+        for holder in (
+            getattr(self.model, "self_attention", None),
+            getattr(self.model, "attention", None),
+        ):
+            inner = getattr(holder, "inner_attention", None)
+            if hasattr(inner, "last_direction_deterministic"):
+                return inner
+        return None
 
     @staticmethod
     def _module_bkd_keep(mod) -> Optional[torch.Tensor]:
@@ -2933,13 +3282,75 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_desc_weight_frac = float(1.0 - kept_frac)
         return desc
 
+    # ------------------------------------------------------------------
+    # HSIC-derived key scaling (RESIT-style source prior)
+    # ------------------------------------------------------------------
+
+    def _update_hsic_key_scale(
+        self,
+        hsic_mat: Optional[torch.Tensor],
+        row_weight: Optional[torch.Tensor],
+        stage: str,
+    ) -> None:
+        """EMA-update the per-key HSIC scale and push it into the gated modules.
+
+        Nodal contribution of target ``i``: the row mean
+        ``mean_j HSIC(source_j, res_i)`` with the SAME pair weights as the
+        scalar aggregation (``row_weight``, detached).  A high row marks a
+        source-like node (its residual still depends on its descendants); a
+        low row a well-explained sink.  Weights are max-normalised (top node
+        = 1), sharpened by ``exponent``, floored, and EMA-smoothed.  Train
+        batches only, after ``warmup_epochs``; rows that are NaN this batch
+        (fully excluded) keep their previous weight.  Everything is detached:
+        the loss can never reach the weights, so the model cannot lower its
+        own penalty by manipulating them.
+        """
+        if (
+            not self.hsic_key_scale_enabled
+            or stage != "train"
+            or hsic_mat is None
+        ):
+            return
+        if int(self.current_epoch) < self.hsic_key_scale_warmup_epochs:
+            return
+        rows = hsic_row_means(hsic_mat.detach(), pair_mask=row_weight)
+        finite = torch.isfinite(rows)
+        if not bool(finite.any()):
+            return
+        r_max = float(rows[finite].max())
+        if r_max <= 1e-12:
+            # No structural signal this step; keep the previous weights.
+            return
+        w_new = (rows / r_max) ** self.hsic_key_scale_exponent
+        w_new = w_new.clamp_min(self.hsic_key_scale_floor)
+        state = self._hsic_key_scale_state
+        if state is None:
+            # Start from the flat (legacy) frame and anneal into the prior.
+            state = torch.ones_like(rows)
+        ema = self.hsic_key_scale_ema
+        w = torch.where(finite, ema * state + (1.0 - ema) * w_new, state)
+        self._hsic_key_scale_state = w.detach()
+        for mod in self.modules():
+            setter = getattr(mod, "set_hsic_key_scale", None)
+            if callable(setter):
+                setter(self._hsic_key_scale_state)
+        self.log("train_hsic_key_scale_min", float(w.min()),
+                 on_step=False, on_epoch=True)
+        self.log("train_hsic_key_scale_mean", float(w.mean()),
+                 on_step=False, on_epoch=True)
+        self.log("train_hsic_key_scale_max", float(w.max()),
+                 on_step=False, on_epoch=True)
+
     def _build_hsic_descendant_mask(
         self,
         score_tensor: Optional[torch.Tensor],
-    ) -> Tuple[Optional[torch.Tensor], float, bool]:
+    ) -> Tuple[Optional[torch.Tensor], float, bool, bool]:
         """Build the detached HSIC pair mask that excludes ``Desc(i) U {i}``.
 
-        Returns ``(mask, kept_frac, is_cyclic)``.  ``mask is None`` means "no
+        Returns ``(mask, kept_frac, is_cyclic, first_order)``; the last flag
+        is True when the threshold-mode mask was DEGRADED to direct children
+        (hops=1) because the full closure was cyclic or starving.  ``mask is
+        None`` means "no
         masking this step" Ã¢â‚¬â€ the HSIC term then falls back to the plain mean, so
         every guard below degrades gracefully to the pre-feature behaviour.
 
@@ -2954,25 +3365,27 @@ class AttentionSelectorForecaster(pl.LightningModule):
              structure phase Ã¢â‚¬â€ the epochs that actually train the structure Ã¢â‚¬â€
              instead of having it silently expire during the (long) reconstruct
              warmup.  ``anchor is None`` means the warmup was already served;
-          4. collapse: if a dense adjacency makes the closure swallow almost
-             every pair, the structural gradient would silently vanish, so we
-             fall back to no masking and log it.
+          4. degrade/fallback: when the full closure is cyclic or would
+             starve the objective (kept_frac < min_kept_frac), threshold mode
+             rebuilds the mask with hops=1 (direct children only) when
+             ``hsic_descendant_degrade_first_order`` is set; only if even the
+             first-order mask starves do we fall back to no masking and log it.
         """
         if not (self.hsic_exclude_descendants and self._descendant_mask_supported):
-            return None, 1.0, False
+            return None, 1.0, False, False
 
         if score_tensor is None or not isinstance(score_tensor, torch.Tensor):
-            return None, 1.0, False
+            return None, 1.0, False, False
         if score_tensor.dim() != 2:
             # Multi-head posteriors have no single (target, source) adjacency.
-            return None, 1.0, False
+            return None, 1.0, False, False
 
         anchor = self._descendant_warmup_anchor
         if (
             anchor is not None
             and (self.current_epoch - anchor) < self.hsic_descendant_warmup_epochs
         ):
-            return None, 1.0, False
+            return None, 1.0, False, False
 
         score = score_tensor.detach()
 
@@ -2989,6 +3402,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 )
             score = self._descendant_ema_score
 
+        first_order = False
         try:
             if self.hsic_descendant_mode == "budget":
                 # Budgeted variant: rank the pairs by the soft descendant score
@@ -3004,6 +3418,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     excluded_weight=self.hsic_descendant_weight,
                     tnorm=self.hsic_descendant_tnorm,
                     hops=self.hsic_descendant_hops,
+                    confident_score=getattr(
+                        self, "hsic_descendant_confident_score", None),
                 )
             else:
                 mask, kept_frac, is_cyclic = build_hsic_pair_mask(
@@ -3021,25 +3437,52 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "Descendant HSIC mask skipped (%s). Falling back to unmasked HSIC.",
                 exc,
             )
-            return None, 1.0, False
+            return None, 1.0, False, False
 
         # The collapse guard is a THRESHOLD-mode concern: in budget mode the
         # cap itself bounds the exclusion, so the guard would fire spuriously.
-        if (
-            self.hsic_descendant_mode == "threshold"
-            and kept_frac < self.hsic_descendant_min_kept_frac
-        ):
-            logger.warning(
-                "Descendant HSIC mask would keep only %.1f%% of pairs "
-                "(< min_kept_frac=%.1f%%) Ã¢â‚¬â€ the learned graph is too dense and "
-                "the structural signal would collapse. Falling back to unmasked "
-                "HSIC for this step.",
-                100.0 * kept_frac,
-                100.0 * self.hsic_descendant_min_kept_frac,
-            )
-            return None, kept_frac, is_cyclic
+        if self.hsic_descendant_mode == "threshold":
+            starved = kept_frac < self.hsic_descendant_min_kept_frac
+            if (
+                self.hsic_descendant_degrade_first_order
+                and self.hsic_descendant_hops != 1   # already first-order
+                and (is_cyclic or starved)
+            ):
+                # Graded fallback: the full closure is unresolvable (cyclic
+                # hardened graph) or starves the objective, so rebuild with
+                # hops=1.  First-order exclusion cannot explode (at most the
+                # out-degree per row) and still removes the strongest
+                # irreducible terms, which attenuate per hop.
+                logger.warning(
+                    "Descendant HSIC mask degraded to FIRST-ORDER (hops=1): "
+                    "the full closure is %s.",
+                    "cyclic" if is_cyclic else
+                    f"starving (kept {100.0 * kept_frac:.1f}% of pairs)",
+                )
+                mask, kept_frac, _ = build_hsic_pair_mask(
+                    score_tensor=score,
+                    s_seq_len=self.S_seq_len,
+                    homogeneous_nodes=self.homogeneous_nodes,
+                    threshold=self.hsic_descendant_threshold,
+                    hops=1,
+                    exclude_self=self.hsic_descendant_exclude_self,
+                    excluded_weight=self.hsic_descendant_weight,
+                )
+                first_order = True
+                starved = kept_frac < self.hsic_descendant_min_kept_frac
+            if starved:
+                logger.warning(
+                    "Descendant HSIC mask%s would keep only %.1f%% of pairs "
+                    "(< min_kept_frac=%.1f%%) -- the learned graph is too dense "
+                    "and the structural signal would collapse. Falling back to "
+                    "unmasked HSIC for this step.",
+                    " (first-order)" if first_order else "",
+                    100.0 * kept_frac,
+                    100.0 * self.hsic_descendant_min_kept_frac,
+                )
+                return None, kept_frac, is_cyclic, first_order
 
-        return mask, kept_frac, is_cyclic
+        return mask, kept_frac, is_cyclic, first_order
 
     # ------------------------------------------------------------------
     # Acyclicity helper (mirrors SingleCausalForecaster)
@@ -3135,6 +3578,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
     # Structural-regularizer safeguard helpers
     # ------------------------------------------------------------------
+
+    def _dhsic_residual_hsic(self, residuals: torch.Tensor) -> torch.Tensor:
+        """NOTIME objective on the current residuals, honouring bandwidths.
+
+        Bandwidth policy mirrors the pairwise path: phase-frozen per-column
+        bandwidths when latched (``_hsic_bw_frozen_sigmas``), the NOTIME
+        per-column median heuristic when ``hsic_adaptive_bandwidth`` is on,
+        otherwise the fixed scalar ``hsic_sigma`` for all columns.
+        """
+        if self._hsic_bw_frozen_sigmas is not None:
+            sigma = self._hsic_bw_frozen_sigmas[1]  # per-column residual sigmas
+        elif self.hsic_adaptive_bandwidth:
+            sigma = None  # NOTIME median heuristic per column
+        else:
+            sigma = float(self.hsic_sigma) if not torch.is_tensor(
+                self.hsic_sigma) else self.hsic_sigma
+        return dhsic_residual_independence(residuals, sigma=sigma)
 
     def freeze_hsic_bandwidth(self, combined_source, residuals) -> None:
         """Latch per-variable median-heuristic bandwidths for this phase.
@@ -3292,6 +3752,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 str(self._hsic_rung_keys),
             )
 
+    def acyclicity_constraint_on_phase_switch(
+        self,
+        phase: Optional[str] = None,
+        bkd_min_keys: Optional[int] = None,
+    ) -> None:
+        """Reset per-regime constraint memory at an adaptive phase boundary.
+
+        Mirrors ``hsic_constraint_on_phase_switch`` for the reversed
+        H_CONSTRAINT regime (HSIC objective, acyclicity constraint): the
+        h(W) regime shifts at every phase switch (new cross-fit fold, new
+        BKD rung), so the EMA and the rho-escalation memory are not
+        comparable across the boundary.  The dual variables (lambda, rho)
+        deliberately PERSIST -- they accumulate constraint evidence over
+        the whole run.  ``phase`` / ``bkd_min_keys`` are accepted for
+        signature parity with the HSIC hook and are currently unused.
+        """
+        self._acy_ema = None
+        self._acy_prev_violation = None
+        self._acy_stall_epochs = 0
+
     def _update_hsic_dual(self) -> None:
         """Per-epoch dual ascent for the HSIC constraint (Lagrangian mode).
 
@@ -3378,16 +3858,30 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.acy_dual_max,
             max(0.0, self._acy_dual_lambda + self.acy_dual_lr * violation),
         )
+        # NOTEARS 1/4-rule stall detection, gated by an escalation patience:
+        # the counter must accumulate rho_escalation_patience CONSECUTIVE
+        # stalled epochs before rho escalates (approximates the canonical
+        # "escalate only after the primal subproblem is solved" and stops
+        # the quadratic term from drowning the HSIC gradient).
+        stalled = (
+            violation > 0.0
+            and self._acy_prev_violation is not None
+            and violation > 0.25 * self._acy_prev_violation
+        )
+        if stalled:
+            self._acy_stall_epochs += 1
+        else:
+            self._acy_stall_epochs = 0
         if (
             violation > 0.0
             and self._acy_rho > 0.0
             and self.acy_rho_mult > 1.0
-            and self._acy_prev_violation is not None
-            and violation > 0.25 * self._acy_prev_violation
+            and self._acy_stall_epochs >= self.acy_rho_escalation_patience
         ):
             self._acy_rho = min(
                 self.acy_rho_max, self._acy_rho * self.acy_rho_mult
             )
+            self._acy_stall_epochs = 0
         self._acy_prev_violation = violation
         self.log("acyclicity/dual_lambda", self._acy_dual_lambda,
                  on_step=False, on_epoch=True)
@@ -3399,6 +3893,122 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
     # Per-rung HSIC tolerance calibration (permutation null)
     # ------------------------------------------------------------------
+    def _hsic_permutation_replicates(
+        self,
+        combined_source: torch.Tensor,
+        residuals: torch.Tensor,
+        attention_weights: Optional[torch.Tensor],
+        bkd_keep_mask: Optional[torch.Tensor],
+        hsic_pair_mask: Optional[torch.Tensor],
+        n_perms: int,
+        generator: torch.Generator,
+    ) -> list:
+        """Draw ``n_perms`` permutation-null replicates of the structural HSIC.
+
+        The residuals are permuted across the batch dimension (destroying any
+        residual/source dependence -- equivalent to permuting the source
+        observations) and re-aggregated through the SAME path the objective
+        uses (softmax / attention-weighted / masked mean) with the SAME
+        detached pair weights and BKD keep mask, so the null matches the
+        current regime.  Everything is detached; the caller's RNG is untouched
+        (permutations come exclusively from ``generator``).
+
+        Returns the list of FINITE replicate values (NaN replicates dropped).
+        """
+        hsic_kw = dict(
+            sigma=self.hsic_sigma,
+            adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+            mode=self.hsic_mode,
+            nhsic_epsilon=self.nhsic_epsilon,
+            source_kernel=self.hsic_kernel_source,
+            bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+        )
+        out: list = []
+        B = residuals.shape[0]
+        att_mean = None
+        if getattr(self, "hsic_direction", False):
+            # Direction-weighted null: same DETACHED direction gate as the
+            # objective (diagonal is excluded inside the aggregation).
+            inner_self = self._direction_gate_module()
+            att_mean = getattr(inner_self, "last_direction_deterministic", None)
+            if att_mean is not None:
+                att_mean = att_mean.detach()
+                if bkd_keep_mask is not None:
+                    att_mean = att_mean * bkd_keep_mask
+        elif self.use_attention_weighted_hsic and attention_weights is not None:
+            att_mean = attention_weights.detach().mean(dim=0)
+            if bkd_keep_mask is not None:
+                att_mean = att_mean * bkd_keep_mask
+                if self.hsic_softmax:
+                    # Dropped keys are -inf logits (weight exactly 0),
+                    # matching the train aggregation.
+                    att_mean = att_mean.masked_fill(
+                        bkd_keep_mask == 0, float("-inf")
+                    )
+        for _ in range(int(n_perms)):
+            perm = torch.randperm(B, generator=generator).to(residuals.device)
+            res_p = residuals.detach()[perm]
+            if self.hsic_objective == "dhsic_residual":
+                # Null for MUTUAL residual independence: permute each column
+                # independently across the batch (permuting whole rows would
+                # preserve the inter-column dependence being tested).
+                res_d = residuals.detach()
+                res_p = torch.stack(
+                    [
+                        res_d[
+                            torch.randperm(B, generator=generator).to(res_d.device),
+                            j,
+                        ]
+                        for j in range(res_d.shape[1])
+                    ],
+                    dim=1,
+                )
+                v = self._dhsic_residual_hsic(res_p)
+            elif self.use_attention_weighted_hsic and att_mean is not None:
+                if getattr(self, "hsic_direction", False):
+                    v = hsic_direction_weighted(
+                        source_values=combined_source.detach(),
+                        residuals=res_p,
+                        direction=att_mean,
+                        return_matrix=False,
+                        **hsic_kw,
+                    )
+                elif self.hsic_softmax:
+                    v = hsic_attention_softmax(
+                        source_values=combined_source.detach(),
+                        residuals=res_p,
+                        attention_weights=att_mean,
+                        return_matrix=False,
+                        diagonal_offset=(
+                            0 if self.homogeneous_nodes else self.S_seq_len
+                        ),
+                        pair_weight_mode=self.hsic_pair_weight_mode,
+                        tilt_tau=self.hsic_tilt_tau,
+                        **hsic_kw,
+                    )
+                else:
+                    v = hsic_attention_weighted(
+                        source_values=combined_source.detach(),
+                        residuals=res_p,
+                        attention_weights=att_mean,
+                        exclude_diagonal=self.hsic_weight_descendants_only,
+                        return_matrix=False,
+                        descendant_mask=None,
+                        **hsic_kw,
+                    )
+            else:
+                v = hsic_cross_per_pair(
+                    combined_source.detach(),
+                    res_p,
+                    pair_mask=hsic_pair_mask,
+                    return_matrix=False,
+                    **hsic_kw,
+                )
+            fv = float(v)
+            if fv == fv:  # NaN guard
+                out.append(fv)
+        return out
+
     @torch.no_grad()
     def _collect_hsic_null_sample(
         self,
@@ -3410,21 +4020,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
     ) -> None:
         """Accumulate permutation-null HSIC replicates from ONE train batch.
 
-        The residuals are permuted across the batch dimension (destroying any
-        residual/source dependence) and re-aggregated through the SAME path
-        the constraint uses (softmax / attention-weighted / masked mean) with
-        the SAME detached pair weights and BKD keep mask, so the null matches
-        the current rung regime.  Everything is detached; training RNG is
-        untouched (dedicated generator seeded per calibration round+batch).
+        Thin wrapper over :meth:`_hsic_permutation_replicates` (see there for
+        the null construction).  Permutations come from a dedicated generator
+        seeded per calibration round+batch, so the training RNG is untouched.
         """
-        hsic_kw = dict(
-            sigma=self.hsic_sigma,
-            adaptive_bandwidth=self.hsic_adaptive_bandwidth,
-            mode=self.hsic_mode,
-            nhsic_epsilon=self.nhsic_epsilon,
-            source_kernel=self.hsic_kernel_source,
-            bandwidth_multipliers=self.hsic_bandwidth_multipliers,
-        )
         try:
             gen = torch.Generator()
             gen.manual_seed(
@@ -3432,56 +4031,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 + 1009 * self._hsic_null_calib_round
                 + self._hsic_null_calib_remaining
             )
-            B = residuals.shape[0]
-            att_mean = None
-            if self.use_attention_weighted_hsic and attention_weights is not None:
-                att_mean = attention_weights.detach().mean(dim=0)
-                if bkd_keep_mask is not None:
-                    att_mean = att_mean * bkd_keep_mask
-                    if self.hsic_softmax:
-                        # Dropped keys are -inf logits (weight exactly 0),
-                        # matching the train aggregation.
-                        att_mean = att_mean.masked_fill(
-                            bkd_keep_mask == 0, float("-inf")
-                        )
-            for _ in range(self.hsic_calib_perms):
-                perm = torch.randperm(B, generator=gen).to(residuals.device)
-                res_p = residuals.detach()[perm]
-                if self.use_attention_weighted_hsic and att_mean is not None:
-                    if self.hsic_softmax:
-                        v = hsic_attention_softmax(
-                            source_values=combined_source.detach(),
-                            residuals=res_p,
-                            attention_weights=att_mean,
-                            return_matrix=False,
-                            diagonal_offset=(
-                                0 if self.homogeneous_nodes else self.S_seq_len
-                            ),
-                            pair_weight_mode=self.hsic_pair_weight_mode,
-                            tilt_tau=self.hsic_tilt_tau,
-                            **hsic_kw,
-                        )
-                    else:
-                        v = hsic_attention_weighted(
-                            source_values=combined_source.detach(),
-                            residuals=res_p,
-                            attention_weights=att_mean,
-                            exclude_diagonal=self.hsic_weight_descendants_only,
-                            return_matrix=False,
-                            descendant_mask=None,
-                            **hsic_kw,
-                        )
-                else:
-                    v = hsic_cross_per_pair(
-                        combined_source.detach(),
-                        res_p,
-                        pair_mask=hsic_pair_mask,
-                        return_matrix=False,
-                        **hsic_kw,
-                    )
-                fv = float(v)
-                if fv == fv:  # NaN guard
-                    self._hsic_null_samples.append(fv)
+            self._hsic_null_samples.extend(
+                self._hsic_permutation_replicates(
+                    combined_source=combined_source,
+                    residuals=residuals,
+                    attention_weights=attention_weights,
+                    bkd_keep_mask=bkd_keep_mask,
+                    hsic_pair_mask=hsic_pair_mask,
+                    n_perms=self.hsic_calib_perms,
+                    generator=gen,
+                )
+            )
         except Exception as exc:  # never break training on calibration
             logger.warning("HSIC null calibration sample skipped: %s", exc)
         self._hsic_null_calib_remaining -= 1
@@ -3519,6 +4079,144 @@ class AttentionSelectorForecaster(pl.LightningModule):
             null_q, self.hsic_calib_margin, samples.size,
             str(self._hsic_rung_keys),
         )
+
+    # ------------------------------------------------------------------
+    # Null distribution of the structural objective (structure-phase entry)
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def estimate_structural_null(
+        self,
+        dataloader,
+        num_samples: int = 100,
+        distribution: str = "gaussian",
+        seed: int = 20240817,
+        perms_per_batch: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Monte Carlo estimate of the structural objective's NULL distribution.
+
+        Null hypothesis: "the residuals are independent from the sources".
+        Estimated by permuting the residuals across the batch dimension (which
+        destroys any residual/source pairing -- equivalent to permuting the
+        source observations) and re-evaluating the SAME structural HSIC
+        aggregation used by ``_step`` via :meth:`_hsic_permutation_replicates`.
+        Each loader batch costs ONE eval-mode forward pass (no gradient) plus
+        ``perms_per_batch`` cheap permutation re-evaluations, until
+        ``num_samples`` finite replicates are collected.
+
+        The replicates are summarised by their mean and standard deviation.
+        NOTE (documented simplification): HSIC is strictly positive, so the
+        null is right-skewed and a Gaussian (mean, std) summary can be
+        misleading; it is kept as an initial approximation (``distribution``
+        is recorded for provenance; only "gaussian" is currently supported).
+
+        The residuals/sources are computed as in ``_step`` WITHOUT the
+        cross-fit fold and WITHOUT BKD / descendant masks (eval forward: BKD
+        is off), i.e. the null matches the unmasked ``val_hsic``-style
+        reference aggregation.
+
+        The result is stored on ``self.hsic_null_stats`` and logged
+        (``hsic/null_mean`` / ``hsic/null_std`` / ``hsic/null_n``) for the CSV
+        logs; training is unaffected.  Returns the stats dict, or ``None``
+        when too few finite samples could be collected.
+        """
+        distribution = str(distribution).lower()
+        if distribution != "gaussian":
+            logger.warning(
+                "null_estimation.distribution=%r not supported; falling back "
+                "to 'gaussian' (mean/std summary).", distribution,
+            )
+            distribution = "gaussian"
+
+        self.hsic_null_stats: Optional[Dict[str, Any]] = None
+        round_idx = getattr(self, "_struct_null_round", 0) + 1
+        self._struct_null_round = round_idx
+        gen = torch.Generator()
+        gen.manual_seed(int(seed) + 1009 * round_idx)
+
+        device = next(self.parameters()).device
+        was_training = self.training
+        self.eval()
+        samples: list = []
+        n_forwards = 0
+        # Forward-pass budget: bounds the cost when batches yield few finite
+        # replicates (degenerate batches are skipped rather than looped on).
+        max_forwards = max(10, int(num_samples))
+        try:
+            it = iter(dataloader)
+            while len(samples) < int(num_samples) and n_forwards < max_forwards:
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(dataloader)
+                    batch = next(it)
+                n_forwards += 1
+                S = batch[0].to(device)
+                X = batch[1].to(device)
+                # Residuals / combined source EXACTLY as the non-cross-fit
+                # branch of ``_step``.
+                x_val = X[:, :, self.val_idx]
+                if self.homogeneous_nodes:
+                    x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
+                pred_x, attention_weights, _aux = self.forward(S, X)
+                x_target = torch.nan_to_num(x_val)
+                residuals = x_target.squeeze() - pred_x.squeeze()
+                if self.homogeneous_nodes:
+                    combined_source = x_target.squeeze()
+                else:
+                    combined_source = torch.cat(
+                        [S[:, :, self.val_idx], x_target.squeeze()], dim=1
+                    )
+                samples.extend(
+                    self._hsic_permutation_replicates(
+                        combined_source=combined_source,
+                        residuals=residuals,
+                        attention_weights=attention_weights,
+                        bkd_keep_mask=None,
+                        hsic_pair_mask=None,
+                        n_perms=min(
+                            int(perms_per_batch),
+                            int(num_samples) - len(samples),
+                        ),
+                        generator=gen,
+                    )
+                )
+        finally:
+            if was_training:
+                self.train()
+        # __NULL_STATS_TAIL__
+        import numpy as np
+        arr = np.asarray(samples, dtype=np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size < 4:
+            logger.warning(
+                "null_estimation: only %d finite samples after %d forward "
+                "passes - no null stats recorded.", arr.size, n_forwards,
+            )
+            return None
+
+        mean = float(arr.mean())
+        std = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+        stats: Dict[str, Any] = {
+            "mean": mean,
+            "std": std,
+            "n": int(arr.size),
+            "distribution": distribution,
+        }
+        self.hsic_null_stats = stats
+        # CSV logging (diagnostic only); guarded for calls without an active
+        # trainer/logger attachment (unit tests).
+        try:
+            self.log("hsic/null_mean", mean, on_step=False, on_epoch=True)
+            self.log("hsic/null_std", std, on_step=False, on_epoch=True)
+            self.log("hsic/null_n", float(arr.size), on_step=False, on_epoch=True)
+        except Exception as exc:
+            logger.warning("null_estimation logging skipped: %s", exc)
+        logger.info(
+            "[null-estimation] structural objective null: mean=%.3e std=%.3e "
+            "(n=%d, distribution=%s, %d forward passes).",
+            mean, std, arr.size, distribution, n_forwards,
+        )
+        return stats
 
     # ------------------------------------------------------------------
     # Group-L1 (identical to SingleCausalForecaster implementation)
@@ -3827,8 +4525,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
             opt_recon.zero_grad()
             opt_struct.zero_grad()
 
-            # Backward 1: recon loss (retain graph for second backward)
-            self.manual_backward(loss_recon, retain_graph=True)
+            # Backward 1: recon loss (retain graph for second backward).
+            # With dense_adjacency_edge_dropout the applied adjacency is
+            # DETACHED, so in the structure phase (recon params frozen)
+            # loss_recon has NO gradient path at all - it is purely a probe.
+            # Skip the backward (and the grad save) in that case.
+            if loss_recon.requires_grad:
+                self.manual_backward(loss_recon, retain_graph=True)
 
             # Save recon gradients for reconstruction params
             _saved_recon_grads = {}
@@ -3967,9 +4670,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     on_step=False, on_epoch=True,
                 )
             nw.reset_epoch_diagnostics()
-        if self.hsic_constraint_enabled:
+        # Constraint dual ascent / rho escalation is only meaningful while the
+        # structural parameters are TRAINABLE (the structure phase of the
+        # adaptive schedule; always true in the static trainer).  Running it
+        # against FROZEN gates (warmup/reconstruct phases) measures a constant
+        # violation, so rho escalates x10 every epoch and the dual grows
+        # linearly - by the first structure phase the quadratic ALM term
+        # completely silences the HSIC primal.  When no routing groups exist
+        # (legacy non-routed runs) the constraints update every epoch as
+        # before.
+        _sp = getattr(self, "_structural_params", None)
+        struct_trainable = True if not _sp else any(p.requires_grad for p in _sp)
+        if self.hsic_constraint_enabled and struct_trainable:
             self._update_hsic_dual()
-        if self.acyclicity_constraint_enabled:
+        if self.acyclicity_constraint_enabled and struct_trainable:
             self._update_acyclicity_dual()
         super().on_train_epoch_end()
 
@@ -3990,8 +4704,27 @@ class AttentionSelectorForecaster(pl.LightningModule):
     def _lean_hsic(self, S, X, overrides=None):
         """HSIC term of ONE grad-enabled forward, using the stashed
         structural pair mask (descendant x LOO, no BKD) and, when latched,
-        the phase's frozen bandwidths."""
-        pred = self._lean_pred(S, X, overrides)
+        the phase's frozen bandwidths.
+
+        When the attention-weighted aggregation is active
+        (``hsic_aggregation: attw_softmax``), the SAME weighted aggregation
+        as ``_step`` is used (``hsic_attention_softmax`` with the configured
+        ``hsic_pair_weight_mode`` / ``hsic_tilt_tau`` over the lean forward's
+        batch-mean attention), so the unrolled gradient optimizes the same
+        objective as the first-order stream.  Otherwise the raw unweighted
+        per-pair HSIC is returned (historical behaviour).
+        """
+        # Need the attention weights too: call the forward directly rather
+        # than _lean_pred.
+        if overrides is None:
+            out = self.forward(data_source=S, data_intermediate=X)
+        else:
+            from torch.func import functional_call
+            out = functional_call(
+                self, overrides, (),
+                {"data_source": S, "data_intermediate": X},
+            )
+        pred, att = out[0], out[1] if len(out) > 1 else None
         x_val = X[:, :, self.val_idx]
         if self.homogeneous_nodes:
             x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
@@ -4003,6 +4736,74 @@ class AttentionSelectorForecaster(pl.LightningModule):
             sigma, adaptive = self._hsic_bw_frozen_sigmas, False
         else:
             sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
+        if self.hsic_objective == "dhsic_residual":
+            # NOTIME objective: no pair mask exists; bandwidth policy is the
+            # same as the pairwise path (frozen > median heuristic > fixed).
+            return self._dhsic_residual_hsic(residuals)
+        if (
+            getattr(self, "use_attention_weighted_hsic", False)
+            and getattr(self, "hsic_softmax", False)
+            and att is not None
+            and att.dim() == 3
+            and self._last_probe_pair_mask is None  # no descendant/LOO mask
+        ):
+            return hsic_attention_softmax(
+                source_values=combined,
+                residuals=residuals,
+                attention_weights=att.mean(dim=0),
+                sigma=sigma,
+                adaptive_bandwidth=adaptive,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                diagonal_offset=(0 if self.homogeneous_nodes
+                                 else self.S_seq_len),
+                pair_weight_mode=self.hsic_pair_weight_mode,
+                tilt_tau=self.hsic_tilt_tau,
+            )
+        if (
+            getattr(self, "hsic_direction", False)
+        ):
+            # Direction-weighted HSIC, matching the ``direction`` branch of
+            # ``_step``: the deterministic direction gate is the pair weight
+            # (diagonal excluded inside the aggregation).
+            inner_self = self._direction_gate_module()
+            dir_w = getattr(inner_self, "last_direction_deterministic", None)
+            if dir_w is not None:
+                return hsic_direction_weighted(
+                    source_values=combined,
+                    residuals=residuals,
+                    direction=dir_w,
+                    sigma=sigma,
+                    adaptive_bandwidth=adaptive,
+                    mode=self.hsic_mode,
+                    nhsic_epsilon=self.nhsic_epsilon,
+                    bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                )
+        if (
+            getattr(self, "use_attention_weighted_hsic", False)
+            and not getattr(self, "hsic_softmax", False)
+            and not getattr(self, "hsic_direction", False)
+            and not self.hsic_weight_descendants_only
+            and att is not None
+            and att.dim() == 3
+        ):
+            # Plain attention-weighted HSIC (w = p, unnormalised), matching
+            # the ``attw`` branch of ``_step`` (diagonal weight is exactly 0
+            # on the gated posterior, so no diagonal exclusion is needed).
+            return hsic_attention_weighted(
+                source_values=combined,
+                residuals=residuals,
+                attention_weights=att.mean(dim=0),
+                sigma=sigma,
+                exclude_diagonal=False,
+                adaptive_bandwidth=adaptive,
+                mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon,
+                source_kernel=self.hsic_kernel_source,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+            )
         return hsic_cross_per_pair(
             combined, residuals, sigma=sigma, adaptive_bandwidth=adaptive,
             mode=self.hsic_mode, nhsic_epsilon=self.nhsic_epsilon,
@@ -4019,6 +4820,58 @@ class AttentionSelectorForecaster(pl.LightningModule):
             x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
         x_target = torch.nan_to_num(x_val)
         return torch.nn.functional.mse_loss(pred.squeeze(), x_target.squeeze())
+
+    def reconstruction_mse(self, dataloader, gate_mode: str = "relaxed") -> float:
+        """No-grad reconstruction MSE over ``dataloader`` under an explicit gate mode.
+
+        Used by the adaptive phase controller for structure-phase baselines:
+        the measurement must be deterministic w.r.t. the gate, so
+        ``gate_mode="relaxed"`` temporarily disables the dense-gate override
+        AND the eval probe on every gated module, then restores them.  No
+        logging, no backward, no training-RNG consumption.
+
+        ``gate_mode="current"`` measures under the module's current settings.
+        """
+        if gate_mode not in ("relaxed", "current"):
+            raise ValueError(f"gate_mode must be 'relaxed' or 'current', got {gate_mode!r}")
+
+        was_training = self.training
+        saved = []
+        if gate_mode == "relaxed":
+            for mod in self.modules():
+                if hasattr(mod, "set_dense_gate_mode"):
+                    saved.append((
+                        mod,
+                        bool(getattr(mod, "_dense_gate_active", False)),
+                        bool(getattr(mod, "_dense_gate_eval", False)),
+                    ))
+                    mod.set_dense_gate_mode(False, eval_mode=False)
+
+        device = next(self.parameters()).device
+        total_sum = 0.0
+        total_count = 0
+        try:
+            self.eval()
+            with torch.no_grad():
+                for batch in dataloader:
+                    S = batch[0].to(device)
+                    X = batch[1].to(device)
+                    pred = self.forward(S, X)[0]
+                    x_val = X[:, :, self.val_idx]
+                    if self.homogeneous_nodes:
+                        x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)
+                    x_target = torch.nan_to_num(x_val)
+                    total_sum += float(torch.nn.functional.mse_loss(
+                        pred.reshape(-1), x_target.reshape(-1), reduction="sum"
+                    ))
+                    total_count += int(x_target.numel())
+        finally:
+            if was_training:
+                self.train()
+            for mod, active, eval_flag in saved:
+                mod.set_dense_gate_mode(active, eval_mode=eval_flag)
+
+        return total_sum / max(total_count, 1)
 
     def _shadow_evidence(self, batch):
         """Shadow gradient for the commit controller: first-order HSIC
@@ -4338,7 +5191,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # MSE/L0 caps continue from the same reference.
             checkpoint["mse_acyclic_cap"] = {"ema": self._acyclic_reg_ema}
 
-
+        # Deterministic existence-gate offset (adaptive schedule state): the
+        # value lives on the GatedSelfAttention module(s) as a plain
+        # attribute and is NOT in the state_dict (keeps pre-offset
+        # checkpoints loadable); persist it here so a resumed run continues
+        # the accumulated drift instead of resetting to the config init.
+        edge_offsets = [
+            float(mod.edge_offset)
+            for mod in self.model.modules()
+            if hasattr(mod, "set_edge_offset")
+        ]
+        if edge_offsets:
+            checkpoint["edge_offset"] = {"value": edge_offsets[0]}
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
         """
@@ -4544,6 +5408,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
             saved = checkpoint.get("mse_acyclic_cap", None)
             if saved is not None:
                 self._acyclic_reg_ema = saved.get("ema", None)
+
+        # Restore the existence-gate offset drift (absent in checkpoints that
+        # predate the feature -> modules keep their config init value, which
+        # is also the correct behaviour for eval-only loads of new-style
+        # checkpoints under an old code path).
+        saved = checkpoint.get("edge_offset", None)
+        if saved is not None:
+            for mod in self.model.modules():
+                if hasattr(mod, "set_edge_offset"):
+                    mod.set_edge_offset(float(saved.get("value", 0.0)))
 
     def on_fit_start(self):
         """

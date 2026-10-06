@@ -159,4 +159,20 @@ adaptive_training:
                                    # the moment it clears).  max_epochs (budget)
                                    # always takes precedence.
 
+    # --- Null-distribution estimation at structure-phase entry -------------
+    # Before the first structural update of each structure phase, estimate the
+    # NULL distribution of the structural objective (H0: "the residuals are
+    # independent from the sources") by Monte Carlo: per loader batch, one
+    # eval forward pass (no gradient), then the residuals are permuted across
+    # the batch (equivalent to permuting the source observations) and the SAME
+    # HSIC aggregation is re-evaluated.  The replicates are summarised by
+    # mean/std and logged to CSV (hsic/null_mean, hsic/null_std, hsic/null_n)
+    # -- diagnostic only, training is unaffected.  NOTE: HSIC is strictly
+    # positive, so the Gaussian (mean, std) summary is an initial
+    # simplification.
+    null_estimation:
+      run_bool: false              # master switch (default off: no behaviour change)
+      num_samples: 100             # Monte Carlo permutation replicates
+      distribution: gaussian       # moment-matched summary (only gaussian supported)
+
 
