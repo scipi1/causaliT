@@ -151,6 +151,7 @@ from causaliT.utils.hsic_utils import (
     dhsic_residual_independence,
     _median_bandwidth,
 )
+from causaliT.utils.causal_order import estimate_hsic_causal_order
 from causaliT.utils.descendant_mask import (
     build_hsic_pair_mask,
     build_hsic_pair_mask_budgeted,
@@ -191,6 +192,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
         super().__init__()
 
         self.config = config
+        # Kept for lazily loaded ground-truth artifacts (oracle combined mask,
+        # oracle_shd GT buffer); None on the checkpoint-loading path.
+        self._data_dir = data_dir
 
         # Build model
         self.model = AttentionSelectorLayer(**config["model"]["kwargs"])
@@ -307,23 +311,60 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # stashed every step when log_hsic_rows materialises it.  Read by the
         # HSICClassMetrics callback (hsic_class/* diagnostics).
         self._last_hsic_pair_mat = None
+        # ---- Raw causal-order estimator (diagnostic source prior) --------
+        # This estimator is intentionally separate from the scalar HSIC loss:
+        # it uses the unweighted off-diagonal pair matrix, retains descendants
+        # (the RESIT-style source signal) and is fully detached.  Loss masks /
+        # attention / direction / LOO weights remain loss-specific and never
+        # enter this ordering score.
+        _co = config["training"].get("causal_order", None) or {}
+        self.causal_order_enabled = bool(_co.get("enabled", False))
+        self.causal_order_method = str(_co.get("method", "row_mean"))
+        self.causal_order_null_permutations = int(
+            _co.get("null_permutations", 0)
+        )
+        self.causal_order_null_seed = int(_co.get("null_seed", 20240817))
+        self.causal_order_log_scores = bool(_co.get("log_scores", True))
+        if self.causal_order_method not in {"row_mean", "iterative_sink"}:
+            raise ValueError(
+                "causal_order.method must be 'row_mean' or 'iterative_sink', "
+                f"got {self.causal_order_method!r}."
+            )
+        if self.causal_order_null_permutations < 0:
+            raise ValueError(
+                "causal_order.null_permutations must be non-negative, got "
+                f"{self.causal_order_null_permutations}."
+            )
+        if (
+            self.causal_order_method == "iterative_sink"
+            and not self.homogeneous_nodes
+        ):
+            raise ValueError(
+                "causal_order.method='iterative_sink' requires "
+                "homogeneous_nodes=True (a square node pair matrix)."
+            )
+        self._last_causal_order = None
+
         # ---- HSIC-derived key scaling (RESIT-style source prior) ---------
-        # Per-node weights from the nodal HSIC contributions (row means of
-        # the pair matrix): high row = source-like (residual still dependent
-        # on its descendants) -> key keeps full magnitude; low row =
-        # sink-like -> key is shrunk, weakening query alignment onto it.  The
-        # weights are max-normalised (top node = 1, so only the ORDERING
-        # matters, not the decaying HSIC scale), floored, EMA-smoothed, fully
-        # DETACHED, and pushed into the gated self-attention modules
-        # (``GatedSelfAttention.set_hsic_key_scale``).
+        # Per-key weights are derived from the DETACHED causal-order scores,
+        # not from the pair matrix used by the scalar loss.  The default rank
+        # transform is deliberately gentle: it preserves ordering but removes
+        # sensitivity to the absolute HSIC scale.  A warmup + ramp schedule
+        # then interpolates from the flat frame to the target prior, followed
+        # by EMA smoothing.
         _hks = config["training"].get("hsic_key_scale", None) or {}
         self.hsic_key_scale_enabled = bool(_hks.get("enabled", False))
         self.hsic_key_scale_ema = float(_hks.get("ema", 0.9))
-        self.hsic_key_scale_floor = float(_hks.get("floor", 0.1))
+        self.hsic_key_scale_floor = float(_hks.get("floor", 0.5))
         self.hsic_key_scale_warmup_epochs = int(_hks.get("warmup_epochs", 0))
         self.hsic_key_scale_exponent = float(_hks.get("exponent", 1.0))
+        self.hsic_key_scale_transform = str(_hks.get("transform", "rank"))
+        self.hsic_key_scale_schedule = str(_hks.get("schedule", "cosine"))
+        self.hsic_key_scale_ramp_epochs = int(_hks.get("ramp_epochs", 0))
+        self.hsic_key_scale_max_strength = float(_hks.get("max_strength", 1.0))
         self._hsic_key_scale_state: Optional[torch.Tensor] = None
         if self.hsic_key_scale_enabled:
+            self.causal_order_enabled = True
             if not (0.0 <= self.hsic_key_scale_ema < 1.0):
                 raise ValueError(
                     f"hsic_key_scale.ema must be in [0, 1), got "
@@ -338,6 +379,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 raise ValueError(
                     f"hsic_key_scale.exponent must be > 0, got "
                     f"{self.hsic_key_scale_exponent}."
+                )
+            if self.hsic_key_scale_transform not in {"rank", "raw_max"}:
+                raise ValueError(
+                    "hsic_key_scale.transform must be 'rank' or 'raw_max', "
+                    f"got {self.hsic_key_scale_transform!r}."
+                )
+            if self.hsic_key_scale_schedule not in {"none", "linear", "cosine"}:
+                raise ValueError(
+                    "hsic_key_scale.schedule must be 'none', 'linear' or "
+                    f"'cosine', got {self.hsic_key_scale_schedule!r}."
+                )
+            if self.hsic_key_scale_ramp_epochs < 0:
+                raise ValueError(
+                    "hsic_key_scale.ramp_epochs must be non-negative, got "
+                    f"{self.hsic_key_scale_ramp_epochs}."
+                )
+            if not (0.0 <= self.hsic_key_scale_max_strength <= 1.0):
+                raise ValueError(
+                    "hsic_key_scale.max_strength must be in [0, 1], got "
+                    f"{self.hsic_key_scale_max_strength}."
                 )
             if str(config["training"].get("hsic_objective", "pairwise")) != "pairwise":
                 raise ValueError(
@@ -389,7 +450,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         _agg = config["training"].get("hsic_aggregation", None)
         _legacy = config["training"].get("use_attention_weighted_hsic", None)
         _valid_agg = ("plain", "attw", "attw_descendants", "attw_softmax",
-                      "direction")
+                      "direction", "dual_logratio")  # dual_logratio: removed, rejected below
         if _agg is None:
             self.hsic_aggregation = "attw" if bool(_legacy) else "plain"
         else:
@@ -422,6 +483,36 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         self.hsic_softmax = self.hsic_aggregation == "attw_softmax"
         self.hsic_direction = self.hsic_aggregation == "direction"
+        # ---- Order-factorized selector: two orthogonal choices -----------
+        #   variable_selection_objective: who trains the symmetric existence gate
+        #     "struct" -> structural objective, together with the order
+        #     "recon"  -> reconstruction loss (+ lambda_l0_selector); the
+        #                 structural objective trains the order only
+        #   (gate type / order mask of reconstruction forwards: see
+        #    adaptive_training.recon_gates / use_order_in_recon)
+        #   anti_adjacency_lambda: a > 0 replaces the plain HSIC by the causal /
+        #     anti-causal log-ratio on the order
+        #       L = mean_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)]
+        #     a == 0 keeps the plain (optionally descendant-masked) HSIC.
+        self._resolve_order_config(config)
+        self._last_anti_adjacency_stats: Optional[Dict[str, Any]] = None
+        _sat = config["model"]["kwargs"].get("self_attention_type")
+        if self.variable_selection_objective == "recon" or self.anti_adjacency_on:
+            if _sat != "OrderFactorizedSelfAttention" or not self.homogeneous_nodes:
+                raise ValueError(
+                    "variable_selection_objective='recon' / anti_adjacency_lambda > 0 "
+                    "require self_attention_type='OrderFactorizedSelfAttention' "
+                    f"and homogeneous_nodes=True (got {_sat!r}, "
+                    f"homogeneous_nodes={self.homogeneous_nodes}).")
+        if self.anti_adjacency_on:
+            if bool(config["training"].get("hsic_exclude_descendants", False)):
+                raise ValueError(
+                    "anti_adjacency_lambda > 0 (log-ratio) tests each residual only "
+                    "against its own oriented inputs: set "
+                    "training.hsic_exclude_descendants: false.")
+            if self.anti_adjacency_eps <= 0.0:
+                raise ValueError(
+                    f"anti_adjacency_eps must be > 0, got {self.anti_adjacency_eps}.")
         self._dir_bias_warned = False
         if self.hsic_direction:
             if not self.homogeneous_nodes:
@@ -484,6 +575,50 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "training.hsic_objective must be 'pairwise' or "
                 f"'dhsic_residual', got {self.hsic_objective!r}."
             )
+
+        # ---- Log-transformed structural objective -----------------------
+        # When enabled, the FIXED-lambda structural term becomes
+        #   hsic_reg = lambda_hsic * log(HSIC + floor)
+        # whose gradient lambda * grad(HSIC) / (HSIC + floor) is RELATIVE to
+        # the current HSIC level: supervision does not degrade as the raw
+        # objective flattens towards its noise floor.  Log is unit-covariant
+        # (rescaling HSIC shifts the loss by a constant, gradients unchanged).
+        # The floor is the permutation-null mean estimated at structure-phase
+        # entry (hsic_null_stats, floor mode "null"), so the gradient smoothly
+        # saturates exactly at the measured noise floor; falls back to
+        # ``hsic_log_epsilon`` when no null estimate is available.  Raw HSIC
+        # logging/diagnostics are unaffected (the transform is monotone, so
+        # best_causal selection on val_hsic_reg is preserved).
+        self.hsic_log_transform = bool(
+            config["training"].get("hsic_log_transform", False)
+        )
+        _floor_cfg = config["training"].get("hsic_log_floor", "null")
+        if isinstance(_floor_cfg, str):
+            if _floor_cfg != "null":
+                raise ValueError(
+                    "training.hsic_log_floor must be 'null' or a positive "
+                    f"float, got {_floor_cfg!r}."
+                )
+            self.hsic_log_floor_mode = "null"
+            self.hsic_log_floor_value = None
+        else:
+            _floor_val = float(_floor_cfg)
+            if _floor_val <= 0.0:
+                raise ValueError(
+                    "training.hsic_log_floor must be > 0, got "
+                    f"{_floor_val}."
+                )
+            self.hsic_log_floor_mode = "fixed"
+            self.hsic_log_floor_value = _floor_val
+        self.hsic_log_epsilon = float(
+            config["training"].get("hsic_log_epsilon", 1e-12)
+        )
+        if self.hsic_log_epsilon <= 0.0:
+            raise ValueError(
+                "training.hsic_log_epsilon must be > 0, got "
+                f"{self.hsic_log_epsilon}."
+            )
+        self._hsic_log_floor_warned = False
 
         # ---- HSIC cross-fitting -----------------------------------------
         # Evaluate the independence statistic on a DISJOINT, PERMANENT fold of
@@ -602,6 +737,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.hsic_descendant_degrade_first_order = bool(
             config["training"].get("hsic_descendant_degrade_first_order", True)
         )
+        # Edge dropout on the HARDENED adjacency before the transitive closure
+        # (threshold mode): each hardened edge is dropped with probability
+        # ``hsic_descendant_edge_dropout`` at every mask build, so a wrong hub
+        # edge cannot permanently self-confirm its own descendant set.  Train
+        # only by default (val_hsic stays the deterministic reference curve,
+        # same precedent as BKD); ``hsic_descendant_dropout_eval`` opts in.
+        self.hsic_descendant_edge_dropout = float(
+            config["training"].get("hsic_descendant_edge_dropout", 0.0)
+        )
+        if not (0.0 <= self.hsic_descendant_edge_dropout < 1.0):
+            raise ValueError(
+                "hsic_descendant_edge_dropout must be in [0, 1), got "
+                f"{self.hsic_descendant_edge_dropout}"
+            )
+        self.hsic_descendant_dropout_eval = bool(
+            config["training"].get("hsic_descendant_dropout_eval", False)
+        )
         self.hsic_descendant_ema = float(
             config["training"].get("hsic_descendant_ema", 0.0)
         )
@@ -681,6 +833,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_hsic_desc_kept_frac = 1.0
         self._last_hsic_desc_cyclic = False
         self._last_hsic_desc_first_order = False
+        self._last_hsic_desc_edge_dropout = 0.0
         self._last_hsic_bkd_kept_frac = 1.0
         # LOO gamma gate state (detached, EMA-smoothed across refreshes).
         self._loo_gamma_cache: Optional[torch.Tensor] = None
@@ -823,6 +976,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # ----------------------------------------------------------------
         ac_cfg = config["training"].get("acyclicity_constraint", None) or {}
         self.acyclicity_constraint_enabled = bool(ac_cfg.get("enabled", False))
+        # Order-factorized selector: hard samples are acyclic by construction,
+        # so adjacency acyclicity penalties are rejected (design doc Phase 2).
+        if (config["model"]["kwargs"].get("self_attention_type")
+                == "OrderFactorizedSelfAttention"):
+            if self.kappa > 0.0 or self.acyclicity_constraint_enabled:
+                raise ValueError(
+                    "self_attention_type='OrderFactorizedSelfAttention' is "
+                    "incompatible with training.kappa > 0 and "
+                    "training.acyclicity_constraint.enabled (acyclicity is "
+                    "enforced by the sampled order)."
+                )
         if self.acyclicity_constraint_enabled:
             conflicting = []
             if self.kappa > 0.0:
@@ -1025,8 +1189,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
             structural_params, reconstruction_params = classify_parameters(
                 self.model, verbose=True
             )
+            # variable_selection_objective=recon: the symmetric existence gate (the
+            # free query tables) is the VARIABLE SELECTOR, trained by the
+            # reconstruction loss (+ L0); only the order stays structural.
+            if self.variable_selection_objective == "recon":
+                sel_ids = {id(p) for n, p in self.model.named_parameters()
+                           if "query_embed" in n}
+                structural_params = [p for p in structural_params
+                                     if id(p) not in sel_ids]
+                reconstruction_params = reconstruction_params + [
+                    p for n, p in self.model.named_parameters()
+                    if "query_embed" in n]
+                logger.info(
+                    "variable_selection_objective=recon: %d selector tensors moved "
+                    "to the reconstruction group.", len(sel_ids))
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
+        elif self.variable_selection_objective == "recon":
+            raise ValueError(
+                "training.variable_selection_objective='recon' requires "
+                "use_gradient_routing=True.")
 
         # ----------------------------------------------------------------
         # Gradient surgery (PCGrad): per-block projection of the L0 / NOTEARS
@@ -1115,6 +1297,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         hc_cfg = config["training"].get("hsic_constraint", None) or {}
         self.hsic_constraint_enabled = bool(hc_cfg.get("enabled", False))
         self.hsic_constraint_source = str(hc_cfg.get("source", "hsic"))
+        if self.hsic_constraint_enabled and self.hsic_log_transform:
+            raise ValueError(
+                "training.hsic_log_transform=True is mutually exclusive with "
+                "hsic_constraint.enabled=True: the ALM constraint (violation "
+                "HSIC - tolerance, dual ascent) is defined on the RAW HSIC; "
+                "the log transform applies to the fixed lambda_hsic path only."
+            )
         if self.hsic_constraint_enabled:
             conflicting = []
             if self.gradient_surgery:
@@ -1673,8 +1862,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self.homogeneous_nodes:
             # Homogeneous mode: the model expects the SQUARE (N, N) GT
             # adjacency because every node is a child.  Rows 0..L_S-1 are the
-            # S children Ã¢â‚¬â€ sources have no parents in this dataset family, so
-            # those rows are all-zero Ã¢â‚¬â€ and rows L_S..N-1 carry the X children's
+            # S children --> sources have no parents in this dataset family, so
+            # those rows are all-zero --> and rows L_S..N-1 carry the X children's
             # parents as [dec_cross | dec_self].
             combined = torch.zeros(self.N, self.N, dtype=cross_mask.dtype)
             combined[self.S_seq_len :, : self.S_seq_len] = cross_mask
@@ -1896,9 +2085,50 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         return x, rounds, delta
 
+    def _hsic_log_floor(self) -> float:
+        """Additive floor inside ``log(HSIC + floor)`` (detached scalar).
+
+        Floor mode ``"null"`` uses the permutation-null mean cached on
+        ``self.hsic_null_stats`` by ``estimate_structural_null`` (refreshed
+        at every structure-phase entry): the measured noise floor of the
+        structural objective on the current regime.  Falls back to
+        ``hsic_log_epsilon`` (with a one-time warning) when no usable null
+        estimate is available.  Mode ``"fixed"`` always returns the
+        configured positive float.
+        """
+        if self.hsic_log_floor_mode == "fixed":
+            return float(self.hsic_log_floor_value)
+        stats = getattr(self, "hsic_null_stats", None)
+        mean = stats.get("mean") if isinstance(stats, dict) else None
+        if mean is not None:
+            mean = float(mean)
+            if mean > 0.0 and mean == mean and mean != float("inf"):
+                return mean
+        if not self._hsic_log_floor_warned:
+            logger.warning(
+                "hsic_log_floor='null' but no usable permutation-null "
+                "estimate is available (hsic_null_stats unset or non-positive "
+                "mean); falling back to hsic_log_epsilon=%.3e.  Enable "
+                "adaptive.structure.null_estimation.run_bool to measure the "
+                "noise floor at every structure-phase entry.",
+                self.hsic_log_epsilon,
+            )
+            self._hsic_log_floor_warned = True
+        return float(self.hsic_log_epsilon)
+
     # ------------------------------------------------------------------
     # Common step
     # ------------------------------------------------------------------
+
+    def _log_nodewise_validation_mse(self, pred_x, x_target, n_source):
+        """Log sample-weighted MSE by one-based position in the S/X tensors."""
+        mse = (pred_x.detach().squeeze(-1) - x_target).square().mean(dim=0)
+        for i, value in enumerate(mse):
+            label = f"S{i + 1}" if i < n_source else f"X{i - n_source + 1}"
+            self.log(
+                f"val_mse_{label}", value, on_step=False, on_epoch=True,
+                batch_size=x_target.shape[0], prog_bar=False, sync_dist=True,
+            )
 
     def _step(self, batch, stage: str = "train"):
         # Unpack Ã¢â‚¬â€ support (S, X) and (S, X, Y)
@@ -1932,6 +2162,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         x_target = torch.nan_to_num(x_val)
         mse_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
         loss_x = mse_per_elem.mean()
+        if stage == "val":
+            self._log_nodewise_validation_mse(
+                pred_x, x_target, S.shape[1] if self.homogeneous_nodes else 0,
+            )
 
         # ----------------------------------------------------------------
         # Score sparsity (L1 on raw attention weights)
@@ -2074,11 +2308,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 hsic_pair_mask = loo_gamma
 
         # Stash the probe/virtual-pass pair weights (descendant x LOO, no BKD)
-        # for the bilevel gate and the unrolled shadow.  Train stage only;
+        # for the bilevel gate, unrolled shadow and unrolled structural loss.
+        # Train stage only;
         # None when the attention-weighted HSIC variant is in use (the probe
         # then measures the plain per-pair rows, which the gate docs note).
         if stage == "train" and (
-                self._gate_enabled or self._commit_source == "hsic_unrolled"):
+                self._gate_enabled or self._commit_source == "hsic_unrolled"
+                or self.structural_grad == "hsic_unrolled"):
             if self.use_attention_weighted_hsic:
                 self._last_probe_pair_mask = None
             elif loo_gamma is not None and not self.use_attention_weighted_hsic:
@@ -2103,6 +2339,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
             hsic_value = self._dhsic_residual_hsic(residuals)
             self._last_hsic_pair_mat = None
             self._last_hsic_row_means = None
+        elif self.anti_adjacency_on:
+            # Causal / anti-causal log-ratio objective.  Reuses the
+            # causal residuals of this step (cross-fit fold when active) and
+            # adds ONE anti-causal forward on the same rows and noise.  The
+            # value can be negative (log-ratio); val stage is a no-grad probe.
+            if xfit is not None:
+                S_d, X_d = xfit[0], xfit[1]
+            else:
+                S_d, X_d = S, X
+            ctx = torch.no_grad() if stage != "train" else torch.enable_grad()
+            with ctx:
+                hsic_value = self._anti_adjacency_hsic(
+                    S_d, X_d, causal=(combined_source, residuals))
+            self._last_hsic_row_means = (
+                self._last_anti_adjacency_stats["rows"] if self.log_hsic_rows else None)
         elif pair_mask_empty:
             # Every pair excluded this batch (e.g. BKD dropped all keys):
             # no learnable HSIC signal - contribute an exact zero rather
@@ -2155,7 +2406,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 # stashed detached for the hsic_class/* diagnostics
             )
             self._last_hsic_pair_mat = hsic_mat.detach()
-            self._update_hsic_key_scale(hsic_mat, dir_w.detach(), stage)
             if self.log_hsic_rows:
                 # Node-responsible rows with the SAME pair weights as the
                 # scalar aggregation -- the (detached) direction gate itself,
@@ -2215,7 +2465,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 self._last_hsic_pair_mat = (
                     hsic_mat.detach() if hsic_mat is not None else None
                 )
-                self._update_hsic_key_scale(hsic_mat, pair_w, stage)
                 # Entropy of the ACTUAL pair weights used by the aggregation
                 # (detached): H ~ ln(K) = near-uniform competition (legacy
                 # [0,1]-logit mode is pinned there by construction); falling
@@ -2278,7 +2527,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 )
                 hsic_value, hsic_mat = hsic_out
                 self._last_hsic_pair_mat = hsic_mat.detach()
-                self._update_hsic_key_scale(hsic_mat, att_mean.detach(), stage)
                 if self.log_hsic_rows:
                     # Node-responsible rows with the SAME pair weights as the
                     # scalar aggregation -- here the (detached) attention posterior
@@ -2300,9 +2548,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 source_kernel=self.hsic_kernel_source,
                 bandwidth_multipliers=self.hsic_bandwidth_multipliers,
                 pair_mask=hsic_pair_mask,
-                return_matrix=(self.log_hsic_rows or self.hsic_key_scale_enabled),
+                return_matrix=self.log_hsic_rows,
             )
-            if self.log_hsic_rows or self.hsic_key_scale_enabled:
+            if self.log_hsic_rows:
                 hsic_value, hsic_mat = hsic_out
                 if self.log_hsic_rows:
                     # Node-responsible rows: mean_j HSIC(source_j, res_i) with the
@@ -2311,9 +2559,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     self._last_hsic_row_means = hsic_row_means(
                         hsic_mat.detach(), pair_mask=hsic_pair_mask
                     )
-                self._update_hsic_key_scale(hsic_mat, hsic_pair_mask, stage)
             else:
                 hsic_value = hsic_out
+        # Diagnostic causal order / downstream key prior: computed from the
+        # RAW off-diagonal pair matrix, independently of the loss aggregation
+        # selected above (mask, attention, direction, BKD and LOO weights).
+        self._maybe_apply_causal_order(combined_source, residuals, stage)
+
         # Constraint source switch: the monitored quantity is the HSIC
         # (default) or, with source='oracle_shd', the EXPECTED SHD to the GT
         # DAG under the directed gate posterior (mean per-pair
@@ -2365,7 +2617,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
                         d * self._hsic_constraint_ema + (1.0 - d) * v
                     )
         else:
-            hsic_reg = self.lambda_hsic * hsic_value
+            if self.hsic_log_transform:
+                # Log-transformed fixed-lambda path (see __init__).  The floor
+                # is detached and constant within a phase; clamp guards
+                # against tiny negative HSIC estimates (numerical noise).
+                floor = self._hsic_log_floor()
+                hsic_reg = self.lambda_hsic * torch.log(
+                    torch.clamp(hsic_value, min=0.0) + floor
+                )
+                self.log(
+                    f"{stage}_hsic_log_floor", floor,
+                    on_step=False, on_epoch=True,
+                )
+            else:
+                hsic_reg = self.lambda_hsic * hsic_value
 
         # --- Per-rung tolerance calibration (permutation null) -------------
         # Armed by hsic_constraint_on_phase_switch(phase=structure); consumes
@@ -2575,8 +2840,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
+        # variable_selection_objective=recon: the selector (existence gate) is a
+        # reconstruction parameter, so its L0 budget rides on the RECON loss
+        # with its own coefficient (not overwritten by per-phase lambda_l0).
+        loss_recon_routed = loss_x
+        if self.variable_selection_objective == "recon":
+            sel_l0 = self.lambda_l0_selector * l0_penalty
+            loss_recon_routed = loss_x + sel_l0
+            self.log(f"{stage}_l0_selector_reg", sel_l0.detach(),
+                     on_step=False, on_epoch=True)
         self._last_loss_components = {
-            "loss_recon": loss_x,
+            "loss_recon": loss_recon_routed,
             "loss_structural": (
                 (1.0 - alpha) * hsic_reg
                 + struct_recon_reg
@@ -2609,6 +2883,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_score_sparse", score_sparse_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
+        if self.anti_adjacency_on and self._last_anti_adjacency_stats is not None:
+            self.log(f"{stage}_hsic_causal", self._last_anti_adjacency_stats["C"],
+                     on_step=False, on_epoch=True)
+            self.log(f"{stage}_hsic_anticausal", self._last_anti_adjacency_stats["A"],
+                     on_step=False, on_epoch=True)
+            self.log(f"{stage}_anti_adjacency_obj", hsic_value.detach(),
+                     on_step=False, on_epoch=True)
         if self.hsic_weight_descendants_only:
             # Fraction of pairs currently classed as descendants, i.e. the only
             # pairs whose attention receives gradient.  Watch for drift: -> 0
@@ -2645,6 +2926,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log(
                 f"{stage}_hsic_desc_first_order",
                 float(self._last_hsic_desc_first_order),
+                on_step=False, on_epoch=True,
+            )
+            # Effective edge-dropout probability applied at the last mask build
+            # (0.0 in eval unless hsic_descendant_dropout_eval is set).
+            self.log(
+                f"{stage}_hsic_desc_edge_dropout",
+                float(self._last_hsic_desc_edge_dropout),
                 on_step=False, on_epoch=True,
             )
         if self.use_loo_gamma_gate:
@@ -2936,7 +3224,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # (existence gate x direction gate), from which "descendant" is well
     # defined.  Symmetric / undirected scores cannot orient an edge, so the
     # descendant set would be meaningless there.
-    _DIRECTED_SELF_ATTENTION_TYPES = ("GatedSelfAttention",)
+    _DIRECTED_SELF_ATTENTION_TYPES = (
+        "GatedSelfAttention",
+        # Score tensor = the step's hard (existence x order) DAG.
+        "OrderFactorizedSelfAttention",
+    )
 
     def _direction_gate_module(self):
         """Inner self-attention module exposing the direction gate.
@@ -3283,52 +3575,151 @@ class AttentionSelectorForecaster(pl.LightningModule):
         return desc
 
     # ------------------------------------------------------------------
-    # HSIC-derived key scaling (RESIT-style source prior)
+    # Raw causal-order estimation and key scaling
     # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _estimate_causal_order(
+        self,
+        combined_source: torch.Tensor,
+        residuals: torch.Tensor,
+    ):
+        """Estimate node order from the raw, unweighted off-diagonal HSIC."""
+        return estimate_hsic_causal_order(
+            source_values=combined_source.detach(),
+            residuals=residuals.detach(),
+            method=self.causal_order_method,
+            diagonal_offset=(0 if self.homogeneous_nodes else self.S_seq_len),
+            sigma=self.hsic_sigma,
+            adaptive_bandwidth=self.hsic_adaptive_bandwidth,
+            mode=self.hsic_mode,
+            nhsic_epsilon=self.nhsic_epsilon,
+            source_kernel=self.hsic_kernel_source,
+            bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+            null_permutations=self.causal_order_null_permutations,
+            null_seed=self.causal_order_null_seed,
+        )
+
+    def _maybe_apply_causal_order(
+        self,
+        combined_source: torch.Tensor,
+        residuals: torch.Tensor,
+        stage: str,
+    ) -> None:
+        """Log the diagnostic order estimate and update its downstream prior."""
+        if not self.causal_order_enabled:
+            return
+        estimate = self._estimate_causal_order(combined_source, residuals)
+        self._last_causal_order = estimate
+        if self.causal_order_log_scores:
+            for i, value in enumerate(estimate.scores):
+                self.log(
+                    f"{stage}_causal_order_score_{i}",
+                    float(value),
+                    on_step=False,
+                    on_epoch=True,
+                )
+            if estimate.zscores is not None:
+                for i, value in enumerate(estimate.zscores):
+                    self.log(
+                        f"{stage}_causal_order_z_{i}",
+                        float(value),
+                        on_step=False,
+                        on_epoch=True,
+                    )
+            if estimate.p_values is not None:
+                for i, value in enumerate(estimate.p_values):
+                    self.log(
+                        f"{stage}_causal_order_p_{i}",
+                        float(value),
+                        on_step=False,
+                        on_epoch=True,
+                    )
+        self._update_hsic_key_scale(estimate.scores, stage)
+
+    def _key_scale_full_target(self, scores: torch.Tensor) -> torch.Tensor:
+        """Map causal-order scores to full-strength, pre-schedule weights."""
+        finite = torch.isfinite(scores)
+        target = torch.full_like(scores, float("nan"))
+        if self.hsic_key_scale_transform == "raw_max":
+            if not bool(finite.any()):
+                return target
+            s_max = float(scores[finite].max())
+            if s_max <= 1e-12:
+                return target
+            raw = (scores / s_max) ** self.hsic_key_scale_exponent
+            target[finite] = raw[finite].clamp_min(self.hsic_key_scale_floor)
+            return target
+
+        # Rank transform: ordering only, bounded and independent of HSIC scale.
+        n = scores.numel()
+        if n == 1:
+            target[finite] = 1.0
+            return target
+        safe_scores = torch.where(
+            finite,
+            scores,
+            torch.full_like(scores, -float("inf")),
+        )
+        order = torch.argsort(safe_scores, descending=True, stable=True)
+        ranks = torch.empty_like(order)
+        ranks[order] = torch.arange(n, device=scores.device)
+        q = (n - 1 - ranks).to(scores.dtype) / float(n - 1)
+        ranked = (
+            self.hsic_key_scale_floor
+            + (1.0 - self.hsic_key_scale_floor)
+            * q.pow(self.hsic_key_scale_exponent)
+        )
+        target[finite] = ranked[finite]
+        return target
+
+    def _key_scale_strength(self) -> Optional[float]:
+        """Warmup + ramp strength for applying the full target prior."""
+        epoch = int(self.current_epoch)
+        if epoch < self.hsic_key_scale_warmup_epochs:
+            return None
+        max_strength = self.hsic_key_scale_max_strength
+        if (
+            self.hsic_key_scale_schedule == "none"
+            or self.hsic_key_scale_ramp_epochs == 0
+        ):
+            return max_strength
+        u = min(
+            1.0,
+            float(epoch - self.hsic_key_scale_warmup_epochs + 1)
+            / float(self.hsic_key_scale_ramp_epochs),
+        )
+        if self.hsic_key_scale_schedule == "linear":
+            return max_strength * u
+        # Cosine ramp: zero derivative at both endpoints.
+        return max_strength * (0.5 - 0.5 * math.cos(math.pi * u))
 
     def _update_hsic_key_scale(
         self,
-        hsic_mat: Optional[torch.Tensor],
-        row_weight: Optional[torch.Tensor],
+        order_scores: Optional[torch.Tensor],
         stage: str,
     ) -> None:
-        """EMA-update the per-key HSIC scale and push it into the gated modules.
-
-        Nodal contribution of target ``i``: the row mean
-        ``mean_j HSIC(source_j, res_i)`` with the SAME pair weights as the
-        scalar aggregation (``row_weight``, detached).  A high row marks a
-        source-like node (its residual still depends on its descendants); a
-        low row a well-explained sink.  Weights are max-normalised (top node
-        = 1), sharpened by ``exponent``, floored, and EMA-smoothed.  Train
-        batches only, after ``warmup_epochs``; rows that are NaN this batch
-        (fully excluded) keep their previous weight.  Everything is detached:
-        the loss can never reach the weights, so the model cannot lower its
-        own penalty by manipulating them.
-        """
+        """EMA-update key scales from detached causal-order scores."""
         if (
             not self.hsic_key_scale_enabled
             or stage != "train"
-            or hsic_mat is None
+            or order_scores is None
         ):
             return
-        if int(self.current_epoch) < self.hsic_key_scale_warmup_epochs:
+        strength = self._key_scale_strength()
+        if strength is None:
             return
-        rows = hsic_row_means(hsic_mat.detach(), pair_mask=row_weight)
-        finite = torch.isfinite(rows)
+        full_target = self._key_scale_full_target(order_scores.detach())
+        target = 1.0 + float(strength) * (full_target - 1.0)
+        finite = torch.isfinite(target)
         if not bool(finite.any()):
             return
-        r_max = float(rows[finite].max())
-        if r_max <= 1e-12:
-            # No structural signal this step; keep the previous weights.
-            return
-        w_new = (rows / r_max) ** self.hsic_key_scale_exponent
-        w_new = w_new.clamp_min(self.hsic_key_scale_floor)
         state = self._hsic_key_scale_state
         if state is None:
             # Start from the flat (legacy) frame and anneal into the prior.
-            state = torch.ones_like(rows)
+            state = torch.ones_like(target)
         ema = self.hsic_key_scale_ema
-        w = torch.where(finite, ema * state + (1.0 - ema) * w_new, state)
+        w = torch.where(finite, ema * state + (1.0 - ema) * target, state)
         self._hsic_key_scale_state = w.detach()
         for mod in self.modules():
             setter = getattr(mod, "set_hsic_key_scale", None)
@@ -3339,6 +3730,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log("train_hsic_key_scale_mean", float(w.mean()),
                  on_step=False, on_epoch=True)
         self.log("train_hsic_key_scale_max", float(w.max()),
+                 on_step=False, on_epoch=True)
+        self.log("train_hsic_key_scale_strength", float(strength),
                  on_step=False, on_epoch=True)
 
     def _build_hsic_descendant_mask(
@@ -3372,6 +3765,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
              first-order mask starves do we fall back to no masking and log it.
         """
         if not (self.hsic_exclude_descendants and self._descendant_mask_supported):
+            self._last_hsic_desc_edge_dropout = 0.0
             return None, 1.0, False, False
 
         if score_tensor is None or not isinstance(score_tensor, torch.Tensor):
@@ -3385,9 +3779,47 @@ class AttentionSelectorForecaster(pl.LightningModule):
             anchor is not None
             and (self.current_epoch - anchor) < self.hsic_descendant_warmup_epochs
         ):
+            self._last_hsic_desc_edge_dropout = 0.0
             return None, 1.0, False, False
 
+        # Order-factorized ATTACHED exclusion (ablation): soft, differentiable
+        # mask 1 - desc_soft from the relaxed (pi * M) closure; diagonal 0.
+        # The detached default falls through to the hard path below, where
+        # score_tensor is the step's hard (existence x order) DAG.
+        # getattr chain: unit tests drive this method on a bare namespace.
+        oa_get = getattr(getattr(self, "model", None), "order_attention", None)
+        oa = oa_get() if callable(oa_get) else None
+        if oa is not None and not oa.detach_exclusion:
+            desc = oa.soft_descendant_scores()
+            mask = 1.0 - desc
+            if self.hsic_descendant_exclude_self:
+                mask = mask * (1.0 - torch.eye(
+                    mask.shape[0], device=mask.device, dtype=mask.dtype))
+            self._last_hsic_desc_edge_dropout = 0.0
+            kept_frac = float(mask.detach().mean().item())
+            if kept_frac < self.hsic_descendant_min_kept_frac:
+                logger.warning(
+                    "Attached order exclusion would keep only %.1f%% of pair "
+                    "weight (< min_kept_frac=%.1f%%); unmasked HSIC this step.",
+                    100.0 * kept_frac, 100.0 * self.hsic_descendant_min_kept_frac,
+                )
+                return None, kept_frac, False, False
+            return mask, kept_frac, False, False
+
         score = score_tensor.detach()
+
+        # Edge dropout is a TRAIN-time perturbation only (unless explicitly
+        # opted into for eval): the val mask stays deterministic so val_hsic
+        # remains a comparable reference curve across epochs and arms.
+        edge_p = (
+            # getattr defaults: unit tests drive this method on a bare
+            # namespace carrying only the pre-feature attributes.
+            getattr(self, "hsic_descendant_edge_dropout", 0.0)
+            if (getattr(self, "training", True)
+                or getattr(self, "hsic_descendant_dropout_eval", False))
+            else 0.0
+        )
+        self._last_hsic_desc_edge_dropout = edge_p
 
         # Optional EMA smoothing: stops the mask from thrashing between batches
         # when edge posteriors sit near the threshold.
@@ -3430,6 +3862,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     hops=self.hsic_descendant_hops,
                     exclude_self=self.hsic_descendant_exclude_self,
                     excluded_weight=self.hsic_descendant_weight,
+                    edge_dropout=edge_p,
                 )
         except ValueError as exc:
             # Shape inconsistency: never break training over a diagnostic mask.
@@ -3467,6 +3900,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     hops=1,
                     exclude_self=self.hsic_descendant_exclude_self,
                     excluded_weight=self.hsic_descendant_weight,
+                    edge_dropout=edge_p,
                 )
                 first_order = True
                 starved = kept_frac < self.hsic_descendant_min_kept_frac
@@ -4091,6 +4525,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         distribution: str = "gaussian",
         seed: int = 20240817,
         perms_per_batch: int = 20,
+        mask_consistent: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Monte Carlo estimate of the structural objective's NULL distribution.
 
@@ -4113,6 +4548,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         cross-fit fold and WITHOUT BKD / descendant masks (eval forward: BKD
         is off), i.e. the null matches the unmasked ``val_hsic``-style
         reference aggregation.
+
+        ``mask_consistent=True`` (``null_estimation.mask_consistent``) adds
+        one diagnostic per estimation round:
+
+        * ``hsic/null_mean_masked`` -- the SAME permutation replicates
+          re-aggregated through the CURRENT descendant mask, so masked arms
+          can form the honest ``train_hsic / null`` ratio.
 
         The result is stored on ``self.hsic_null_stats`` and logged
         (``hsic/null_mean`` / ``hsic/null_std`` / ``hsic/null_n``) for the CSV
@@ -4137,6 +4579,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         was_training = self.training
         self.eval()
         samples: list = []
+        samples_masked: list = []
         n_forwards = 0
         # Forward-pass budget: bounds the cost when batches yield few finite
         # replicates (degenerate batches are skipped rather than looped on).
@@ -4180,6 +4623,36 @@ class AttentionSelectorForecaster(pl.LightningModule):
                         generator=gen,
                     )
                 )
+                if mask_consistent:
+                    # Mask-consistent null: the SAME permutations re-aggregated
+                    # through the CURRENT descendant mask (eval mode: no edge
+                    # dropout, warmup/degrade guards honoured).
+                    try:
+                        get_score = getattr(
+                            self.model, "get_score_tensor_for_sparsity", None)
+                        score_tensor = get_score() if callable(get_score) else None
+                        cur_mask = None
+                        if score_tensor is not None:
+                            cur_mask = self._build_hsic_descendant_mask(
+                                score_tensor)[0]
+                        if cur_mask is not None:
+                            samples_masked.extend(
+                                self._hsic_permutation_replicates(
+                                    combined_source=combined_source,
+                                    residuals=residuals,
+                                    attention_weights=attention_weights,
+                                    bkd_keep_mask=None,
+                                    hsic_pair_mask=cur_mask,
+                                    n_perms=min(
+                                        int(perms_per_batch),
+                                        int(num_samples) - len(samples_masked),
+                                    ),
+                                    generator=gen,
+                                )
+                            )
+                    except Exception as exc:  # never break the estimation
+                        logger.warning(
+                            "null_estimation masked replicate skipped: %s", exc)
         finally:
             if was_training:
                 self.train()
@@ -4209,6 +4682,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log("hsic/null_mean", mean, on_step=False, on_epoch=True)
             self.log("hsic/null_std", std, on_step=False, on_epoch=True)
             self.log("hsic/null_n", float(arr.size), on_step=False, on_epoch=True)
+            if mask_consistent:
+                if samples_masked:
+                    sm = np.asarray(samples_masked, dtype=np.float64)
+                    self.log("hsic/null_mean_masked", float(sm.mean()),
+                             on_step=False, on_epoch=True)
+                    self.log("hsic/null_std_masked",
+                             float(sm.std(ddof=1)) if sm.size > 1 else 0.0,
+                             on_step=False, on_epoch=True)
         except Exception as exc:
             logger.warning("null_estimation logging skipped: %s", exc)
         logger.info(
@@ -4503,6 +4984,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # One-off: place every X query at the key centroid before the first step.
         self._maybe_init_query_centroid(batch)
 
+        # Order-factorized selector: the structure is global, so its noise is
+        # drawn ONCE per gradient step and reused by every forward of the
+        # step (including the cross-fitting pass).  No-op for other types.
+        resample = getattr(self.model, "resample", None)
+        if callable(resample):
+            resample()
+
         if self.use_gradient_routing:
 
             # --- Manual optimization with dual backward ---
@@ -4714,6 +5202,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         objective as the first-order stream.  Otherwise the raw unweighted
         per-pair HSIC is returned (historical behaviour).
         """
+        # Log-ratio objective: its own causal + anti-causal passes, so the
+        # unrolled gradient optimizes the same objective as _step.
+        if getattr(self, "anti_adjacency_on", False):
+            return self._anti_adjacency_hsic(S, X, overrides)
         # Need the attention weights too: call the forward directly rather
         # than _lean_pred.
         if overrides is None:
@@ -4812,6 +5304,127 @@ class AttentionSelectorForecaster(pl.LightningModule):
             pair_mask=self._last_probe_pair_mask,
         )
 
+    # ------------------------------------------------------------------
+    # Order-factorized selector: config + causal / anti-causal log-ratio
+    # ------------------------------------------------------------------
+    _LEGACY_ORDER_KEYS = {
+        "dual_selector_routing": "variable_selection_objective",
+        "order_selection": "variable_selection_objective",
+        "dual_logratio_eps": "anti_adjacency_eps",
+        "order_logratio_eps": "anti_adjacency_eps",
+        "dual_logratio_anti_weight": "anti_adjacency_lambda",
+        "order_anti_weight": "anti_adjacency_lambda",
+    }
+
+    def _resolve_order_config(self, config) -> None:
+        """Parse variable_selection_objective / anti_adjacency_lambda / anti_adjacency_eps /
+        lambda_l0_selector.  Legacy dual_* keys and hsic_aggregation:
+        dual_logratio are rejected with the replacement key."""
+        tr = config["training"]
+        for old, new in self._LEGACY_ORDER_KEYS.items():
+            if old in tr:
+                raise ValueError(
+                    f"training.{old} was removed: use training.{new}.")
+        if self.hsic_aggregation == "dual_logratio":
+            raise ValueError(
+                "hsic_aggregation='dual_logratio' was removed: set "
+                "hsic_aggregation: plain and training.anti_adjacency_lambda > 0.")
+        self.variable_selection_objective = str(tr.get("variable_selection_objective", "struct"))
+        if self.variable_selection_objective not in ("struct", "recon"):
+            raise ValueError(
+                "training.variable_selection_objective must be 'struct' or 'recon', "
+                f"got {self.variable_selection_objective!r}.")
+        self.anti_adjacency_lambda = float(tr.get("anti_adjacency_lambda", 0.0))
+        if self.anti_adjacency_lambda < 0.0:
+            raise ValueError(
+                f"anti_adjacency_lambda must be >= 0, got {self.anti_adjacency_lambda}.")
+        self.anti_adjacency_on = self.anti_adjacency_lambda > 0.0
+        if self.anti_adjacency_on and self.hsic_aggregation != "plain":
+            raise ValueError(
+                "anti_adjacency_lambda > 0 replaces the HSIC aggregation: set "
+                f"hsic_aggregation: plain (got {self.hsic_aggregation!r}).")
+        self.anti_adjacency_eps = float(tr.get("anti_adjacency_eps", 0.1))
+        self.lambda_l0_selector = float(tr.get("lambda_l0_selector", 0.0))
+
+    def _order_residuals(self, S, X, overrides=None, orientation="causal"):
+        """(target, residuals) of ONE forward under the given orientation.
+        The orientation is always reset to causal afterwards."""
+        self.model.set_order_orientation(orientation)
+        try:
+            pred = self._lean_pred(S, X, overrides)
+        finally:
+            self.model.set_order_orientation("causal")
+        x_val = torch.cat([S[:, :, self.val_idx], X[:, :, self.val_idx]], dim=1)
+        target = torch.nan_to_num(x_val).squeeze()
+        return target, target - pred.squeeze()
+
+    def _anti_adjacency_hsic(self, S, X, overrides=None, causal=None):
+        """Causal / anti-causal log-ratio objective (lower = better order).
+        Active only for anti_adjacency_lambda > 0.
+
+        For every unordered pair e = (i, j), with M[i, j] = P(i before j)
+        (relaxed, gradient-carrying) and residual matrices
+        H[t, s] = HSIC(x_s, r_t):
+
+            C_e = M_ij H^c[j, i] + M_ji H^c[i, j]   (later causal residual
+                                                      vs earlier node: low)
+            A_e = M_ij H^a[i, j] + M_ji H^a[j, i]   (earlier anti-causal
+                                                      residual vs later: high)
+            L   = sum_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)] / sum_e w_e
+
+        a = anti_adjacency_lambda (> 0).
+        w_e = detached selector probability pi_e (1 with full existence);
+        nu = permutation-null mean of the current phase (1.0 before the first
+        calibration).  ``causal`` optionally passes precomputed causal
+        ``(target, residuals)`` (the cross-fit forward of ``_step``).
+        """
+        if causal is None:
+            target, r_c = self._order_residuals(S, X, overrides, "causal")
+        else:
+            target, r_c = causal
+        oa = self.model.order_attention()
+        _, r_a = self._order_residuals(S, X, overrides, "anticausal")
+        M = oa._last_M                      # causal relaxed order, same noise
+        pi = oa._last_pi.detach()
+
+        if self._hsic_bw_frozen_sigmas is not None:
+            sigma, adaptive = self._hsic_bw_frozen_sigmas, False
+        else:
+            sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
+        kw = dict(sigma=sigma, adaptive_bandwidth=adaptive, mode=self.hsic_mode,
+                  nhsic_epsilon=self.nhsic_epsilon,
+                  source_kernel=self.hsic_kernel_source,
+                  bandwidth_multipliers=self.hsic_bandwidth_multipliers,
+                  return_matrix=True)
+        H_c = torch.nan_to_num(hsic_cross_per_pair(target, r_c, **kw)[1])
+        H_a = torch.nan_to_num(hsic_cross_per_pair(target, r_a, **kw)[1])
+
+        Cd = M * H_c.transpose(0, 1)        # [i, j]: M_ij HSIC(x_i, r^c_j)
+        Ad = M * H_a                        # [i, j]: M_ij HSIC(x_j, r^a_i)
+        C = (Cd + Cd.transpose(0, 1)).clamp_min(0.0)
+        A = (Ad + Ad.transpose(0, 1)).clamp_min(0.0)
+
+        stats = getattr(self, "hsic_null_stats", None)
+        nu = float(stats["mean"]) if stats and float(stats.get("mean", 0.0)) > 0.0 else 1.0
+        eps = self.anti_adjacency_eps
+        lr = (torch.log(eps + C / nu)
+              - self.anti_adjacency_lambda * torch.log(eps + A / nu))
+        off = 1.0 - torch.eye(lr.shape[0], device=lr.device, dtype=lr.dtype)
+        w = pi * off
+        triu = torch.triu(off, diagonal=1).bool()
+        w_sum = w[triu].sum().clamp_min(1e-12)
+        loss = (w[triu] * lr[triu]).sum() / w_sum
+
+        with torch.no_grad():
+            row_w = w.sum(dim=1).clamp_min(1e-12)
+            self._last_anti_adjacency_stats = {
+                "C": float((w[triu] * C[triu]).sum() / w_sum),
+                "A": float((w[triu] * A[triu]).sum() / w_sum),
+                "nu": nu,
+                "rows": (w * lr).sum(dim=1) / row_w,
+            }
+        return loss
+
     def _lean_recon(self, S, X, overrides=None):
         """MSE of ONE grad-enabled forward (same target layout as _step)."""
         pred = self._lean_pred(S, X, overrides)
@@ -4846,6 +5459,15 @@ class AttentionSelectorForecaster(pl.LightningModule):
                         bool(getattr(mod, "_dense_gate_eval", False)),
                     ))
                     mod.set_dense_gate_mode(False, eval_mode=False)
+        # Order-factorized selector: the probe uses the structure-phase
+        # forward (soft gates x relaxed order) in every phase, so baseline
+        # and later probes measure the same map.
+        oa = self.model.order_attention() if (
+            gate_mode == "relaxed" and hasattr(self.model, "order_attention")) else None
+        oa_saved = (oa.order_path, oa.gate_mode) if oa is not None else None
+        if oa is not None:
+            oa.set_order_path("relaxed")
+            oa.set_gate_mode("soft")
 
         device = next(self.parameters()).device
         total_sum = 0.0
@@ -4870,6 +5492,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 self.train()
             for mod, active, eval_flag in saved:
                 mod.set_dense_gate_mode(active, eval_mode=eval_flag)
+            if oa_saved is not None:
+                oa.set_order_path(oa_saved[0])
+                oa.set_gate_mode(oa_saved[1])
 
         return total_sum / max(total_count, 1)
 
@@ -5165,6 +5790,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Persist the centroid-commit controller state (taboos, counters)."""
+        if getattr(self, "_order_initialization_report", None) is not None:
+            checkpoint["order_initialization"] = self._order_initialization_report
         if self._commit is not None:
             checkpoint["centroid_commit"] = self._commit.state_dict()
         if self.hsic_constraint_enabled:
@@ -5235,6 +5862,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         the *current* model but absent from the checkpoint when they
         belong to ``batch_key_dropout.*``.
         """
+        self._order_initialization_report = checkpoint.get("order_initialization")
         if "state_dict" not in checkpoint:
             return
 

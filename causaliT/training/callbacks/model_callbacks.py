@@ -109,6 +109,13 @@ class PeriodicDAGMetrics(Callback):
       recovery; chance level ~ L_S/N.
     * ``dag/source_auroc``       -- ranking of true-source labels against
       negated source scores (threshold-free; 0.5 = chance).
+    * ``dag/order_pair_acc_full`` / ``dag/order_kendall_full`` --
+      HOMOGENEOUS mode only: causal-order agreement of the posterior's
+      outgoing-edge mass with the true DAG (ancestor-pair accuracy and
+      Kendall-style concordance with the true topological depth).  With
+      ``causal_order.enabled``, ``dag/order_pair_acc_hsic`` /
+      ``dag/order_kendall_hsic`` score the detached residual-HSIC order
+      estimate the same way.
 
     Enabled via ``training.log_dag_metrics: true``; cadence via
     ``training.dag_metrics_every_n_epochs`` (default 50).  Metrics are always
@@ -286,6 +293,9 @@ class PeriodicDAGMetrics(Callback):
           incoming-edge mass (the model's ``source_scores``) is low.
         * ``dag/shd_full`` -- SHD of the full posterior against the full true
           DAG (S->X and X->X combined), reversal counting active.
+        * ``dag/order_pair_acc_full`` / ``dag/order_kendall_full`` --
+          causal-ORDER agreement of the posterior with the true DAG (see
+          ``_log_order_metrics``).
         """
         import numpy as np
         n = att_full.shape[0]
@@ -338,6 +348,7 @@ class PeriodicDAGMetrics(Callback):
             if self._true_full.shape == att_full.shape:
                 self._log_shd(pl_module, att_full, self._true_full,
                               "full", is_cross=False)
+                self._log_order_metrics(pl_module, att_full)
             elif "full" not in self._warned_skip:
                 self._warned_skip.add("full")
                 logger.warning(
@@ -345,6 +356,119 @@ class PeriodicDAGMetrics(Callback):
                     f"{att_full.shape} vs true {self._true_full.shape}; "
                     f"skipping dag/shd_full."
                 )
+
+    # -- causal-order agreement ------------------------------------------
+    @staticmethod
+    def _order_agreement(upstreamness: "np.ndarray", true_full: "np.ndarray"):
+        """Agreement between an upstreamness score and the true causal order.
+
+        ``upstreamness[j]`` larger = node j estimated more upstream (the
+        posterior's outgoing-edge mass, or a RESIT-style HSIC score).
+        ``true_full[i, j] = 1`` means ``j -> i``.
+
+        Returns ``(pair_acc, kendall)``:
+        * ``pair_acc`` -- fraction of TRUE ancestor pairs (j -> ... -> i)
+          with upstreamness[j] > upstreamness[i] (ties count 1/2); 1.0 =
+          perfectly ordered, 0.5 = chance.
+        * ``kendall`` -- Kendall-tau-style concordance of the score against
+          the true topological depth (longest path from a source), computed
+          over node pairs with DISTINCT true depth; +1 = score decreases
+          monotonically downstream, 0 = no agreement.
+        """
+        import numpy as np
+        g = np.asarray(true_full) > 0.5
+        n = g.shape[0]
+        # GT ancestor relation: anc[i, j] = True iff j -> ... -> i.
+        anc = g.copy()
+        for _ in range(n):
+            new = anc | (anc @ g)
+            if (new == anc).all():
+                break
+            anc = new
+        np.fill_diagonal(anc, False)
+        # GT topological depth (longest path from a source).
+        depth = np.zeros(n, dtype=float)
+        for _ in range(n):
+            new_depth = depth.copy()
+            for i in range(n):
+                pa = np.where(g[i])[0]
+                if pa.size:
+                    new_depth[i] = max(new_depth[i], depth[pa].max() + 1)
+            if np.array_equal(new_depth, depth):
+                break
+            depth = new_depth
+
+        u = np.asarray(upstreamness, dtype=float).ravel()
+        ii, jj = np.where(anc)
+        if ii.size:
+            d = u[jj] - u[ii]          # j ancestor of i: should be positive
+            pair_acc = float((np.sum(d > 0) + 0.5 * np.sum(d == 0)) / ii.size)
+        else:
+            pair_acc = float("nan")
+
+        concordant = discordant = 0
+        for a in range(n):
+            for b in range(a + 1, n):
+                if depth[a] == depth[b]:
+                    continue
+                true_sign = 1.0 if depth[a] < depth[b] else -1.0
+                s = np.sign(u[a] - u[b])
+                if s == 0:
+                    concordant += 0.5
+                    discordant += 0.5
+                elif s == true_sign:
+                    concordant += 1
+                else:
+                    discordant += 1
+        tot = concordant + discordant
+        kendall = float((concordant - discordant) / tot) if tot else float("nan")
+        return pair_acc, kendall
+
+    def _log_order_metrics(self, pl_module: LightningModule,
+                           att_full: "np.ndarray"):
+        """Log causal-order agreement of the posterior (and of the diagnostic
+        HSIC order estimate, when ``causal_order.enabled``) with the true DAG.
+
+        * ``dag/order_pair_acc_full`` / ``dag/order_kendall_full`` -- order
+          implied by the posterior's OUTGOING-edge mass (att[i, j] = P(j->i),
+          so column sums measure how much j is attended to as a parent).
+        * ``dag/order_pair_acc_hsic`` / ``dag/order_kendall_hsic`` -- same
+          agreement for the detached residual-HSIC order scores
+          (``pl_module._last_causal_order.scores``); scores the ordering the
+          key-scale prior ACTS on, separately from the posterior it tilts.
+        """
+        import numpy as np
+        try:
+            up_post = att_full.sum(axis=0)      # outgoing-edge mass
+            pair_acc, kendall = self._order_agreement(up_post, self._true_full)
+            pl_module.log("dag/order_pair_acc_full", pair_acc,
+                          on_step=False, on_epoch=True)
+            pl_module.log("dag/order_kendall_full", kendall,
+                          on_step=False, on_epoch=True)
+        except Exception as e:   # pragma: no cover - diagnostics only
+            if "order" not in self._warned_skip:
+                self._warned_skip.add("order")
+                logger.warning(
+                    f"PeriodicDAGMetrics: order metrics failed: {e}")
+        co = getattr(pl_module, "_last_causal_order", None)
+        scores = getattr(co, "scores", None) if co is not None else None
+        if scores is None:
+            return
+        try:
+            s = scores.detach().cpu().numpy().astype(float).ravel()
+            if s.shape[0] != self._true_full.shape[0]:
+                return
+            pair_acc, kendall = self._order_agreement(s, self._true_full)
+            pl_module.log("dag/order_pair_acc_hsic", pair_acc,
+                          on_step=False, on_epoch=True)
+            pl_module.log("dag/order_kendall_hsic", kendall,
+                          on_step=False, on_epoch=True)
+        except Exception as e:   # pragma: no cover - diagnostics only
+            if "order_hsic" not in self._warned_skip:
+                self._warned_skip.add("order_hsic")
+                logger.warning(
+                    f"PeriodicDAGMetrics: HSIC order metrics failed: {e}")
+
 
     # -- lifecycle -------------------------------------------------------
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule):

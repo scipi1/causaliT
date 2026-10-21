@@ -302,6 +302,9 @@ def train_single_fold(
             )
         logger_info.info(f"Warm-starting from: {warm_start_ckpt}")
         checkpoint = torch.load(warm_start_ckpt, map_location="cpu", weights_only=False)
+        # Keep one-off order initialization from being repeated on a warm start.
+        if "order_initialization" in checkpoint:
+            model._order_initialization_report = checkpoint["order_initialization"]
         state_dict = checkpoint.get("state_dict", checkpoint)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:

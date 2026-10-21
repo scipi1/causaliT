@@ -348,6 +348,107 @@ def sample_bkd_keep_mask(
     return keep_mask
 
 
+class BKDMixin:
+    """Inline batch-consistent key dropout for attention modules.
+
+    Same interface as the inline BKD of the gated modules
+    (``set_bkd_schedule`` / ``set_bkd_phase_active`` / ``set_bkd_sampling`` /
+    ``set_bkd_eval`` / ``last_bkd_keep``), so the adaptive trainer drives it
+    unchanged.  The keep mask is a CONSTANT: a dropped key gets zero forward
+    weight and zero gradient (also through any straight-through gate term).
+    The annealing clock advances on every training forward; the phase flag
+    only gates the application.
+    """
+
+    def _init_bkd(
+        self,
+        p: Optional[float] = None,
+        p_final: Optional[float] = None,
+        annealing_batches: Optional[int] = None,
+        min_keys: int = 0,
+        deterministic: bool = False,
+        eval_enabled: bool = False,
+        eval_seed: int = 12345,
+    ) -> None:
+        self._bkd_p0 = p
+        self._bkd_p1 = p_final if p_final is not None else p
+        self._bkd_anneal = annealing_batches
+        self._bkd_min_keys = int(min_keys)
+        self._bkd_deterministic = bool(deterministic)
+        self._bkd_eval = bool(eval_enabled)
+        self._bkd_eval_seed = int(eval_seed)
+        self._bkd_phase_active = True
+        self._bkd_schedule = "linear"
+        self._bkd_p_base: Optional[float] = None
+        self._bkd_amp: Optional[float] = None
+        self._bkd_cycles: Optional[float] = None
+        self.register_buffer("_bkd_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.register_buffer("_bkd_eval_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.last_bkd_keep: Optional[torch.Tensor] = None
+
+    def _current_bkd_p(self) -> Optional[float]:
+        if self._bkd_p0 is None:
+            return None
+        if self._bkd_anneal is None or self._bkd_anneal <= 0:
+            return float(self._bkd_p0)
+        frac = min(1.0, float(self._bkd_step.item()) / float(self._bkd_anneal))
+        if self._bkd_schedule == "cosine":
+            p_end = float(self._bkd_p1)
+            p_base = float(self._bkd_p_base) if self._bkd_p_base is not None else float(self._bkd_p0)
+            amp = float(self._bkd_amp) if self._bkd_amp is not None else 0.0
+            cycles = float(self._bkd_cycles) if self._bkd_cycles else 1.0
+            osc = 0.5 * (1.0 + np.cos(2.0 * np.pi * cycles * frac))
+            return p_end + (1.0 - frac) * ((p_base - p_end) + amp * osc)
+        return float(self._bkd_p0) + frac * (float(self._bkd_p1) - float(self._bkd_p0))
+
+    def set_bkd_schedule(self, p0, p1=None, annealing_batches=None,
+                         schedule="linear", p_base=None, amp=None, cycles=None) -> None:
+        """Run-time schedule override; the step counter is NOT reset."""
+        self._bkd_p0 = p0
+        self._bkd_p1 = p1 if p1 is not None else p0
+        self._bkd_anneal = annealing_batches
+        self._bkd_schedule = str(schedule)
+        self._bkd_p_base, self._bkd_amp, self._bkd_cycles = p_base, amp, cycles
+
+    def set_bkd_phase_active(self, active: bool) -> None:
+        self._bkd_phase_active = bool(active)
+
+    def set_bkd_sampling(self, min_keys=None, deterministic=None) -> None:
+        if min_keys is not None:
+            self._bkd_min_keys = int(min_keys)
+        if deterministic is not None:
+            self._bkd_deterministic = bool(deterministic)
+
+    def set_bkd_eval(self, enabled: bool, seed: Optional[int] = None) -> None:
+        self._bkd_eval = bool(enabled)
+        if seed is not None:
+            self._bkd_eval_seed = int(seed)
+
+    def _bkd_keep(self, num_keys: int, device) -> Optional[torch.Tensor]:
+        """Float ``(num_keys,)`` keep mask for this forward (1 = kept), or
+        None when BKD is not applied.  Advances the clock in training."""
+        p = self._current_bkd_p()
+        self.last_bkd_keep = None
+        if p is None:
+            return None
+        if self.training:
+            self._bkd_step += 1
+            if not (self._bkd_phase_active and p > 0.0):
+                return None
+            keep = sample_bkd_keep_mask(num_keys, p, self._bkd_min_keys,
+                                        self._bkd_deterministic, device)
+        elif self._bkd_eval and self._bkd_phase_active and p > 0.0:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self._bkd_eval_seed + int(self._bkd_eval_step.item()))
+            keep = sample_bkd_keep_mask(num_keys, p, self._bkd_min_keys,
+                                        self._bkd_deterministic, device, generator=gen)
+            self._bkd_eval_step += 1
+        else:
+            return None
+        self.last_bkd_keep = keep.to(torch.float32)
+        return self.last_bkd_keep
+
+
 class BatchConsistentKeyDropout(nn.Module):
     """
     Batch-consistent key (column) dropout for attention matrices.

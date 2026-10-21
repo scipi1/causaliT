@@ -87,10 +87,15 @@ class TestConfigParsing:
     def test_enabled_with_defaults(self):
         o = _resolve(hsic_key_scale={"enabled": True})
         assert o.hsic_key_scale_enabled
+        assert o.causal_order_enabled
         assert o.hsic_key_scale_ema == 0.9
-        assert o.hsic_key_scale_floor == 0.1
+        assert o.hsic_key_scale_floor == 0.5
         assert o.hsic_key_scale_warmup_epochs == 0
         assert o.hsic_key_scale_exponent == 1.0
+        assert o.hsic_key_scale_transform == "rank"
+        assert o.hsic_key_scale_schedule == "cosine"
+        assert o.hsic_key_scale_ramp_epochs == 0
+        assert o.hsic_key_scale_max_strength == 1.0
 
     def test_requires_fixed_orthonormal_keys(self):
         torch.manual_seed(0)
@@ -113,7 +118,10 @@ class TestConfigParsing:
                      hsic_objective="dhsic_residual")
 
     @pytest.mark.parametrize("bad", [{"ema": 1.0}, {"floor": -0.1},
-                                     {"exponent": 0.0}])
+                                     {"exponent": 0.0},
+                                     {"transform": "bogus"},
+                                     {"schedule": "bogus"},
+                                     {"max_strength": 1.5}])
     def test_invalid_hyperparams_raise(self, bad):
         with pytest.raises(ValueError, match="hsic_key_scale"):
             _resolve(hsic_key_scale=dict(bad, enabled=True))
@@ -125,28 +133,46 @@ class TestWeightUpdate:
         o.log = lambda *a, **k: None  # no logger attached in unit tests
         return o
 
-    def _mat(self):
-        # Row 0 high (source-like), rows 1-2 low (sink-like).
-        return torch.tensor([
-            [0.8, 0.9, 0.7],
-            [0.05, 0.02, 0.03],
-            [0.10, 0.08, 0.06],
-        ])
+    def _scores(self):
+        # Entry 0 high (source-like), entries 1-2 low (sink-like).
+        return torch.tensor([0.8, 0.05, 0.10])
 
-    def test_max_normalisation_and_floor(self):
+    def test_rank_transform_and_floor(self):
         o = self._armed(floor=0.1)
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         w = o._hsic_key_scale_state
         assert w is not None
-        assert float(w.max()) == pytest.approx(1.0)     # top node pinned to 1
-        assert float(w[0]) == pytest.approx(1.0)        # highest row
-        assert float(w.min()) >= 0.1                    # floor respected
-        # Ordering preserved: row 0 >> rows 1, 2.
-        assert float(w[0]) > float(w[1]) and float(w[0]) > float(w[2])
+        # Rank transform: q = 1, 0.5, 0 for ranks 0, 1, 2 (n=3).
+        assert float(w[0]) == pytest.approx(1.0)         # top node pinned to 1
+        assert float(w[2]) == pytest.approx(0.55)        # 0.1 + 0.9 * 0.5
+        assert float(w[1]) == pytest.approx(0.1)         # lowest rank -> floor
+        assert float(w.min()) >= 0.1                     # floor respected
+
+    def test_raw_max_transform(self):
+        o = self._armed(transform="raw_max", floor=0.1)
+        o._update_hsic_key_scale(self._scores(), "train")
+        w = o._hsic_key_scale_state
+        assert float(w[0]) == pytest.approx(1.0)              # 0.8 / 0.8
+        assert float(w[1]) == pytest.approx(0.1)              # 0.0625 -> floor
+        assert float(w[2]) == pytest.approx(0.125)            # 0.10 / 0.8
+
+    def test_max_strength_blends_toward_one(self):
+        o = self._armed(floor=0.0, max_strength=0.5)
+        o._update_hsic_key_scale(self._scores(), "train")
+        w = o._hsic_key_scale_state
+        assert float(w[0]) == pytest.approx(1.0)
+        # Full target 0 for the lowest rank; half strength -> 0.5.
+        assert float(w[1]) == pytest.approx(0.5)
+
+    def test_linear_ramp_scales_strength(self):
+        o = self._armed(floor=0.0, schedule="linear", ramp_epochs=4)
+        o._update_hsic_key_scale(self._scores(), "train")     # epoch 0 -> u=1/4
+        w = o._hsic_key_scale_state
+        assert float(w[1]) == pytest.approx(0.75)  # 1 + 0.25 * (0 - 1)
 
     def test_pushed_into_modules(self):
         o = self._armed()
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         mods = [m for m in o.modules()
                 if isinstance(m, GatedSelfAttention)]
         assert mods, "fixture must contain a GatedSelfAttention"
@@ -158,47 +184,52 @@ class TestWeightUpdate:
     def test_ema_smoothing(self):
         o = self._armed()
         o.hsic_key_scale_ema = 0.5
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         first = o._hsic_key_scale_state.clone()
         # First update: 0.5 * ones + 0.5 * w_new (state starts at 1).
         assert float(first[0]) == pytest.approx(1.0)
         assert 0.5 < float(first[1]) < 1.0
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         second = o._hsic_key_scale_state
-        # Converging toward w_new (< first for sink rows).
+        # Converging toward w_new (< first for sink entries).
         assert float(second[1]) < float(first[1])
 
-    def test_nan_row_keeps_previous_weight(self):
+    def test_nan_entry_keeps_previous_weight(self):
         o = self._armed()
-        mat = self._mat()
-        o._update_hsic_key_scale(mat, None, "train")
+        scores = self._scores()
+        o._update_hsic_key_scale(scores, "train")
         before = o._hsic_key_scale_state.clone()
-        mat2 = mat.clone()
-        mat2[1] = float("nan")   # row fully excluded this batch
-        mat2[2] = torch.tensor([0.2, 0.16, 0.12])  # row 2 signal changes
-        o._update_hsic_key_scale(mat2, None, "train")
+        scores2 = scores.clone()
+        scores2[1] = float("nan")  # entry excluded this batch
+        scores2[2] = 0.9           # entry 2 overtakes entry 0 in the ranking
+        o._update_hsic_key_scale(scores2, "train")
         after = o._hsic_key_scale_state
         assert float(after[1]) == float(before[1])
-        assert float(after[2]) != float(before[2])  # other rows still update
+        assert float(after[2]) != float(before[2])  # other entries still update
 
     def test_val_stage_skipped(self):
         o = self._armed()
-        o._update_hsic_key_scale(self._mat(), None, "val")
+        o._update_hsic_key_scale(self._scores(), "val")
         assert o._hsic_key_scale_state is None
 
     def test_warmup_gating(self):
         o = self._armed(warmup_epochs=5)
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         assert o._hsic_key_scale_state is None  # current_epoch 0 < 5
 
-    def test_all_nan_matrix_skipped(self):
+    def test_all_nan_scores_skipped(self):
         o = self._armed()
         o._update_hsic_key_scale(
-            torch.full((3, 3), float("nan")), None, "train")
+            torch.full((3,), float("nan")), "train")
+        assert o._hsic_key_scale_state is None
+
+    def test_none_scores_skipped(self):
+        o = self._armed()
+        o._update_hsic_key_scale(None, "train")
         assert o._hsic_key_scale_state is None
 
     def test_disabled_is_noop(self):
         o = _resolve()
-        o._update_hsic_key_scale(self._mat(), None, "train")
+        o._update_hsic_key_scale(self._scores(), "train")
         assert o._hsic_key_scale_state is None
 

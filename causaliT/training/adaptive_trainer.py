@@ -352,6 +352,11 @@ class PhaseController(Callback):
             null_cfg.get("distribution", "gaussian")
         )
         self.null_est_seed: int = int(null_cfg.get("seed", 20240817))
+        # Mask-consistent diagnostic: also log the permutation null through
+        # the CURRENT descendant mask (hsic/null_mean_masked).
+        self.null_est_mask_consistent: bool = bool(
+            null_cfg.get("mask_consistent", False)
+        )
 
         # HSIC-progress gates ("regularizers trim after HSIC ranks"): an armed
         # regularizer is applied only while the structural signal
@@ -524,6 +529,33 @@ class PhaseController(Callback):
                 )
             self._bkd_managed = True
 
+        # Phases the BKD ladders apply to (default: all, legacy behaviour).
+        # Phases not listed fall back to their own phase-block BKD keys, so
+        # e.g. [warmup, reconstruct, final_reconstruct] keeps structure free.
+        _all_phases = ["warmup", "reconstruct", "final_reconstruct", "structure"]
+        lph = ad.get("bkd_ladder_phases", None)
+        self._bkd_ladder_phases = set(_all_phases if lph is None else [str(v) for v in lph])
+        if not self._bkd_ladder_phases <= set(_all_phases):
+            raise ValueError(
+                f"adaptive_training.bkd_ladder_phases must be a subset of "
+                f"{_all_phases}, got {sorted(self._bkd_ladder_phases)}.")
+
+        # Reconstruction-forward settings of the order-factorized selector
+        # (global default, overridable per warmup / reconstruct / final block).
+        # Structure phases always use soft gates on the relaxed order.
+        #   recon_gates: hard (straight-through Bernoulli) | soft (Hard-Concrete)
+        #   use_order_in_recon: apply the step's hard order mask (detached)
+        self._recon_gates_default = str(ad.get("recon_gates", "hard"))
+        self._use_order_in_recon_default = bool(ad.get("use_order_in_recon", False))
+        for _blk in (self.warmup_cfg, self.recon_cfg, self.final_cfg, {"recon_gates": self._recon_gates_default}):
+            if _blk.get("recon_gates", "hard") not in ("hard", "soft"):
+                raise ValueError(
+                    "adaptive_training.recon_gates must be 'hard' or 'soft', "
+                    f"got {_blk.get('recon_gates')!r}.")
+        for _old in ("reconstruct_gate", "dense_gate_mode"):
+            if _old in ad:
+                raise ValueError(f"adaptive_training.{_old} is not a key: use recon_gates.")
+
         # Per-phase direction-gate bias (GatedSelfAttention direction gate).
         # Managed only when at least one phase block sets ``dir_bias``:
         # reconstruct phases then run with a positive bias (both directions
@@ -590,7 +622,8 @@ class PhaseController(Callback):
             cfg = {**self.recon_cfg, **self.final_cfg}
         else:
             cfg = self.struct_cfg
-        if self._bkd_ladder is not None:
+        on_ladder = phase in self._bkd_ladder_phases
+        if self._bkd_ladder is not None and on_ladder:
             # Constant p for the whole cycle (recon + structure alike);
             # _cycle_count counts COMPLETED structure phases, so both phases
             # of cycle k see rung k.
@@ -600,7 +633,7 @@ class PhaseController(Callback):
                    "batch_key_dropout": p_rung,
                    "batch_key_dropout_final": p_rung,
                    "batch_key_dropout_annealing_batches": None}
-        if self._bkd_min_keys_ladder is not None:
+        if self._bkd_min_keys_ladder is not None and on_ladder:
             # Constant key budget for the whole cycle (same rung semantics as
             # the p ladder); overrides any static per-phase min_keys.  The
             # p=1 default below activates BKD when no p key is set.
@@ -702,6 +735,40 @@ class PhaseController(Callback):
             pl_module.log(
                 "open_gate_active", float(active), on_step=False, on_epoch=True
             )
+
+    def _apply_recon_forward_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Order-factorized selector forward for ``phase`` (no-op otherwise).
+
+        structure: soft gates x relaxed order (gradient to the order).
+        warmup / reconstruct / final_reconstruct: ``recon_gates`` x (hard
+        detached order if ``use_order_in_recon`` else no order mask).
+        """
+        model = getattr(pl_module, "model", None)
+        if model is None or not callable(getattr(model, "set_order_path", None)):
+            return
+        if phase == "structure":
+            ok = model.set_order_path("relaxed")
+            model.set_gate_mode("soft")
+            gates, use_order = "soft", True
+        else:
+            cfg = {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
+                   "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})
+            gates = str(cfg.get("recon_gates", self._recon_gates_default))
+            use_order = bool(cfg.get("use_order_in_recon", self._use_order_in_recon_default))
+            ok = model.set_order_path("hard" if use_order else "none")
+            model.set_gate_mode(gates)
+        if ok:
+            pl_module.log("recon_gates_hard", float(gates == "hard"), on_step=False, on_epoch=True)
+            pl_module.log("use_order_in_recon", float(use_order), on_step=False, on_epoch=True)
+            if (phase == "structure" and self._bkd_managed
+                    and not getattr(pl_module, "hsic_bkd_exclude_dropped", True)):
+                bkd_on = any(getattr(m, "_bkd_phase_active", False)
+                             and getattr(m, "_bkd_p0", None) for m in pl_module.modules())
+                if bkd_on:
+                    logger.warning(
+                        "[adaptive] BKD active in a structure phase with "
+                        "hsic_bkd_exclude_dropped=false: dropped keys make their "
+                        "HSIC pairs trivially independent.")
 
     def _dense_gate_expected(self, phase: str) -> Tuple[bool, bool]:
         """Expected ``(train_dense, eval_dense)`` gate flags for a phase.
@@ -1289,6 +1356,9 @@ class PhaseController(Callback):
         # Dense-adjacency edge-dropout (reconstruct phases only).
         self._apply_dense_gate_cfg(pl_module, phase)
 
+        # Order-factorized selector: gate type and order mask of the forward.
+        self._apply_recon_forward_cfg(pl_module, phase)
+
         # Per-phase direction-gate bias (reconstruct: open both directions;
         # structure: unbiased).  No-op unless a phase block sets dir_bias.
         self._apply_dir_bias_cfg(pl_module, phase)
@@ -1303,6 +1373,18 @@ class PhaseController(Callback):
         if self.reset_opt_on_switch:
             for opt in trainer.optimizers:
                 opt.state = defaultdict(dict)
+
+        init_cfg = self.config.get("adaptive_training", {}).get("order_initialization", {}) or {}
+        if phase == "structure" and bool(init_cfg.get("enabled", False)):
+            if getattr(pl_module, "_order_initialization_report", None) is None:
+                if self.start_phase != "warmup" or self._phase_index != 1:
+                    raise ValueError("Order initialization requires the first post-warmup structure entry.")
+                from causaliT.training.order_initialization import initialize_order_from_hsic
+                get_loader = getattr(self.dm, "hsic_cross_fit_eval_dataloader", None)
+                loader = get_loader("b") if callable(get_loader) else None
+                report = initialize_order_from_hsic(
+                    pl_module, loader, init_cfg, self.out_dir / "order_initialization.json")
+                logger.info("[adaptive] HSIC order initialization: %s", report["status"])
 
         # 4. Structure drift baseline: relaxed-gate reconstruction on the same
         # split the structure phase optimizes, measured BEFORE any structural
@@ -1338,6 +1420,7 @@ class PhaseController(Callback):
                     num_samples=self.null_est_num_samples,
                     distribution=self.null_est_distribution,
                     seed=self.null_est_seed,
+                    mask_consistent=self.null_est_mask_consistent,
                 )
 
         # 5. Hard readiness contract: the phase must not start half-configured.
@@ -2269,6 +2352,16 @@ def adaptive_trainer(
                     "warmup weights (%s).", starting_ckpt, winner_ckpt,
                 )
             starting_ckpt = winner_ckpt
+
+    # Calibration-only jobs reuse the normal data/config setup, then stop.
+    if bool(ds_cfg.get("stop_after_selection", False)):
+        if not bool(ds_cfg.get("enabled", False)):
+            raise ValueError("stop_after_selection requires dropout_selection.enabled.")
+        if best_dropout is None:
+            raise RuntimeError("Calibration-only job did not select a dropout candidate.")
+        _save_config_snapshot(config, save_dir)
+        logger.info("Dropout calibration complete; skipping adaptive training.")
+        return
 
     # --- Build model once ---
     seed_everything(seed)

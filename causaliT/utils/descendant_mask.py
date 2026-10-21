@@ -177,6 +177,7 @@ def build_hsic_pair_mask(
     exclude_self: bool = True,
     excluded_weight: float = 0.0,
     resolve_two_cycles: bool = True,
+    edge_dropout: float = 0.0,
 ) -> Tuple[torch.Tensor, float, bool]:
     """Build the element-wise HSIC pair weight matrix that drops descendants.
 
@@ -195,6 +196,16 @@ def build_hsic_pair_mask(
             removes them entirely; a small positive value keeps a gradient
             trickle (the "soft" variant).
         resolve_two_cycles: Forwarded to :func:`harden_adjacency`.
+        edge_dropout: Probability of dropping each HARDENED edge before the
+            transitive closure is computed.  Breaks the self-confirmation of
+            the deterministic threshold mask: dropping one wrong hub edge
+            reinstates its entire downstream subtree in a single step, and
+            de-cycles the hardened graph (so the first-order degrade path is
+            needed less often).  ``0.0`` (default) is bit-identical to the
+            pre-feature behaviour.  Sampled from the global torch generator
+            (seeded by Lightning), so runs stay reproducible under a fixed
+            seed.  ``kept_frac``/``is_cyclic`` below refer to the DROPPED
+            graph actually used.
 
     Returns:
         ``(mask, kept_frac, is_cyclic)`` where
@@ -209,6 +220,8 @@ def build_hsic_pair_mask(
         * ``is_cyclic`` — whether the thresholded graph contains a cycle
           (diagnostic; a cycle inflates the closure and is worth logging).
     """
+    if not (0.0 <= float(edge_dropout) < 1.0):
+        raise ValueError(f"edge_dropout must be in [0, 1), got {edge_dropout!r}.")
     if score_tensor.dim() != 2:
         raise ValueError(
             f"build_hsic_pair_mask expects a 2-D (target, source) score tensor, "
@@ -220,6 +233,13 @@ def build_hsic_pair_mask(
     S = int(s_seq_len)
 
     hard = harden_adjacency(score, threshold=threshold, resolve_two_cycles=resolve_two_cycles)
+
+    if edge_dropout > 0.0:
+        # Edge dropout on the hardened graph BEFORE the closure: each kept
+        # edge survives with probability (1 - p), so one unlucky hub edge
+        # releases its whole downstream subtree from the descendant set.
+        keep = torch.rand(hard.shape, device=hard.device) >= float(edge_dropout)
+        hard = hard & keep
 
     if homogeneous_nodes:
         if L_target != L_source:

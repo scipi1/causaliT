@@ -114,6 +114,9 @@ STRUCTURAL_PATTERNS = [
     # the structural query direction and is charged the over-spend penalty on
     # the STRUCTURAL loss, so it belongs to the structural group.
     "query_norm_log_scale",
+    # OrderFactorizedSelfAttention node order scores (structural, trained by
+    # the routed independence loss).
+    "order_scores",
     # Attention internal parameters (gain, temperature, Gumbel tau, etc.)
 
     "inner_attention.log_gain",

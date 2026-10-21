@@ -397,6 +397,15 @@ model:
     # Homogeneous node topology (square (N, N) posterior over [S ; X]);
     # see experiment.homogeneous_nodes.
     homogeneous_nodes: ${experiment.homogeneous_nodes}
+    # OrderFactorizedSelfAttention (self_attention_type, homogeneous only);
+    # see docs/ideas/ORDER_FACTORIZED_VISION.md.  Ignored by other types.
+    order_noise_scale: 1.0          # Gumbel noise scale on the order scores
+    order_tau: 1.0                  # Sinkhorn relaxation temperature
+    order_sinkhorn_iters: 20        # Sinkhorn sweeps
+    order_r_init: "flat"            # "flat" | "random"
+    order_existence_threshold: 0.5  # pi threshold of the hard exclusion graph
+    order_detach_exclusion: true    # false = attached soft-closure ablation
+    order_exclusion_tnorm: "min"    # soft closure t-norm (attached only)
     # Direction-gate temperature of the self block's antisymmetric term;
     # see experiment.dir_tau_self.
     dir_tau_self: ${experiment.dir_tau_self}
@@ -588,6 +597,22 @@ training:
   #                    hsic_objective: "dhsic_residual", lambda_hsic: 1.0,
   #                    hsic_adaptive_bandwidth: true (NOTIME median heuristic).
   hsic_objective: "pairwise"
+  # --- Log-transformed structural objective (fixed lambda_hsic path only) ---
+  # Replaces hsic_reg = lambda_hsic * HSIC with
+  #   hsic_reg = lambda_hsic * log(HSIC + floor)
+  # Gradient becomes lambda * grad(HSIC) / (HSIC + floor): supervision stays
+  # proportional to the RELATIVE HSIC level and does not die as the raw
+  # objective flattens.  Mutually exclusive with hsic_constraint.enabled
+  # (the ALM constraint is defined on raw HSIC).
+  hsic_log_transform: false
+  # Floor inside the log:
+  #   "null" (default) -> permutation-null mean (hsic_null_stats), refreshed
+  #                       at every structure-phase entry by
+  #                       adaptive.structure.null_estimation; falls back to
+  #                       hsic_log_epsilon when unavailable.
+  #   float > 0        -> fixed floor.
+  hsic_log_floor: "null"
+  hsic_log_epsilon: 1.0e-12
   hsic_sigma: 1.0
   hsic_adaptive_bandwidth: true
   hsic_kernel_source: "rbf"
@@ -597,24 +622,36 @@ training:
   hsic_mode: "biased"
   nhsic_epsilon: 0.01
 
+  # --- Raw causal-order estimator (RESIT-style diagnostic) ---------------
+  # Computes nodal upstreamness from the RAW off-diagonal pair matrix:
+  # mean_j HSIC(source_j, residual_i), j != i.  Descendant terms are retained
+  # (they carry the source signal); loss masks, attention/direction weights,
+  # BKD and LOO gates never enter this estimate.  Disabled by default unless
+  # hsic_key_scale is enabled (which consumes this detached estimate).
+  causal_order:
+    enabled: false
+    method: row_mean          # row_mean | iterative_sink (homogeneous only)
+    null_permutations: 0      # row-wise permutation calibration (diagnostic)
+    null_seed: 20240817
+    log_scores: true
+
   # --- HSIC-derived key scaling (RESIT-style source prior, OPT-IN) ---------
-  # Turns the per-node HSIC contributions (row means of the pair matrix) into
-  # a DETACHED per-key multiplier on the structural keys of the self-attention
-  # block: source-like nodes (high row HSIC: residual still dependent on their
-  # descendants) keep full key magnitude; sink-like nodes (well explained by
-  # the current regressor) are shrunk, so queries align weakly onto them and
-  # the direction gate is tilted toward edges flowing OUT of sources.  The
-  # weights are max-normalised (top node = 1), so only the node ORDERING
-  # matters, not the decaying HSIC scale.  Requires the FIXED orthonormal key
-  # frame (struct_embedding_type=orthogonal_fixed + remove_key_projection=true)
-  # -- with learnable keys the optimizer would regrow ||k_j|| and cancel the
-  # prior.  Weights are updated on train batches only, after warmup_epochs.
+  # Consumes the DETACHED causal-order scores above, never the pair matrix /
+  # weights used by the scalar structural loss.  Default transform is a gentle
+  # rank map: only node ORDER matters, not the noisy absolute HSIC scale.  A
+  # warmup + ramp interpolates from the flat frame to the target prior; EMA
+  # then smooths batch noise.  Requires the FIXED orthonormal key frame
+  # (struct_embedding_type=orthogonal_fixed + remove_key_projection=true).
   hsic_key_scale:
     enabled: false
-    ema: 0.9             # smoothing of the per-node weights (0 = no memory)
-    floor: 0.1           # minimum key scale (keys are never fully silenced)
-    warmup_epochs: 0     # arm the prior only once the dense fit is meaningful
-    exponent: 1.0        # sharpening: w = (row/max)^exponent before the floor
+    transform: rank          # rank | raw_max (legacy, magnitude-sensitive)
+    ema: 0.9                 # smoothing of the per-node weights (0 = no memory)
+    floor: 0.5               # full-strength minimum key scale
+    warmup_epochs: 0         # no ordering prior before this epoch
+    ramp_epochs: 0           # 0 = immediate at max_strength after warmup
+    schedule: cosine         # cosine | linear | none
+    max_strength: 1.0        # asymptotic fraction of the target prior applied
+    exponent: 1.0            # sharpening of the rank map
 
   # --- Descendant-excluding HSIC (self-attention block only) --------------
   # Under an ANM (X_i = f_i(PA_i) + e_i) the ideal residual r_i = e_i is

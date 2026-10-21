@@ -141,6 +141,59 @@ class TestBiLevelGrads:
 
 
 class TestTrainingStepIntegration:
+    @pytest.mark.parametrize("enabled,warmup,masked", [
+        (True, 0, True), (True, 10, False), (False, 0, False),
+    ])
+    def test_standalone_unrolled_uses_main_pair_mask(
+            self, monkeypatch, enabled, warmup, masked):
+        """Unrolled HSIC honors masking without a commit controller."""
+        import causaliT.training.forecasters.attention_selector_forecaster as module
+
+        m = _bilevel_model(
+            hsic_aggregation="plain", hsic_exclude_descendants=enabled,
+            hsic_descendant_warmup_epochs=warmup,
+            hsic_descendant_min_kept_frac=0.0,
+        )
+        assert not m.centroid_commit_enabled and not m._gate_enabled
+        assert m._commit_source == "hsic"
+        n = m.model.S_seq_len + m.model.X_seq_len
+        score = torch.zeros(n, n)
+        score[1, 0] = 1.0
+        score[2, 1] = 1.0
+        builder = m._build_hsic_descendant_mask
+        monkeypatch.setattr(m, "_build_hsic_descendant_mask",
+                            lambda *_: builder(score))
+        seen = []
+        original = module.hsic_cross_per_pair
+
+        def capture(*args, **kwargs):
+            seen.append(kwargs.get("pair_mask"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, "hsic_cross_per_pair", capture)
+        batch = _qbatches(1)[0]
+        m.train()
+        m._step(batch=batch, stage="train")
+        main_mask = seen[-1]
+        if masked:
+            assert main_mask is not None
+            assert not main_mask.requires_grad
+            assert torch.equal(m._last_probe_pair_mask, main_mask)
+            assert bool((main_mask.diagonal() == 0).all())
+            assert main_mask[0, 2] == 0  # transitive descendant
+            assert main_mask[2, 0] == 1  # ancestor retained
+        else:
+            assert main_mask is None
+            assert m._last_probe_pair_mask is None
+        seen.clear()
+        m._bi_level_step(batch)
+        assert seen, "the unrolled HSIC pass must be exercised"
+        for mask in seen:
+            if masked:
+                assert torch.equal(mask, main_mask)
+            else:
+                assert mask is None
+
     def test_end_to_end_routed_step(self):
         """Full routing training_step in bi-level mode: both optimizers step,
         the retained main graph survives the virtual passes."""

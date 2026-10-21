@@ -48,6 +48,7 @@ import numpy as np
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
+from pytorch_lightning.loggers import CSVLogger
 
 from causaliT.utils.query_sensitivity import hsic_query_sensitivity
 
@@ -96,7 +97,8 @@ def _set_mlp_dropout(config: Dict[str, Any], p: float) -> List[str]:
 # Per-candidate warmup + sensitivity
 # ---------------------------------------------------------------------------
 
-def _recon_warmup(model, dm, warmup_epochs: int, cluster: bool) -> None:
+def _recon_warmup(model, dm, warmup_epochs: int, cluster: bool,
+                  metrics_logger=None) -> None:
     """Reconstruction-only warmup: train with the structure frozen.
 
     Uses the forecaster's ``training.freeze_structural_params`` flag (applied
@@ -109,12 +111,12 @@ def _recon_warmup(model, dm, warmup_epochs: int, cluster: bool) -> None:
         max_epochs=warmup_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        logger=False,
+        logger=metrics_logger if metrics_logger is not None else False,
         enable_checkpointing=False,
         enable_progress_bar=not cluster,
         enable_model_summary=False,
         num_sanity_val_steps=0,
-        limit_val_batches=0,  # selection needs no validation metrics
+        limit_val_batches=1.0,
         # Deterministic warmup: the selection must be reproducible (same seed
         # -> same dropout chosen).  Safe because the caller sets
         # CUBLAS_WORKSPACE_CONFIG before any GEMM (see adaptive_trainer).
@@ -205,7 +207,12 @@ def run_dropout_selection(
         seed_everything(seed)
         model = create_model_instance(cfg_p, data_dir)
         model.freeze_structural_params = True  # recon-only warmup
-        _recon_warmup(model, dm, warmup_epochs, cluster)
+        metrics_logger = CSVLogger(
+            save_dir=str(Path(save_dir) / "dropout_selection_logs"),
+            name=f"dropout_{p:g}",
+        )
+        _recon_warmup(model, dm, warmup_epochs, cluster,
+                      metrics_logger=metrics_logger)
 
         device = next(model.parameters()).device
         batches = _structure_split_batches(dm, n_batches, device)

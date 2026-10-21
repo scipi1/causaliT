@@ -99,6 +99,7 @@ from causaliT.core.modules import (
     GatedCrossAttention,
     GatedSelfAttention,
     CommutatorSelfAttention,
+    OrderFactorizedSelfAttention,
     AttentionLayer,
     ModularEmbedding,
     Normalization,
@@ -670,6 +671,19 @@ class AttentionSelectorLayer(nn.Module):
         topk_annealing_batches: Optional[int] = None,
         topk_per_row_slack: bool = True,
         batch_key_dropout_eval_seed: int = 12345,
+        # ---- OrderFactorizedSelfAttention (homogeneous mode only) ---------
+        # See docs/ideas/ORDER_FACTORIZED_VISION.md.  Ignored unless
+        # self_attention_type="OrderFactorizedSelfAttention".
+        order_noise_scale: float = 1.0,
+        order_tau: float = 1.0,
+        order_sinkhorn_iters: int = 20,
+        order_r_init: str = "flat",
+        order_existence_threshold: float = 0.5,
+        order_detach_exclusion: bool = True,
+        order_exclusion_tnorm: str = "min",
+        order_exclusion_existence: str = "threshold",
+        order_existence_mode: str = "learned",
+        order_straight_through: bool = False,
     ):
 
 
@@ -679,6 +693,19 @@ class AttentionSelectorLayer(nn.Module):
 
 
         super().__init__()
+
+        self._order_kwargs = dict(
+            order_noise_scale=order_noise_scale,
+            order_tau=order_tau,
+            order_sinkhorn_iters=order_sinkhorn_iters,
+            order_r_init=order_r_init,
+            order_existence_threshold=order_existence_threshold,
+            order_detach_exclusion=order_detach_exclusion,
+            order_exclusion_tnorm=order_exclusion_tnorm,
+            order_exclusion_existence=order_exclusion_existence,
+            order_existence_mode=order_existence_mode,
+            order_straight_through=order_straight_through,
+        )
 
 
         self.model_name = model
@@ -1069,8 +1096,16 @@ class AttentionSelectorLayer(nn.Module):
         # by a dedicated ``GatedSelfAttention`` block (edge-direction aware)
         # instead of the right-hand columns of the single combined cross block.
         # ------------------------------------------------------------------
-        SELF_ATTENTION_TYPES = ("GatedSelfAttention", "CommutatorSelfAttention")
+        SELF_ATTENTION_TYPES = (
+            "GatedSelfAttention", "CommutatorSelfAttention", "OrderFactorizedSelfAttention",
+        )
         self.self_attention_type = self_attention_type
+        if (self_attention_type == "OrderFactorizedSelfAttention"
+                and not self.homogeneous_nodes):
+            raise ValueError(
+                f"self_attention_type='{self_attention_type}' requires "
+                "homogeneous_nodes=True (square self-attention over all nodes)."
+            )
         if self_attention_type is not None and self_attention_type not in SELF_ATTENTION_TYPES:
             raise ValueError(
                 f"self_attention_type='{self_attention_type}' is invalid. "
@@ -1208,6 +1243,7 @@ class AttentionSelectorLayer(nn.Module):
         self_att_cls_map = {
             "GatedSelfAttention": GatedSelfAttention,
             "CommutatorSelfAttention": CommutatorSelfAttention,
+            "OrderFactorizedSelfAttention": OrderFactorizedSelfAttention,
         }
 
         if self.homogeneous_nodes:
@@ -1350,6 +1386,8 @@ class AttentionSelectorLayer(nn.Module):
             gain_score_dim=gain_score_dim,
             # Source-side top-k budget (None = disabled).
             topk_gate=topk_gate_main,
+            # Order-factorized selector options (ignored by other types).
+            order_kwargs=self._order_kwargs,
         )
 
 
@@ -1726,6 +1764,14 @@ class AttentionSelectorLayer(nn.Module):
         else:
             self.query_embed_X = None
             self.query_embed_S = None
+
+        # Order-only ablation: with full existence the queries carry no
+        # structural role; freeze them explicitly (no weight-decay drift).
+        if order_existence_mode == "full":
+            for tab in (self.query_embed_X, self.query_embed_S):
+                if tab is not None:
+                    for p in tab.parameters():
+                        p.requires_grad_(False)
 
         # Arm the frozen-row gradient hooks at construction time (no data
         # needed): the hook zeroes gradients on prior-fixed rows from the very
@@ -2969,6 +3015,49 @@ class AttentionSelectorLayer(nn.Module):
         if cross is None or self_score is None:
             return None
         return torch.cat([cross, self_score], dim=-1)   # (L_X, L_S + L_X)
+
+    # ------------------------------------------------------------------
+    # Order-factorized selector hooks
+    # ------------------------------------------------------------------
+
+    def order_attention(self):
+        """The OrderFactorizedSelfAttention block, or None for other types."""
+        inner = getattr(self.attention, "inner_attention", None)
+        return inner if isinstance(inner, OrderFactorizedSelfAttention) else None
+
+    def set_order_orientation(self, mode: str) -> bool:
+        """Switch the order block orientation ("causal" | "anticausal").
+        Returns False when the order selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_orientation(mode)
+        return True
+
+    def resample(self, generator: Optional[torch.Generator] = None) -> None:
+        """Draw the global structural noise for one gradient step (no-op
+        unless the order-factorized selector is in use)."""
+        oa = self.order_attention()
+        if oa is not None:
+            oa.resample(generator)
+
+    def set_order_path(self, mode: str) -> bool:
+        """Order mask of the order-factorized block ("relaxed" | "hard" |
+        "none").  Returns False when the selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_order_path(mode)
+        return True
+
+    def set_gate_mode(self, mode: str) -> bool:
+        """Existence gate of non-relaxed forwards ("hard" | "soft").
+        Returns False when the selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_gate_mode(mode)
+        return True
 
     # ------------------------------------------------------------------
     # Prior-softmax gain schedule

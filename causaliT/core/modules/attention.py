@@ -10,6 +10,7 @@ from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
 from causaliT.core.modules.gated_cross_attention import GatedCrossAttention
 from causaliT.core.modules.topk_gate import TopKGate
 from causaliT.core.modules.gated_self_attention import GatedSelfAttention
+from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
 from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 
 from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
@@ -1534,6 +1535,9 @@ class AttentionLayer(nn.Module):
         # only; see causaliT/core/modules/topk_gate.py).  Passed straight
         # through to the inner attention; None (default) = disabled.
         topk_gate: Optional[TopKGate] = None,
+        # OrderFactorizedSelfAttention options (``order_*`` keys); ignored by
+        # every other inner attention.
+        order_kwargs: Optional[dict] = None,
     ):
         super(AttentionLayer, self).__init__()
 
@@ -1738,6 +1742,32 @@ class AttentionLayer(nn.Module):
                     # Source-side top-k budget (None = disabled).
                     topk_gate=topk_gate,
                 )
+            elif attention is OrderFactorizedSelfAttention:
+                # Order-factorized selector (docs/ideas/ORDER_FACTORIZED_VISION.md):
+                # symmetric Hard-Concrete existence x sampled order mask.
+                okw = dict(order_kwargs or {})
+                if query_seq_len != key_seq_len or query_seq_len is None:
+                    raise ValueError(
+                        f"{attention.__name__} requires square self-attention "
+                        f"(query_seq_len == key_seq_len), got {query_seq_len}, {key_seq_len}."
+                    )
+                self.inner_attention = attention(
+                    num_nodes=query_seq_len,
+                    attention_dropout=attention_dropout,
+                    register_entropy=register_entropy,
+                    layer_name=layer_name,
+                    init_tau=init_tau,
+                    gamma=init_gamma,
+                    zeta=init_zeta,
+                    batch_key_dropout=batch_key_dropout,
+                    batch_key_dropout_p_final=batch_key_dropout_p_final,
+                    batch_key_dropout_annealing_batches=batch_key_dropout_annealing_batches,
+                    batch_key_dropout_min_keys=batch_key_dropout_min_keys,
+                    batch_key_dropout_deterministic=batch_key_dropout_deterministic,
+                    batch_key_dropout_eval=batch_key_dropout_eval,
+                    batch_key_dropout_eval_seed=batch_key_dropout_eval_seed,
+                    **okw,
+                )
             elif attention is CausalCrossAttention:
 
 
@@ -1909,6 +1939,7 @@ class AttentionLayer(nn.Module):
             GatedSelfAttention,
             CommutatorSelfAttention,
             ScaledDotSoftmax,
+            OrderFactorizedSelfAttention,
         )
         if self.value_structure_query_dim > 0:
             if not self._value_query_capable:
