@@ -1,7 +1,7 @@
 """
 Dataset loading for the external benchmarks.
 
-The benchmarks (NOTEARS, DAGMA, PC) are plain structure learners: they expect
+The benchmarks (DAGMA, PC, order-based methods) are plain structure learners: they expect
 one ``(n_samples, n_nodes)`` design matrix and know nothing about causaliT's
 token layout.  This module performs that single conversion, and it is the only
 place where the on-disk format is interpreted.
@@ -139,7 +139,7 @@ def load_benchmark_data(
         split: ``train`` (default), ``test`` or ``all``.  Benchmarks are fitted
             on the training split so they see exactly the data the models were
             trained on.
-        standardize: Z-score each column.  Both NOTEARS and DAGMA assume
+        standardize: Z-score each column.  The continuous methods (DAGMA) assume
             comparable scales across variables (their L1 penalty is shared), and
             the papers standardize their simulated data, so this defaults to
             True.  Note that standardizing cannot change the graph: it is a

@@ -121,6 +121,7 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         seconds=seconds,
         params=merged,
         is_binary=True,
+        output_type="cpdag",
         extra={
             "implementation": "causallearn.search.ConstraintBased.PC.pc",
             "returns": "CPDAG (1.0 = oriented, 0.5 = undirected)",

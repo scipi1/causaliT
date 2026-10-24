@@ -151,9 +151,9 @@ def test_sampled_exclusion_graph():
         _module(order_exclusion_existence="bogus")
 
 
-def test_full_existence_mode_is_order_dag():
+def test_both_selectors_off_is_order_dag():
     q, k, v = _qk()
-    m = _module(order_existence_mode="full")
+    m = _module(toggle_on_recon_att_selector=False)
     m.train()
     m.set_order_path("hard")
     m.resample(torch.Generator().manual_seed(0))
@@ -167,14 +167,13 @@ def test_full_existence_mode_is_order_dag():
     out.sum().backward()
     assert q.grad is None or q.grad.abs().sum() == 0  # no existence gradient
     assert m.order_scores.grad.abs().sum() > 0
-    with pytest.raises(ValueError):
-        _module(order_existence_mode="bogus")
 
 
 @pytest.mark.parametrize("existence", ["full", "learned"])
 def test_straight_through_order(existence):
     q, k, v = _qk()
-    m = _module(order_existence_mode=existence, order_straight_through=True)
+    m = _module(toggle_on_recon_att_selector=existence == "learned",
+                order_straight_through=True)
     m.train()
     m.set_order_path("relaxed")
     for s in range(50):
@@ -190,7 +189,7 @@ def test_straight_through_order(existence):
     out.sum().backward()
     assert m.order_scores.grad is not None and m.order_scores.grad.abs().sum() > 0
     # Eval: identical to the non-ST module.
-    ref = _module(order_existence_mode=existence)
+    ref = _module(toggle_on_recon_att_selector=existence == "learned")
     m.eval(); ref.eval()
     with torch.no_grad():
         o1, _, _ = m(q, k, v)

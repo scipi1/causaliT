@@ -13,8 +13,11 @@ Three things are worth testing here, in decreasing order of danger:
    writing the same artefacts as the model evaluation, so ``eval_seed_sweep``
    and the notebooks work unchanged.
 
-The two MLP methods are minutes-per-fit; they are covered by an opt-in slow test
-(``CAUSALIT_RUN_SLOW_BENCHMARKS=1``) and by the shared registry tests.
+4. **Metrics.**  ``metrics.py`` values on hand-checked graphs; ground truth
+   must give zero SHD / SID / order divergence.
+
+DAGMA-MLP, RESIT and DAGuerreotype are slow; they are covered by an opt-in
+slow test (``CAUSALIT_RUN_SLOW_BENCHMARKS=1``) and by the registry tests.
 """
 
 import json
@@ -26,8 +29,11 @@ import pandas as pd
 import pytest
 from omegaconf import OmegaConf
 
+from causaliT.benchmarks import metrics as M
 from causaliT.benchmarks.base import (
+    EXCLUDED_METHODS,
     METHOD_REQUIREMENTS,
+    BenchmarkResult,
     available_methods,
     default_params,
     is_available,
@@ -98,6 +104,18 @@ def simulate_linear_sem(n_samples: int = 600, seed: int = 0) -> np.ndarray:
     return X
 
 
+def simulate_nonlinear_sem(n_samples: int = 300, seed: int = 0) -> np.ndarray:
+    """Standardised nonlinear ANM on the same graph (identifiable by ANM methods)."""
+    rng = np.random.default_rng(seed)
+    X = np.zeros((n_samples, N))
+    X[:, 0] = rng.normal(size=n_samples)
+    X[:, 1] = rng.normal(size=n_samples)
+    X[:, 2] = np.sin(2 * X[:, 0]) + 0.3 * rng.normal(size=n_samples)
+    X[:, 3] = 2 * np.tanh(X[:, 1]) + 0.3 * rng.normal(size=n_samples)
+    X[:, 4] = X[:, 2] ** 2 + X[:, 3] + 0.3 * rng.normal(size=n_samples)
+    return (X - X.mean(axis=0)) / X.std(axis=0)
+
+
 # =============================================================================
 # Fixtures: a minimal on-disk dataset + experiment folder
 # =============================================================================
@@ -149,7 +167,7 @@ def experiment_dir(tmp_path, dataset_dir):
     exp = tmp_path / "bench_exp"
     exp.mkdir()
     # ``standardize: false`` is deliberate here (it is *true* in production): on
-    # raw data from its own model class NOTEARS recovers this SEM exactly, which
+    # raw (varsortable) data var-sortnregress recovers this SEM exactly, which
     # turns the end-to-end assertions into a strict zero-SHD check instead of a
     # vague "some numbers were written".  See
     # ``test_standardization_removes_the_varsortability_shortcut``.
@@ -157,7 +175,7 @@ def experiment_dir(tmp_path, dataset_dir):
         "data": {"dataset": dataset_name, "data_root": data_root,
                  "S_seq_len": L_S, "X_seq_len": L_X},
         "evaluation": {"dag_threshold": 0.5},
-        "benchmark": {"methods": ["notears_linear"], "seeds": [0],
+        "benchmark": {"methods": ["var_sort"], "seeds": [0],
                       "standardize": False},
     }
     OmegaConf.save(OmegaConf.create(config), exp / "config_bench.yaml")
@@ -294,8 +312,15 @@ class TestRegistry:
 
     def test_expected_methods_are_registered(self):
         assert set(method_names()) == {
-            "notears_linear", "notears_mlp", "dagma_linear", "dagma_mlp", "pc",
+            "dagma_linear", "dagma_mlp", "pc", "resit", "cam", "score", "das",
+            "nogam", "caps", "daguerreo", "var_sort", "r2_sort",
         }
+
+    def test_excluded_methods_are_not_registered(self):
+        """Dropped methods stay documented but must not be runnable."""
+        for name in ("notears_linear", "notears_mlp", "vi_dp_dag", "bcd_nets"):
+            assert name in EXCLUDED_METHODS
+            assert name not in method_names()
 
     def test_unknown_method_raises(self):
         with pytest.raises(KeyError):
@@ -304,22 +329,33 @@ class TestRegistry:
     def test_available_methods_covers_every_name(self):
         assert set(available_methods()) == set(method_names())
 
-    def test_notears_linear_is_always_available(self):
-        """It only needs the vendored code + scipy, so it must never be optional."""
-        assert METHOD_REQUIREMENTS["notears_linear"] is None
-        assert is_available("notears_linear")
+    def test_dagma_mlp_uses_the_paper_mlp_width(self):
+        """The paper reports a single hidden layer of 10 units for every N."""
+        if not is_available("dagma_mlp"):
+            pytest.skip("dagma_mlp unavailable")
+        assert default_params("dagma_mlp")["hidden_units"] == 10
 
-    @pytest.mark.parametrize("method", ["notears_mlp", "dagma_mlp"])
-    def test_nonlinear_variants_use_the_paper_mlp_width(self, method):
-        """Both papers report a single hidden layer of 10 units for every N."""
-        if not is_available(method):
-            pytest.skip(f"{method} unavailable")
-        assert default_params(method)["hidden_units"] == 10
+    def test_multi_method_modules_have_per_method_defaults(self):
+        """toporder.py hosts four methods; each must get its own defaults."""
+        if not is_available("das"):
+            pytest.skip("dodiscover unavailable")
+        assert "das_cutoff" in default_params("das")
+        assert "das_cutoff" not in default_params("score")
 
     def test_merge_params_overrides_defaults(self):
-        merged = merge_params("notears_linear", {"lambda1": 0.5})
+        merged = merge_params("dagma_linear", {"lambda1": 0.5})
         assert merged["lambda1"] == 0.5
-        assert merged["loss_type"] == default_params("notears_linear")["loss_type"]
+        assert merged["loss_type"] == default_params("dagma_linear")["loss_type"]
+
+    def test_result_contract_derives_output_type_and_probs(self):
+        samples = np.stack([W_TRUE != 0, np.zeros((N, N), dtype=bool)]).astype(float)
+        result = BenchmarkResult(W=samples.mean(axis=0), graph_samples=samples)
+        assert result.output_type == "samples"
+        np.testing.assert_allclose(result.edge_probs, 0.5 * (W_TRUE != 0))
+        assert BenchmarkResult(W=W_TRUE).output_type == "weighted"
+        assert BenchmarkResult(W=W_TRUE, is_binary=True).output_type == "dag"
+        with pytest.raises(ValueError):
+            BenchmarkResult(W=W_TRUE, output_type="bogus")
 
 
 # =============================================================================
@@ -363,8 +399,11 @@ class TestDataLoading:
 # Methods
 # =============================================================================
 
-FAST_METHODS = ["notears_linear", "dagma_linear", "pc"]
-SLOW_METHODS = ["notears_mlp", "dagma_mlp"]
+FAST_METHODS = ["var_sort", "r2_sort", "dagma_linear", "pc"]
+#: Order-based methods: each must return a DAG plus a full permutation.
+ORDER_METHODS = ["cam", "score", "das", "nogam", "caps"]
+#: RESIT (GP regressions, ~30 s for N=5) and the MLP / learned-order methods.
+SLOW_METHODS = ["dagma_mlp", "resit", "daguerreo"]
 
 
 def _fit(method: str, X: np.ndarray):
@@ -385,7 +424,7 @@ class TestMethods:
         assert result.seconds >= 0.0
         assert "implementation" in result.extra
 
-    @pytest.mark.parametrize("method", ["notears_linear", "dagma_linear"])
+    @pytest.mark.parametrize("method", ["var_sort", "dagma_linear"])
     def test_linear_methods_recover_the_chain(self, method):
         """
         On raw data from their own model class recovery must be exact.
@@ -403,7 +442,7 @@ class TestMethods:
 
     def test_standardization_removes_the_varsortability_shortcut(self):
         """
-        Standardised data is much harder for NOTEARS - by design of the protocol.
+        Standardised data defeats var-sortnregress - by design of the protocol.
 
         The benchmark runner standardises by default (``benchmark.standardize``)
         precisely so the reported numbers do not credit the methods for reading
@@ -415,8 +454,8 @@ class TestMethods:
         X = simulate_linear_sem(n_samples=1000, seed=5)
         Z = (X - X.mean(axis=0)) / X.std(axis=0)
 
-        raw_blocks = adjacency_to_blocks(_fit("notears_linear", X).W, L_S=L_S, L_X=L_X)
-        std_blocks = adjacency_to_blocks(_fit("notears_linear", Z).W, L_S=L_S, L_X=L_X)
+        raw_blocks = adjacency_to_blocks(_fit("var_sort", X).W, L_S=L_S, L_X=L_X)
+        std_blocks = adjacency_to_blocks(_fit("var_sort", Z).W, L_S=L_S, L_X=L_X)
 
         np.testing.assert_allclose(raw_blocks["cross"], TRUE_CROSS)
         assert not (
@@ -437,13 +476,111 @@ class TestMethods:
         true_skeleton = (true_full > 0) | (true_full.T > 0)
         np.testing.assert_array_equal(skeleton, true_skeleton)
 
+    def test_pc_declares_a_cpdag(self):
+        result = _fit("pc", simulate_linear_sem(n_samples=300, seed=3))
+        assert result.output_type == "cpdag"
+        assert result.order is None
+
+    @pytest.mark.parametrize("method", ORDER_METHODS)
+    def test_order_methods_return_a_dag_and_a_permutation(self, method):
+        """The order is what the order metrics score; it must be a permutation."""
+        X = simulate_nonlinear_sem(n_samples=300, seed=6)
+        result = _fit(method, X)
+        assert result.W.shape == (N, N)
+        assert result.output_type == "dag"
+        assert sorted(result.order) == list(range(N))
+        assert M.is_acyclic(result.W)
+        # Every predicted edge must agree with the method's own order.
+        assert M.order_divergence(result.W, result.order) == 0
+
+    @pytest.mark.parametrize("method", ["var_sort", "r2_sort"])
+    def test_sortnregress_order_is_its_sorting_criterion(self, method):
+        X = simulate_linear_sem(n_samples=600, seed=0)
+        result = _fit(method, X)
+        assert sorted(result.order) == list(range(N))
+        if method == "var_sort":
+            assert list(result.order) == list(np.argsort(X.var(axis=0), kind="stable"))
+
     @pytest.mark.skipif(not RUN_SLOW, reason="set CAUSALIT_RUN_SLOW_BENCHMARKS=1")
     @pytest.mark.parametrize("method", SLOW_METHODS)
-    def test_nonlinear_methods_output_contract(self, method):
-        X = simulate_linear_sem(n_samples=200, seed=4)
+    def test_slow_methods_output_contract(self, method):
+        X = simulate_nonlinear_sem(n_samples=200, seed=4)
         result = _fit(method, X)
         assert result.W.shape == (N, N)
         assert np.all(np.isfinite(result.W))
+        if method != "dagma_mlp":
+            assert sorted(result.order) == list(range(N))
+
+
+# =============================================================================
+# Metric suite (metrics.py)
+# =============================================================================
+
+#: Paper-orientation binary true graph of the shared fixture.
+T_TRUE = (W_TRUE != 0).astype(int)
+
+
+class TestMetrics:
+    """Hand-checked values; ground truth must score perfectly on every metric."""
+
+    def test_ground_truth_scores_perfectly(self):
+        m = M.compute_structure_metrics(T_TRUE, T_TRUE, order=[0, 1, 2, 3, 4])
+        assert m["shd"] == 0 and m["sid"] == 0 and m["order_divergence"] == 0
+        assert m["f1"] == 1.0 and m["skeleton_f1"] == 1.0
+        assert m["order_accuracy"] == 1.0 and m["auprc"] == 1.0
+        assert m["is_dag"] is True
+
+    def test_reversed_edge_costs_one_shd_but_keeps_the_skeleton(self):
+        pred = T_TRUE.copy()
+        pred[0, 2], pred[2, 0] = 0, 1
+        m = M.edge_metrics(T_TRUE, pred)
+        assert m["shd"] == 1
+        assert m["skeleton_f1"] == 1.0
+        assert m["precision"] == 0.75
+
+    def test_cpdag_gets_shd_but_no_sid(self):
+        pred = T_TRUE.copy()
+        pred[2, 0] = 1  # 0 -- 2 undirected
+        m = M.compute_structure_metrics(T_TRUE, pred)
+        assert m["shd"] == 1
+        assert m["sid"] is None and m["sid_note"] == "prediction is not a DAG"
+
+    def test_sid_on_two_nodes(self):
+        """Peters & Buhlmann: reversing X->Y gets both interventions wrong."""
+        T = np.array([[0, 1], [0, 0]])
+        assert M.sid(T, T.T)["sid"] == 2
+        assert M.sid(T, np.zeros((2, 2)))["sid"] == 1
+
+    def test_reversed_order(self):
+        rev = [4, 3, 2, 1, 0]
+        assert M.order_divergence(T_TRUE, rev) == int(T_TRUE.sum())
+        assert M.order_accuracy(T_TRUE, rev) == 0.0
+
+    def test_order_accuracy_ignores_unordered_pairs(self):
+        """S1 and S2 have no path between them: their relative order is free."""
+        assert M.order_accuracy(T_TRUE, [1, 0, 3, 2, 4]) == 1.0
+
+    def test_calibration_metrics(self):
+        probs = 0.9 * T_TRUE + 0.1 * (1 - T_TRUE)
+        m = M.score_metrics(T_TRUE, probs, probabilistic=True)
+        assert m["brier"] == pytest.approx(0.01)
+        assert m["ece"] == pytest.approx(0.1)
+        assert M.score_metrics(T_TRUE, probs, probabilistic=False)["brier"] is None
+
+    def test_sample_metrics(self):
+        cyclic = T_TRUE.copy()
+        cyclic[4, 0] = 1
+        m = M.sample_metrics(T_TRUE, np.stack([T_TRUE, cyclic]))
+        assert m["expected_shd"] == 0.5
+        assert m["acyclic_fraction"] == 0.5
+
+    def test_varsortability_of_the_raw_linear_sem(self):
+        d = M.data_diagnostics(simulate_linear_sem(n_samples=2000, seed=0), T_TRUE)
+        assert d["var_sortability"] == pytest.approx(1.0)
+
+    def test_aggregate_skips_missing_values(self):
+        out = M.aggregate({"a": {"shd": 1, "sid": None}, "b": {"shd": 3, "sid": None}})
+        assert out["mean"]["shd"] == 2.0 and out["mean"]["sid"] is None
 
 
 # =============================================================================
@@ -457,14 +594,14 @@ class TestRunner:
         data_root, dataset_name = dataset_dir
         metrics = run_benchmark_method(
             experiment=experiment_dir,
-            method="notears_linear",
+            method="var_sort",
             datadir_path=data_root,
             dataset_name=dataset_name,
             seeds=[0],
             standardize=False,
             verbose=False,
         )
-        files = join(experiment_dir, "eval", eval_name_for("notears_linear"), "files")
+        files = join(experiment_dir, "eval", eval_name_for("var_sort"), "files")
         for name in ("dag_metrics.json", "learned_dag_edges.json",
                      "attention_labels.json", BENCHMARK_RUN_FILENAME):
             assert exists(join(files, name)), f"missing {name}"
@@ -476,20 +613,28 @@ class TestRunner:
         assert metrics["standard_shd_self"]["mean"] == 0
         assert metrics["soft_hamming_cross"]["mean"] == 0.0
         assert metrics["mec_membership_rate"] == 1.0
-        assert metrics["benchmark"]["method"] == "notears_linear"
+        assert metrics["benchmark"]["method"] == "var_sort"
+
+        # Full-graph suite: present, perfect, and persisted to dag_metrics.json.
+        structure = metrics["structure"]["mean"]
+        assert structure["shd"] == 0 and structure["sid"] == 0
+        assert structure["order_divergence"] == 0
+        assert metrics["data_diagnostics"]["var_sortability"] == pytest.approx(1.0)
+        with open(join(files, "dag_metrics.json"), encoding="utf-8") as fh:
+            assert json.load(fh)["structure"]["mean"]["f1"] == 1.0
 
     def test_seeds_become_folds(self, experiment_dir, dataset_dir):
         data_root, dataset_name = dataset_dir
         run_benchmark_method(
             experiment=experiment_dir,
-            method="notears_linear",
+            method="var_sort",
             datadir_path=data_root,
             dataset_name=dataset_name,
             seeds=[0, 1],
             standardize=False,
             verbose=False,
         )
-        path = join(experiment_dir, "eval", eval_name_for("notears_linear"),
+        path = join(experiment_dir, "eval", eval_name_for("var_sort"),
                     "files", "learned_dag_edges.json")
         with open(path, encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -500,14 +645,14 @@ class TestRunner:
         data_root, dataset_name = dataset_dir
         run_benchmark_method(
             experiment=experiment_dir,
-            method="notears_linear",
+            method="var_sort",
             datadir_path=data_root,
             dataset_name=dataset_name,
             seeds=[0],
             standardize=False,
             verbose=False,
         )
-        path = join(experiment_dir, "eval", eval_name_for("notears_linear"),
+        path = join(experiment_dir, "eval", eval_name_for("var_sort"),
                     "files", BENCHMARK_RUN_FILENAME)
         with open(path, encoding="utf-8") as fh:
             record = json.load(fh)
@@ -527,7 +672,7 @@ class TestRunner:
         with pytest.raises(ValueError):
             run_benchmark_method(
                 experiment=experiment_dir,
-                method="notears_linear",
+                method="var_sort",
                 datadir_path=data_root,
                 dataset_name=dataset_name,
                 metadata={"variable_info": {"source_labels": ["S1"],
@@ -538,17 +683,17 @@ class TestRunner:
 
     def test_run_benchmarks_reads_the_config_section(self, experiment_dir):
         results = run_benchmarks(experiment_dir, verbose=False)
-        assert set(results) == {"notears_linear"}
-        assert "error" not in results["notears_linear"]
+        assert set(results) == {"var_sort"}
+        assert "error" not in results["var_sort"]
 
     def test_failed_method_does_not_abort_the_others(self, experiment_dir):
         results = run_benchmarks(
             experiment_dir,
-            methods=["notears_linear"],
+            methods=["var_sort"],
             overrides={"split": "nonexistent_split"},
             verbose=False,
         )
-        assert "error" in results["notears_linear"]
+        assert "error" in results["var_sort"]
 
     def test_unknown_method_in_config_raises(self, experiment_dir):
         with pytest.raises(ValueError):
@@ -557,7 +702,7 @@ class TestRunner:
     def test_summarize_produces_one_row_per_method(self):
         """The summary must read the artefacts' own key names (``standard_shd_*``)."""
         results = {
-            "notears_linear": {
+            "var_sort": {
                 "standard_shd_cross": {"mean": 0.0},
                 "standard_shd_self": {"mean": 1.0},
                 "soft_hamming_cross": {"mean": 0.1}, "soft_hamming_self": {"mean": 0.2},
@@ -567,10 +712,10 @@ class TestRunner:
             "dagma_mlp": {"error": "boom"},
         }
         rows = {row["method"]: row for row in summarize_benchmarks(results)}
-        assert rows["notears_linear"]["shd_cross_mean"] == 0.0
-        assert rows["notears_linear"]["shd_self_mean"] == 1.0
-        assert rows["notears_linear"]["mec_distance_mean"] == 0.25
-        assert rows["notears_linear"]["seconds_mean"] == pytest.approx(2.0)
+        assert rows["var_sort"]["shd_cross_mean"] == 0.0
+        assert rows["var_sort"]["shd_self_mean"] == 1.0
+        assert rows["var_sort"]["mec_distance_mean"] == 0.25
+        assert rows["var_sort"]["seconds_mean"] == pytest.approx(2.0)
         assert rows["dagma_mlp"]["error"] == "boom"
 
     def test_summary_columns_are_populated_from_a_real_run(
@@ -614,7 +759,7 @@ class TestSweepIntegration:
             data_dir=data_root,
             cluster=False,
         )
-        assert list(df["method"]) == ["notears_linear"]
+        assert list(df["method"]) == ["var_sort"]
         assert df["shd_cross_mean"].iloc[0] == 0
 
     def test_sweep_wrapper_persists_the_summary_csv(self, experiment_dir, dataset_dir):
@@ -635,6 +780,8 @@ class TestSweepIntegration:
 
         csv_path = join(experiment_dir, "benchmark_summary.csv")
         assert exists(csv_path)
-        pd.testing.assert_frame_equal(pd.read_csv(csv_path), df)
+        # Metrics that do not apply are None (object dtype) in memory and NaN
+        # (float) after the CSV round trip, so compare values, not dtypes.
+        pd.testing.assert_frame_equal(pd.read_csv(csv_path), df, check_dtype=False)
 
 

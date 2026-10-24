@@ -682,7 +682,10 @@ class AttentionSelectorLayer(nn.Module):
         order_detach_exclusion: bool = True,
         order_exclusion_tnorm: str = "min",
         order_exclusion_existence: str = "threshold",
-        order_existence_mode: str = "learned",
+        toggle_on_recon_att_selector: bool = True,
+        toggle_on_struct_att_selector: bool = False,
+        struct_att_selector_init_logit: float = 2.0,
+        struct_att_selector_init: str = "constant",
         order_straight_through: bool = False,
     ):
 
@@ -703,7 +706,10 @@ class AttentionSelectorLayer(nn.Module):
             order_detach_exclusion=order_detach_exclusion,
             order_exclusion_tnorm=order_exclusion_tnorm,
             order_exclusion_existence=order_exclusion_existence,
-            order_existence_mode=order_existence_mode,
+            toggle_on_recon_att_selector=toggle_on_recon_att_selector,
+            toggle_on_struct_att_selector=toggle_on_struct_att_selector,
+            struct_att_selector_init_logit=struct_att_selector_init_logit,
+            struct_att_selector_init=struct_att_selector_init,
             order_straight_through=order_straight_through,
         )
 
@@ -1765,9 +1771,9 @@ class AttentionSelectorLayer(nn.Module):
             self.query_embed_X = None
             self.query_embed_S = None
 
-        # Order-only ablation: with full existence the queries carry no
-        # structural role; freeze them explicitly (no weight-decay drift).
-        if order_existence_mode == "full":
+        # Reconstruction selector off: the queries carry no role; freeze them
+        # explicitly (no weight-decay drift).
+        if not toggle_on_recon_att_selector:
             for tab in (self.query_embed_X, self.query_embed_S):
                 if tab is not None:
                     for p in tab.parameters():
@@ -3049,6 +3055,13 @@ class AttentionSelectorLayer(nn.Module):
             return False
         oa.set_order_path(mode)
         return True
+
+    def request_struct_selector_sync(self) -> bool:
+        """Arm the one-off G_S <- G_R copy of the order-factorized block
+        (struct_att_selector_init='recon').  Returns True if a copy is
+        pending, False otherwise (not in use, other init, already synced)."""
+        oa = self.order_attention()
+        return False if oa is None else oa.request_struct_selector_sync()
 
     def set_gate_mode(self, mode: str) -> bool:
         """Existence gate of non-relaxed forwards ("hard" | "soft").

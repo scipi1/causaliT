@@ -750,6 +750,12 @@ class PhaseController(Callback):
             ok = model.set_order_path("relaxed")
             model.set_gate_mode("soft")
             gates, use_order = "soft", True
+            # One-off G_S <- G_R copy (struct_att_selector_init='recon'),
+            # applied at the next forward; no-op once synced.
+            if callable(getattr(model, "request_struct_selector_sync", None)) \
+                    and model.request_struct_selector_sync():
+                logger.info("[adaptive] structural selector G_S initialised "
+                            "from G_R at the next forward.")
         else:
             cfg = {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
                    "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})

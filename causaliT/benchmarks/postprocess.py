@@ -4,7 +4,7 @@ Estimated adjacency -> canonical causaliT DAG blocks.
 This module owns the two conventions that would otherwise be easy to get
 silently wrong.
 
-**1. Orientation.**  NOTEARS, DAGMA and the linear SEM literature write the
+**1. Orientation.**  DAGMA and the linear SEM literature write the
 model as ``X = X W + noise``, so ``W[i, j] != 0`` means ``i -> j``: rows are
 parents.  causaliT's DAG masks and every metric built on them use the opposite
 layout - rows are *children*, columns are parents (``dec_cross`` has shape

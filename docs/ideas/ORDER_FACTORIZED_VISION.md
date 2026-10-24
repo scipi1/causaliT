@@ -3,6 +3,8 @@
 Status: design proposal, not an implemented or validated method.
 Companions: `docs/MAIN.md` (P1/P2), `docs/PAPER_TEMPLATE.md`, and
 `docs/documentation/ATTENTION_TEMPERATURES.md`. 
+Anti-adjacency (causal / anti-causal log-ratio) structural loss:
+`docs/documentation/ANTI_ADJACENCY_LOSS.md`.
 
 ## 1. Current model and its limitations
 

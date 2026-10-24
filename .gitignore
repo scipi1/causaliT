@@ -3,6 +3,8 @@
 /experiments
 /notebooks/eval
 /logs
+.clinerules/
+.vscode/
 
 # Python / pytest auto-generated artifacts
 .pytest_cache/

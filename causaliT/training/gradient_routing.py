@@ -117,6 +117,9 @@ STRUCTURAL_PATTERNS = [
     # OrderFactorizedSelfAttention node order scores (structural, trained by
     # the routed independence loss).
     "order_scores",
+    # OrderFactorizedSelfAttention structural selector G_S (free symmetric
+    # logits, trained by the structural loss only).
+    "struct_gate_logits",
     # Attention internal parameters (gain, temperature, Gumbel tau, etc.)
 
     "inner_attention.log_gain",

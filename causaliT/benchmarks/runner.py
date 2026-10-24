@@ -15,14 +15,16 @@ special-casing::
 reports best/mean/worst across them.  The deterministic benchmarks have no folds,
 so the runner refits each method once per seed and stores the results under
 ``seed_<i>`` keys, which ``write_dag_report`` consumes exactly like ``fold_<i>``.
-Linear NOTEARS / DAGMA / PC are deterministic given the data, so their seeds
-differ only if the data does; the MLP variants differ through initialisation.
+Linear DAGMA / PC / the order-based methods are (nearly) deterministic given
+the data; the MLP and learned-order variants differ through initialisation.
 That is intentional: the reported spread then reflects the true variability of
 each method rather than a pretend one.
 
 Outputs, under ``<experiment>/eval/eval_benchmark_<method>/``:
 
-``files/dag_metrics.json``        metrics, identical schema to the models
+``files/dag_metrics.json``        metrics, identical schema to the models,
+                                  plus ``structure`` (full-graph suite from
+                                  ``metrics.py``) and ``data_diagnostics``
 ``files/learned_dag_edges.json``  per-seed blocks + ground truth + labels
 ``files/attention_labels.json``   block descriptions
 ``files/benchmark_run.json``      raw ``W`` per seed, hyperparameters, timings,
@@ -43,11 +45,17 @@ from omegaconf import OmegaConf
 
 from causaliT.benchmarks.base import (
     METHOD_DESCRIPTIONS,
+    METHOD_REQUIREMENTS,
     merge_params,
     method_names,
     resolve_method,
 )
 from causaliT.benchmarks.data import load_benchmark_data
+from causaliT.benchmarks.metrics import (
+    aggregate,
+    compute_structure_metrics,
+    data_diagnostics,
+)
 from causaliT.benchmarks.postprocess import (
     adjacency_to_blocks,
     count_edges,
@@ -57,6 +65,7 @@ from causaliT.benchmarks.postprocess import (
 )
 from causaliT.evaluation.eval_funs.helpers.datadir import resolve_datadir
 from causaliT.evaluation.eval_funs.helpers.eval_dag_report import (
+    DAG_METRICS_FILENAME,
     resolve_dag_dims,
     write_dag_report,
 )
@@ -69,9 +78,16 @@ BENCHMARK_RUN_FILENAME = "benchmark_run.json"
 #: Eval-name prefix; the method name is appended (``eval_benchmark_dagma_mlp``).
 EVAL_NAME_PREFIX = "eval_benchmark"
 
+#: Full-graph metrics (``dag_metrics["structure"]["mean"]``) copied into the
+#: summary rows as ``<key>_mean`` columns.
+SUMMARY_STRUCTURE_KEYS = (
+    "shd", "shd_normalized", "f1", "skeleton_f1", "sid", "sid_normalized",
+    "order_divergence", "order_accuracy", "auprc", "expected_shd",
+)
+
 #: Defaults for the ``benchmark`` config section.
 DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
-    "methods": ["notears_linear", "dagma_linear", "pc"],
+    "methods": ["dagma_linear", "pc", "score"],
     "seeds": [0],
     "split": "train",
     "standardize": True,
@@ -84,8 +100,40 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
 
 
 def eval_name_for(method: str) -> str:
-    """Eval folder name used for *method* (``eval_benchmark_notears_mlp``)."""
+    """Eval folder name used for *method* (``eval_benchmark_dagma_mlp``)."""
     return f"{EVAL_NAME_PREFIX}_{method}"
+
+
+def _true_dag_paper(datadir_path: str, dataset_name: str) -> Optional[np.ndarray]:
+    """Full binary true DAG in paper orientation, or None if unavailable."""
+    from causaliT.evaluation.eval_funs.helpers.eval_utils import _load_full_true_dag
+
+    canonical = _load_full_true_dag(datadir_path, dataset_name)  # [child, parent]
+    if canonical is None:
+        return None
+    return (np.asarray(canonical).T != 0).astype(np.int8)
+
+
+def _predicted_graph(result, w_threshold: float, L_S: int, forbid_into_sources: bool):
+    """
+    Binary prediction and edge scores (paper orientation) for ``metrics.py``.
+
+    Weighted outputs are thresholded at ``|W| >= w_threshold`` (same rule as
+    ``postprocess.to_edge_scores``); CPDAGs keep undirected edges in both
+    directions; DAG and sample outputs are already binary.
+    """
+    W = np.asarray(result.W, dtype=float)
+    if result.output_type == "weighted":
+        pred = np.abs(W) >= float(w_threshold)
+        scores = np.abs(W)
+    else:
+        pred = W != 0
+        scores = result.edge_probs if result.edge_probs is not None else np.abs(W)
+    pred = pred.astype(np.int8)
+    np.fill_diagonal(pred, 0)
+    if forbid_into_sources:
+        pred[:, :L_S] = 0
+    return pred, np.asarray(scores, dtype=float)
 
 
 def _load_experiment_config(experiment: str):
@@ -147,26 +195,13 @@ def _package_versions(method: str) -> Dict[str, str]:
         versions["numpy"] = _np.__version__
     except Exception:  # pragma: no cover
         pass
-    if method.startswith("dagma"):
+    # The method's own package (registry) plus the ones that shape its result.
+    packages = {METHOD_REQUIREMENTS.get(method), "torch", "sklearn", "gadjid"}
+    for package in sorted(p for p in packages if p):
         try:
-            import dagma
-
-            versions["dagma"] = getattr(dagma, "__version__", "unknown")
-        except Exception:  # pragma: no cover
-            pass
-    if method == "pc":
-        try:
-            import causallearn
-
-            versions["causallearn"] = getattr(causallearn, "__version__", "unknown")
-        except Exception:  # pragma: no cover
-            pass
-    if method.endswith("mlp"):
-        try:
-            import torch
-
-            versions["torch"] = torch.__version__
-        except Exception:  # pragma: no cover
+            module = __import__(package)
+            versions[package] = getattr(module, "__version__", "unknown")
+        except Exception:  # noqa: BLE001 - optional package, version is best effort
             pass
     return versions
 
@@ -265,6 +300,8 @@ def run_benchmark_method(
 
     per_fold_blocks: Dict[str, Dict[str, np.ndarray]] = {}
     per_seed_record: Dict[str, Any] = {}
+    per_seed_structure: Dict[str, Dict[str, Any]] = {}
+    true_paper = _true_dag_paper(datadir_path, dataset_name)
 
     for seed in seeds:
         key = f"seed_{int(seed)}"
@@ -296,8 +333,23 @@ def run_benchmark_method(
             "seconds": result.seconds,
             "n_edges": count_edges(scores),
             "is_dag": is_dag(scores),
+            "output_type": result.output_type,
+            "order": result.order,
+            "edge_probs": None if result.edge_probs is None
+            else np.asarray(result.edge_probs).tolist(),
             "extra": result.extra,
         }
+        if true_paper is not None and true_paper.shape == np.shape(result.W):
+            pred, edge_scores = _predicted_graph(result, w_threshold, L_S, forbid_into_sources)
+            per_seed_structure[key] = compute_structure_metrics(
+                true_paper,
+                pred,
+                scores=edge_scores,
+                probabilistic=result.output_type == "samples",
+                order=result.order,
+                graph_samples=result.graph_samples,
+            )
+            per_seed_structure[key]["seconds"] = result.seconds
         if verbose:
             print(
                 f"  [benchmark] {key}: {per_seed_record[key]['n_edges']} edges, "
@@ -362,6 +414,21 @@ def run_benchmark_method(
     }
     with open(join(files_dir, BENCHMARK_RUN_FILENAME), "w", encoding="utf-8") as fh:
         json.dump(make_json_serializable(record), fh, indent=2)
+
+    # Full-graph metric suite (metrics.py), added next to the block metrics.
+    # Data diagnostics use the RAW data: standardising hides varsortability.
+    if per_seed_structure:
+        dag_metrics["structure"] = {
+            "per_seed": per_seed_structure,
+            **aggregate(per_seed_structure),
+        }
+        raw = data if not data.standardized else load_benchmark_data(
+            datadir_path=datadir_path, dataset_name=dataset_name, split=split,
+            standardize=False, max_samples=max_samples, metadata=metadata,
+        )
+        dag_metrics["data_diagnostics"] = data_diagnostics(raw.X, true_paper)
+        with open(join(files_dir, DAG_METRICS_FILENAME), "w", encoding="utf-8") as fh:
+            json.dump(make_json_serializable(dag_metrics), fh, indent=2)
 
     dag_metrics["benchmark"] = {
         "method": method,
@@ -454,6 +521,9 @@ def summarize_benchmarks(results: Dict[str, Dict[str, Any]]) -> List[Dict[str, A
         mec = metrics.get("mec_distance") or {}
         row["mec_distance_mean"] = mec.get("mean") if isinstance(mec, dict) else None
         row["mec_membership_rate"] = metrics.get("mec_membership_rate")
+        structure_mean = (metrics.get("structure") or {}).get("mean") or {}
+        for key in SUMMARY_STRUCTURE_KEYS:
+            row[f"{key}_mean"] = structure_mean.get(key)
         seconds = (metrics.get("benchmark") or {}).get("seconds") or {}
         row["seconds_mean"] = float(np.mean(list(seconds.values()))) if seconds else None
         rows.append(row)

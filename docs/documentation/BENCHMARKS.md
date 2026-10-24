@@ -1,4 +1,4 @@
-# Structure-Learning Benchmarks (NOTEARS, DAGMA, PC)
+﻿# Structure-Learning Benchmarks
 
 External baselines for DAG recovery, wired into the existing causaliT evaluation
 plumbing so their numbers are directly comparable to the models'.
@@ -10,27 +10,52 @@ Tests: `tests/test_benchmarks.py`
 
 ## 1. What is implemented
 
-| Method           | Class                    | Source of the code                                | Extra dependency |
-|------------------|--------------------------|---------------------------------------------------|------------------|
-| `notears_linear` | linear SEM, continuous   | vendored paper code (`vendor/notears/`)           | none (scipy)     |
-| `notears_mlp`    | nonlinear, per-node MLP  | vendored paper code (`vendor/notears/`)           | `torch`          |
-| `dagma_linear`   | linear SEM, continuous   | `dagma` package (authors' own release)            | `dagma`          |
-| `dagma_mlp`      | nonlinear, per-node MLP  | `dagma` package                                   | `dagma`          |
-| `pc`             | constraint-based, CPDAG  | `causal-learn` package (CMU, reference impl.)     | `causal-learn`   |
+Methods are grouped by the part of the order-factorized design they test
+(see `docs/ideas/ORDER_FACTORIZED_VISION.md`): (a) explicit order plus edges
+given the order, (b) residual-independence signal under an ANM, (c) a learned
+order distribution.
 
-Nothing is reimplemented from scratch. DAGMA and PC come from the authors'
-published packages; NOTEARS has no PyPI release, so `notears_linear.py` and
-`notears_mlp.py` from https://github.com/xunzheng/notears are vendored verbatim
-under `causaliT/benchmarks/vendor/notears/` together with their Apache-2.0
-licence and a `PROVENANCE.md` recording the commit. The wrappers in
-`causaliT/benchmarks/methods/` never modify the algorithms - they only convert
-arguments and results.
+| Method | Family / role | Output | Source of the code | Install |
+|---|---|---|---|---|
+| `dagma_linear`, `dagma_mlp` | continuous acyclicity penalty | weighted | `dagma` (authors) | `pip install dagma` |
+| `pc` | constraint-based | CPDAG | `causal-learn` (reference impl.) | `pip install causal-learn` |
+| `resit` | (b) order by residual HSIC | DAG + order | `lingam.RESIT` | `pip install --no-deps lingam` + deps (1) |
+| `cam` | (a) greedy order + CAM pruning | DAG + order | `dodiscover.toporder` | GitHub (2) |
+| `score`, `das`, `nogam` | (a) score-matching order + pruning | DAG + order | `dodiscover.toporder` (authors' code) | GitHub (2) |
+| `caps` | (a) Hessian order, mixed linear/nonlinear | DAG + order | vendored `vendor/caps/` (MIT) | none extra |
+| `daguerreo` | (a)+(c) learned order on the permutahedron | DAG + order | authors' repo, compiled | Linux build (3) |
+| `var_sort`, `r2_sort` | trivial baselines (data-leak check) | weighted + order | `CausalDisco` (authors) | `pip install --no-deps causaldisco` |
 
-Install everything with:
+(1) `lingam` pins an old scipy that does not build on Python 3.13; install
+with `--no-deps` plus `pygam psy semopy statsmodels graphviz` (semopy also
+`--no-deps`, plus `numdifftools`).
+(2) `dodiscover` is no longer on PyPI:
+`pip install --no-deps git+https://github.com/py-why/dodiscover.git`.
+(3) DAGuerreotype (BSD-3, commit `47fc2ae`) needs `lp-sparsemap` and two C++
+extensions; build it on the cluster with the repository's `linux-install.sh`,
+plus `wandb`. Not buildable here without MSVC; `cli list` reports it
+unavailable until installed.
 
-```bash
-pip install -r requirements.txt   # includes dagma and causal-learn
-```
+Nothing is reimplemented from scratch. The project is **Python-only** (no R),
+for portability to the cluster. The price: CAM pruning (used by `cam`,
+`score`, `nogam`, `caps`) is dodiscover's `pygam` version, not the R `CAM`
+package the papers used, so pruned graphs can differ slightly from published
+numbers; orders are unaffected. CaPS's R pruning call is replaced the same
+way (`vendor/caps/PROVENANCE.md`). The wrappers in `methods/` never modify
+the algorithms - they only convert arguments and results.
+
+### 1.1 Methods considered and excluded
+
+Kept in code as `base.EXCLUDED_METHODS`, so the reasons travel with the registry.
+
+| Method | Reason |
+|---|---|
+| NOTEARS (linear, MLP) | dropped: same continuous-penalty family as DAGMA, which supersedes it |
+| VI-DP-DAG (Charpentier et al., 2022) | repository has no licence: cannot be vendored or redistributed |
+| BCD-Nets (Cundy et al., 2021) | repository has no licence; also linear-Gaussian only |
+| DiffIntersort (Chevalley et al., 2024) | needs interventional data; no public code |
+
+If a licence appears later, add the method with a wrapper; nothing else changes.
 
 Check what is currently runnable:
 
@@ -45,13 +70,22 @@ python -m causaliT.benchmarks.cli list
 ```
 causaliT/benchmarks/
   data.py          ds.npz (token tensors) -> (n_samples, N) design matrix
-  base.py          BenchmarkResult, method registry, paper defaults
+  base.py          BenchmarkResult, method registry, paper defaults, exclusions
   methods/         one thin wrapper per method (lazy third-party imports)
+  metrics.py       full-graph metric suite (section 4.1)
   postprocess.py   estimated W -> canonical causaliT DAG blocks
   runner.py        fit + write the standard eval artefacts
   cli.py           `list` / `run` commands
-  vendor/notears/  verbatim paper code + LICENSE + PROVENANCE.md
+  vendor/caps/     CaPS order search + LICENSE + PROVENANCE.md
 ```
+
+**Result contract.** `fit(X, **params) -> BenchmarkResult` with `W` in paper
+orientation plus optional fields that decide which metrics apply:
+`output_type` (`weighted` | `dag` | `cpdag` | `samples`), `order` (most
+upstream first), `graph_samples` (`(S, N, N)`), `edge_probs` (derived from the
+samples when omitted). A method fills only what it truly produces. causaliT's
+own order-factorized model should report through the same contract (order +
+sampled DAGs), so it is scored by identical code.
 
 The evaluation side gained one shared module,
 `causaliT/evaluation/eval_funs/helpers/eval_dag_report.py`, which holds the
@@ -84,7 +118,7 @@ with the matrix and are recorded in `benchmark_run.json`.
 
 **Scores.** `write_dag_report` expects edge probabilities in `[0, 1]`:
 
-- weighted methods (NOTEARS, DAGMA): `|W| >= w_threshold` -> `1.0`, else `0.0`
+- weighted methods (DAGMA, sortnregress): `|W| >= w_threshold` -> `1.0`, else `0.0`
   (`score_mode: binary`, the papers' own reporting), or `|W| / max|W|`
   (`score_mode: scaled`) to keep a notion of confidence;
 - PC returns a CPDAG: oriented edges get `1.0`, unoriented edges `0.5` in both
@@ -95,6 +129,35 @@ with the matrix and are recorded in `benchmark_run.json`.
 ---
 
 ## 4. Protocol decisions
+
+### 4.1 Metric suite (`metrics.py`)
+
+Written to `dag_metrics.json` under `structure` (`per_seed`, `mean`, `std`),
+next to the unchanged block metrics. Computed on the full `(N, N)` graph.
+A metric that does not apply is `null`, never imputed.
+
+| Group | Metric | Question | Applies to |
+|---|---|---|---|
+| graph | `shd`, `shd_normalized` (/ true edges) | right edges? (reversal costs 1) | all |
+| | `precision`, `recall`, `f1`, `edge_ratio` | too dense / sparse? | all |
+| | `skeleton_f1` | right adjacencies, ignoring direction? | all, incl. CPDAG |
+| interventional | `sid`, `sid_normalized` (`gadjid`) | would interventions on this graph be wrong? | DAG outputs; `null` + `sid_note` for CPDAG / cyclic |
+| order | `order_divergence` | true edges against the learned order | methods with an order |
+| | `order_accuracy` | fraction of ancestor pairs ordered right | methods with an order |
+| probabilistic | `auroc`, `auprc` | do higher scores mean true edges? | any edge score |
+| | `brier`, `ece` | calibrated edge probabilities? | `samples` outputs |
+| | `expected_shd`, `acyclic_fraction` | quality / validity of sampled graphs | `samples` outputs |
+| cost | `seconds` | practical cost | all |
+
+`data_diagnostics` (per dataset): `var_sortability`, `r2_sortability`
+(`CausalDisco`), always on the **raw** data. Near 1 means the order leaks
+through scale; read every result on that dataset with this in mind, and
+compare against `var_sort` / `r2_sort`.
+
+**ATE is deliberately not a benchmark metric.** Discovery papers do not score
+methods on downstream effect estimates, which would mix graph quality with
+the estimator. SID covers the interventional question; probabilistic ATE
+from sampled graphs is a separate downstream study.
 
 **Fixed paper hyperparameters, no tuning.** Each method module exposes
 `DEFAULT_PARAMS` copied from the paper/package defaults; sweeps never search over
@@ -110,7 +173,7 @@ Fixing `H = 10` reproduces the published setting instead of inventing a new one.
 **Seeds play the role of folds.** causaliT reports best/mean/worst across `k`
 folds. The benchmarks have no folds, so each method is refitted once per seed and
 stored under `seed_<i>`, which `write_dag_report` consumes exactly like
-`fold_<i>`. Linear NOTEARS/DAGMA/PC are deterministic given the data, so their
+`fold_<i>`. Linear DAGMA, PC and the order-based methods are (nearly) deterministic given the data, so their
 spread is zero unless the data changes; the MLP variants vary through
 initialisation. The reported spread is thus each method's true variability.
 
@@ -119,7 +182,7 @@ true` z-scores every column before fitting. Simulated linear SEMs are
 *varsortable*: marginal variance grows along the topological order, and the
 continuous methods can read the order off the scale rather than off the
 dependence structure (Reisach et al., 2021, "Beware of the Simulated DAG"). On
-this project's own synthetic chain, `notears_linear` recovers the DAG exactly on
+this project's own synthetic chain, `var_sort` recovers the DAG exactly on
 raw data and clearly worse after standardising - the difference is the shortcut,
 not the signal. `tests/test_benchmarks.py::TestMethods::
 test_standardization_removes_the_varsortability_shortcut` pins this so a weak
@@ -145,7 +208,7 @@ python -m causaliT.benchmarks.cli list
 # Fit on the dataset of an existing experiment folder (config only, no checkpoint)
 python -m causaliT.benchmarks.cli run \
     --experiment experiments/.../my_run \
-    --methods notears_linear,dagma_linear,pc \
+    --methods dagma_linear,pc,score,caps \
     --seeds 0,1,2 \
     --csv_out benchmarks.csv
 ```
@@ -166,7 +229,7 @@ Artefacts land in `<experiment>/eval/eval_benchmark_<method>/files/`:
 
 ```yaml
 benchmark:
-  methods: [notears_linear, notears_mlp, dagma_linear, dagma_mlp, pc]
+  methods: [dagma_linear, pc, resit, cam, score, das, nogam, caps, var_sort, r2_sort]
   seeds: [0, 1, 2]
   split: train
   standardize: true          # see the varsortability note above
@@ -174,7 +237,7 @@ benchmark:
   score_mode: binary         # or "scaled"
   forbid_into_sources: false # background knowledge, opt-in
   params:                    # optional per-method overrides
-    notears_linear: {lambda1: 0.05}
+    dagma_linear: {lambda1: 0.05}
 ```
 
 Defaults live in `runner.DEFAULT_BENCHMARK_CONFIG`; the config section overrides
@@ -201,7 +264,7 @@ Two ready-to-run smoke tests double as annotated templates (each ~10 s, CPU only
 
 | Folder | Covers |
 | --- | --- |
-| `experiments/0_TESTS/FUN_benchmarks/` | score-based path (`notears_linear` active, DAGMA / MLP arms commented) |
+| `experiments/0_TESTS/FUN_benchmarks/` | score-based path (`var_sort` active, other arms commented) |
 | `experiments/0_TESTS/FUN_benchmarks_pc/` | constraint-based path: CPDAG scores, MEC metrics, the load-bearing `dag_threshold` |
 
 ```bash
@@ -250,3 +313,21 @@ Nothing else changes: the registry, runner, CLI and sweep integration pick it up
 - Spirtes & Glymour, *An Algorithm for Fast Recovery of Sparse Causal Graphs*,
   1991 (PC) - implementation: https://github.com/py-why/causal-learn
 - Reisach et al., *Beware of the Simulated DAG!*, NeurIPS 2021 (varsortability)
+- Reisach et al., *A Scale-Invariant Sorting Criterion to Find a Causal Order
+  in Additive Noise Models*, NeurIPS 2023 (R2-sortability) -
+  https://github.com/CausalDisco/CausalDisco
+- Peters et al., *Causal Discovery with Continuous Additive Noise Models*,
+  JMLR 2014 (RESIT) - implementation: https://github.com/cdt15/lingam
+- Buhlmann, Peters & Ernest, *CAM*, Annals of Statistics 2014
+- Rolland et al., *Score Matching Enables Causal Discovery of Nonlinear
+  Additive Noise Models*, ICML 2022 (SCORE)
+- Montagna et al., *Causal Discovery with Score Matching on Additive Models
+  with Arbitrary Noise* (NoGAM) and *Scalable Causal Discovery with Score
+  Matching* (DAS), CLeaR 2023 - implementation: https://github.com/py-why/dodiscover
+- Xu et al., *Ordering-Based Causal Discovery for Linear and Nonlinear
+  Relations*, NeurIPS 2024 (CaPS) - https://github.com/E2real/CaPS
+- Zantedeschi et al., *DAG Learning on the Permutahedron*, ICLR 2023 -
+  https://github.com/vzantedeschi/DAGuerreotype
+- Peters & Buhlmann, *Structural Intervention Distance for Evaluating Causal
+  Graphs*, Neural Computation 2015 (SID) - implementation:
+  https://github.com/CausalDisco/gadjid

@@ -38,7 +38,7 @@ def _split_list(value: Optional[str]) -> Optional[List[str]]:
 
 @click.group()
 def cli():
-    """Structure-learning benchmarks (NOTEARS, DAGMA, PC)."""
+    """Structure-learning benchmarks (DAGMA, PC, order-based ANM methods)."""
     pass
 
 

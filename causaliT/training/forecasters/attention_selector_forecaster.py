@@ -196,8 +196,20 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # oracle_shd GT buffer); None on the checkpoint-loading path.
         self._data_dir = data_dir
 
-        # Build model
-        self.model = AttentionSelectorLayer(**config["model"]["kwargs"])
+        # Build model.  Removed key order_existence_mode: checkpoints / old
+        # configs are mapped onto the selector toggles ("full" == G_R off).
+        mkw = dict(config["model"]["kwargs"])
+        if "order_existence_mode" in mkw:
+            mode = mkw.pop("order_existence_mode")
+            if mode not in ("learned", "full"):
+                raise ValueError(
+                    "order_existence_mode was removed: use "
+                    "toggle_on_recon_att_selector / toggle_on_struct_att_selector.")
+            logger.warning(
+                "model.kwargs.order_existence_mode is deprecated: mapped %r to "
+                "toggle_on_recon_att_selector=%s.", mode, mode == "learned")
+            mkw["toggle_on_recon_att_selector"] = mode == "learned"
+        self.model = AttentionSelectorLayer(**mkw)
 
         # ----------------------------------------------------------------
         # Query centroid initialisation (see AttentionSelectorLayer
@@ -483,13 +495,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         self.hsic_softmax = self.hsic_aggregation == "attw_softmax"
         self.hsic_direction = self.hsic_aggregation == "direction"
-        # ---- Order-factorized selector: two orthogonal choices -----------
-        #   variable_selection_objective: who trains the symmetric existence gate
-        #     "struct" -> structural objective, together with the order
-        #     "recon"  -> reconstruction loss (+ lambda_l0_selector); the
-        #                 structural objective trains the order only
-        #   (gate type / order mask of reconstruction forwards: see
-        #    adaptive_training.recon_gates / use_order_in_recon)
+        # ---- Order-factorized selector ------------------------------------
+        #   Two symmetric selectors with fixed owners (model kwargs
+        #   toggle_on_recon_att_selector / toggle_on_struct_att_selector):
+        #     G_R -> reconstruction loss (+ lambda_l0_selector), applied in
+        #            reconstruction forwards (and in structure forwards as a
+        #            plain weight when G_S is off)
+        #     G_S -> structural loss, applied in structure forwards only
+        #   The order is always structural.  (Gate type / order mask of
+        #   reconstruction forwards: adaptive_training.recon_gates /
+        #   use_order_in_recon.)
         #   anti_adjacency_lambda: a > 0 replaces the plain HSIC by the causal /
         #     anti-causal log-ratio on the order
         #       L = mean_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)]
@@ -497,11 +512,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._resolve_order_config(config)
         self._last_anti_adjacency_stats: Optional[Dict[str, Any]] = None
         _sat = config["model"]["kwargs"].get("self_attention_type")
-        if self.variable_selection_objective == "recon" or self.anti_adjacency_on:
+        self._order_selector = self.model.order_attention() is not None
+        if self.anti_adjacency_on:
             if _sat != "OrderFactorizedSelfAttention" or not self.homogeneous_nodes:
                 raise ValueError(
-                    "variable_selection_objective='recon' / anti_adjacency_lambda > 0 "
-                    "require self_attention_type='OrderFactorizedSelfAttention' "
+                    "anti_adjacency_lambda > 0 "
+                    "requires self_attention_type='OrderFactorizedSelfAttention' "
                     f"and homogeneous_nodes=True (got {_sat!r}, "
                     f"homogeneous_nodes={self.homogeneous_nodes}).")
         if self.anti_adjacency_on:
@@ -1189,10 +1205,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
             structural_params, reconstruction_params = classify_parameters(
                 self.model, verbose=True
             )
-            # variable_selection_objective=recon: the symmetric existence gate (the
-            # free query tables) is the VARIABLE SELECTOR, trained by the
-            # reconstruction loss (+ L0); only the order stays structural.
-            if self.variable_selection_objective == "recon":
+            # Order-factorized selector: the query tables parameterize the
+            # RECONSTRUCTION selector G_R, always owned by the reconstruction
+            # loss (+ L0).  The order and G_S stay structural.
+            if self._order_selector:
                 sel_ids = {id(p) for n, p in self.model.named_parameters()
                            if "query_embed" in n}
                 structural_params = [p for p in structural_params
@@ -1201,14 +1217,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     p for n, p in self.model.named_parameters()
                     if "query_embed" in n]
                 logger.info(
-                    "variable_selection_objective=recon: %d selector tensors moved "
+                    "order selector: %d reconstruction-selector tensors moved "
                     "to the reconstruction group.", len(sel_ids))
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
-        elif self.variable_selection_objective == "recon":
+        elif self._order_selector:
             raise ValueError(
-                "training.variable_selection_objective='recon' requires "
-                "use_gradient_routing=True.")
+                "self_attention_type='OrderFactorizedSelfAttention' requires "
+                "use_gradient_routing=True (each selector has a fixed owner).")
 
         # ----------------------------------------------------------------
         # Gradient surgery (PCGrad): per-block projection of the L0 / NOTEARS
@@ -2840,11 +2856,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
-        # variable_selection_objective=recon: the selector (existence gate) is a
-        # reconstruction parameter, so its L0 budget rides on the RECON loss
-        # with its own coefficient (not overwritten by per-phase lambda_l0).
+        # Order-factorized selector: G_R is a reconstruction parameter, so its
+        # L0 budget rides on the RECON loss with its own coefficient (not
+        # overwritten by per-phase lambda_l0).
         loss_recon_routed = loss_x
-        if self.variable_selection_objective == "recon":
+        if self._order_selector:
             sel_l0 = self.lambda_l0_selector * l0_penalty
             loss_recon_routed = loss_x + sel_l0
             self.log(f"{stage}_l0_selector_reg", sel_l0.detach(),
@@ -5307,9 +5323,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
     # Order-factorized selector: config + causal / anti-causal log-ratio
     # ------------------------------------------------------------------
+    _SELECTOR_TOGGLES = ("model.kwargs.toggle_on_recon_att_selector / "
+                         "toggle_on_struct_att_selector")
     _LEGACY_ORDER_KEYS = {
-        "dual_selector_routing": "variable_selection_objective",
-        "order_selection": "variable_selection_objective",
+        "variable_selection_objective": _SELECTOR_TOGGLES,
+        "dual_selector_routing": _SELECTOR_TOGGLES,
+        "order_selection": _SELECTOR_TOGGLES,
         "dual_logratio_eps": "anti_adjacency_eps",
         "order_logratio_eps": "anti_adjacency_eps",
         "dual_logratio_anti_weight": "anti_adjacency_lambda",
@@ -5317,23 +5336,28 @@ class AttentionSelectorForecaster(pl.LightningModule):
     }
 
     def _resolve_order_config(self, config) -> None:
-        """Parse variable_selection_objective / anti_adjacency_lambda / anti_adjacency_eps /
-        lambda_l0_selector.  Legacy dual_* keys and hsic_aggregation:
-        dual_logratio are rejected with the replacement key."""
+        """Parse anti_adjacency_lambda / anti_adjacency_eps / lambda_l0_selector.
+        Removed keys (variable_selection_objective, dual_*) and
+        hsic_aggregation: dual_logratio are rejected with the replacement."""
         tr = config["training"]
+        # variable_selection_objective: "recon" IS the current behaviour
+        # (G_R owned by reconstruction), so old checkpoints / configs load
+        # with a warning; "struct" (G_R trained by the structural loss) has
+        # no equivalent and is rejected below.
+        if tr.get("variable_selection_objective") == "recon":
+            logger.warning(
+                "training.variable_selection_objective is deprecated and "
+                "ignored: 'recon' is now the fixed owner of the reconstruction "
+                "selector (see toggle_on_struct_att_selector).")
+            tr = {k: v for k, v in tr.items() if k != "variable_selection_objective"}
         for old, new in self._LEGACY_ORDER_KEYS.items():
             if old in tr:
-                raise ValueError(
-                    f"training.{old} was removed: use training.{new}.")
+                new = new if new == self._SELECTOR_TOGGLES else f"training.{new}"
+                raise ValueError(f"training.{old} was removed: use {new}.")
         if self.hsic_aggregation == "dual_logratio":
             raise ValueError(
                 "hsic_aggregation='dual_logratio' was removed: set "
                 "hsic_aggregation: plain and training.anti_adjacency_lambda > 0.")
-        self.variable_selection_objective = str(tr.get("variable_selection_objective", "struct"))
-        if self.variable_selection_objective not in ("struct", "recon"):
-            raise ValueError(
-                "training.variable_selection_objective must be 'struct' or 'recon', "
-                f"got {self.variable_selection_objective!r}.")
         self.anti_adjacency_lambda = float(tr.get("anti_adjacency_lambda", 0.0))
         if self.anti_adjacency_lambda < 0.0:
             raise ValueError(
@@ -5377,6 +5401,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         nu = permutation-null mean of the current phase (1.0 before the first
         calibration).  ``causal`` optionally passes precomputed causal
         ``(target, residuals)`` (the cross-fit forward of ``_step``).
+        Full derivation and gradient flow: docs/documentation/ANTI_ADJACENCY_LOSS.md.
         """
         if causal is None:
             target, r_c = self._order_residuals(S, X, overrides, "causal")

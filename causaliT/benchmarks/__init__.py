@@ -1,15 +1,21 @@
 """
 External structure-learning benchmarks for causaliT.
 
-Five reference methods, all fitted with their papers' own hyperparameters:
+Reference methods, all fitted with their papers' own hyperparameters
+(``base.METHOD_SPECS``; dropped ones and why in ``base.EXCLUDED_METHODS``):
 
-===================  =====================================================
-``notears_linear``   NOTEARS, linear SEM            (vendored paper code)
-``notears_mlp``      NOTEARS, per-node MLP          (vendored paper code)
-``dagma_linear``     DAGMA, linear SEM              (``dagma`` package)
-``dagma_mlp``        DAGMA, per-node MLP            (``dagma`` package)
-``pc``               PC, Fisher-z, PC-stable        (``causal-learn`` package)
-===================  =====================================================
+=========================  ===============================================
+``dagma_linear/_mlp``      DAGMA, continuous acyclicity  (``dagma``)
+``pc``                     PC, Fisher-z, PC-stable       (``causal-learn``)
+``resit``                  RESIT, residual independence  (``lingam``)
+``cam/score/das/nogam``    order-based ANM methods       (``dodiscover``)
+``caps``                   CaPS order search             (vendored, MIT)
+``daguerreo``              permutahedron order learning  (external build)
+``var_sort/r2_sort``       trivial sortnregress          (``CausalDisco``)
+=========================  ===============================================
+
+``metrics.py`` holds the full-graph metric suite (SHD, SID, F1, order and
+probabilistic metrics, sortability diagnostics) written by the runner.
 
 Module map::
 
