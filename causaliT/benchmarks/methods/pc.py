@@ -5,7 +5,10 @@ Uses ``causallearn.search.ConstraintBased.PC.pc`` (``pip install causal-learn``)
 the reference implementation maintained by the CMU/Tsinghua group.
 
 Defaults: ``alpha=0.05`` with the Fisher-z conditional independence test, the
-standard choice for continuous data and the package's own default.  ``stable=True``
+standard choice for continuous data and the package's own default.  Fisher-z
+only detects LINEAR dependence; for nonlinear SCMs pass ``indep_test='rcit'``
+(random-feature approximation of KCI, seeded via ``seed``), as the
+8_BENCHMARKS/MAIN arms do.  ``stable=True``
 selects PC-stable (order-independent skeleton), which is what practically
 everybody reports today.
 
@@ -97,8 +100,15 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
 
     merged = {**DEFAULT_PARAMS, **params}
     merged.pop("w_threshold", None)   # no weights to threshold
+    seed = merged.pop("seed", None)
 
     X = np.ascontiguousarray(np.asarray(X, dtype=float))
+
+    # RCIT/KCI draw random features from numpy's GLOBAL RNG and accept no seed
+    # argument; seeding it here makes those tests reproducible. No effect on
+    # the deterministic fisherz test.
+    if seed is not None:
+        np.random.seed(int(seed))
 
     start = time.perf_counter()
     cg = pc(

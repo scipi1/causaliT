@@ -28,7 +28,11 @@ module exposes the hooks it needs:
 * ``gate_mode`` (``set_gate_mode``, from ``adaptive_training.recon_gates``):
   ``G_R`` of reconstruction forwards.  ``"hard"``: exact 0/1 draw
   ``B ~ Bernoulli(pi)`` with the straight-through gradient
-  ``B + pi - pi.detach()``.  ``"soft"``: Hard-Concrete sample.
+  ``B + pi - pi.detach()``.  ``"soft"``: Hard-Concrete sample.  On the
+  relaxed (structure) path the gate mode comes from
+  ``struct_gate_mode`` (``set_struct_gate_mode``, from
+  ``adaptive_training.structure.struct_gates``, default ``"soft"``);
+  ``"hard"`` applies the ST Bernoulli of the LEARNED ``pi``.
 * ``order_path`` (``set_order_path``): ``"relaxed"`` (structure phases,
   Sinkhorn mask with gradient), ``"hard"`` (the step's sampled hard order,
   detached; ``use_order_in_recon: true``) or ``"none"`` (no order mask:
@@ -281,6 +285,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.struct_selector_on = bool(toggle_on_struct_att_selector)
         self.straight_through = bool(order_straight_through)
         self.gate_mode = "hard"
+        self.struct_gate_mode = "soft"     # gate of relaxed (structure) forwards
         self._init_bkd(batch_key_dropout, batch_key_dropout_p_final,
                        batch_key_dropout_annealing_batches,
                        batch_key_dropout_min_keys, batch_key_dropout_deterministic,
@@ -338,6 +343,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         if mode not in _GATE_MODES:
             raise ValueError(f"gate_mode must be one of {_GATE_MODES}, got {mode!r}.")
         self.gate_mode = mode
+
+    def set_struct_gate_mode(self, mode: str) -> None:
+        """Existence gate of relaxed (structure) forwards: ``"soft"``
+        (Hard-Concrete, default) or ``"hard"`` (straight-through Bernoulli
+        of the learned ``pi``)."""
+        if mode not in _GATE_MODES:
+            raise ValueError(f"struct_gate_mode must be one of {_GATE_MODES}, got {mode!r}.")
+        self.struct_gate_mode = mode
 
     def set_orientation(self, mode: str) -> None:
         """Select the applied orientation: ``"causal"`` (G * M) or
@@ -530,10 +543,20 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             B_draw = B_learn = None
 
         # 1) Applied gate: ONE selector per forward, never both.
-        #    structure (relaxed order path): G_S if on, else G_R (soft);
+        #    structure (relaxed order path): G_S if on, else G_R (soft, or
+        #    ST Bernoulli of the learned pi when struct_gate_mode == "hard");
         #    reconstruction (hard / none): G_R per gate_mode.
         relaxed = self.order_path == "relaxed"
-        if relaxed and self.struct_selector_on:
+        if relaxed and self.struct_gate_mode == "hard" and (
+                self.struct_selector_on or self.recon_selector_on):
+            # Hard structure gates (structure.struct_gates: hard): ST Bernoulli
+            # of the LEARNED existence (pi_S if on, else pi_R), same draw as
+            # the exclusion graph; eval thresholds it.
+            if self.training:
+                G = B_learn + pi - pi.detach()
+            else:
+                G = (pi.detach() > self.existence_threshold).to(pi.dtype)
+        elif relaxed and self.struct_selector_on:
             G = _relaxed_gate(L_S, "hc_s", 0.0)
         elif not self.recon_selector_on:
             G = off

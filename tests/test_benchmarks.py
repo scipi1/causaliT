@@ -312,8 +312,8 @@ class TestRegistry:
 
     def test_expected_methods_are_registered(self):
         assert set(method_names()) == {
-            "dagma_linear", "dagma_mlp", "pc", "resit", "cam", "score", "das",
-            "nogam", "caps", "daguerreo", "var_sort", "r2_sort",
+            "dagma_linear", "dagma_mlp", "pc", "resit", "direct_lingam", "cam",
+            "score", "das", "nogam", "caps", "daguerreo", "var_sort", "r2_sort",
         }
 
     def test_excluded_methods_are_not_registered(self):
@@ -399,7 +399,7 @@ class TestDataLoading:
 # Methods
 # =============================================================================
 
-FAST_METHODS = ["var_sort", "r2_sort", "dagma_linear", "pc"]
+FAST_METHODS = ["var_sort", "r2_sort", "dagma_linear", "pc", "direct_lingam"]
 #: Order-based methods: each must return a DAG plus a full permutation.
 ORDER_METHODS = ["cam", "score", "das", "nogam", "caps"]
 #: RESIT (GP regressions, ~30 s for N=5) and the MLP / learned-order methods.

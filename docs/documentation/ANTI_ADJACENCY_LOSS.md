@@ -150,6 +150,8 @@ NEVER multiply: each forward applies exactly one of them.
 | reconstruction (warmup / reconstruct) | $G_R$ (times $M_{hard}$ if `use_order_in_recon`) |
 | structure (both orientations) | $G_S \odot M$ if `toggle_on_struct_att_selector`, else $G_R \odot M$ |
 
+Gate type: reconstruction forwards use `adaptive_training.recon_gates`; structure forwards use `adaptive_training.structure.struct_gates` (`soft` = Hard-Concrete, default; `hard` = straight-through Bernoulli of the learned pi, same draw as the sampled exclusion graph). Set both to the same value for hard-hard / soft-soft runs.
+
 | `toggle_on_recon_att_selector` | `toggle_on_struct_att_selector` | Behaviour |
 |---|---|---|
 | true (default) | false (default) | $G_R$ in all forwards; in structure it is a plain weight (former `variable_selection_objective: recon`) |

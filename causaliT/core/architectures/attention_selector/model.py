@@ -3072,6 +3072,15 @@ class AttentionSelectorLayer(nn.Module):
         oa.set_gate_mode(mode)
         return True
 
+    def set_struct_gate_mode(self, mode: str) -> bool:
+        """Existence gate of relaxed (structure) forwards ("soft" | "hard").
+        Returns False when the selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_struct_gate_mode(mode)
+        return True
+
     # ------------------------------------------------------------------
     # Prior-softmax gain schedule
     # ------------------------------------------------------------------

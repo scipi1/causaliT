@@ -46,6 +46,7 @@ from omegaconf import OmegaConf
 from causaliT.benchmarks.base import (
     METHOD_DESCRIPTIONS,
     METHOD_REQUIREMENTS,
+    default_seeds,
     merge_params,
     method_names,
     resolve_method,
@@ -88,7 +89,8 @@ SUMMARY_STRUCTURE_KEYS = (
 #: Defaults for the ``benchmark`` config section.
 DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "methods": ["dagma_linear", "pc", "score"],
-    "seeds": [0],
+    # None -> per-method default from base.METHOD_DEFAULT_N_SEEDS.
+    "seeds": None,
     "split": "train",
     "standardize": True,
     "max_samples": None,
@@ -97,6 +99,96 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "forbid_into_sources": False,
     "params": {},
 }
+
+
+#: Raw per-seed output file, re-scored by the global collector (collect.py).
+RESULT_NPZ_TEMPLATE = "benchmark_result_{key}.npz"
+
+#: Status record written for every attempted method (ok / unavailable / error).
+STATUS_FILENAME = "benchmark_status.json"
+
+#: Normalization methods applied PER NODE at generation time.  Loader-side
+#: z-scoring on top of them is forbidden (sweep protocol: one normalization).
+PER_NODE_NORMALIZATIONS = ("standardize_node", "minmax_node")
+
+
+def dataset_normalization(datadir_path: str, dataset_name: str) -> Optional[str]:
+    """
+    Normalization applied at generation time, or None if unknown / disabled.
+
+    Reads ``normalization.json`` (``input.method``) and falls back to
+    ``dag_recipe.json`` (``generation.normalize_method``).
+    """
+    folder = join(str(datadir_path), str(dataset_name))
+    try:
+        with open(join(folder, "normalization.json"), encoding="utf-8") as fh:
+            norm = json.load(fh)
+        for section in norm.values():
+            if isinstance(section, dict) and section.get("method"):
+                return str(section["method"])
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(join(folder, "dag_recipe.json"), encoding="utf-8") as fh:
+            recipe = json.load(fh)
+        gen = recipe.get("generation", {}) or {}
+        if gen.get("normalize") is False:
+            return None
+        method = gen.get("normalize_method")
+        return None if method is None else str(method)
+    except (OSError, ValueError):
+        return None
+
+
+def check_normalization(at_generation: Optional[str], standardize: bool) -> None:
+    """Fail loudly when loader z-scoring is stacked on per-node normalization."""
+    if standardize and at_generation in PER_NODE_NORMALIZATIONS:
+        raise ValueError(
+            f"benchmark.standardize=true combined with a dataset normalized at "
+            f"generation ('{at_generation}'). Normalization must be applied once, "
+            f"at generation: set benchmark.standardize: false."
+        )
+
+
+def save_result_npz(path: str, result) -> None:
+    """Store the raw ``BenchmarkResult`` fields needed for offline re-scoring."""
+    arrays = {
+        "W": np.asarray(result.W, dtype=float),
+        "output_type": np.array(result.output_type),
+        "seconds": np.array(float(result.seconds)),
+    }
+    if result.order is not None:
+        arrays["order"] = np.asarray(result.order, dtype=np.int64)
+    if result.edge_probs is not None:
+        arrays["edge_probs"] = np.asarray(result.edge_probs, dtype=float)
+    if result.graph_samples is not None:
+        arrays["graph_samples"] = (np.asarray(result.graph_samples) != 0).astype(np.int8)
+    np.savez_compressed(path, **arrays)
+
+
+def load_result_npz(path: str):
+    """Rebuild a ``BenchmarkResult`` from :func:`save_result_npz` output."""
+    from causaliT.benchmarks.base import BenchmarkResult
+
+    with np.load(path, allow_pickle=False) as z:
+        return BenchmarkResult(
+            W=z["W"],
+            seconds=float(z["seconds"]),
+            output_type=str(z["output_type"]),
+            order=z["order"].tolist() if "order" in z else None,
+            edge_probs=z["edge_probs"] if "edge_probs" in z else None,
+            graph_samples=z["graph_samples"] if "graph_samples" in z else None,
+        )
+
+
+def write_status(experiment: str, method: str, status: str, **info) -> None:
+    """Write ``benchmark_status.json`` for one method of one run."""
+    files_dir = join(experiment, "eval", eval_name_for(method), "files")
+    makedirs(files_dir, exist_ok=True)
+    payload = {"method": method, "status": status,
+               "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), **info}
+    with open(join(files_dir, STATUS_FILENAME), "w", encoding="utf-8") as fh:
+        json.dump(make_json_serializable(payload), fh, indent=2)
 
 
 def eval_name_for(method: str) -> str:
@@ -277,6 +369,10 @@ def run_benchmark_method(
         dataset_name=dataset_name,
     )
 
+    # Normalization protocol: applied once, at generation (fail loudly otherwise).
+    norm_at_generation = dataset_normalization(datadir_path, dataset_name)
+    check_normalization(norm_at_generation, standardize)
+
     data = load_benchmark_data(
         datadir_path=datadir_path,
         dataset_name=dataset_name,
@@ -287,6 +383,10 @@ def run_benchmark_method(
     )
     if verbose:
         print(f"  [benchmark] {data.summary()}")
+    normalization = {
+        "at_generation": norm_at_generation,
+        "loader_standardize": bool(standardize),
+    }
 
     if data.n_nodes != L_S + L_X:
         raise ValueError(
@@ -302,6 +402,8 @@ def run_benchmark_method(
     per_seed_record: Dict[str, Any] = {}
     per_seed_structure: Dict[str, Dict[str, Any]] = {}
     true_paper = _true_dag_paper(datadir_path, dataset_name)
+    files_dir = join(experiment, "eval", eval_name_for(method), "files")
+    makedirs(files_dir, exist_ok=True)
 
     for seed in seeds:
         key = f"seed_{int(seed)}"
@@ -309,6 +411,8 @@ def run_benchmark_method(
             print(f"  [benchmark] fitting {method} ({key}) ...")
 
         result = fit_fn(data.X, **{**merged_params, "seed": int(seed)})
+        # Raw output first: survives even if scoring/reporting fails later.
+        save_result_npz(join(files_dir, RESULT_NPZ_TEMPLATE.format(key=key)), result)
 
         blocks = adjacency_to_blocks(
             result.W,
@@ -384,8 +488,6 @@ def run_benchmark_method(
     # ------------------------------------------------------------------
     # Raw-fit record: allows re-scoring at any threshold without refitting
     # ------------------------------------------------------------------
-    files_dir = join(experiment, "eval", eval_name, "files")
-    makedirs(files_dir, exist_ok=True)
     record = {
         "method": method,
         "description": METHOD_DESCRIPTIONS.get(method, ""),
@@ -398,6 +500,7 @@ def run_benchmark_method(
         "L_X": L_X,
         "labels": data.labels,
         "standardized": data.standardized,
+        "normalization": normalization,
         "n_dropped_samples": data.n_dropped,
         "max_samples": max_samples,
         "seeds": [int(s) for s in seeds],
@@ -417,6 +520,10 @@ def run_benchmark_method(
 
     # Full-graph metric suite (metrics.py), added next to the block metrics.
     # Data diagnostics use the RAW data: standardising hides varsortability.
+    dag_metrics["normalization"] = normalization
+    if not per_seed_structure:
+        with open(join(files_dir, DAG_METRICS_FILENAME), "w", encoding="utf-8") as fh:
+            json.dump(make_json_serializable(dag_metrics), fh, indent=2)
     if per_seed_structure:
         dag_metrics["structure"] = {
             "per_seed": per_seed_structure,
@@ -475,15 +582,23 @@ def run_benchmarks(
     for method in settings["methods"]:
         if verbose:
             print(f"\n[benchmark] === {method} ===")
+        # Seed policy: explicit list wins, else the registry default.
+        seeds = settings["seeds"] if settings["seeds"] is not None else default_seeds(method)
+        # max_samples: scalar (all methods) or {method: cap}.
+        cap = settings["max_samples"]
+        if isinstance(cap, dict):
+            cap = cap.get(method)
+        write_status(experiment, method, "started", seeds=list(seeds), max_samples=cap)
+        t0 = time.time()
         try:
             results[method] = run_benchmark_method(
                 experiment=experiment,
                 method=method,
                 datadir_path=datadir_path,
-                seeds=settings["seeds"],
+                seeds=seeds,
                 split=settings["split"],
                 standardize=settings["standardize"],
-                max_samples=settings["max_samples"],
+                max_samples=cap,
                 w_threshold=settings["w_threshold"],
                 score_mode=settings["score_mode"],
                 forbid_into_sources=settings["forbid_into_sources"],
@@ -491,9 +606,17 @@ def run_benchmarks(
                 config=config,
                 verbose=verbose,
             )
+            write_status(experiment, method, "ok", seeds=list(seeds), max_samples=cap,
+                         seconds_total=time.time() - t0)
+        except ImportError as exc:
+            print(f"[benchmark] {method} UNAVAILABLE: {exc}")
+            results[method] = {"error": str(exc)}
+            write_status(experiment, method, "unavailable", error=str(exc))
         except Exception as exc:  # noqa: BLE001 - one method must not kill the rest
             print(f"[benchmark] {method} FAILED: {exc}")
             results[method] = {"error": str(exc)}
+            write_status(experiment, method, "error", error=str(exc),
+                         seconds_total=time.time() - t0)
     return results
 
 
@@ -534,7 +657,13 @@ __all__ = [
     "BENCHMARK_RUN_FILENAME",
     "DEFAULT_BENCHMARK_CONFIG",
     "EVAL_NAME_PREFIX",
+    "RESULT_NPZ_TEMPLATE",
+    "STATUS_FILENAME",
+    "check_normalization",
+    "dataset_normalization",
     "eval_name_for",
+    "load_result_npz",
+    "save_result_npz",
     "run_benchmark_method",
     "run_benchmarks",
     "summarize_benchmarks",

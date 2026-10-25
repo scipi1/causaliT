@@ -474,6 +474,55 @@ def test_trainer_applies_recon_forward_and_ladder_phases():
     assert (oa.order_path, oa.gate_mode) == ("relaxed", "soft")
 
 
+@pytest.mark.parametrize("struct_sel", [False, True])
+def test_hard_struct_gates_binary_with_gradient(struct_sel):
+    """Relaxed path + gate_mode hard: exact 0/1 existence of the learned pi,
+    ST gradient to the learned selector and order gradient kept."""
+    m = _mod(toggle_on_struct_att_selector=struct_sel, order_exclusion_existence="sample")
+    m.train()
+    m.set_order_path("relaxed")
+    m.set_struct_gate_mode("hard")
+    q, k, v = _qk()
+    m.resample(torch.Generator().manual_seed(2))
+    out, _, _ = m(q, k, v)
+    # Applied A = (G * M).T with the relaxed order M: recover G and check 0/1.
+    A = m.last_applied_A[0].detach()
+    M = m._last_M.detach()
+    off = 1.0 - torch.eye(N)
+    Z = A.transpose(0, 1)                     # G * M, source -> target
+    # G is symmetric: recover each pair from the better-conditioned direction.
+    use_t = M.transpose(0, 1) > M
+    G = torch.where(use_t, Z.transpose(0, 1) / M.transpose(0, 1).clamp_min(1e-12),
+                    Z / M.clamp_min(1e-12)) * off
+    assert torch.allclose(G, G.round(), atol=1e-4)
+    assert torch.allclose(G, G.transpose(0, 1), atol=1e-4)
+    # Same Bernoulli draw as the sampled exclusion graph (skeletons match).
+    excl = m.score_tensor_for_sparsity
+    assert torch.equal(((excl + excl.transpose(0, 1)) > 0).float(), G.round())
+    out.sum().backward()
+    learned = m.struct_gate_logits if struct_sel else q
+    assert learned.grad is not None and learned.grad.abs().sum() > 0
+    assert m.order_scores.grad is not None
+
+
+def test_trainer_struct_gates_config():
+    from causaliT.training.adaptive_trainer import PhaseController as _T
+    t = _T.__new__(_T)
+    t.warmup_cfg, t.recon_cfg, t.final_cfg = {}, {}, {}
+    t.struct_cfg = {"struct_gates": "hard"}
+    t._recon_gates_default, t._use_order_in_recon_default = "hard", False
+    t._bkd_managed = False
+    m, _ = _dual_forecaster(anti_adjacency_lambda=0.0)
+    oa = m.model.order_attention()
+    assert oa.struct_gate_mode == "soft"                     # default unchanged
+    t._apply_recon_forward_cfg(m, "structure")
+    assert (oa.order_path, oa.struct_gate_mode) == ("relaxed", "hard")
+    t._apply_recon_forward_cfg(m, "warmup")
+    assert (oa.order_path, oa.gate_mode) == ("none", "hard")
+    with pytest.raises(ValueError):
+        oa.set_struct_gate_mode("relaxed")
+
+
 def _unused_plain_hsic():
     m, batch = _dual_forecaster(anti_adjacency_lambda=0.0)
     oa = m.model.order_attention()

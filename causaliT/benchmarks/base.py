@@ -99,6 +99,7 @@ METHOD_SPECS: Dict[str, str] = {
     "dagma_mlp": "dagma_mlp:fit",
     "pc": "pc:fit",
     "resit": "resit:fit",
+    "direct_lingam": "direct_lingam:fit",
     "cam": "toporder:fit_cam",
     "score": "toporder:fit_score",
     "das": "toporder:fit_das",
@@ -115,6 +116,7 @@ METHOD_DESCRIPTIONS: Dict[str, str] = {
     "dagma_mlp": "DAGMA, per-node MLP dims=[d,10,1] (dagma package)",
     "pc": "PC constraint-based, Fisher-z (causal-learn package)",
     "resit": "RESIT, residual-independence order search (lingam package)",
+    "direct_lingam": "DirectLiNGAM, linear non-Gaussian order + adaptive Lasso (lingam package)",
     "cam": "CAM, greedy additive-model order + CAM pruning (dodiscover)",
     "score": "SCORE, Stein-Hessian order + CAM pruning (dodiscover)",
     "das": "DAS, SCORE order + Hessian edge selection (dodiscover)",
@@ -131,6 +133,7 @@ METHOD_REQUIREMENTS: Dict[str, Optional[str]] = {
     "dagma_mlp": "dagma",
     "pc": "causallearn",
     "resit": "lingam",
+    "direct_lingam": "lingam",
     "cam": "dodiscover",
     "score": "dodiscover",
     "das": "dodiscover",
@@ -140,6 +143,31 @@ METHOD_REQUIREMENTS: Dict[str, Optional[str]] = {
     "var_sort": "CausalDisco",
     "r2_sort": "CausalDisco",
 }
+
+#: Default number of init seeds per method (seed policy).  Deterministic
+#: methods are refitted once; stochastic ones (random init) three times.
+#: Used when ``benchmark.seeds`` is omitted from the config.
+METHOD_DEFAULT_N_SEEDS: Dict[str, int] = {
+    "dagma_linear": 1,
+    "dagma_mlp": 3,
+    "pc": 1,
+    "resit": 1,
+    "direct_lingam": 1,
+    "cam": 1,
+    "score": 1,
+    "das": 1,
+    "nogam": 1,
+    "caps": 1,
+    "daguerreo": 3,
+    "var_sort": 1,
+    "r2_sort": 1,
+}
+
+
+def default_seeds(name: str) -> List[int]:
+    """Default init seeds ``[0, ..., k-1]`` for *name* (see METHOD_DEFAULT_N_SEEDS)."""
+    return list(range(METHOD_DEFAULT_N_SEEDS.get(name, 1)))
+
 
 #: Methods considered and deliberately NOT included, with the reason.  Kept in
 #: code so the CLI and the docs report the same list.
@@ -257,6 +285,8 @@ __all__ = [
     "METHOD_SPECS",
     "METHOD_DESCRIPTIONS",
     "METHOD_REQUIREMENTS",
+    "METHOD_DEFAULT_N_SEEDS",
+    "default_seeds",
     "method_names",
     "resolve_method",
     "is_available",

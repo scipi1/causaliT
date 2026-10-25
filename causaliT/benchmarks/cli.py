@@ -3,6 +3,7 @@ Click CLI for the benchmarks (same style as ``causaliT/cli.py``).
 
     python -m causaliT.benchmarks.cli list
     python -m causaliT.benchmarks.cli run --experiment <path> --methods pc,dagma_linear
+    python -m causaliT.benchmarks.cli collect --root experiments/8_BENCHMARKS/MAIN
 
 ``list`` prints the registry with the availability of each optional dependency
 and the paper hyperparameters that will be used - handy for checking an install
@@ -145,8 +146,28 @@ def run(experiment, methods, seeds, split, standardize, max_samples, w_threshold
         sys.exit(1)
 
 
+# COLLECT RESULTS
+@click.command()
+@click.option("--root", required=True, help="Study folder (e.g. experiments/8_BENCHMARKS/MAIN) or one arm")
+@click.option("--out", default=None, help="Output table (.parquet or .csv; default <root>/results_long.parquet)")
+def collect(root, out):
+    """Re-score every arm under ROOT and write one long results table."""
+    from os.path import join
+
+    from causaliT.benchmarks.collect import collect as collect_results
+
+    out = out or join(root, "results_long.parquet")
+    df = collect_results(root, out_path=out)
+    if df.empty:
+        click.echo("No arms / runs found.")
+        return
+    status = df.drop_duplicates(["arm", "method", "n_nodes", "dag_seed", "init_seed"])
+    click.echo(status.groupby(["method", "status"]).size().to_string())
+
+
 cli.add_command(list_methods)
 cli.add_command(run)
+cli.add_command(collect)
 
 
 if __name__ == "__main__":

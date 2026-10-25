@@ -552,6 +552,13 @@ class PhaseController(Callback):
                 raise ValueError(
                     "adaptive_training.recon_gates must be 'hard' or 'soft', "
                     f"got {_blk.get('recon_gates')!r}.")
+        #   structure.struct_gates: soft (Hard-Concrete, default) | hard (ST
+        #   Bernoulli of the learned pi): pair with recon_gates for
+        #   hard-hard / soft-soft runs.
+        if self.struct_cfg.get("struct_gates", "soft") not in ("hard", "soft"):
+            raise ValueError(
+                "adaptive_training.structure.struct_gates must be 'hard' or 'soft', "
+                f"got {self.struct_cfg.get('struct_gates')!r}.")
         for _old in ("reconstruct_gate", "dense_gate_mode"):
             if _old in ad:
                 raise ValueError(f"adaptive_training.{_old} is not a key: use recon_gates.")
@@ -748,8 +755,11 @@ class PhaseController(Callback):
             return
         if phase == "structure":
             ok = model.set_order_path("relaxed")
+            gates = str(getattr(self, "struct_cfg", {}).get("struct_gates", "soft"))
             model.set_gate_mode("soft")
-            gates, use_order = "soft", True
+            if callable(getattr(model, "set_struct_gate_mode", None)):
+                model.set_struct_gate_mode(gates)
+            use_order = True
             # One-off G_S <- G_R copy (struct_att_selector_init='recon'),
             # applied at the next forward; no-op once synced.
             if callable(getattr(model, "request_struct_selector_sync", None)) \

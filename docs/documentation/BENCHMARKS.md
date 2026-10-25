@@ -20,11 +20,17 @@ order distribution.
 | `dagma_linear`, `dagma_mlp` | continuous acyclicity penalty | weighted | `dagma` (authors) | `pip install dagma` |
 | `pc` | constraint-based | CPDAG | `causal-learn` (reference impl.) | `pip install causal-learn` |
 | `resit` | (b) order by residual HSIC | DAG + order | `lingam.RESIT` | `pip install --no-deps lingam` + deps (1) |
+| `direct_lingam` | linear non-Gaussian (LiNGAM) order + adaptive Lasso | weighted + order | `lingam.DirectLiNGAM` | same as `resit` (1) |
 | `cam` | (a) greedy order + CAM pruning | DAG + order | `dodiscover.toporder` | GitHub (2) |
 | `score`, `das`, `nogam` | (a) score-matching order + pruning | DAG + order | `dodiscover.toporder` (authors' code) | GitHub (2) |
 | `caps` | (a) Hessian order, mixed linear/nonlinear | DAG + order | vendored `vendor/caps/` (MIT) | none extra |
 | `daguerreo` | (a)+(c) learned order on the permutahedron | DAG + order | authors' repo, compiled | Linux build (3) |
 | `var_sort`, `r2_sort` | trivial baselines (data-leak check) | weighted + order | `CausalDisco` (authors) | `pip install --no-deps causaldisco` |
+
+PC defaults to the Fisher-z test, which only detects linear dependence. On
+nonlinear SCMs use `indep_test: rcit` (random-feature approximation of KCI;
+seeded through the init seed), as `experiments/8_BENCHMARKS/MAIN` does. See its
+`PROTOCOL.md`, section "Method/data matching", for the rationale.
 
 (1) `lingam` pins an old scipy that does not build on Python 3.13; install
 with `--no-deps` plus `pygam psy semopy statsmodels graphviz` (semopy also
