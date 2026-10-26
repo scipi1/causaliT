@@ -1219,6 +1219,35 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 logger.info(
                     "order selector: %d reconstruction-selector tensors moved "
                     "to the reconstruction group.", len(sel_ids))
+            # Shared selector (shared_att_selector=True): the unique G
+            # (struct_gate_logits) belongs to the "both" parameter class:
+            # it is trained by the recon loss when the recon toggle is on
+            # and by the structural loss when the struct toggle is on.
+            # It is therefore added to each optimizer group whose toggle is
+            # on and stays requires_grad=True in every phase (the adaptive
+            # trainer exempts it from the phase freezing).
+            self._shared_selector_params = []
+            oa = self.model.order_attention() if self._order_selector else None
+            if oa is not None and getattr(oa, "handoff", False):
+                # Handoff mode: G_S is purely structural (recon forwards
+                # apply it detached after the copy); G_R (query tables)
+                # stays in the recon group and simply receives no gradient
+                # once retired.
+                logger.info("shared selector (handoff): G_R trained by recon "
+                            "until the first structure phase, then G_S by struct only.")
+            elif oa is not None and getattr(oa, "shared_selector", False):
+                shared = [oa.struct_gate_logits]
+                shared_ids = {id(p) for p in shared}
+                if oa.recon_selector_on:
+                    reconstruction_params = reconstruction_params + shared
+                if not oa.struct_selector_on:
+                    structural_params = [p for p in structural_params
+                                         if id(p) not in shared_ids]
+                self._shared_selector_params = shared
+                logger.info(
+                    "shared selector: struct_gate_logits trained by %s.",
+                    "+".join(n for n, on in [("recon", oa.recon_selector_on),
+                                             ("struct", oa.struct_selector_on)] if on))
             self._structural_params = structural_params
             self._reconstruction_params = reconstruction_params
         elif self._order_selector:
@@ -5586,7 +5615,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if recon_params is None:
             # No gradient routing (single optimizer): classify on the fly.
             _, recon_params = classify_parameters(self.model, verbose=False)
-        recon_ids = {id(p) for p in recon_params}
+        # Targets are the upper-level variables: never refit them, even when
+        # they also sit in the recon group (shared selector, "both" class);
+        # otherwise the lean passes would substitute detached copies and the
+        # targets would get no gradient path.
+        recon_ids = {id(p) for p in recon_params} - {id(t) for t in shadows}
         base = {n: p for n, p in self.named_parameters()
                 if id(p) in recon_ids}
         names = list(base)

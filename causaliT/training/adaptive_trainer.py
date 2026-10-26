@@ -1276,6 +1276,10 @@ class PhaseController(Callback):
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
+        # "Both" parameter class (shared_att_selector): the shared G stays
+        # trainable in EVERY phase; which optimizer steps it (recon and/or
+        # structural) was decided at group construction by the toggles.
+        shared_params = list(getattr(pl_module, "_shared_selector_params", []))
 
         # 1. Split selection FIRST: with cross-fitting the phase must not
         # start before the datamodule points at the correct subset.  The
@@ -1332,6 +1336,8 @@ class PhaseController(Callback):
                 p.requires_grad_(False)
             for p in recon_params:
                 p.requires_grad_(True)
+            for p in shared_params:
+                p.requires_grad_(True)
             # Descendant-HSIC overrides are honoured in every phase so a run can
             # e.g. keep the mask off during reconstruct and on during structure.
             # The final phase inherits the reconstruct block's settings and lets
@@ -1347,6 +1353,8 @@ class PhaseController(Callback):
             for p in recon_params:
                 p.requires_grad_(False)
             for p in struct_params:
+                p.requires_grad_(True)
+            for p in shared_params:
                 p.requires_grad_(True)
             # Apply structure-phase loss weights (e.g. lambda_hsic_cross), with
             # lambda_l0 disarmed when the HSIC-progress gate is closed.
@@ -1599,14 +1607,19 @@ class PhaseController(Callback):
                     "recompute them on split changes."
                 )
 
-        # 2. Parameter-group trainability matches the phase.
+        # 2. Parameter-group trainability matches the phase.  The "both"
+        # class (shared_att_selector) is exempt: it is trainable in every
+        # phase by design.
+        shared_ids = {id(p) for p in getattr(pl_module, "_shared_selector_params", [])}
+        struct_check = [p for p in struct_params if id(p) not in shared_ids]
+        recon_check = [p for p in recon_params if id(p) not in shared_ids]
         want_struct = phase == "structure"
         want_recon = phase in ("warmup", "reconstruct", "final_reconstruct")
-        if any(p.requires_grad != want_struct for p in struct_params):
+        if any(p.requires_grad != want_struct for p in struct_check):
             raise RuntimeError(
                 f"[adaptive] structural params trainability mismatch at '{phase}' entry."
             )
-        if any(p.requires_grad != want_recon for p in recon_params):
+        if any(p.requires_grad != want_recon for p in recon_check):
             raise RuntimeError(
                 f"[adaptive] reconstruction params trainability mismatch at '{phase}' entry."
             )

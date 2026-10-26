@@ -13,6 +13,21 @@ They never multiply: each forward applies exactly one of them.
   symmetric Hard-Concrete logits (``struct_gate_logits``, structural group),
   initialised open (``struct_att_selector_init_logit``).
 
+SHARED selector (``shared_att_selector``): ONE existence matrix
+(``struct_gate_logits``) applied in EVERY forward; the two toggles then
+select which stages TRAIN it (recon loss / structural loss) instead of
+which selector exists.  A stage whose toggle is off applies the shared G
+detached.  Both toggles off is a config error.
+
+HANDOFF mode (``shared_att_selector`` + ``struct_att_selector_init="recon"``,
+both toggles on): before the first structure phase only ``G_R`` exists in
+the forwards (trained by reconstruction, order per ``order_path``, i.e. no
+order with ``use_order_in_recon: false``).  On entering the first structure
+phase ``G_S <- G_R`` is copied once and ``G_R`` is retired: from then on
+every forward applies ``G_S``; structure forwards train it (structural
+loss), reconstruction forwards apply it DETACHED (no order with
+``order_path="none"``).  State persists via ``struct_selector_synced``.
+
 Applied gate per forward:
 
 * reconstruction forwards (``order_path`` ``"hard"`` / ``"none"``): ``G_R``;
@@ -184,6 +199,10 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             (called by the adaptive trainer on entering the first structure
             phase).  The persistent buffer ``struct_selector_synced`` prevents
             a second copy, also after a checkpoint reload.
+        shared_att_selector: ONE selector (``struct_gate_logits``) applied in
+            every forward; the two toggles select which stages train it (see
+            module docstring).  Incompatible with
+            ``struct_att_selector_init="recon"``.
         order_straight_through: Relaxed training forward uses the step's hard
             order ``M_hard`` with the gradient of the Sinkhorn mask ``M``
             (``M_hard + M - M.detach()``).  Eval is unaffected.
@@ -212,6 +231,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         toggle_on_struct_att_selector: bool = False,
         struct_att_selector_init_logit: float = 2.0,
         struct_att_selector_init: str = "constant",
+        shared_att_selector: bool = False,
         order_straight_through: bool = False,
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
@@ -260,6 +280,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             raise ValueError(
                 "struct_att_selector_init='recon' requires both "
                 "toggle_on_struct_att_selector and toggle_on_recon_att_selector.")
+        if shared_att_selector:
+            if not (toggle_on_recon_att_selector or toggle_on_struct_att_selector):
+                raise ValueError(
+                    "shared_att_selector=True with both selector toggles off: "
+                    "the shared G would never be trained.")
 
         self.num_nodes = N
         self.dropout = nn.Dropout(attention_dropout)
@@ -283,6 +308,15 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.exclusion_existence = str(order_exclusion_existence)
         self.recon_selector_on = bool(toggle_on_recon_att_selector)
         self.struct_selector_on = bool(toggle_on_struct_att_selector)
+        # Shared mode: ONE existence matrix (struct_gate_logits) applied in
+        # every forward; the toggles then select WHICH stages train it
+        # (recon loss / structural loss) instead of which selector exists.
+        self.shared_selector = bool(shared_att_selector)
+        # Handoff mode (shared + "recon" init): G_R alone until the one-off
+        # copy G_S <- G_R, then G_S alone in every forward (G_R retired).
+        # After the handoff only the structural loss trains G_S; recon
+        # forwards apply it detached.
+        self.handoff = self.shared_selector and str(struct_att_selector_init) == "recon"
         self.straight_through = bool(order_straight_through)
         self.gate_mode = "hard"
         self.struct_gate_mode = "soft"     # gate of relaxed (structure) forwards
@@ -299,10 +333,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
 
         # Structural selector G_S: free symmetric logits (only the strict
         # upper triangle is read).  The name ``struct_gate_logits`` is matched
-        # by gradient_routing.STRUCTURAL_PATTERNS.
+        # by gradient_routing.STRUCTURAL_PATTERNS.  In shared mode this is THE
+        # selector, so it exists whenever shared_selector is on.
         self.struct_gate_logits = (
             nn.Parameter(torch.full((N, N), float(struct_att_selector_init_logit)))
-            if self.struct_selector_on else None)
+            if (self.struct_selector_on or self.shared_selector) else None)
         # One-off copy from G_R ("recon" init).  The buffer is registered only
         # in that mode, so "constant" state dicts are unchanged.
         self.struct_init = str(struct_att_selector_init)
@@ -370,6 +405,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
     def struct_selector_is_synced(self) -> bool:
         return self.struct_init == "recon" and bool(self.struct_selector_synced)
 
+    @property
+    def shared_active(self) -> bool:
+        """True when the single shared G drives every forward: always in
+        plain shared mode, only after the copy in handoff mode."""
+        if self.handoff:
+            return bool(self.struct_selector_synced)
+        return self.shared_selector
+
     def set_edge_offset(self, value: float) -> None:
         """Set the deterministic existence offset (adaptive-trainer drift)."""
         self.edge_offset = float(value)
@@ -394,7 +437,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         }
         # Drawn last and only when needed, so runs without the structural
         # selector keep the exact same random stream.
-        if self.struct_selector_on:
+        if self.struct_selector_on or self.shared_selector:
             self._noise["hc_s"] = _u()
 
     def _get_noise(self) -> Dict[str, torch.Tensor]:
@@ -450,6 +493,12 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         """Existence probability of the LEARNED graph: ``pi_S`` if the
         structural selector is on, else ``pi_R`` (zero diagonal)."""
         off = 1.0 - torch.eye(self.num_nodes, device=query.device, dtype=query.dtype)
+        if self.handoff and not self.shared_active:
+            return self._recon_pi(query, key, off)[1]     # pre-handoff: G_R
+        if self.shared_selector:
+            # No edge_offset: the shared G is the learned existence in every
+            # phase and its gate is centred at the l0 offset only.
+            return torch.sigmoid(self._struct_logits() - self._l0_offset) * off
         if self.struct_selector_on:
             # No edge_offset: the drift offset belongs to G_R only.
             return torch.sigmoid(self._struct_logits() - self._l0_offset) * off
@@ -491,19 +540,45 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         off = 1.0 - torch.eye(N, device=query.device, dtype=query.dtype)
         # pi_R: reconstruction selector (all-ones when toggled off).  pi_S:
         # structural selector.  ``pi`` = existence of the LEARNED graph.
-        S_sym, pi_R = self._recon_pi(query, key, off)
+        # Shared mode: ONE G (struct_gate_logits) everywhere; the stage's
+        # toggle decides whether this forward is attached (training stage)
+        # or detached (the other stage merely applies the current G).
+        relaxed = self.order_path == "relaxed"
         if self._struct_sync_pending:
             # One-off G_S <- G_R: identical existence (pi_S = pi_R) and, with
-            # G_S's offset fixed at 0, the identical relaxed gate.
+            # G_S's offset fixed at 0, the identical relaxed gate.  Done
+            # before the selector choice so handoff mode switches to G_S in
+            # this very forward.
             with torch.no_grad():
-                self.struct_gate_logits.copy_(S_sym.detach() - self.edge_offset)
+                S_copy = self._existence_score(query, key)
+                self.struct_gate_logits.copy_(S_copy - self.edge_offset)
                 self.struct_selector_synced.fill_(1)
             self._struct_sync_pending = False
-        if self.struct_selector_on:
+        shared = self.shared_active
+        # Handoff mode before the copy: G_S does not exist yet in the
+        # forwards; G_R is the only selector (also on the relaxed path).
+        struct_on = self.struct_selector_on and not (self.handoff and not shared)
+        if shared:
+            S_sym, pi_R = None, off
             L_S = self._struct_logits()
-            pi = torch.sigmoid(L_S - self._l0_offset) * off
+            if self.handoff:
+                # Post-handoff: only the structural loss trains G_S; recon
+                # forwards apply it detached.
+                train_stage = relaxed
+            else:
+                train_stage = self.struct_selector_on if relaxed else self.recon_selector_on
+            L_use = L_S if train_stage else L_S.detach()
+            pi = torch.sigmoid(L_use - self._l0_offset) * off
         else:
-            pi = pi_R
+            # Includes handoff mode before the copy: G_R from query/key,
+            # trained by the reconstruction loss.
+            S_sym, pi_R = self._recon_pi(query, key, off)
+        if not shared:
+            if struct_on:
+                L_S = self._struct_logits()
+                pi = torch.sigmoid(L_S - self._l0_offset) * off
+            else:
+                pi = pi_R
         theta = self.theta()
         noise = self._get_noise() if self.training else None
         perturbed = theta + self.noise_scale * noise["gumbel"] if self.training else theta
@@ -535,10 +610,12 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
 
         # Step's Bernoulli draws (train only, same uniforms): of pi_R for the
         # hard reconstruction gate, of the learned pi for the exclusion graph.
+        # Shared mode: both draws come from the shared pi.
         if self.training:
-            B_draw = self._mirror_upper((noise["bern"] < pi_R.detach()).to(pi.dtype))
+            base_draw = pi.detach() if shared else pi_R.detach()
+            B_draw = self._mirror_upper((noise["bern"] < base_draw).to(pi.dtype))
             B_learn = (self._mirror_upper((noise["bern"] < pi.detach()).to(pi.dtype))
-                       if self.struct_selector_on else B_draw)
+                       if (struct_on or shared) else B_draw)
         else:
             B_draw = B_learn = None
 
@@ -546,8 +623,20 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         #    structure (relaxed order path): G_S if on, else G_R (soft, or
         #    ST Bernoulli of the learned pi when struct_gate_mode == "hard");
         #    reconstruction (hard / none): G_R per gate_mode.
-        relaxed = self.order_path == "relaxed"
-        if relaxed and self.struct_gate_mode == "hard" and (
+        #    Shared mode: the shared G everywhere, per the stage's gate mode.
+        if shared:
+            if relaxed:
+                if self.struct_gate_mode == "hard":
+                    G = (B_learn + pi - pi.detach()) if self.training else \
+                        (pi.detach() > self.existence_threshold).to(pi.dtype)
+                else:
+                    G = _relaxed_gate(L_use, "hc_s", 0.0)
+            elif self.gate_mode == "hard":
+                G = (B_draw + pi - pi.detach()) if self.training else \
+                    (pi.detach() > self.existence_threshold).to(pi.dtype)
+            else:
+                G = _relaxed_gate(L_use, "hc", self.edge_offset)
+        elif relaxed and self.struct_gate_mode == "hard" and (
                 self.struct_selector_on or self.recon_selector_on):
             # Hard structure gates (structure.struct_gates: hard): ST Bernoulli
             # of the LEARNED existence (pi_S if on, else pi_R), same draw as
@@ -556,7 +645,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
                 G = B_learn + pi - pi.detach()
             else:
                 G = (pi.detach() > self.existence_threshold).to(pi.dtype)
-        elif relaxed and self.struct_selector_on:
+        elif relaxed and struct_on:
             G = _relaxed_gate(L_S, "hc_s", 0.0)
         elif not self.recon_selector_on:
             G = off
@@ -589,10 +678,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         else:
             B_ex = (pi.detach() > self.existence_threshold).to(pi.dtype)
         excl = (B_ex * M_hard).transpose(0, 1)
-        pi_l0 = pi_R
+        # L0 base: the recon selector normally; the shared G in shared mode.
+        pi_l0 = pi if shared else pi_R
         if hard_mask is not None:
             hm = (hard_mask[0] if hard_mask.dim() == 3 else hard_mask).to(A.dtype)
-            A, posterior, excl, pi_l0 = A * hm, posterior * hm, excl * hm, pi_R * hm
+            A, posterior, excl, pi_l0 = A * hm, posterior * hm, excl * hm, pi_l0 * hm
 
         # L0 of the RECONSTRUCTION selector: expected open UNDIRECTED pairs,
         # not masked by the order (consumed by lambda_l0_selector).
@@ -701,6 +791,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             f"exclusion_existence={self.exclusion_existence}, "
             f"recon_selector={self.recon_selector_on}, "
             f"struct_selector={self.struct_selector_on}, "
+            f"shared_selector={self.shared_selector}, "
             f"struct_init={self.struct_init}, "
             f"straight_through={self.straight_through}, "
             f"gate_mode={self.gate_mode}, "

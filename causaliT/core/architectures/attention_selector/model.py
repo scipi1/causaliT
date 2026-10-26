@@ -686,6 +686,7 @@ class AttentionSelectorLayer(nn.Module):
         toggle_on_struct_att_selector: bool = False,
         struct_att_selector_init_logit: float = 2.0,
         struct_att_selector_init: str = "constant",
+        shared_att_selector: bool = False,
         order_straight_through: bool = False,
     ):
 
@@ -710,6 +711,7 @@ class AttentionSelectorLayer(nn.Module):
             toggle_on_struct_att_selector=toggle_on_struct_att_selector,
             struct_att_selector_init_logit=struct_att_selector_init_logit,
             struct_att_selector_init=struct_att_selector_init,
+            shared_att_selector=shared_att_selector,
             order_straight_through=order_straight_through,
         )
 
