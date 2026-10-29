@@ -3083,6 +3083,15 @@ class AttentionSelectorLayer(nn.Module):
         oa.set_struct_gate_mode(mode)
         return True
 
+    def set_order_temperature(self, tau=None, noise_scale=None) -> bool:
+        """Anneal the order Sinkhorn temperature / Gumbel noise scale.
+        Returns False when the selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_order_temperature(tau=tau, noise_scale=noise_scale)
+        return True
+
     # ------------------------------------------------------------------
     # Prior-softmax gain schedule
     # ------------------------------------------------------------------

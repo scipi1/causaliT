@@ -25,7 +25,7 @@ Layout (see ``euler_sweep.opt_train_sweep``)::
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,7 @@ from causaliT.benchmarks.runner import (
 
 #: Columns describing the grid cell of a row.
 GRID_COLUMNS = ("graph_type", "degree", "linearity", "noise", "normalization",
-                "n_nodes", "n_samples", "dag_seed")
+                "n_nodes", "n_samples", "dag_seed", "resample_seed")
 
 NPZ_PREFIX = "benchmark_result_seed_"
 
@@ -71,6 +71,7 @@ def _grid_from_dag_block(dag: Dict[str, Any]) -> Dict[str, Any]:
         "n_nodes": dag.get("n_nodes"),
         "n_samples": dag.get("n_samples"),
         "dag_seed": dag.get("seed"),
+        "resample_seed": None,
     }
 
 
@@ -78,8 +79,13 @@ def _grid_from_recipe(recipe: Optional[dict]) -> Dict[str, Any]:
     """Grid settings of one dataset from its ``dag_recipe.json``."""
     if not recipe:
         return {}
-    merged = {**(recipe.get("random_scm_config") or {}), **(recipe.get("generation") or {})}
-    return _grid_from_dag_block(merged)
+    # Generation first, SCM config last: both carry a ``seed`` and the DAG seed
+    # (random_scm_config.seed) must win over the sampling seed.
+    merged = {**(recipe.get("generation") or {}), **(recipe.get("random_scm_config") or {})}
+    grid = _grid_from_dag_block(merged)
+    # Same SCM, new noise draw (stability study); None outside resampling.
+    grid["resample_seed"] = recipe.get("resample_seed")
+    return grid
 
 
 def _score_files(files_dir: Path, datasets_dir: Path, record: dict) -> List[Dict[str, Any]]:
@@ -145,7 +151,9 @@ def _rows_for_method(arm: str, files_dir: Path) -> List[Dict[str, Any]]:
     rows = []
     for s in seeds:
         for metric, value in s["metrics"].items():
-            if isinstance(value, (list, dict, tuple)):
+            # Non-scalar or textual entries (e.g. sid_note) are not metrics;
+            # is_dag / sid=NaN already carry that information.
+            if isinstance(value, (list, dict, tuple, str)):
                 continue
             rows.append({**base, "init_seed": s["init_seed"], "status": s["status"],
                          "output_type": s["output_type"], "error": None,
@@ -173,7 +181,11 @@ def collect_arm(arm_dir: str) -> List[Dict[str, Any]]:
     arm, job_id = split_arm_folder(arm_path.name)
     spec = OmegaConf.to_container(OmegaConf.load(arm_path / "dagsweep.yaml"), resolve=True)
     configs = sorted(arm_path.glob("config*.yaml"))
-    cfg = OmegaConf.to_container(OmegaConf.load(configs[0]), resolve=True) if configs else {}
+    cfg_raw = OmegaConf.load(configs[0]) if configs else None
+    # resolve=False: stochastic arms use ``seeds: ${training.seed}``, which has
+    # no target outside a staged run; _expected_init_seeds reads model_seeds
+    # from the spec first, so the interpolation is never needed.
+    cfg = OmegaConf.to_container(cfg_raw, resolve=False) if cfg_raw is not None else {}
     methods = list((cfg.get("benchmark") or {}).get("methods") or [])
 
     rows: List[Dict[str, Any]] = []
@@ -182,24 +194,94 @@ def collect_arm(arm_dir: str) -> List[Dict[str, Any]]:
         rows.extend(_rows_for_method(arm, files_dir))
 
     # Expected-but-absent runs: no folder at all (job never started / lost).
+    # The expectation comes from the SWEEP's own plan (build_groups + run_plan),
+    # so multi-axis arms (degree, scm bundles) and resample/model seeds are all
+    # covered; rows carry each group's grid (bUNDLE dag overrides included).
     dag_block = spec.get("dag") or {}
-    template = _grid_from_dag_block(dag_block)
-    n_nodes_list = (spec.get("group_axes") or {}).get("n_nodes") or [dag_block.get("n_nodes")]
-    dag_seeds = spec.get("dag_seeds") or spec.get("seeds") or []
-    seen = {(r["n_nodes"], r["dag_seed"], r["method"]) for r in rows}
-    for n_nodes in n_nodes_list:
-        for dag_seed in dag_seeds:
-            for method in methods:
-                if (n_nodes, dag_seed, method) in seen:
+    method_seeds = _expected_init_seeds(spec, cfg, methods)
+    seen = {(r["n_nodes"], r["dag_seed"], r.get("resample_seed"),
+             r.get("init_seed"), r["method"]) for r in rows}
+    for grid, dag_seed, resample_seed in _expected_datasets(spec):
+        for method in methods:
+            for init_seed in method_seeds[method]:
+                if (grid.get("n_nodes"), dag_seed, resample_seed,
+                        init_seed, method) in seen:
                     continue
-                rows.append({**template, "arm": arm, "method": method, "run": None,
-                             "n_nodes": n_nodes, "dag_seed": dag_seed,
-                             "init_seed": None, "status": "missing",
+                rows.append({**grid, "arm": arm, "method": method, "run": None,
+                             "dag_seed": dag_seed, "resample_seed": resample_seed,
+                             "init_seed": init_seed, "status": "missing",
                              "output_type": None, "error": None,
                              "metric": None, "value": None})
     for row in rows:
         row["job_id"] = job_id
     return rows
+
+
+def _expected_datasets(spec: Dict[str, Any]) -> List[Tuple[Dict[str, Any], int, Optional[int]]]:
+    """
+    ``(grid, dag_seed, resample_seed)`` for every dataset the sweep should
+    produce, expanded with the sweep's own ``build_groups`` / ``run_plan``.
+
+    Falls back to the flat ``n_nodes x dag_seeds x resample_seeds`` product for
+    legacy specs the current sweep code cannot expand.
+    """
+    try:
+        from causaliT.euler_sweep.euler_sweep.opt_train_sweep import (
+            build_groups,
+            run_plan,
+        )
+        groups = build_groups(spec)
+    except Exception:
+        groups = None
+
+    if groups is None:
+        dag_block = spec.get("dag") or {}
+        template = _grid_from_dag_block(dag_block)
+        n_nodes_list = (spec.get("group_axes") or {}).get("n_nodes") or [dag_block.get("n_nodes")]
+        dag_seeds = spec.get("dag_seeds") or spec.get("seeds") or []
+        resample_seeds = spec.get("resample_seeds") or [None]
+        return [({**template, "n_nodes": n}, d, r)
+                for n in n_nodes_list for d in dag_seeds for r in resample_seeds]
+
+    dag_block = spec.get("dag") or {}
+    out: List[Tuple[Dict[str, Any], int, Optional[int]]] = []
+    for group in groups:
+        # Grid cell = spec dag block + plain axes (n_nodes, degree, ...)
+        # + the bundles' dag fields (linearity, noise, ...).
+        axes = {k: v for k, v in group["axes"].items()
+                if k not in group.get("bundle_axes", ())}
+        merged = {**dag_block, **axes, **(group.get("dag_overrides") or {})}
+        grid = _grid_from_dag_block(merged)
+        datasets = {(d, r) for d, r, _m, _k, _s in run_plan(group)}
+        out.extend((grid, d, r) for d, r in sorted(
+            datasets, key=lambda t: (t[0], -1 if t[1] is None else t[1])))
+    return out
+
+
+def _expected_init_seeds(spec: Dict[str, Any], cfg: Dict[str, Any],
+                         methods: List[str]) -> Dict[str, List[int]]:
+    """
+    Init seeds each (dataset, method) pair should have produced.
+
+    With ``model_seeds`` every model seed is its own run task, so the init
+    seeds ARE the model seeds.  Otherwise the init seeds of a run folder are
+    the config's ``benchmark.seeds`` (registry default when omitted).
+    """
+    from causaliT.benchmarks.base import default_seeds
+
+    model_seeds = spec.get("model_seeds")
+    cfg_seeds = ((cfg.get("benchmark") or {}).get("seeds"))
+    out: Dict[str, List[int]] = {}
+    for method in methods:
+        if model_seeds:
+            out[method] = [int(s) for s in model_seeds]
+        elif isinstance(cfg_seeds, int):
+            out[method] = [cfg_seeds]
+        elif cfg_seeds:
+            out[method] = [int(s) for s in cfg_seeds]
+        else:
+            out[method] = default_seeds(method)
+    return out
 
 
 def find_arms(root: str) -> List[str]:

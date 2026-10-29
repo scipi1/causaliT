@@ -15,6 +15,7 @@ order              order_divergence, order_accuracy  (methods with an order)
 probabilistic      auroc, auprc                 (any edge score)
                    brier, ece                   (probability outputs only)
                    expected_shd, acyclic_fraction (graph samples only)
+source             source_recall, source_auroc  (any edge score)
 data diagnostics   var_sortability, r2_sortability  (per dataset, CausalDisco)
 =================  =========================================================
 
@@ -209,6 +210,51 @@ def score_metrics(true: np.ndarray, scores: np.ndarray, probabilistic: bool) -> 
     return out
 
 
+# =============================================================================
+# Source metrics
+# =============================================================================
+
+def source_metrics(true: np.ndarray, scores: np.ndarray) -> Dict[str, Any]:
+    """
+    Recovery of the source (parentless) nodes from incoming edge mass.
+
+    True sources are the nodes without parents in *true* (the S variables of
+    causaliT datasets), so the result does not depend on node ordering.  A node
+    looks like a source when its incoming score ``sum_i |scores[i, node]|`` is
+    low (same idea as the models' ``dag/source_recall``).
+
+    * ``source_recall`` - recall@L_S: fraction of true sources among the L_S
+      nodes with the lowest incoming score.  Ties at the cut-off get
+      fractional credit (expected recall over random tie breaking), so
+      discrete outputs are not favoured by node order.  Chance ~ L_S / N.
+    * ``source_auroc``  - AUROC of true-source labels vs the negated incoming
+      score (ties as average ranks; 0.5 = chance).
+
+    Both are ``None`` when all or no nodes are sources.
+    """
+    out: Dict[str, Any] = {"source_recall": None, "source_auroc": None}
+    T = _binary(true)
+    y = (T.sum(axis=0) == 0).astype(int)          # paper orientation: column = child
+    L_S = int(y.sum())
+    if not 0 < L_S < len(y):
+        return out
+    S = np.abs(np.asarray(scores, dtype=float))
+    np.fill_diagonal(S, 0.0)
+    inc = S.sum(axis=0)
+
+    cut = np.sort(inc)[L_S - 1]                   # score of the L_S-th lowest
+    below, tied = inc < cut, np.isclose(inc, cut)
+    below &= ~tied
+    n_free = L_S - int(below.sum())               # slots filled from the tie
+    hits = y[below].sum() + n_free * y[tied].sum() / tied.sum()
+    out["source_recall"] = float(hits / L_S)
+
+    from sklearn.metrics import roc_auc_score
+
+    out["source_auroc"] = float(roc_auc_score(y, -inc))
+    return out
+
+
 def sample_metrics(true: np.ndarray, samples: np.ndarray) -> Dict[str, Any]:
     """Expected SHD and fraction of acyclic graphs over ``(S, N, N)`` samples."""
     samples = np.asarray(samples)
@@ -274,6 +320,7 @@ def compute_structure_metrics(
     metrics["order_divergence"] = None if order is None else order_divergence(true, order)
     metrics["order_accuracy"] = None if order is None else order_accuracy(true, order)
     metrics.update(score_metrics(true, pred if scores is None else scores, probabilistic))
+    metrics.update(source_metrics(true, pred if scores is None else scores))
     if graph_samples is None:
         metrics.update({"expected_shd": None, "acyclic_fraction": None, "n_graph_samples": None})
     else:
@@ -305,6 +352,7 @@ __all__ = [
     "order_divergence",
     "order_accuracy",
     "score_metrics",
+    "source_metrics",
     "sample_metrics",
     "data_diagnostics",
     "compute_structure_metrics",

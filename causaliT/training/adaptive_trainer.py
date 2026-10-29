@@ -108,6 +108,15 @@ Example ``config['adaptive_training']`` block::
       gain_lambda_ramp: 0              # epochs to ramp 0 -> final (0 = jump)
       gain_lambda_final: 1.0           # ramp target (1.0 = full prior-softmax)
 
+      # Order-factorized selector temperature anneal (phase-agnostic, global
+      # epoch; no-op unless order_tau_final / order_noise_final is set).
+      # tau interpolates GEOMETRICALLY order_tau -> order_tau_final, the
+      # Gumbel noise LINEARLY -> order_noise_final, both over [start, end].
+      order_tau_final: null            # anneal target (null = constant tau)
+      order_tau_anneal_start: null     # (null -> warmup end / 0)
+      order_tau_anneal_end: null       # (null -> 0.8 * total_epoch_budget)
+      order_noise_final: null          # optional noise target, same window
+
       reconstruct:
         max_epochs: 100                # per-phase safety cap
         min_epochs: 0                  # floor: suppress plateau exit before N epochs
@@ -339,6 +348,15 @@ class PhaseController(Callback):
             self.struct_cfg.get("hsic_min_epochs", self.struct_min_epochs)
         )
 
+        # Late L0 turn-on: ``lambda_l0`` from the structure block is applied as
+        # 0.0 while global_epoch < lambda_l0_start_epoch (default 0 = active
+        # from the first structure phase, i.e. unchanged behaviour).  Lets the
+        # selector stay over-complete while the order is still rough, then
+        # prunes once the graph has co-adapted.
+        self.struct_l0_start_epoch: int = int(
+            self.struct_cfg.get("lambda_l0_start_epoch", 0)
+        )
+
         # Null-distribution estimation of the structural objective at
         # structure-phase entry (Monte Carlo permutation null, H0: "residuals
         # independent of the sources").  Diagnostic only: the estimated
@@ -423,6 +441,40 @@ class PhaseController(Callback):
         )
         self.gain_lambda_ramp: int = int(ad.get("gain_lambda_ramp", 0))
         self.gain_lambda_final: float = float(ad.get("gain_lambda_final", 1.0))
+
+        # Order-factorized selector temperature anneal (phase-agnostic, driven
+        # by the GLOBAL epoch; mirrors the gain-lambda ramp).  Off when
+        # ``order_tau_final`` is unset.  tau is interpolated GEOMETRICALLY
+        # (temperature convention) from the model's initial order_tau to
+        # ``order_tau_final`` over [start, end]; the Gumbel noise scale is
+        # interpolated LINEARLY to ``order_noise_final`` over the same window.
+        #   order_tau_final:        anneal target (None -> constant tau)
+        #   order_tau_anneal_start: global epoch where the anneal begins
+        #                           (None -> warmup end / 0)
+        #   order_tau_anneal_end:   global epoch where the target is reached
+        #                           (None -> 0.8 * total_epoch_budget)
+        #   order_noise_final:      optional noise target over the same window
+        _tau_final = ad.get("order_tau_final", None)
+        self.order_tau_final: Optional[float] = (
+            None if _tau_final is None else float(_tau_final)
+        )
+        _tau_start = ad.get("order_tau_anneal_start", None)
+        if _tau_start is None:
+            _tau_start = (self.warmup_max_epochs
+                          if self.warmup_enabled else 0)
+        self.order_tau_anneal_start: int = int(_tau_start)
+        _tau_end = ad.get("order_tau_anneal_end", None)
+        if _tau_end is None and _total_budget is not None:
+            _tau_end = int(0.8 * int(_total_budget))
+        self.order_tau_anneal_end: Optional[int] = (
+            None if _tau_end is None else int(_tau_end)
+        )
+        _noise_final = ad.get("order_noise_final", None)
+        self.order_noise_final: Optional[float] = (
+            None if _noise_final is None else float(_noise_final)
+        )
+        self._order_tau_init: Optional[float] = None   # latched at first update
+        self._order_noise_init: Optional[float] = None
         if self.final_enabled and self.final_max_epochs <= 0:
             logger.warning(
                 "[adaptive] final_reconstruct.enabled=true but max_epochs=%d "
@@ -1273,6 +1325,58 @@ class PhaseController(Callback):
                 "gain_lambda", float(lam), on_step=False, on_epoch=True
             )
 
+    # ------------------------------------------------------------------
+    # Order-factorized temperature anneal (OrderFactorizedSelfAttention)
+    # ------------------------------------------------------------------
+    def _update_order_temperature(self, trainer: pl.Trainer,
+                                  pl_module: pl.LightningModule) -> None:
+        """Anneal the order Sinkhorn tau / Gumbel noise over the run (global
+        epoch, phase-agnostic; mirrors the gain-lambda ramp).
+
+        tau:   tau_init * (tau_final / tau_init)^frac   (geometric)
+        noise: noise_init + (noise_final - noise_init)*frac  (linear)
+        with frac = clamp((epoch - start) / (end - start), 0, 1).  The initial
+        values are latched from the module at the first update.  No-op when
+        ``order_tau_final`` is unset (constant tau, backward compatible) or
+        the model owns no order-factorized block.
+        """
+        if self.order_tau_final is None and self.order_noise_final is None:
+            return
+        model = getattr(pl_module, "model", None)
+        oa = getattr(model, "order_attention", lambda: None)() if model else None
+        if oa is None:
+            return
+        if self._order_tau_init is None:
+            self._order_tau_init = float(oa.perm_tau)
+            self._order_noise_init = float(oa.noise_scale)
+        epoch = int(trainer.current_epoch)
+        end = self.order_tau_anneal_end
+        span = None if end is None else max(1, end - self.order_tau_anneal_start)
+        frac = 0.0 if span is None else min(
+            1.0, max(0.0, (epoch - self.order_tau_anneal_start) / float(span))
+        )
+        tau = None
+        if self.order_tau_final is not None:
+            if span is None:
+                frac_tau = 1.0 if epoch >= self.order_tau_anneal_start else 0.0
+            else:
+                frac_tau = frac
+            tau = self._order_tau_init * (
+                (self.order_tau_final / self._order_tau_init) ** frac_tau
+            )
+        noise = None
+        if self.order_noise_final is not None:
+            noise = self._order_noise_init + (
+                self.order_noise_final - self._order_noise_init
+            ) * (frac if span is not None else 1.0)
+        if model.set_order_temperature(tau=tau, noise_scale=noise):
+            if tau is not None:
+                pl_module.log("order_tau", float(tau),
+                              on_step=False, on_epoch=True)
+            if noise is not None:
+                pl_module.log("order_noise_scale", float(noise),
+                              on_step=False, on_epoch=True)
+
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
                      phase: str) -> None:
         struct_params, recon_params = self._resolve_param_groups(pl_module)
@@ -1357,8 +1461,23 @@ class PhaseController(Callback):
             for p in shared_params:
                 p.requires_grad_(True)
             # Apply structure-phase loss weights (e.g. lambda_hsic_cross), with
-            # lambda_l0 disarmed when the HSIC-progress gate is closed.
-            self._apply_lambdas(pl_module, self._gated_struct_cfg(pl_module))
+            # lambda_l0 disarmed when the HSIC-progress gate is closed and held
+            # at 0.0 before lambda_l0_start_epoch (late L0 turn-on).
+            struct_lambdas = self._gated_struct_cfg(pl_module)
+            if int(trainer.current_epoch) < self.struct_l0_start_epoch:
+                if float(struct_lambdas.get("lambda_l0", 0.0)) != 0.0:
+                    logger.info(
+                        "[adaptive] lambda_l0 held at 0.0 (global_epoch=%d < "
+                        "lambda_l0_start_epoch=%d).",
+                        int(trainer.current_epoch), self.struct_l0_start_epoch,
+                    )
+                struct_lambdas = {**struct_lambdas, "lambda_l0": 0.0}
+            self._apply_lambdas(pl_module, struct_lambdas)
+            pl_module.log(
+                "lambda_l0_eff",
+                float(getattr(pl_module, "lambda_l0", 0.0)),
+                on_step=False, on_epoch=True,
+            )
             # ...and the structure-phase descendant-exclusion settings.
             self._struct_phase_count += 1
             self._apply_descendant_mask_cfg(pl_module, self.struct_cfg)
@@ -1790,6 +1909,9 @@ class PhaseController(Callback):
         # alternating reconstruct <-> structure.  Runs in EVERY phase (and in
         # the optional final phase), before the phase dispatch.
         self._update_gain_lambda(trainer, pl_module)
+
+        # Order-factorized temperature anneal (phase-agnostic, global epoch).
+        self._update_order_temperature(trainer, pl_module)
 
         # BKD anneal progress (run-level mean over all BKD modules; no-op
         # unless the run manages per-phase BKD).

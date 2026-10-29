@@ -76,6 +76,7 @@ from causaliT.euler_sweep.euler_sweep.opt_train_sweep import (
     _find_base_files,
     build_group_study,
     build_groups,
+    dataset_key,
     finalize_group_study,
     load_best_params,
     load_dagsweep_spec,
@@ -281,12 +282,13 @@ def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
         datasets_dir = str(group_dir / "datasets")
 
         runs: List[Dict[str, Any]] = []
-        for dag_seed, model_seed, run_key, suffix in run_plan(group):
+        for dag_seed, resample_seed, model_seed, run_key, suffix in run_plan(group):
             run_name = f"{exp_id}_{group['name']}_{suffix}"
             runs.append({
                 "index": len(runs),
                 "run_key": str(run_key),
                 "dag_seed": int(dag_seed),
+                "resample_seed": None if resample_seed is None else int(resample_seed),
                 "model_seed": None if model_seed is None else int(model_seed),
                 "run_name": run_name,
                 "save_dir": str(group_dir / "sweeper" / "runs" / "combinations" / run_name),
@@ -297,6 +299,12 @@ def build_static_plan(exp_dir: str, home_exp_dir: str, cluster: bool = True,
             "axes": group["axes"],
             "dag_seeds": group["dag_seeds"],
             "model_seeds": group["model_seeds"],
+            "resample_seeds": group.get("resample_seeds"),
+            # Bundle data must reach the workers: ``prepare`` and
+            # ``train_task`` rebuild the source/config from the plan alone.
+            "dag_overrides": group["dag_overrides"],
+            "config_overrides": group["config_overrides"],
+            "bundle_axes": group["bundle_axes"],
             "group_dir": str(group_dir),
             "datasets_dir": datasets_dir,
             "n_trials": n_trials,
@@ -379,6 +387,7 @@ def rebuild_progress(exp_dir: str) -> Dict[str, Any]:
             runs[run["run_key"]] = {
                 "state": (state or {}).get("state", "pending"),
                 "dag_seed": run["dag_seed"],
+                "resample_seed": run.get("resample_seed"),
                 "model_seed": run["model_seed"],
                 "save_dir": run["save_dir"],
                 "error": (state or {}).get("error"),
@@ -496,7 +505,10 @@ def prepare_stage(exp_dir: str) -> Dict[str, Any]:
 
             # ``ensure`` takes the group dict the source understands; only the
             # axes select the data (the seed plan lives in the plan file).
-            group_spec = {"axes": group["axes"]}
+            group_spec = {"axes": group["axes"],
+                          "dag_overrides": group.get("dag_overrides") or {},
+                          "config_overrides": group.get("config_overrides") or {},
+                          "bundle_axes": group.get("bundle_axes") or []}
             entry: Dict[str, Any] = {"datasets": {}, "opt_dataset": None}
 
             # --- optimisation dataset + staged search config + study DB -------
@@ -536,9 +548,13 @@ def prepare_stage(exp_dir: str) -> Dict[str, Any]:
             # --- evaluation datasets (one per data seed, shared by model seeds)
             # For a fixed SCM every seed resolves to the same folder, which the
             # idempotent generator materializes once and then reuses.
+            # With resample_seeds every (dag_seed, resample_seed) pair is its own
+            # dataset (same SCM, new draw), keyed "<dag>_r<resample>".
             for dag_seed in group["dag_seeds"]:
-                name = source.ensure(group_spec, datasets_dir, int(dag_seed))
-                entry["datasets"][str(dag_seed)] = name
+              for resample_seed in (group.get("resample_seeds") or [None]):
+                name = source.ensure(group_spec, datasets_dir, int(dag_seed),
+                                     resample_seed=resample_seed)
+                entry["datasets"][dataset_key(dag_seed, resample_seed)] = name
                 entry.setdefault("n_keys", int(n_keys_from_metadata(
                     datasets_dir, name, fallback=group["axes"].get("n_nodes"))))
 
@@ -729,17 +745,18 @@ def train_task(exp_dir: str, task_id: int, force: bool = False) -> None:
 
     prepared = load_prepared(exp_dir)["groups"][group["name"]]
     datasets = prepared.get("datasets", {})
-    if str(run["dag_seed"]) not in datasets:
+    key = dataset_key(run["dag_seed"], run.get("resample_seed"))
+    if key not in datasets:
         # A bare KeyError inside an array task says nothing about what to do.
         message = (
             f"group {group['name']}: the prepare stage resolved no dataset for "
-            f"data seed {run['dag_seed']} (known: {sorted(datasets)}). Re-run the "
+            f"data seed {key} (known: {sorted(datasets)}). Re-run the "
             "prepare stage - the plan and prepared.json are out of sync."
         )
         record_progress(exp_dir, item, {"state": "failed", "group": group["name"],
                                         "error": message})
         raise RuntimeError(message)
-    dataset_name = datasets[str(run["dag_seed"])]
+    dataset_name = datasets[key]
 
 
     spec = load_dagsweep_spec(exp_dir)
@@ -758,7 +775,9 @@ def train_task(exp_dir: str, task_id: int, force: bool = False) -> None:
     try:
         # Same staging function as the sequential sweep -> identical config.
         config = stage_run_config(
-            plan["base_config"], {"axes": group["axes"]}, spec, dataset_name,
+            plan["base_config"], {"axes": group["axes"],
+                                  "config_overrides": group.get("config_overrides") or {}},
+            spec, dataset_name,
             group["datasets_dir"], run["dag_seed"], run["model_seed"], best_params,
         )
         run_single_combination(

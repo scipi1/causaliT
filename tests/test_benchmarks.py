@@ -545,6 +545,33 @@ class TestMetrics:
         assert m["shd"] == 1
         assert m["sid"] is None and m["sid_note"] == "prediction is not a DAG"
 
+    # Sources 0, 1 (no parents); 0->2, 1->2, 2->3.
+    T_SRC = np.array([[0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0]])
+
+    def test_source_recall_perfect(self):
+        m = M.source_metrics(self.T_SRC, self.T_SRC)
+        assert m["source_recall"] == 1.0 and m["source_auroc"] == 1.0
+
+    def test_source_recall_ties_get_chance_not_index_bias(self):
+        """All-zero prediction: every node tied -> L_S / N, AUROC 0.5."""
+        m = M.source_metrics(self.T_SRC, np.zeros((4, 4)))
+        assert m["source_recall"] == pytest.approx(2 / 4)
+        assert m["source_auroc"] == pytest.approx(0.5)
+
+    def test_source_recall_reversed(self):
+        """Edges into the true sources only: they look least source-like."""
+        pred = np.zeros((4, 4))
+        pred[2, 0] = pred[3, 1] = 1
+        assert M.source_metrics(self.T_SRC, pred)["source_recall"] == 0.0
+
+    def test_source_recall_invariant_to_node_order(self):
+        rng = np.random.default_rng(0)
+        scores = rng.random((4, 4))
+        p = [3, 1, 0, 2]
+        a = M.source_metrics(self.T_SRC, scores)
+        b = M.source_metrics(self.T_SRC[np.ix_(p, p)], scores[np.ix_(p, p)])
+        assert a == pytest.approx(b)
+
     def test_sid_on_two_nodes(self):
         """Peters & Buhlmann: reversing X->Y gets both interventions wrong."""
         T = np.array([[0, 1], [0, 0]])
@@ -783,5 +810,64 @@ class TestSweepIntegration:
         # Metrics that do not apply are None (object dtype) in memory and NaN
         # (float) after the CSV round trip, so compare values, not dtypes.
         pd.testing.assert_frame_equal(pd.read_csv(csv_path), df, check_dtype=False)
+
+
+# =============================================================================
+# Collector (collect.py)
+# =============================================================================
+
+class TestCollector:
+    """Missing-run detection expands the sweep's own plan (bundles, seeds)."""
+
+    def _write_arm(self, tmp_path, spec_extra=None):
+        arm = tmp_path / "pc_ER_zscore"
+        arm.mkdir()
+        spec = {
+            "group_axes": {
+                "n_nodes": [10, 20],
+                "degree": [2, 4],
+                "scm": [
+                    {"name": "nlin_gauss",
+                     "dag": {"linearity": "nonlinear", "noise": "gaussian",
+                             "source_noise": "gaussian"}},
+                    {"name": "lin_nongauss",
+                     "dag": {"linearity": "linear", "noise": "nongaussian",
+                             "source_noise": "uniform"}},
+                ],
+            },
+            "dag_seeds": [0, 1],
+            "resample_seeds": [0, 1, 2],
+            "dag": {"n_samples": 1000, "normalize_method": "standardize_node",
+                    "mode": "flat"},
+            "optuna": {"enabled": False},
+            "training": {"trainer": "benchmark"},
+        }
+        spec.update(spec_extra or {})
+        OmegaConf.save(OmegaConf.create(spec), arm / "dagsweep.yaml")
+        cfg = {"benchmark": {"methods": ["pc"], "seeds": [0]}}
+        OmegaConf.save(OmegaConf.create(cfg), arm / "config_benchmark.yaml")
+        return arm
+
+    def test_missing_runs_cover_every_bundle_cell(self, tmp_path):
+        from causaliT.benchmarks.collect import collect_arm
+
+        rows = collect_arm(str(self._write_arm(tmp_path)))
+        missing = [r for r in rows if r["status"] == "missing"]
+        # 2 n x 2 deg x 2 scm x 2 dags x 3 resamples, one fit per dataset.
+        assert len(missing) == 2 * 2 * 2 * 2 * 3
+        cells = {(r["n_nodes"], r["degree"], r["linearity"], r["noise"],
+                  r["dag_seed"], r["resample_seed"]) for r in missing}
+        assert len(cells) == 48
+        assert all(r["init_seed"] == 0 for r in missing)
+        assert all(r["method"] == "pc" for r in missing)
+
+    def test_model_seeds_multiply_the_expected_init_seeds(self, tmp_path):
+        from causaliT.benchmarks.collect import collect_arm
+
+        arm = self._write_arm(tmp_path, spec_extra={"model_seeds": [0, 1]})
+        rows = collect_arm(str(arm))
+        missing = [r for r in rows if r["status"] == "missing"]
+        assert len(missing) == 48 * 2
+        assert {r["init_seed"] for r in missing} == {0, 1}
 
 

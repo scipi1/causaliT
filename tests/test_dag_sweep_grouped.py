@@ -174,17 +174,170 @@ def test_run_plan_is_the_dag_x_model_product(tmp_path):
     group = ots.build_groups(ots.load_dagsweep_spec(str(exp_dir)))[0]
     plan = ots.run_plan(group)
 
+    # Tuples are (dag_seed, resample_seed, model_seed, run_key, suffix).
     assert len(plan) == 6
     assert [p[0] for p in plan] == [0, 0, 0, 1, 1, 1]      # grouped by DAG seed
-    assert [p[1] for p in plan[:3]] == [7, 8, 9]           # inits within a DAG
-    assert plan[0][3] == "dag_0_model_7"
+    assert all(p[1] is None for p in plan)                 # no resampling
+    assert [p[2] for p in plan[:3]] == [7, 8, 9]           # inits within a DAG
+    assert plan[0][4] == "dag_0_model_7"
 
     # Without model_seeds the legacy one-run-per-DAG naming is preserved.
     legacy = ots.run_plan(ots.build_groups(
         ots.load_dagsweep_spec(str(_write_experiment(tmp_path / "b", seeds=(0, 1))))
     )[0])
-    assert [p[1] for p in legacy] == [None, None]
-    assert [p[3] for p in legacy] == ["seed_0", "seed_1"]
+    assert [p[2] for p in legacy] == [None, None]
+    assert [p[4] for p in legacy] == ["seed_0", "seed_1"]
+
+
+def test_run_plan_with_resample_seeds(tmp_path):
+    """2 DAGs x 3 resamples (x 2 inits) runs, names carry every varying seed."""
+    exp_dir = _write_experiment(tmp_path, seeds=(0, 1),
+                                extra_spec={"resample_seeds": [4, 5, 6]})
+    plan = ots.run_plan(ots.build_groups(ots.load_dagsweep_spec(str(exp_dir)))[0])
+    assert len(plan) == 6
+    assert [p[1] for p in plan[:3]] == [4, 5, 6]
+    assert plan[0][4] == "dag_0_resample_4"
+    # One dataset per (dag, resample), all inits of a dataset grouped together.
+    assert len(ots._group_plan_by_dag(plan)) == 6
+
+    both = _write_experiment(tmp_path / "b", seeds=(0,),
+                             extra_spec={"resample_seeds": [4, 5],
+                                         "model_seeds": [7, 8]})
+    plan = ots.run_plan(ots.build_groups(ots.load_dagsweep_spec(str(both)))[0])
+    assert len(plan) == 4
+    assert plan[0][4] == "dag_0_resample_4_model_7"
+    assert [len(runs) for _, _, runs in ots._group_plan_by_dag(plan)] == [2, 2]
+
+
+def test_empty_or_duplicated_resample_seeds_are_rejected(tmp_path):
+    for i, bad in enumerate(([], [1, 1])):
+        exp_dir = _write_experiment(tmp_path / str(i), seeds=(0,),
+                                    extra_spec={"resample_seeds": bad})
+        with pytest.raises(ValueError, match="resample_seeds"):
+            ots.load_dagsweep_spec(str(exp_dir))
+
+
+def test_resample_keeps_the_scm_and_changes_the_samples(tmp_path):
+    """Same DAG seed + different resample seed: same graph, new data."""
+    import numpy as np
+
+    cfg = dp.build_dag_config(DAG_BLOCK, seed=3, n_nodes=5)
+    _, gen = dp.split_dag_block(DAG_BLOCK)
+    base = dp.ensure_dag_dataset(cfg, tmp_path, gen, verbose=False)
+    r1 = dp.ensure_dag_dataset(cfg, tmp_path, gen, verbose=False, resample_seed=1)
+    r2 = dp.ensure_dag_dataset(cfg, tmp_path, gen, verbose=False, resample_seed=2)
+
+    # Historical name unchanged without a resample seed.
+    assert base == dp.dag_dataset_name(cfg)
+    assert r1 == base + "_r1" and r2 == base + "_r2"
+
+    adj = [(tmp_path / n / "dag_adj_mask.csv").read_text() for n in (base, r1, r2)]
+    assert adj[0] == adj[1] == adj[2]
+    x = [np.load(tmp_path / n / "ds.npz")["x"] for n in (base, r1, r2)]
+    assert not np.allclose(x[1], x[2]) and not np.allclose(x[0], x[1])
+
+    recipe = dp.read_recipe(tmp_path / r1)
+    assert recipe["resample_seed"] == 1 and recipe["generation"]["seed"] == 1
+
+    # A pruned resample is regenerated bit-identically from its recipe.
+    dp.prune_dag_arrays(tmp_path / r1, verbose=False)
+    assert dp.regenerate_from_recipe(tmp_path / r1, verbose=False) == r1
+    assert np.array_equal(np.load(tmp_path / r1 / "ds.npz")["x"], x[1])
+
+
+# ---------------------------------------------------------------------------
+# Named SCM bundles
+# ---------------------------------------------------------------------------
+
+BUNDLES = [
+    {"name": "nlin_gauss",
+     "dag": {"linearity": "nonlinear", "noise": "gaussian"},
+     "config": {"experiment.note": "nlin"}},
+    {"name": "lin_nongauss",
+     "dag": {"linearity": "linear", "noise": "nongaussian"},
+     "config": {"experiment.note": "lin"}},
+]
+
+
+def _write_bundle_experiment(tmp_path, bundles=BUNDLES, **kwargs):
+    extra = {"group_axes": {"n_nodes": [4], "degree": [2],
+                            "scm": list(bundles)}}
+    extra.update(kwargs.pop("extra_spec", {}))
+    return _write_experiment(tmp_path, extra_spec=extra, **kwargs)
+
+
+def test_bundles_expand_to_one_group_per_combo(tmp_path):
+    """Bundles pack (linearity, noise) so the product skips invalid combos."""
+    exp_dir = _write_bundle_experiment(tmp_path)
+    groups = ots.build_groups(ots.load_dagsweep_spec(str(exp_dir)))
+
+    assert len(groups) == 2                       # 1 n_nodes x 1 degree x 2 scm
+    names = sorted(g["name"] for g in groups)
+    assert names == ["n_nodes_4_degree_2_scm_lin_nongauss",
+                     "n_nodes_4_degree_2_scm_nlin_gauss"]
+    nlin = next(g for g in groups if "nlin" in g["name"])
+    assert nlin["axes"]["scm"] == "nlin_gauss"    # name becomes the axis value
+    assert nlin["dag_overrides"]["linearity"] == "nonlinear"
+    assert nlin["config_overrides"]["experiment.note"] == "nlin"
+    assert nlin["bundle_axes"] == ["scm"]
+
+
+def test_bundle_dag_fields_reach_the_dataset_recipe(tmp_path):
+    """A bundled SCM samples with its own linearity/noise, not the block's."""
+    from causaliT.euler_sweep.euler_sweep.data_source import build_data_source
+
+    exp_dir = _write_bundle_experiment(tmp_path)
+    spec = ots.load_dagsweep_spec(str(exp_dir))
+    source = build_data_source(spec)
+    groups = ots.build_groups(spec, source)
+    for group in groups:
+        cfg = source._config(group, seed=0)
+        expect = "nonlinear" if "nlin" in group["name"] else "linear"
+        assert cfg.linearity == expect
+        assert cfg.n_nodes == 4 and cfg.degree == 2
+
+
+def test_bundle_config_overrides_are_staged_before_best_params(tmp_path):
+    """Bundle overrides land in the run config; tuned params still win."""
+    exp_dir = _write_bundle_experiment(tmp_path)
+    spec = ots.load_dagsweep_spec(str(exp_dir))
+    group = next(g for g in ots.build_groups(spec) if "nlin" in g["name"])
+    config = ots.stage_run_config(
+        str(exp_dir / "config_test.yaml"), group, spec, "DS", "DD", 0, None,
+        best_params={"experiment.note": "tuned"},
+    )
+    assert config["experiment"]["note"] == "tuned"
+    config = ots.stage_run_config(
+        str(exp_dir / "config_test.yaml"), group, spec, "DS", "DD", 0, None)
+    assert config["experiment"]["note"] == "nlin"
+
+
+def test_invalid_bundles_are_rejected(tmp_path):
+    """Mixed plain/bundle values, duplicate names, unknown keys, axis clash."""
+    base = tmp_path / "mixed"
+    _write_experiment(base, extra_spec={
+        "group_axes": {"n_nodes": [4], "scm": ["plain", BUNDLES[0]]}})
+    with pytest.raises(ValueError, match="mixes"):
+        ots.build_groups(ots.load_dagsweep_spec(str(base / "exp")))
+
+    dup = tmp_path / "dup"
+    _write_experiment(dup, extra_spec={
+        "group_axes": {"n_nodes": [4], "scm": [BUNDLES[0], BUNDLES[0]]}})
+    with pytest.raises(ValueError, match="duplicated"):
+        ots.build_groups(ots.load_dagsweep_spec(str(dup / "exp")))
+
+    unknown = tmp_path / "unknown"
+    bad = dict(BUNDLES[0], typo=1)
+    _write_experiment(unknown, extra_spec={
+        "group_axes": {"n_nodes": [4], "scm": [bad]}})
+    with pytest.raises(ValueError, match="unknown keys"):
+        ots.build_groups(ots.load_dagsweep_spec(str(unknown / "exp")))
+
+    clash = tmp_path / "clash"
+    _write_experiment(clash, extra_spec={
+        "group_axes": {"linearity": ["linear"], "scm": [BUNDLES[0]]}})
+    with pytest.raises(ValueError, match="only one place"):
+        ots.build_groups(ots.load_dagsweep_spec(str(clash / "exp")))
 
 
 def test_unknown_dag_key_is_rejected():

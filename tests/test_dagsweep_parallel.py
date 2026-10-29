@@ -107,8 +107,10 @@ def fake_datasets(monkeypatch):
     """
     generated = []
 
-    def fake_ensure(cfg, datasets_dir, gen_kwargs, verbose=True):
+    def fake_ensure(cfg, datasets_dir, gen_kwargs, verbose=True, resample_seed=None):
         name = f"ds_n{cfg.n_nodes}_s{cfg.seed}"
+        if resample_seed is not None:
+            name += f"_r{resample_seed}"
         Path(datasets_dir, name).mkdir(parents=True, exist_ok=True)
         generated.append(name)
         return name
@@ -927,5 +929,58 @@ def test_fixed_dataset_cleanup_prunes_the_shared_folder_once(tmp_path, monkeypat
     dsp.cleanup_stage(str(exp_dir))
 
     assert sorted(pruned) == list(FIXED_NAMES)
+
+
+# ---------------------------------------------------------------------------
+# SCM bundles (regression: partial group dicts in the parallel driver)
+# ---------------------------------------------------------------------------
+
+BUNDLE_AXIS = {
+    "n_nodes": [4],
+    "scm": [
+        {"name": "nlin_gauss",
+         "dag": {"linearity": "nonlinear", "noise": "gaussian"},
+         "config": {"experiment.note": "nlin"}},
+    ],
+}
+
+
+def test_bundled_arm_runs_end_to_end_in_parallel(tmp_path, monkeypatch,
+                                                 fake_datasets):
+    """
+    The parallel driver rebuilds (partial) group dicts from plan.json for
+    ``prepare`` and ``train_task``.  The bundle data (dag_overrides,
+    config_overrides, bundle_axes) must survive that round trip, or
+    ``RandomSCMConfig`` receives the bundle axis name as a keyword.
+    """
+    calls = []
+
+    def fake_run(config, save_dir, train_fn, data_dir, cluster, **kwargs):
+        calls.append(OmegaConf.to_container(config, resolve=False))
+
+    monkeypatch.setattr(dsp, "run_single_combination", fake_run)
+    monkeypatch.setattr(dsp, "resolve_trainer",
+                        lambda name: (lambda **kw: None, "mod", "attr"))
+
+    exp_dir, plan = _prepared_experiment(
+        tmp_path, monkeypatch, fake_datasets, optuna_enabled=False,
+        dag_seeds=(0,),
+        extra_spec={"group_axes": BUNDLE_AXIS, "resample_seeds": [0, 1]},
+    )
+
+    group = plan["groups"][0]
+    assert group["name"] == "n_nodes_4_scm_nlin_gauss"
+    prepared = dsp.load_prepared(str(exp_dir))["groups"][group["name"]]
+    # One dataset per (dag_seed, resample_seed).  Reaching this point without
+    # a TypeError from RandomSCMConfig IS the regression check; the stub names
+    # the folders from the resolved config.
+    assert sorted(prepared["datasets"]) == ["0_r0", "0_r1"]
+    assert sorted(prepared["datasets"].values()) == ["ds_n4_s0_r0", "ds_n4_s0_r1"]
+
+    # train_task stages the config with the bundle's config overrides.
+    dsp.train_task(str(exp_dir), 0)
+    assert len(calls) == 1
+    assert calls[0]["experiment"]["note"] == "nlin"
+    assert calls[0]["data"]["dataset"] == prepared["datasets"]["0_r0"]
 
 

@@ -161,6 +161,28 @@ def model_seeds_of(spec: Any) -> Optional[List[int]]:
     return seeds
 
 
+def resample_seeds_of(spec: Any) -> Optional[List[int]]:
+    """
+    Return the resample seeds, or ``None`` when unspecified.
+
+    A resample seed draws a NEW dataset (same size) from the SAME sampled SCM:
+    graph, weights and mechanisms stay fixed by the DAG seed, only the noise
+    draw changes.  This measures a method's stability under data resampling.
+    ``None`` keeps one dataset per DAG seed (historical behaviour).
+    """
+    if "resample_seeds" not in spec or spec.get("resample_seeds") is None:
+        return None
+    seeds = [int(s) for s in spec.get("resample_seeds")]
+    if not seeds:
+        raise ValueError(
+            "'resample_seeds' is present but empty. Remove the key to use one "
+            "dataset per DAG seed, or list at least one seed."
+        )
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(f"'resample_seeds' contains duplicates: {seeds}.")
+    return seeds
+
+
 def find_dagsweep_spec(exp_dir: str) -> str:
     """
     Locate the single sweep spec of an experiment folder.
@@ -226,6 +248,11 @@ def load_dagsweep_spec(exp_dir: str) -> Any:
     if not dag_seeds:
         raise ValueError("'dag_seeds' must list at least one evaluation seed.")
     model_seeds_of(spec)  # validate early (raises on an empty list)
+    if resample_seeds_of(spec) is not None and source.group_axis_values() is not None:
+        raise ValueError(
+            "'resample_seeds' needs a sampled-DAG sweep ('dag:' block): a fixed "
+            "dataset has no SCM seed to hold while redrawing the samples."
+        )
 
     opt_seed = int((spec.get("optuna", {}) or {}).get("opt_seed", DEFAULT_OPT_SEED))
     if opt_seed in dag_seeds:
@@ -253,6 +280,65 @@ def group_name_of(values: Dict[str, Any]) -> str:
     )
 
 
+#: Keys of a group-axis bundle (see ``_expand_bundles``).
+BUNDLE_KEYS = ("name", "dag", "config")
+
+
+def _is_bundle(value: Any) -> bool:
+    """A group-axis entry written as a named bundle (dict with a ``name``)."""
+    return isinstance(value, dict) and "name" in value
+
+
+def _expand_bundles(axes: Dict[str, List[Any]]) -> Dict[str, List[Any]]:
+    """
+    Validate bundle-valued axes and split them off the plain values.
+
+    A bundle packs the settings that belong together when independent axes
+    would create invalid combinations, e.g. the SCM type::
+
+        group_axes:
+          n_nodes: [10, 20]
+          scm:
+            - name: nlin_gauss
+              dag: {linearity: nonlinear, noise: gaussian}
+              config: {benchmark.params: {pc: {indep_test: rcit}}}
+            - name: lin_nongauss
+              dag: {linearity: linear, noise: nongaussian, source_noise: uniform}
+
+    ``dag`` entries are merged into the spec's ``dag:`` block when the
+    dataset is built (unknown keys are rejected by ``RandomSCMConfig``);
+    ``config`` entries are dotted config overrides applied by
+    ``stage_run_config`` after the group axes and before the tuned params.
+
+    Returns:
+        The axes with every bundle entry replaced by ``{"_bundle": <bundle>}``
+        markers (kept in-place so the axis product stays simple).
+    """
+    out: Dict[str, List[Any]] = {}
+    for key, values in axes.items():
+        bundles = [v for v in values if _is_bundle(v)]
+        if bundles and len(bundles) != len(values):
+            raise ValueError(
+                f"group_axes.{key} mixes plain values and bundles; use one "
+                "form only."
+            )
+        if not bundles:
+            out[key] = values
+            continue
+        names = [str(b["name"]) for b in bundles]
+        if len(set(names)) != len(names):
+            raise ValueError(f"group_axes.{key} has duplicated bundle names: {names}.")
+        for b in bundles:
+            unknown = set(b) - set(BUNDLE_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"group_axes.{key} bundle '{b.get('name')}' has unknown "
+                    f"keys {sorted(unknown)}; allowed: {list(BUNDLE_KEYS)}."
+                )
+        out[key] = [{"_bundle": b} for b in bundles]
+    return out
+
+
 def build_groups(spec: Any, source: Optional[DataSource] = None) -> List[Dict[str, Any]]:
     """
     Expand the group axes into groups, each carrying the full seed plan.
@@ -263,6 +349,14 @@ def build_groups(spec: Any, source: Optional[DataSource] = None) -> List[Dict[st
     fixed-SCM sweep) and ``model_seeds`` (initialisations trained on each of
     those datasets; ``None`` = one run with model seed == DAG seed).  ``seeds``
     is kept as a mirror of ``dag_seeds`` for backwards compatibility.
+
+    An axis value may be a named BUNDLE (``_expand_bundles``): its ``name``
+    becomes the axis value, its ``dag`` entries go to the group's
+    ``dag_overrides`` (merged into the ``dag:`` block when the dataset is
+    built) and its ``config`` entries to ``config_overrides`` (dotted config
+    overrides applied by ``stage_run_config``).  This packs settings that
+    belong together - e.g. (linearity, noise, source_noise) - when independent
+    axes would create invalid combinations.
 
     A fixed-dataset source contributes an IMPLICIT, outermost ``dataset`` axis
     (its aliases), so one group is created per dataset - each with its own study,
@@ -289,72 +383,113 @@ def build_groups(spec: Any, source: Optional[DataSource] = None) -> List[Dict[st
                 "DATA, not a hyper-parameter). Use 'datasets.names' instead."
             )
         axes[key] = list(values)
+    axes = _expand_bundles(axes)
 
     dag_seeds = dag_seeds_of(spec)
 
     model_seeds = model_seeds_of(spec)
+    resample_seeds = resample_seeds_of(spec)
 
     names = list(axes.keys())
     groups: List[Dict[str, Any]] = []
     for combo in itertools.product(*(axes[n] for n in names)):
-        values = dict(zip(names, combo))
+        values: Dict[str, Any] = {}
+        dag_overrides: Dict[str, Any] = {}
+        config_overrides: Dict[str, Any] = {}
+        bundle_axes: List[str] = []
+        for key, value in zip(names, combo):
+            bundle = value.get("_bundle") if isinstance(value, dict) else None
+            if bundle is None:
+                values[key] = value
+                continue
+            values[key] = bundle["name"]
+            bundle_axes.append(key)
+            dag_overrides.update(_as_dict(bundle.get("dag")))
+            config_overrides.update(_as_dict(bundle.get("config")))
+        clash = set(dag_overrides) & set(values)
+        if clash:
+            raise ValueError(
+                f"Bundle 'dag' keys {sorted(clash)} also appear as plain group "
+                "axes; a setting may come from only one place."
+            )
         groups.append({
             "axes": values,
             "name": group_name_of(values),
+            "dag_overrides": dag_overrides,
+            "config_overrides": config_overrides,
+            "bundle_axes": bundle_axes,
 
             "dag_seeds": dag_seeds,
             "model_seeds": model_seeds,
+            "resample_seeds": resample_seeds,
             # Legacy alias: the DAG seeds are what used to be called "seeds".
             "seeds": dag_seeds,
         })
     return groups
 
 
-def run_plan(group: Dict[str, Any]) -> List[Tuple[int, Optional[int], Any, str]]:
-    """
-    Expand a group into its ``(dag_seed, model_seed, run_key, suffix)`` runs.
+#: One planned run: ``(dag_seed, resample_seed, model_seed, run_key, suffix)``.
+RunSpec = Tuple[int, Optional[int], Optional[int], Any, str]
 
-    ``model_seed is None`` marks the legacy single-run-per-DAG case, where the
-    model seed follows the DAG seed and the run keeps its historical
-    ``seed_<dag_seed>`` name / integer result key.  With explicit
-    ``model_seeds`` the DAG and the initialisation appear separately in both the
-    folder name and the result key, so a stability set is trivially groupable by
-    DAG.
+
+def dataset_key(dag_seed: int, resample_seed: Optional[int]) -> str:
+    """Key of a run's dataset in ``prepared.json`` (``"3"`` or ``"3_r7"``)."""
+    return str(dag_seed) if resample_seed is None else f"{dag_seed}_r{resample_seed}"
+
+
+def run_plan(group: Dict[str, Any]) -> List[RunSpec]:
     """
-    plan: List[Tuple[int, Optional[int], Any, str]] = []
+    Expand a group into its ``(dag_seed, resample_seed, model_seed, run_key, suffix)`` runs.
+
+    The plan is ``dag_seeds x resample_seeds x model_seeds`` (absent lists
+    contribute one ``None``).
+
+    * Neither list: legacy single run per DAG, historical ``seed_<dag_seed>``
+      name and integer result key (model seed follows the DAG seed).
+    * ``model_seeds`` only: ``dag_<d>_model_<m>`` (unchanged).
+    * ``resample_seeds``: ``dag_<d>_resample_<r>`` (+ ``_model_<m>``); each
+      resample is a new dataset from the same SCM.
+
+    Names carry every seed that varies, so a stability set is trivially
+    groupable by DAG (and by resample).
+    """
+    plan: List[RunSpec] = []
     model_seeds = group.get("model_seeds")
+    resample_seeds = group.get("resample_seeds")
     for dag_seed in group["dag_seeds"]:
-        if model_seeds is None:
-            plan.append((dag_seed, None, dag_seed, f"seed_{dag_seed}"))
-        else:
-            for model_seed in model_seeds:
-                plan.append((
-                    dag_seed,
-                    model_seed,
-                    f"dag_{dag_seed}_model_{model_seed}",
-                    f"dag_{dag_seed}_model_{model_seed}",
-                ))
+        for resample_seed in (resample_seeds if resample_seeds is not None else [None]):
+            for model_seed in (model_seeds if model_seeds is not None else [None]):
+                if resample_seed is None and model_seed is None:
+                    plan.append((dag_seed, None, None, dag_seed, f"seed_{dag_seed}"))
+                    continue
+                suffix = f"dag_{dag_seed}"
+                if resample_seed is not None:
+                    suffix += f"_resample_{resample_seed}"
+                if model_seed is not None:
+                    suffix += f"_model_{model_seed}"
+                plan.append((dag_seed, resample_seed, model_seed, suffix, suffix))
     return plan
 
 
 def _group_plan_by_dag(
-    plan: List[Tuple[int, Optional[int], Any, str]],
-) -> List[Tuple[int, List[Tuple[Optional[int], Any, str]]]]:
+    plan: List[RunSpec],
+) -> List[Tuple[int, Optional[int], List[Tuple[Optional[int], Any, str]]]]:
     """
-    Collapse a run plan into ``[(dag_seed, [(model_seed, run_key, suffix), ...])]``.
+    Collapse a run plan into ``[(dag_seed, resample_seed, [(model_seed, run_key, suffix), ...])]``.
 
-    Grouping by DAG seed is what lets the orchestrator generate each dataset once
-    and prune it after the last model seed that needs it, keeping disk usage flat
-    no matter how many initialisations are averaged over.
+    Grouping by DATASET (DAG seed + resample seed) is what lets the orchestrator
+    generate each dataset once and prune it after the last model seed that needs
+    it, keeping disk usage flat no matter how many initialisations are averaged.
     """
-    grouped: Dict[int, List[Tuple[Optional[int], Any, str]]] = {}
-    order: List[int] = []
-    for dag_seed, model_seed, run_key, suffix in plan:
-        if dag_seed not in grouped:
-            grouped[dag_seed] = []
-            order.append(dag_seed)
-        grouped[dag_seed].append((model_seed, run_key, suffix))
-    return [(dag_seed, grouped[dag_seed]) for dag_seed in order]
+    grouped: Dict[Tuple[int, Optional[int]], List[Tuple[Optional[int], Any, str]]] = {}
+    order: List[Tuple[int, Optional[int]]] = []
+    for dag_seed, resample_seed, model_seed, run_key, suffix in plan:
+        key = (dag_seed, resample_seed)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append((model_seed, run_key, suffix))
+    return [(d, r, grouped[(d, r)]) for d, r in order]
 
 
 # =============================================================================
@@ -485,6 +620,10 @@ def stage_group_config(base_config_path: str, base_optuna_path: Optional[str],
     if opt_seed is not None:
         _set_dotted(config, "training.data_seed", int(opt_seed))
 
+    # Bundle overrides (e.g. method params an SCM setting demands): the search
+    # must see them too, or it would tune for the wrong configuration.
+    for dotted, value in (group.get("config_overrides") or {}).items():
+        _set_dotted(config, str(dotted), value)
 
     apply_dataset_derived(config, spec, datasets_dir, dataset_name)
 
@@ -520,8 +659,10 @@ def stage_run_config(base_config_path: str, group: Dict[str, Any], spec: Any,
     3. ``training.data_seed`` = DAG seed (graph AND train/val/test split) while
        ``training.seed`` = model seed (weight init only), so several
        initialisations share one dataset and one split;
-    4. the tuned ``best_params`` LAST, so they win over the base defaults;
-    5. dataset-derived and size-derived fields, recomputed with the SAME rules as
+    4. ``config_overrides`` of the group's bundles (e.g. an SCM setting that
+       demands a specific method parameter);
+    5. the tuned ``best_params`` LAST, so they win over the base defaults;
+    6. dataset-derived and size-derived fields, recomputed with the SAME rules as
        the search (a tuned lr belongs to the batch size actually used), then
        ``validate_dimensions`` so a model that cannot represent this DAG is
        repaired instead of crashing hours later.
@@ -538,6 +679,16 @@ def stage_run_config(base_config_path: str, group: Dict[str, Any], spec: Any,
     _set_dotted(config, "training.data_seed", int(dag_seed))
     _set_dotted(config, "training.seed",
                 int(dag_seed if model_seed is None else model_seed))
+
+    for dotted, value in (group.get("config_overrides") or {}).items():
+        _set_dotted(config, str(dotted), value)
+
+    # Benchmark trainer: the init seeds live in ``benchmark.seeds``.  With
+    # explicit model_seeds, each task fits EXACTLY its own seed (one task per
+    # fit instead of ten fits in one); when the config uses
+    # ``seeds: ${training.seed}`` this merely pre-resolves the interpolation.
+    if model_seed is not None and "benchmark" in config:
+        _set_dotted(config, "benchmark.seeds", [int(model_seed)])
 
     for dotted, value in (best_params or {}).items():
         _set_dotted(config, str(dotted), value)
@@ -850,6 +1001,7 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
 
                   f"  model_seeds="
                   f"{group['model_seeds'] if group['model_seeds'] is not None else '= dag_seed'}"
+                  f"  resample_seeds={group.get('resample_seeds') or '-'}"
                   f"  runs={len(plans[group['name']])}"
                   f"  opt_seed={opt_seed if optuna_enabled else '-'}")
         return {"groups": [g["name"] for g in groups], "n_runs": n_runs,
@@ -912,9 +1064,9 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
             # and all of its model seeds train on the very same arrays (identical
             # graph AND identical split - the premise of an edge-stability
             # estimate).
-            for dag_seed, dag_runs in _group_plan_by_dag(plans[group["name"]]):
+            for dag_seed, resample_seed, dag_runs in _group_plan_by_dag(plans[group["name"]]):
               try:
-                with scope.dataset(dag_seed) as dataset_name:
+                with scope.dataset(dag_seed, resample_seed) as dataset_name:
                     for model_seed, run_key, suffix in dag_runs:
 
                         run_name = f"{exp_id}_{group['name']}_{suffix}"
@@ -947,6 +1099,7 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
                                 "model_seed": int(
                                     dag_seed if model_seed is None else model_seed
                                 ),
+                                "resample_seed": resample_seed,
                                 "dataset": dataset_name,
                             }
                             logger.info("Run %s completed", run_name)
@@ -961,7 +1114,8 @@ def run_dag_sweep(exp_dir: str, cluster: bool = False, keep_data: bool = False,
                             }
               except Exception as exc:
                 # Dataset generation / pruning failed: no run of this seed ran.
-                logger.error("Data seed %s failed: %s", dag_seed, exc, exc_info=True)
+                logger.error("Dataset %s failed: %s", dataset_key(dag_seed, resample_seed),
+                             exc, exc_info=True)
                 for model_seed, run_key, _suffix in dag_runs:
                     group_result["seeds"].setdefault(run_key, {
                         "status": "failed",
@@ -984,6 +1138,8 @@ __all__ = [
     "build_group_study",
     "build_groups",
     "dag_seeds_of",
+    "dataset_key",
+    "resample_seeds_of",
     "finalize_group_study",
     "group_study_name",
     "load_best_params",

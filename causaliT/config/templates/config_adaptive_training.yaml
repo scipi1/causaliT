@@ -58,6 +58,19 @@
 adaptive_training:
   # --- Global schedule ------------------------------------------------------
   total_epoch_budget: 800          # global cap = pl.Trainer max_epochs
+
+  # --- Order-factorized selector temperature anneal (optional) --------------
+  # Phase-agnostic, driven by the GLOBAL epoch (like gain_lambda_*).  No-op
+  # unless order_tau_final / order_noise_final is set.  tau interpolates
+  # GEOMETRICALLY (temperature convention) from the model's order_tau to
+  # order_tau_final; the Gumbel noise scale interpolates LINEARLY to
+  # order_noise_final, both over [anneal_start, anneal_end].  Logged to CSV
+  # as order_tau / order_noise_scale.
+  order_tau_final: null            # anneal target (null = constant tau)
+  order_tau_anneal_start: null     # (null -> warmup end, or 0 w/o warmup)
+  order_tau_anneal_end: null       # (null -> 0.8 * total_epoch_budget)
+  order_noise_final: null          # optional noise target, same window
+
   start_phase: reconstruct         # "reconstruct" (warm up predictor first) or
                                    # "structure"
   max_cycles: null                 # OPTIONAL safety cap on completed structure
@@ -136,6 +149,11 @@ adaptive_training:
     # ``lambda_hsic``; other architectures receive the attribute verbatim.
     lambda_hsic_cross: 1.0
     lambda_hsic_self: 0.0
+
+    # Late L0 turn-on (optional): lambda_l0 from this block is applied as 0.0
+    # while global_epoch < lambda_l0_start_epoch (default 0 = active from the
+    # first structure phase).  The effective value is logged as lambda_l0_eff.
+    lambda_l0_start_epoch: 0
 
     # Trigger 1 — struct_drop: the frozen predictor going stale.
     drop_pct: 0.20                 # switch when monitor rises 20% over phase best

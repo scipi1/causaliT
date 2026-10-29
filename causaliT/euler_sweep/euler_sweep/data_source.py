@@ -99,9 +99,10 @@ class GroupScope:
         self.delete_dataset = delete_dataset
 
     @contextmanager
-    def dataset(self, seed: int) -> Iterator[str]:
-        """Yield a ready-to-train dataset name for ``seed``."""
-        name = self.source.ensure(self.group, self.datasets_dir, int(seed))
+    def dataset(self, seed: int, resample_seed: Optional[int] = None) -> Iterator[str]:
+        """Yield a ready-to-train dataset name for ``seed`` (and resample)."""
+        name = self.source.ensure(self.group, self.datasets_dir, int(seed),
+                                  resample_seed=resample_seed)
         try:
             yield name
         finally:
@@ -129,12 +130,19 @@ class DataSource:
     #: Human-readable tag for logs / the sweep summary.
     kind: str = "abstract"
 
-    def dataset_name(self, group: Dict[str, Any], seed: int) -> str:
+    def dataset_name(self, group: Dict[str, Any], seed: int,
+                     resample_seed: Optional[int] = None) -> str:
         """Folder name of the dataset used by ``seed`` (no I/O)."""
         raise NotImplementedError
 
-    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int) -> str:
-        """Materialize (or reuse) that dataset and return its folder name."""
+    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int,
+               resample_seed: Optional[int] = None) -> str:
+        """
+        Materialize (or reuse) that dataset and return its folder name.
+
+        ``resample_seed`` (sampled DAGs only) draws a NEW dataset from the SAME
+        SCM; ``None`` is the historical one-dataset-per-seed behaviour.
+        """
         raise NotImplementedError
 
     def group_axis_values(self) -> Optional[List[Any]]:
@@ -176,14 +184,21 @@ class SampledDagSource(DataSource):
         _, self.gen_kwargs = split_dag_block(self.dag_block)
 
     def _config(self, group: Dict[str, Any], seed: int):
-        return build_dag_config(self.dag_block, seed=int(seed), **group["axes"])
+        # Plain axes are RandomSCMConfig fields (e.g. n_nodes, degree); bundle
+        # axes (e.g. scm) are names, their dag fields come via dag_overrides.
+        overrides = {k: v for k, v in group["axes"].items()
+                     if k not in group.get("bundle_axes", ())}
+        overrides.update(group.get("dag_overrides") or {})
+        return build_dag_config(self.dag_block, seed=int(seed), **overrides)
 
-    def dataset_name(self, group: Dict[str, Any], seed: int) -> str:
-        return dag_dataset_name(self._config(group, seed))
+    def dataset_name(self, group: Dict[str, Any], seed: int,
+                     resample_seed: Optional[int] = None) -> str:
+        return dag_dataset_name(self._config(group, seed), resample_seed)
 
-    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int) -> str:
+    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int,
+               resample_seed: Optional[int] = None) -> str:
         return ensure_dag_dataset(self._config(group, seed), datasets_dir,
-                                  self.gen_kwargs)
+                                  self.gen_kwargs, resample_seed=resample_seed)
 
 
 # =============================================================================
@@ -352,11 +367,21 @@ class FixedDatasetSource(DataSource):
             "the group expansion must add one group per dataset."
         )
 
-    def dataset_name(self, group: Dict[str, Any], seed: int) -> str:
+    def dataset_name(self, group: Dict[str, Any], seed: int,
+                     resample_seed: Optional[int] = None) -> str:
         # Seed-independent on purpose: all seeds of a group share the data.
+        self._reject_resample(resample_seed)
         return self._registry_name(group)
 
-    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int) -> str:
+    @staticmethod
+    def _reject_resample(resample_seed: Optional[int]) -> None:
+        if resample_seed is not None:
+            raise ValueError("'resample_seeds' is only supported for sampled DAGs "
+                             "(a 'dag:' block), not for fixed datasets.")
+
+    def ensure(self, group: Dict[str, Any], datasets_dir: str, seed: int,
+               resample_seed: Optional[int] = None) -> str:
+        self._reject_resample(resample_seed)
         return generate_fixed_dataset(self._registry_name(group), datasets_dir,
                                       self.generation)
 

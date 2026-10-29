@@ -783,6 +783,25 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             "order_freq": torch.stack(orders).mean(dim=0),
         }
 
+    def set_order_temperature(
+        self,
+        tau: Optional[float] = None,
+        noise_scale: Optional[float] = None,
+    ) -> None:
+        """Anneal the Sinkhorn temperature / Gumbel noise of the order.
+
+        Plain attribute writes (both are re-read at every forward), exposed
+        as a setter so the adaptive trainer can anneal them over training.
+        """
+        if tau is not None:
+            if tau <= 0.0:
+                raise ValueError(f"tau must be > 0, got {tau}.")
+            self.perm_tau = float(tau)
+        if noise_scale is not None:
+            if noise_scale < 0.0:
+                raise ValueError(f"noise_scale must be >= 0, got {noise_scale}.")
+            self.noise_scale = float(noise_scale)
+
     def __repr__(self):
         return (
             f"OrderFactorizedSelfAttention(N={self.num_nodes}, beta={self.beta}, "
