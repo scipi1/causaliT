@@ -25,6 +25,7 @@ order distribution.
 | `score`, `das`, `nogam` | (a) score-matching order + pruning | DAG + order | `dodiscover.toporder` (authors' code) | GitHub (2) |
 | `caps` | (a) Hessian order, mixed linear/nonlinear | DAG + order | vendored `vendor/caps/` (MIT) | none extra |
 | `daguerreo` | (a)+(c) learned order on the permutahedron | DAG + order | authors' repo, compiled | Linux build (3) |
+| `dagma_linear_nv`, `dagma_mlp_nv`, `daguerreo_nv` | same, non-equal-variance score (see 1.2) | as the originals | `methods/nv_scores.py` on top of the authors' code | as the originals |
 | `var_sort`, `r2_sort` | trivial baselines (data-leak check) | weighted + order | `CausalDisco` (authors) | `pip install --no-deps causaldisco` |
 
 PC defaults to the Fisher-z test, which only detects linear dependence. On
@@ -49,6 +50,20 @@ package the papers used, so pruned graphs can differ slightly from published
 numbers; orders are unaffected. CaPS's R pruning call is replaced the same
 way (`vendor/caps/PROVENANCE.md`). The wrappers in `methods/` never modify
 the algorithms - they only convert arguments and results.
+
+### 1.2 Fair scoring on standardized data (`*_nv`)
+
+The default scores of DAGMA (`l2`, pooled log-MSE) and DAGuerreotype
+(`nll_ev`) assume equal noise variances. On standardized data that
+assumption is wrong and these methods are handicapped. Following Ng, Huang,
+Zhang (CLeaR 2024, "Structure Learning with Continuous Optimization: A Sober
+Look and Beyond"), the `*_nv` variants replace only the score with the
+GOLEM-NV likelihood `0.5 * sum_j log(mean_i r_ij^2)` (the `log|det(I-W)|` term
+is zero on a DAG) and keep every hyperparameter of the original method. This
+is the one deliberate exception to "wrappers never modify the algorithms".
+The originals are unchanged, so earlier runs stay comparable; results carry
+`extra.score = "ev" | "nv"`. `DagmaLinearNV.minimize` mirrors dagma 1.1.1
+(the package hard-codes the l2 gradient there); a test fails on upgrade.
 
 ### 1.1 Methods considered and excluded
 

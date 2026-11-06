@@ -152,6 +152,7 @@ import copy
 import glob
 import json
 import logging
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -473,6 +474,37 @@ class PhaseController(Callback):
         self.order_noise_final: Optional[float] = (
             None if _noise_final is None else float(_noise_final)
         )
+        # Cyclic tau schedules (pre-defined, no ground-truth trigger):
+        #   order_tau_schedule:  "geometric" (default, monotone), "cosine"
+        #                        (smooth log-space oscillation, C troughs,
+        #                        ends at tau_final) or "restart" (SGDR: cosine
+        #                        decay per cycle, then jump back to the peak)
+        #   order_tau_cycles:    number of cycles C in [start, end]
+        #   order_tau_peak_decay: peak shrink factor per cycle, in (0, 1]
+        #                        (1.0 -> every peak at tau_init)
+        #   order_noise_follows_cycle: noise reheats with tau (True) or stays
+        #                        linear (False)
+        self.order_tau_schedule: str = str(ad.get("order_tau_schedule", "geometric"))
+        if self.order_tau_schedule not in ("geometric", "cosine", "restart"):
+            raise ValueError(
+                "order_tau_schedule must be one of ('geometric', 'cosine', "
+                f"'restart'), got {self.order_tau_schedule!r}.")
+        self.order_tau_cycles: int = int(ad.get("order_tau_cycles", 1))
+        if self.order_tau_cycles < 1:
+            raise ValueError(
+                f"order_tau_cycles must be >= 1, got {self.order_tau_cycles}.")
+        self.order_tau_peak_decay: float = float(ad.get("order_tau_peak_decay", 1.0))
+        if not (0.0 < self.order_tau_peak_decay <= 1.0):
+            raise ValueError(
+                "order_tau_peak_decay must be in (0, 1], got "
+                f"{self.order_tau_peak_decay}.")
+        self.order_noise_follows_cycle: bool = bool(
+            ad.get("order_noise_follows_cycle", True))
+        if self.order_tau_schedule != "geometric" and (
+                self.order_tau_final is None or self.order_tau_anneal_end is None):
+            raise ValueError(
+                f"order_tau_schedule={self.order_tau_schedule!r} requires "
+                "order_tau_final and order_tau_anneal_end (or a total budget).")
         self._order_tau_init: Optional[float] = None   # latched at first update
         self._order_noise_init: Optional[float] = None
         if self.final_enabled and self.final_max_epochs <= 0:
@@ -604,6 +636,27 @@ class PhaseController(Callback):
                 raise ValueError(
                     "adaptive_training.recon_gates must be 'hard' or 'soft', "
                     f"got {_blk.get('recon_gates')!r}.")
+        #   recon_order_sampling: {enabled, p_anticausal, noise_scale}; train
+        #   recon on the one-sided hard-order subsets queried by the structural
+        #   stage (docs/ideas/ORIENTED_RECON_SAMPLING.md).  Block keys
+        #   override the global ones key by key.
+        self._recon_order_sampling_default = {
+            "enabled": False, "p_anticausal": 0.5, "noise_scale": 1.0,
+            **dict(ad.get("recon_order_sampling", None) or {})}
+        for _name in ("warmup", "reconstruct", "final_reconstruct"):
+            _ros = self._recon_order_sampling_cfg(_name)
+            if not _ros["enabled"]:
+                continue
+            if self._phase_cfg(_name).get("use_order_in_recon", self._use_order_in_recon_default):
+                raise ValueError(
+                    f"adaptive_training: recon_order_sampling and use_order_in_recon "
+                    f"are distinct methods; both enabled for '{_name}'.")
+            if not 0.0 <= float(_ros["p_anticausal"]) <= 1.0:
+                raise ValueError(
+                    f"recon_order_sampling.p_anticausal must be in [0, 1], got {_ros['p_anticausal']!r}.")
+            if float(_ros["noise_scale"]) < 0.0:
+                raise ValueError(
+                    f"recon_order_sampling.noise_scale must be >= 0, got {_ros['noise_scale']!r}.")
         #   structure.struct_gates: soft (Hard-Concrete, default) | hard (ST
         #   Bernoulli of the learned pi): pair with recon_gates for
         #   hard-hard / soft-soft runs.
@@ -704,9 +757,10 @@ class PhaseController(Callback):
         # ``min_keys`` keys survive (deterministic mode) or are topped up
         # to (Bernoulli mode).  Combine with batch_key_dropout_deterministic
         # in the same phase block for the exact-count variant.
-        if "batch_key_dropout" not in cfg and "batch_key_dropout_min_keys" in cfg:
+        # An explicit ``batch_key_dropout: null`` means BKD off (same as absent).
+        if cfg.get("batch_key_dropout", None) is None and "batch_key_dropout_min_keys" in cfg:
             cfg = {**cfg, "batch_key_dropout": 1.0}
-        active = "batch_key_dropout" in cfg
+        active = cfg.get("batch_key_dropout", None) is not None
 
         # Optional per-phase sampling overrides (min-keys floor / mode).
         samp_kw = {}
@@ -795,6 +849,18 @@ class PhaseController(Callback):
                 "open_gate_active", float(active), on_step=False, on_epoch=True
             )
 
+    def _phase_cfg(self, phase: str) -> dict:
+        """Config block of a reconstruction phase (final inherits reconstruct)."""
+        return {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
+                "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})
+
+    def _recon_order_sampling_cfg(self, phase: str) -> dict:
+        """recon_order_sampling of ``phase``: global default updated by the block."""
+        default = getattr(self, "_recon_order_sampling_default", None) or {
+            "enabled": False, "p_anticausal": 0.5, "noise_scale": 1.0}
+        return {**default,
+                **dict(self._phase_cfg(phase).get("recon_order_sampling", None) or {})}
+
     def _apply_recon_forward_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
         """Order-factorized selector forward for ``phase`` (no-op otherwise).
 
@@ -818,14 +884,27 @@ class PhaseController(Callback):
                     and model.request_struct_selector_sync():
                 logger.info("[adaptive] structural selector G_S initialised "
                             "from G_R at the next forward.")
+            ros_on = False
+            if callable(getattr(model, "set_recon_noise_scale", None)):
+                model.set_recon_noise_scale(None)
+            if callable(getattr(pl_module, "set_recon_order_sampling", None)):
+                pl_module.set_recon_order_sampling(False)
         else:
-            cfg = {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
-                   "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})
+            cfg = self._phase_cfg(phase)
             gates = str(cfg.get("recon_gates", self._recon_gates_default))
             use_order = bool(cfg.get("use_order_in_recon", self._use_order_in_recon_default))
-            ok = model.set_order_path("hard" if use_order else "none")
+            ros = self._recon_order_sampling_cfg(phase)
+            ros_on = bool(ros["enabled"])
+            # Oriented recon sampling: detached hard order at a constant recon
+            # Gumbel scale; orientation drawn per step by the forecaster.
+            ok = model.set_order_path("hard" if (use_order or ros_on) else "none")
             model.set_gate_mode(gates)
+            if callable(getattr(model, "set_recon_noise_scale", None)):
+                model.set_recon_noise_scale(float(ros["noise_scale"]) if ros_on else None)
+            if callable(getattr(pl_module, "set_recon_order_sampling", None)):
+                pl_module.set_recon_order_sampling(ros_on, float(ros["p_anticausal"]))
         if ok:
+            pl_module.log("recon_order_sampling", float(ros_on), on_step=False, on_epoch=True)
             pl_module.log("recon_gates_hard", float(gates == "hard"), on_step=False, on_epoch=True)
             pl_module.log("use_order_in_recon", float(use_order), on_step=False, on_epoch=True)
             if (phase == "structure" and self._bkd_managed
@@ -1328,6 +1407,36 @@ class PhaseController(Callback):
     # ------------------------------------------------------------------
     # Order-factorized temperature anneal (OrderFactorizedSelfAttention)
     # ------------------------------------------------------------------
+    def _cyclic_order_tau(self, frac: float):
+        """Cyclic tau at anneal progress ``frac`` in [0, 1] (log space).
+
+        With C cycles, l0 = log tau_init, lf = log tau_final and the peak
+        envelope lp(c) = max(lf, l0 + c * log(decay)) (c = cycle index):
+          cosine:  w = 0.5 * (1 + cos(pi * (2C - 1) * frac)), continuous
+                   envelope c = C * frac; C troughs, ends at tau_final.
+          restart: w = 0.5 * (1 + cos(pi * phi)), phi = in-cycle progress,
+                   discrete envelope c = cycle index (jump at each restart).
+          log tau = lf + (lp - lf) * w.
+        Returns (tau, cycle index, heat in [0, 1] relative to l0 - lf).
+        """
+        C = self.order_tau_cycles
+        l0 = math.log(self._order_tau_init)
+        lf = math.log(self.order_tau_final)
+        ld = math.log(self.order_tau_peak_decay)
+        pos = C * frac
+        k = min(int(math.floor(pos)), C - 1)
+        if self.order_tau_schedule == "cosine":
+            w = 0.5 * (1.0 + math.cos(math.pi * (2 * C - 1) * frac))
+            c_env = pos
+        else:
+            w = 0.5 * (1.0 + math.cos(math.pi * (pos - k)))
+            c_env = float(k)
+        lp = l0 + c_env * ld
+        lp = max(lf, lp) if l0 >= lf else min(lf, lp)
+        log_tau = lf + (lp - lf) * w
+        heat = 0.0 if l0 == lf else (log_tau - lf) / (l0 - lf)
+        return math.exp(log_tau), k, heat
+
     def _update_order_temperature(self, trainer: pl.Trainer,
                                   pl_module: pl.LightningModule) -> None:
         """Anneal the order Sinkhorn tau / Gumbel noise over the run (global
@@ -1356,19 +1465,28 @@ class PhaseController(Callback):
             1.0, max(0.0, (epoch - self.order_tau_anneal_start) / float(span))
         )
         tau = None
+        heat = None        # cyclic only: (log tau - log tau_f) / (log tau0 - log tau_f)
         if self.order_tau_final is not None:
             if span is None:
                 frac_tau = 1.0 if epoch >= self.order_tau_anneal_start else 0.0
             else:
                 frac_tau = frac
-            tau = self._order_tau_init * (
-                (self.order_tau_final / self._order_tau_init) ** frac_tau
-            )
+            if self.order_tau_schedule == "geometric":
+                tau = self._order_tau_init * (
+                    (self.order_tau_final / self._order_tau_init) ** frac_tau
+                )
+            else:
+                tau, cycle, heat = self._cyclic_order_tau(frac_tau)
+                pl_module.log("order_tau_cycle", float(cycle),
+                              on_step=False, on_epoch=True)
         noise = None
         if self.order_noise_final is not None:
-            noise = self._order_noise_init + (
-                self.order_noise_final - self._order_noise_init
-            ) * (frac if span is not None else 1.0)
+            if heat is not None and self.order_noise_follows_cycle:
+                w = heat
+            else:
+                w = 1.0 - (frac if span is not None else 1.0)
+            noise = self.order_noise_final + (
+                self._order_noise_init - self.order_noise_final) * w
         if model.set_order_temperature(tau=tau, noise_scale=noise):
             if tau is not None:
                 pl_module.log("order_tau", float(tau),

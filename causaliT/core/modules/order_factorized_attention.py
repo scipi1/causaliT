@@ -351,6 +351,9 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.register_buffer("T", torch.triu(torch.ones(N, N), diagonal=1), persistent=False)
 
         self.order_path = "relaxed"
+        # Gumbel scale of the APPLIED hard order in recon forwards
+        # (None = use noise_scale; see set_recon_noise_scale).
+        self.recon_noise_scale: Optional[float] = None
         self._noise: Optional[Dict[str, torch.Tensor]] = None
 
         # Per-step state / diagnostics (populated by forward).
@@ -365,6 +368,13 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
     # ------------------------------------------------------------------
     # Phase / noise control
     # ------------------------------------------------------------------
+    def set_recon_noise_scale(self, value: Optional[float]) -> None:
+        """Gumbel scale of the applied hard order (order_path="hard",
+        training only).  None restores the structural ``noise_scale``."""
+        if value is not None and value < 0.0:
+            raise ValueError(f"recon_noise_scale must be >= 0, got {value}.")
+        self.recon_noise_scale = None if value is None else float(value)
+
     def set_order_path(self, mode: str) -> None:
         """Order mask of the applied weight: ``"relaxed"``, ``"hard"`` or
         ``"none"``."""
@@ -594,10 +604,20 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         M_fwd = (M_hard + M - M.detach()) if (self.straight_through and self.training) else M
         # Applied orientation: the anti-causal pass flips every selected edge
         # (each node then attends to its selected LATER nodes).
-        if self.orientation == "anticausal":
-            M_fwd, M_app_hard = M_fwd.transpose(0, 1), M_hard.transpose(0, 1)
+        # Oriented recon sampling (docs/ideas/ORIENTED_RECON_SAMPLING.md):
+        # on the hard path the APPLIED order may use a dedicated Gumbel scale
+        # (same noise draw).  The structural M_hard (posterior / exclusion)
+        # is unchanged.
+        if (self.training and self.order_path == "hard"
+                and self.recon_noise_scale is not None):
+            M_rec = self.order_mask(hard_assignment(
+                theta + self.recon_noise_scale * noise["gumbel"]))
         else:
-            M_app_hard = M_hard
+            M_rec = M_hard
+        if self.orientation == "anticausal":
+            M_fwd, M_app_hard = M_fwd.transpose(0, 1), M_rec.transpose(0, 1)
+        else:
+            M_app_hard = M_rec
 
         def _relaxed_gate(logits, noise_key, offset):
             if self.training:

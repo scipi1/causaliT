@@ -36,6 +36,7 @@ from causaliT.benchmarks.base import (
     BenchmarkResult,
     available_methods,
     default_params,
+    default_seeds,
     is_available,
     merge_params,
     method_names,
@@ -314,7 +315,16 @@ class TestRegistry:
         assert set(method_names()) == {
             "dagma_linear", "dagma_mlp", "pc", "resit", "direct_lingam", "cam",
             "score", "das", "nogam", "caps", "daguerreo", "var_sort", "r2_sort",
+            "dagma_linear_nv", "dagma_mlp_nv", "daguerreo_nv",
         }
+
+    @pytest.mark.parametrize("name", ["dagma_linear", "dagma_mlp", "daguerreo"])
+    def test_nv_variants_keep_the_original_hyperparameters(self, name):
+        """Ng et al. (2024) swap only the score; every default must match."""
+        if not is_available(name):
+            pytest.skip(f"{name} unavailable")
+        assert default_params(f"{name}_nv") == default_params(name)
+        assert default_seeds(f"{name}_nv") == default_seeds(name)
 
     def test_excluded_methods_are_not_registered(self):
         """Dropped methods stay documented but must not be runnable."""
@@ -399,11 +409,12 @@ class TestDataLoading:
 # Methods
 # =============================================================================
 
-FAST_METHODS = ["var_sort", "r2_sort", "dagma_linear", "pc", "direct_lingam"]
+FAST_METHODS = ["var_sort", "r2_sort", "dagma_linear", "dagma_linear_nv", "pc",
+                "direct_lingam"]
 #: Order-based methods: each must return a DAG plus a full permutation.
 ORDER_METHODS = ["cam", "score", "das", "nogam", "caps"]
 #: RESIT (GP regressions, ~30 s for N=5) and the MLP / learned-order methods.
-SLOW_METHODS = ["dagma_mlp", "resit", "daguerreo"]
+SLOW_METHODS = ["dagma_mlp", "dagma_mlp_nv", "resit", "daguerreo", "daguerreo_nv"]
 
 
 def _fit(method: str, X: np.ndarray):
@@ -508,8 +519,91 @@ class TestMethods:
         result = _fit(method, X)
         assert result.W.shape == (N, N)
         assert np.all(np.isfinite(result.W))
-        if method != "dagma_mlp":
+        if not method.startswith("dagma_mlp"):
             assert sorted(result.order) == list(range(N))
+
+
+class TestNVScores:
+    """Non-equal-variance scores (Ng et al., CLeaR 2024) in ``nv_scores``."""
+
+    @staticmethod
+    def _data(seed=0, n=400):
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(n, 4)) * np.array([1.0, 2.0, 0.5, 3.0])
+        X -= X.mean(axis=0)
+        return X, X.T @ X / n, rng.normal(scale=0.3, size=(4, 4))
+
+    def test_linear_score_matches_closed_form(self):
+        from causaliT.benchmarks.methods.nv_scores import linear_nv_score
+
+        X, cov, W = self._data()
+        loss, _ = linear_nv_score(W, cov)
+        expected = 0.5 * np.log(((X - X @ W) ** 2).mean(axis=0)).sum()
+        np.testing.assert_allclose(loss, expected, rtol=1e-10)
+
+    def test_linear_gradient_matches_finite_differences(self):
+        from causaliT.benchmarks.methods.nv_scores import linear_nv_score
+
+        _, cov, W = self._data(seed=1)
+        _, grad = linear_nv_score(W, cov)
+        h, num = 1e-6, np.zeros_like(W)
+        for i in range(4):
+            for j in range(4):
+                E = np.zeros_like(W)
+                E[i, j] = h
+                num[i, j] = (linear_nv_score(W + E, cov)[0]
+                             - linear_nv_score(W - E, cov)[0]) / (2 * h)
+        np.testing.assert_allclose(grad, num, rtol=1e-5, atol=1e-8)
+
+    def test_mlp_loss_is_per_variable_log_mse(self):
+        if not is_available("dagma_mlp_nv"):
+            pytest.skip("dagma unavailable")
+        import torch
+
+        from causaliT.benchmarks.methods.nv_scores import make_dagma_nonlinear_nv
+
+        rng = np.random.default_rng(2)
+        out = torch.from_numpy(rng.normal(size=(50, 3)))
+        tgt = torch.from_numpy(rng.normal(size=(50, 3)) * np.array([1.0, 4.0, 0.2]))
+        cls = make_dagma_nonlinear_nv()
+        loss = cls.log_mse_loss(None, out, tgt).item()
+        expected = 0.5 * np.log(((out - tgt).numpy() ** 2).mean(axis=0)).sum()
+        np.testing.assert_allclose(loss, expected, rtol=1e-10)
+
+    def test_nll_nv_reduces_to_nll_ev_on_equal_variances(self):
+        """Local copy of daguerreo's ``nll_ev`` (package not installable here)."""
+        import torch
+
+        from causaliT.benchmarks.methods.nv_scores import nll_nv
+
+        def nll_ev(output, target, dim=(-2, -1)):
+            return torch.log((output - target).square().sum(dim=dim)) * target.shape[-1] / 2
+
+        d = 3
+        r = torch.ones(2, 10, d, dtype=torch.double)   # 2 DAGs, equal variances
+        r[1] *= 2.0
+        tgt = torch.zeros_like(r)
+        nv, ev = nll_nv(r, tgt), nll_ev(r, tgt)
+        assert nv.shape == ev.shape == (2,)
+        np.testing.assert_allclose(nv - ev, -0.5 * d * np.log(d) * np.ones(2), rtol=1e-10)
+
+    def test_minimize_mirror_tracks_dagma_version(self):
+        """``DagmaLinearNV.minimize`` copies dagma's; re-check it on upgrades."""
+        if not is_available("dagma_linear_nv"):
+            pytest.skip("dagma unavailable")
+        from importlib.metadata import version
+
+        from causaliT.benchmarks.methods.nv_scores import DAGMA_VERSION_MIRRORED
+
+        assert version("dagma") == DAGMA_VERSION_MIRRORED
+
+    def test_ev_and_nv_results_are_tagged(self):
+        if not is_available("dagma_linear_nv"):
+            pytest.skip("dagma unavailable")
+        X = simulate_linear_sem(n_samples=300, seed=1)
+        X = (X - X.mean(0)) / X.std(0)
+        assert _fit("dagma_linear", X).extra["score"] == "ev"
+        assert _fit("dagma_linear_nv", X).extra["score"] == "nv"
 
 
 # =============================================================================

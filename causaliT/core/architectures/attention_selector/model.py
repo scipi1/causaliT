@@ -3092,6 +3092,15 @@ class AttentionSelectorLayer(nn.Module):
         oa.set_order_temperature(tau=tau, noise_scale=noise_scale)
         return True
 
+    def set_recon_noise_scale(self, value=None) -> bool:
+        """Gumbel scale of the applied hard order in recon forwards (None =
+        structural noise_scale).  Returns False when the selector is not in use."""
+        oa = self.order_attention()
+        if oa is None:
+            return False
+        oa.set_recon_noise_scale(value)
+        return True
+
     # ------------------------------------------------------------------
     # Prior-softmax gain schedule
     # ------------------------------------------------------------------

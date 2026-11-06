@@ -6,6 +6,7 @@ Reference methods, all fitted with their papers' own hyperparameters
 
 =========================  ===============================================
 ``dagma_linear/_mlp``      DAGMA, continuous acyclicity  (``dagma``)
+``*_nv``                   DAGMA / DAGuerreo, NV score   (``nv_scores``)
 ``pc``                     PC, Fisher-z, PC-stable       (``causal-learn``)
 ``resit``                  RESIT, residual independence  (``lingam``)
 ``cam/score/das/nogam``    order-based ANM methods       (``dodiscover``)

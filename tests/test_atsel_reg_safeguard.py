@@ -260,6 +260,14 @@ class TestCapRegCoeff:
         assert eff == pytest.approx(0.5 / 3.0)
         assert eff * 3.0 == pytest.approx(0.1 * 5.0)
 
+    @pytest.mark.parametrize("ref", [-0.61, 0.0, float("nan"), float("-inf")])
+    def test_nonpositive_reference_never_flips_sign(self, ref):
+        # Regression: anti-adjacency hsic_reg < 0 gave lambda_l0_eff < 0.
+        raw = torch.tensor(103.7)
+        eff = AttentionSelectorForecaster._cap_reg_coeff(1e-4, raw, 0.1, ref)
+        assert eff == pytest.approx(1e-4)
+        assert eff > 0.0
+
     def test_cap_loose_when_term_small(self):
         # base * raw = 0.01 * 3 = 0.03 < 0.1 * 5 = 0.5  ->  uncapped
         raw = torch.tensor(3.0)

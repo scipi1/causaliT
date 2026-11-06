@@ -55,9 +55,34 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         NOTEARS-MLP, the nonlinear model reports edge *magnitudes*, so ``W`` is
         non-negative.
     """
+    return _fit(X, nv=False, **params)
+
+
+def fit_nv(X: np.ndarray, **params: Any) -> BenchmarkResult:
+    """
+    Fit nonlinear DAGMA with the non-equal-variance (GOLEM-NV) score.
+
+    Same hyperparameters as :func:`fit` (as in Ng et al., CLeaR 2024); the
+    pooled log-MSE becomes a per-variable sum of log-MSEs, see
+    :mod:`.nv_scores`.
+    """
+    return _fit(X, nv=True, **params)
+
+
+def _fit(X: np.ndarray, nv: bool, **params: Any) -> BenchmarkResult:
+    """Shared body of :func:`fit` (``nv=False``) and :func:`fit_nv`."""
     import torch  # local import: optional dependency chain
 
     from dagma.nonlinear import DagmaMLP, DagmaNonlinear
+
+    if nv:
+        from causaliT.benchmarks.methods.nv_scores import make_dagma_nonlinear_nv
+
+        solver_cls = make_dagma_nonlinear_nv()
+        implementation = "dagma.nonlinear.DagmaMLP + nv_scores.DagmaNonlinearNV"
+    else:
+        solver_cls = DagmaNonlinear
+        implementation = "dagma.nonlinear.DagmaMLP + DagmaNonlinear"
 
     merged = {**DEFAULT_PARAMS, **params}
     merged.pop("w_threshold", None)      # thresholding happens in postprocess
@@ -75,7 +100,7 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         eq_model = DagmaMLP(
             dims=[d, hidden, 1], bias=bool(merged["bias"]), dtype=torch.double
         ).to(device)
-        model = DagmaNonlinear(eq_model, dtype=torch.double)
+        model = solver_cls(eq_model, dtype=torch.double)
 
         X_torch = torch.from_numpy(X).to(device)
 
@@ -103,7 +128,8 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         params={**merged, "seed": seed, "dims": [d, hidden, 1]},
         is_binary=False,
         extra={
-            "implementation": "dagma.nonlinear.DagmaMLP + DagmaNonlinear",
+            "implementation": implementation,
             "dims": [d, hidden, 1],
+            "score": "nv" if nv else "ev",
         },
     )

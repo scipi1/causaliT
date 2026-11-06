@@ -97,6 +97,8 @@ OUTPUT_TYPES = ("weighted", "dag", "cpdag", "samples")
 METHOD_SPECS: Dict[str, str] = {
     "dagma_linear": "dagma_linear:fit",
     "dagma_mlp": "dagma_mlp:fit",
+    "dagma_linear_nv": "dagma_linear:fit_nv",
+    "dagma_mlp_nv": "dagma_mlp:fit_nv",
     "pc": "pc:fit",
     "resit": "resit:fit",
     "direct_lingam": "direct_lingam:fit",
@@ -106,6 +108,7 @@ METHOD_SPECS: Dict[str, str] = {
     "nogam": "toporder:fit_nogam",
     "caps": "caps:fit",
     "daguerreo": "daguerreo:fit",
+    "daguerreo_nv": "daguerreo:fit_nv",
     "var_sort": "sortnregress:fit_var",
     "r2_sort": "sortnregress:fit_r2",
 }
@@ -114,6 +117,8 @@ METHOD_SPECS: Dict[str, str] = {
 METHOD_DESCRIPTIONS: Dict[str, str] = {
     "dagma_linear": "DAGMA, linear SEM (dagma package)",
     "dagma_mlp": "DAGMA, per-node MLP dims=[d,10,1] (dagma package)",
+    "dagma_linear_nv": "DAGMA linear, non-equal-variance score (Ng et al. 2024)",
+    "dagma_mlp_nv": "DAGMA MLP, non-equal-variance score (Ng et al. 2024)",
     "pc": "PC constraint-based, Fisher-z (causal-learn package)",
     "resit": "RESIT, residual-independence order search (lingam package)",
     "direct_lingam": "DirectLiNGAM, linear non-Gaussian order + adaptive Lasso (lingam package)",
@@ -123,6 +128,7 @@ METHOD_DESCRIPTIONS: Dict[str, str] = {
     "nogam": "NoGAM, score-residual order + CAM pruning (dodiscover)",
     "caps": "CaPS, Hessian order + parent score (vendored, Python pruning)",
     "daguerreo": "DAGuerreotype, permutahedron order learning (external repo)",
+    "daguerreo_nv": "DAGuerreotype, non-equal-variance NLL (Ng et al. 2024)",
     "var_sort": "Var-sortnregress, trivial variance-order baseline (CausalDisco)",
     "r2_sort": "R2-sortnregress, trivial R2-order baseline (CausalDisco)",
 }
@@ -131,6 +137,8 @@ METHOD_DESCRIPTIONS: Dict[str, str] = {
 METHOD_REQUIREMENTS: Dict[str, Optional[str]] = {
     "dagma_linear": "dagma",
     "dagma_mlp": "dagma",
+    "dagma_linear_nv": "dagma",
+    "dagma_mlp_nv": "dagma",
     "pc": "causallearn",
     "resit": "lingam",
     "direct_lingam": "lingam",
@@ -140,6 +148,7 @@ METHOD_REQUIREMENTS: Dict[str, Optional[str]] = {
     "nogam": "dodiscover",
     "caps": "dodiscover",            # vendored order search + dodiscover pruning
     "daguerreo": "daguerreo",        # compiled extensions; see BENCHMARKS.md
+    "daguerreo_nv": "daguerreo",
     "var_sort": "CausalDisco",
     "r2_sort": "CausalDisco",
 }
@@ -150,6 +159,8 @@ METHOD_REQUIREMENTS: Dict[str, Optional[str]] = {
 METHOD_DEFAULT_N_SEEDS: Dict[str, int] = {
     "dagma_linear": 1,
     "dagma_mlp": 3,
+    "dagma_linear_nv": 1,
+    "dagma_mlp_nv": 3,
     "pc": 1,
     "resit": 1,
     "direct_lingam": 1,
@@ -159,6 +170,7 @@ METHOD_DEFAULT_N_SEEDS: Dict[str, int] = {
     "nogam": 1,
     "caps": 1,
     "daguerreo": 3,
+    "daguerreo_nv": 3,
     "var_sort": 1,
     "r2_sort": 1,
 }

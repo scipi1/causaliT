@@ -65,12 +65,33 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         Binary MAP DAG in paper orientation (the package's ``W[parent, child]``)
         and the MAP order (ascending ``theta``, see ``structures.map``).
     """
+    return _fit(X, nv=False, **params)
+
+
+def fit_nv(X: np.ndarray, **params: Any) -> BenchmarkResult:
+    """
+    Fit DAGuerreotype with the non-equal-variance NLL (``nll_nv``).
+
+    Same hyperparameters as :func:`fit` (as in Ng et al., CLeaR 2024); only the
+    equal-variance ``nll_ev`` is replaced, see :mod:`.nv_scores`.  ``loss`` is
+    forced to ``nll_nv``.
+    """
+    return _fit(X, nv=True, **params)
+
+
+def _fit(X: np.ndarray, nv: bool, **params: Any) -> BenchmarkResult:
+    """Shared body of :func:`fit` (``nv=False``) and :func:`fit_nv`."""
     import torch
     import wandb
     from daguerreo import utils as dg_utils
     from daguerreo.models import Daguerro
 
     merged = {**DEFAULT_PARAMS, **params}
+    if nv:
+        from causaliT.benchmarks.methods.nv_scores import nll_nv
+
+        dg_utils.AVAILABLE["nll_nv"] = nll_nv   # register next to nll_ev / sq
+        merged["loss"] = "nll_nv"
     merged.pop("w_threshold", None)
     seed = int(merged.pop("seed", 0))
     args = SimpleNamespace(**merged)
@@ -103,5 +124,9 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         is_binary=True,
         output_type="dag",
         order=order,
-        extra={"implementation": "daguerreo (vzantedeschi/DAGuerreotype 47fc2ae)"},
+        extra={
+            "implementation": "daguerreo (vzantedeschi/DAGuerreotype 47fc2ae)"
+            + (" + nv_scores.nll_nv" if nv else ""),
+            "score": "nv" if nv else "ev",
+        },
     )

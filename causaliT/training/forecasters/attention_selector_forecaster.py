@@ -2705,7 +2705,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         # Safeguard reference: EMA of the weighted HSIC term (detached),
         # updated on train batches only.  None when both caps are disabled.
-        hsic_ref = self._hsic_safeguard_ref(hsic_reg, stage)
+        # Anti-adjacency: hsic_reg is a log-ratio and can be negative, which
+        # flipped the sign of the capped coefficients.  Anchor instead on the
+        # non-negative plain HSIC magnitude lambda_hsic * (C + A).
+        ref_term = hsic_reg
+        if self.anti_adjacency_on and self._last_anti_adjacency_stats is not None:
+            st = self._last_anti_adjacency_stats
+            ref_term = torch.as_tensor(
+                self.lambda_hsic * (float(st["C"]) + float(st["A"]))
+            )
+        hsic_ref = self._hsic_safeguard_ref(ref_term, stage)
 
         # ----------------------------------------------------------------
         # Group-L1 regularization (L2,1 norm on embedding columns)
@@ -4179,9 +4188,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         preserved and only its magnitude is capped.  No-op (returns
         ``base_coeff``) when the cap is disabled, the base coefficient is
         zero, the reference is unavailable, or the raw term is non-positive
-        or non-finite.
+        or non-finite, or the reference is non-positive / non-finite (a
+        negative reference would flip the sign of the coefficient).
         """
         if max_pct <= 0.0 or base_coeff <= 0.0 or hsic_ref is None:
+            return base_coeff
+        if not math.isfinite(hsic_ref) or hsic_ref <= 0.0:
             return base_coeff
         raw = float(raw_term.detach())
         if not math.isfinite(raw) or raw <= 0.0:
@@ -4873,6 +4885,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
         snapshot, ``opt_struct.step()``) is unaffected.  With surgery disabled
         this is exactly the original ``manual_backward(loss_structural)``.
         """
+        # No graph to the structural params (e.g. use_oracle_attention: the
+        # GT mask bypasses every structural parameter).  Structure phases are
+        # then logging-only windows; skip the backward (grads stay None).
+        if not loss_structural.requires_grad:
+            return
         if not self.gradient_surgery:
             self.manual_backward(loss_structural)
             return
@@ -5025,7 +5042,38 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         opt.step()
 
+    def set_recon_order_sampling(self, enabled: bool, p_anticausal: float = 0.5) -> None:
+        """Oriented recon sampling (docs/ideas/ORIENTED_RECON_SAMPLING.md):
+        when enabled, every training step draws ONE orientation (anticausal
+        with prob ``p_anticausal``).  Set per phase by the adaptive trainer."""
+        self._ros_enabled = bool(enabled)
+        self._ros_p = float(p_anticausal)
+
+    def _draw_recon_orientation(self) -> str:
+        """Orientation of this step from a dedicated generator (seeded from
+        training.seed) so the global RNG stream is untouched."""
+        gen = getattr(self, "_ros_gen", None)
+        if gen is None:
+            gen = torch.Generator()
+            gen.manual_seed(int(self.config.get("training", {}).get("seed", 0) or 0) + 7919)
+            self._ros_gen = gen
+        u = torch.rand((), generator=gen).item()
+        return "anticausal" if u < self._ros_p else "causal"
+
     def training_step(self, batch, batch_idx):
+        if not getattr(self, "_ros_enabled", False):
+            return self._training_step_body(batch, batch_idx)
+        orientation = self._draw_recon_orientation()
+        if not self.model.set_order_orientation(orientation):
+            return self._training_step_body(batch, batch_idx)
+        self.log("recon_order/anticausal_frac", float(orientation == "anticausal"),
+                 on_step=False, on_epoch=True)
+        try:
+            return self._training_step_body(batch, batch_idx)
+        finally:
+            self.model.set_order_orientation("causal")
+
+    def _training_step_body(self, batch, batch_idx):
         # One-off: place every X query at the key centroid before the first step.
         self._maybe_init_query_centroid(batch)
 
@@ -5397,6 +5445,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "anti_adjacency_lambda > 0 replaces the HSIC aggregation: set "
                 f"hsic_aggregation: plain (got {self.hsic_aggregation!r}).")
         self.anti_adjacency_eps = float(tr.get("anti_adjacency_eps", 0.1))
+        # detach_order_mask: the order weight M of the log-ratio is detached
+        # (ablation); the order then learns only through the residuals.
+        self.detach_order_mask = bool(tr.get("detach_order_mask", False))
         self.lambda_l0_selector = float(tr.get("lambda_l0_selector", 0.0))
 
     def _order_residuals(self, S, X, overrides=None, orientation="causal"):
@@ -5439,6 +5490,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         oa = self.model.order_attention()
         _, r_a = self._order_residuals(S, X, overrides, "anticausal")
         M = oa._last_M                      # causal relaxed order, same noise
+        if self.detach_order_mask:
+            M = M.detach()                  # ablation: no gradient via weights
         pi = oa._last_pi.detach()
 
         if self._hsic_bw_frozen_sigmas is not None:

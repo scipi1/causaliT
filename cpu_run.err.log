@@ -1,0 +1,33 @@
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\causaliT\training\experiment_control.py:50: UserWarning: No available sweep found
+  warnings.warn("No available sweep found")
+Seed set to 1
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\torch\__init__.py:1617: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\aten\src\ATen\Context.cpp:85.)
+  _C._set_float32_matmul_precision(precision)
+Seed set to 1
+GPU available: False, used: False
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\pytorch_lightning\callbacks\model_checkpoint.py:751: Checkpoint directory C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\experiments\6_INVESTIGATIONS\ORDER_FIRST\noDARTS_bkd_recon_cpu\k_0\checkpoints exists and is not empty.
+
+  | Name       | Type                   | Params | Mode 
+--------------------------------------------------------------
+0 | model      | AttentionSelectorLayer | 3.5 M  | train
+1 | loss_fn    | MSELoss                | 0      | train
+2 | mae_x      | MeanAbsoluteError      | 0      | train
+3 | rmse_x     | MeanSquaredError       | 0      | train
+4 | r2_x       | R2Score                | 0      | train
+5 | r2_x_endo  | R2Score                | 0      | train
+6 | r2_x_macro | R2Score                | 0      | train
+7 | r2_x_src   | R2Score                | 0      | train
+--------------------------------------------------------------
+3.5 M     Trainable params
+0         Non-trainable params
+3.5 M     Total params
+14.194    Total estimated model params size (MB)
+215       Modules in train mode
+0         Modules in eval mode
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\pytorch_lightning\trainer\connectors\data_connector.py:433: The 'val_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\pytorch_lightning\trainer\connectors\data_connector.py:433: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.
+HSICClassMetrics: no pair HSIC matrix stashed on the module (_last_hsic_pair_mat is None) - hsic_class/* metrics need an attw_softmax aggregation branch; columns will be absent from metrics.csv.
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\pytorch_lightning\trainer\connectors\data_connector.py:433: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.
+C:\Users\ScipioneFrancesco\Documents\Projects\causaliT\venv\Lib\site-packages\pytorch_lightning\trainer\connectors\data_connector.py:433: The 'val_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=19` in the `DataLoader` to improve performance.

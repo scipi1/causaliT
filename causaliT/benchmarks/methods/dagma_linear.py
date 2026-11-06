@@ -49,6 +49,22 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         :class:`BenchmarkResult` with the raw ``W`` in paper orientation
         (``W[i, j] != 0`` means ``i -> j``).
     """
+    return _fit(X, nv=False, **params)
+
+
+def fit_nv(X: np.ndarray, **params: Any) -> BenchmarkResult:
+    """
+    Fit linear DAGMA with the non-equal-variance (GOLEM-NV) score.
+
+    Same hyperparameters as :func:`fit` (as in Ng et al., CLeaR 2024); only the
+    least-squares score is replaced, see :mod:`.nv_scores`.  ``loss_type`` is
+    ignored.
+    """
+    return _fit(X, nv=True, **params)
+
+
+def _fit(X: np.ndarray, nv: bool, **params: Any) -> BenchmarkResult:
+    """Shared body of :func:`fit` (``nv=False``) and :func:`fit_nv`."""
     from dagma.linear import DagmaLinear  # local import: optional dependency
 
     merged = {**DEFAULT_PARAMS, **params}
@@ -58,7 +74,14 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
     s = merged["s"]
     s = [float(v) for v in s] if isinstance(s, (list, tuple)) else float(s)
 
-    model = DagmaLinear(loss_type=str(merged["loss_type"]))
+    if nv:
+        from causaliT.benchmarks.methods.nv_scores import make_dagma_linear_nv
+
+        model = make_dagma_linear_nv()()
+        implementation = "nv_scores.DagmaLinearNV (dagma.linear.DagmaLinear + NV score)"
+    else:
+        model = DagmaLinear(loss_type=str(merged["loss_type"]))
+        implementation = "dagma.linear.DagmaLinear"
 
     start = time.perf_counter()
     W = model.fit(
@@ -82,5 +105,5 @@ def fit(X: np.ndarray, **params: Any) -> BenchmarkResult:
         seconds=seconds,
         params={**merged, "s": s},
         is_binary=False,
-        extra={"implementation": "dagma.linear.DagmaLinear"},
+        extra={"implementation": implementation, "score": "nv" if nv else "ev"},
     )
