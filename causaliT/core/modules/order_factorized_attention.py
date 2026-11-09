@@ -2,58 +2,56 @@
 OrderFactorizedSelfAttention: symmetric variable SELECTION x global causal ORDER.
 Design document: ``docs/ideas/ORDER_FACTORIZED_VISION.md``.
 
-Two symmetric selectors, each owned by ONE stage and toggled independently.
-They never multiply: each forward applies exactly one of them.
+Two symmetric selectors, each owned by ONE stage and chosen by
+``adaptive_training.{recon,structure}.gate_opt``.
 
-* RECONSTRUCTION selector ``G_R`` (``toggle_on_recon_att_selector``):
-  Hard-Concrete existence from the query/key descriptors, routed to the
-  reconstruction parameter group.  Off: ``G_R = 1`` off-diagonal (queries
-  frozen).
-* STRUCTURAL selector ``G_S`` (``toggle_on_struct_att_selector``): free
-  symmetric Hard-Concrete logits (``struct_gate_logits``, structural group),
-  initialised open (``struct_att_selector_init_logit``).
+* RECONSTRUCTION selector ``G_R`` (``recon_gate_opt``):
+  - ``"gated"``: Hard-Concrete existence from the query/key descriptors,
+    routed to the reconstruction parameter group.
+  - ``"softmax"``: competitive weights ``W = softmax_row(S_sym)`` over the
+    AVAILABLE parents (see "Applied weight").
+  - ``"none"``: ``G_R = 1`` off-diagonal (queries frozen).
+* STRUCTURAL selector ``G_S`` (``struct_gate_opt``: ``"gated"`` | ``"none"``):
+  free symmetric Hard-Concrete logits (``struct_gate_logits``, structural
+  group), initialised open (``struct_att_selector_init_logit``).
 
-SHARED selector (``shared_att_selector``): ONE existence matrix
-(``struct_gate_logits``) applied in EVERY forward; the two toggles then
+SHARED selector (``shared_att_selector``, gated only): ONE existence matrix
+(``struct_gate_logits``) applied in EVERY forward; the two gate_opts then
 select which stages TRAIN it (recon loss / structural loss) instead of
-which selector exists.  A stage whose toggle is off applies the shared G
-detached.  Both toggles off is a config error.
+which selector exists.  A stage whose selector is off applies the shared G
+detached.
 
 HANDOFF mode (``shared_att_selector`` + ``struct_att_selector_init="recon"``,
-both toggles on): before the first structure phase only ``G_R`` exists in
-the forwards (trained by reconstruction, order per ``order_path``, i.e. no
-order with ``use_order_in_recon: false``).  On entering the first structure
-phase ``G_S <- G_R`` is copied once and ``G_R`` is retired: from then on
-every forward applies ``G_S``; structure forwards train it (structural
-loss), reconstruction forwards apply it DETACHED (no order with
-``order_path="none"``).  State persists via ``struct_selector_synced``.
+both selectors on): before the first structure phase only ``G_R`` exists in
+the forwards.  On entering the first structure phase ``G_S <- G_R`` is
+copied once and ``G_R`` is retired: from then on every forward applies
+``G_S``; structure forwards train it, reconstruction forwards apply it
+DETACHED.  State persists via ``struct_selector_synced``.
 
-Applied gate per forward:
+Stage policy (``set_stage_policy(stage, gate_sampling, order_sampling)``,
+driven per phase by the adaptive trainer):
 
-* reconstruction forwards (``order_path`` ``"hard"`` / ``"none"``): ``G_R``;
-* structure forwards (``order_path="relaxed"``): ``G_S`` if the structural
-  selector is on, otherwise ``G_R`` (a plain weight: the structural optimizer
-  does not own its parameters), times the relaxed order.
+* ``stage="recon"``: applies ``G_R``; the order never gets gradient.
+* ``stage="structure"``: applies ``G_S`` if on, otherwise ``G_R`` (a plain
+  weight: the structural optimizer does not own its parameters).
+* ``gate_sampling``: ``"hard"`` = exact 0/1 draw ``B ~ Bernoulli(pi)`` with
+  the straight-through gradient ``B + pi - pi.detach()`` (in structure
+  forwards: of the LEARNED ``pi``); ``"soft"`` = Hard-Concrete sample.
+* ``order_sampling``: ``"soft"`` (relaxed Sinkhorn mask ``M``), ``"hard"``
+  (the step's sampled hard order, detached), ``"hard_st"`` (structure:
+  hard forward, gradient of ``M``), ``"oriented"`` (recon: hard order at a
+  dedicated Gumbel scale with per-step orientation,
+  docs/ideas/ORIENTED_RECON_SAMPLING.md) or ``"none"`` (no order mask).
 
-The LEARNED graph (posterior, exclusion graph, ``_last_pi``) uses ``pi_S``
-when the structural selector is on, ``pi_R`` otherwise.  The structural
-objective (``training.anti_adjacency_lambda``) lives in the forecaster; this
-module exposes the hooks it needs:
+The EDGE (posterior, exclusion graph, ``_last_pi``, L0) is existence x
+order with the existence coming ONLY from ``G_S`` (or the shared G):
+``E = pi_S * M``; without ``G_S``, ``E = M`` (full DAG of the order).
+``G_R`` (gate or softmax) is a RECONSTRUCTION mixing weight and never
+enters the edge; it is never L0-penalized either: the L0 penalty
+(``lambda_l0``) applies to ``G_S`` / the shared G only.
 
-* ``gate_mode`` (``set_gate_mode``, from ``adaptive_training.recon_gates``):
-  ``G_R`` of reconstruction forwards.  ``"hard"``: exact 0/1 draw
-  ``B ~ Bernoulli(pi)`` with the straight-through gradient
-  ``B + pi - pi.detach()``.  ``"soft"``: Hard-Concrete sample.  On the
-  relaxed (structure) path the gate mode comes from
-  ``struct_gate_mode`` (``set_struct_gate_mode``, from
-  ``adaptive_training.structure.struct_gates``, default ``"soft"``);
-  ``"hard"`` applies the ST Bernoulli of the LEARNED ``pi``.
-* ``order_path`` (``set_order_path``): ``"relaxed"`` (structure phases,
-  Sinkhorn mask with gradient), ``"hard"`` (the step's sampled hard order,
-  detached; ``use_order_in_recon: true``) or ``"none"`` (no order mask:
-  nodewise regression on the symmetric selection).
-* Batch-key dropout (``BKDMixin``): constant per-key keep mask applied
-  last; dropped keys get zero weight and zero gradient.
+* Batch-key dropout (``BKDMixin``): constant per-key keep mask; dropped keys
+  get zero weight and zero gradient.
 * ``orientation`` (``set_orientation``): ``"causal"`` applies ``Z = G * M``
   (each node attends to its selected EARLIER nodes); ``"anticausal"`` applies
   ``Z = G * M^T`` (selected LATER nodes), used by the anti-causal term.
@@ -79,12 +77,20 @@ COL = PARENT, i.e. the transpose.
 
 Applied weight
 ==============
-``A = (G * M_path * keep)^T`` with ``G`` the existence gate (``gate_mode``;
-always soft on the relaxed order path), ``M_path`` the order mask
-(``order_path``: relaxed ``M``, hard ``M_hard`` from a maximum-weight
-assignment on the perturbed scores, or all-ones off-diagonal) and ``keep``
-the BKD key mask.  With ``order_straight_through`` the relaxed path uses
-``M_hard`` forward and the gradient of ``M``.
+``M_path`` is the stage's order mask (``order_sampling``), ``keep`` the BKD
+key mask.
+
+* gated / none: ``A = (G * M_path * keep)^T``.  Masking REMOVES mass.
+* softmax: ``A = G_S^T * W`` with (child <- parent)
+  ``W_ij = softmax_j(S_ij + log M_ij)`` over the available parents.  Hard
+  masks (diagonal, hard order, BKD, hard_mask) enter as -inf, the soft
+  order as the log-prior ``log M`` (zero gradient at exact zero priors).
+  Masking RENORMALIZES the survivors and preserves their
+  ratios, so the regressor input keeps its scale under any order.
+  ``hard_st``: ``W_hard + W_soft - W_soft.detach()``.  ``G_S`` (structure
+  forwards, if on) multiplies afterwards without renormalization.  Rows
+  with no available parent are zero.  ``S_sym`` is detached in structure
+  forwards (owned by reconstruction).
 
 Noise is GLOBAL: drawn once per gradient step by :meth:`resample` (called by
 the forecaster at the start of each training step) and reused by every
@@ -100,7 +106,7 @@ Descendant exclusion
   ``order_exclusion_existence="sample"`` the training-time existence is the
   step's ``Bernoulli(pi)`` draw instead (with hard gates and the hard order
   path it is exactly the applied DAG).  The exclusion graph always uses the
-  order, also when ``order_path="none"``.
+  order, also when ``order_sampling="none"``.
 * Attached (ablation): :meth:`soft_descendant_scores` returns the
   differentiable soft closure of the relaxed ``pi * M``.
 """
@@ -125,8 +131,16 @@ from causaliT.utils.query_norm import (
 __all__ = ["OrderFactorizedSelfAttention", "log_sinkhorn", "hard_assignment"]
 
 
-_ORDER_PATHS = ("relaxed", "hard", "none")
+_STAGES = ("recon", "structure")
 _GATE_MODES = ("hard", "soft")
+_RECON_GATE_OPTS = ("gated", "softmax", "none")
+_STRUCT_GATE_OPTS = ("gated", "none")
+# Order sampling per stage.  "oriented" is the hard order with a dedicated
+# Gumbel scale and a per-step orientation (driven by trainer / forecaster).
+_ORDER_SAMPLING = {
+    "recon": ("none", "hard", "soft", "oriented"),
+    "structure": ("soft", "hard", "hard_st", "none"),
+}
 _ORIENTATIONS = ("causal", "anticausal")
 _R_INITS = ("flat", "random")
 _TNORMS = ("min", "prod")
@@ -182,11 +196,13 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         order_exclusion_existence: Existence of the detached exclusion graph
             in training: ``"threshold"`` (``pi > thr``) or ``"sample"``
             (``Bernoulli(pi)``, the step's draw).  Eval always thresholds.
-        toggle_on_recon_att_selector: Learned reconstruction selector ``G_R``
-            (True) or all-ones (False; with the structural selector also off
-            the graph is the full DAG of the order, order-only ablation).
-        toggle_on_struct_att_selector: Learned structural selector ``G_S``,
-            applied in structure forwards only (relaxed order path).
+        recon_gate_opt: Reconstruction selector ``G_R``
+            (``adaptive_training.recon.gate_opt``): ``"gated"`` (Hard-Concrete
+            gate), ``"softmax"`` (row softmax of ``S_sym`` over the available
+            parents) or ``"none"`` (all-ones; queries frozen).
+        struct_gate_opt: Structural selector ``G_S``
+            (``adaptive_training.structure.gate_opt``): ``"gated"`` or
+            ``"none"``.  Applied in structure forwards only.
         struct_att_selector_init_logit: Initial ``G_S`` logit.  2.0 gives
             ``pi_S ~ 0.88`` (mostly open) while ~18% of the Hard-Concrete
             draws stay unclamped (with gradient) at beta = 0.5; higher
@@ -203,9 +219,6 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             every forward; the two toggles select which stages train it (see
             module docstring).  Incompatible with
             ``struct_att_selector_init="recon"``.
-        order_straight_through: Relaxed training forward uses the step's hard
-            order ``M_hard`` with the gradient of the Sinkhorn mask ``M``
-            (``M_hard + M - M.detach()``).  Eval is unaffected.
         batch_key_dropout*: BKD settings (see ``BKDMixin``); usually driven
             per phase by the adaptive trainer.
     """
@@ -227,12 +240,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         order_detach_exclusion: bool = True,
         order_exclusion_tnorm: str = "min",
         order_exclusion_existence: str = "threshold",
-        toggle_on_recon_att_selector: bool = True,
-        toggle_on_struct_att_selector: bool = False,
+        recon_gate_opt: str = "gated",
+        struct_gate_opt: str = "none",
         struct_att_selector_init_logit: float = 2.0,
         struct_att_selector_init: str = "constant",
         shared_att_selector: bool = False,
-        order_straight_through: bool = False,
         batch_key_dropout: Optional[float] = None,
         batch_key_dropout_p_final: Optional[float] = None,
         batch_key_dropout_annealing_batches: Optional[int] = None,
@@ -275,16 +287,34 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             raise ValueError(
                 f"struct_att_selector_init must be one of {_STRUCT_INITS}, "
                 f"got {struct_att_selector_init!r}.")
-        if struct_att_selector_init == "recon" and not (
-                toggle_on_struct_att_selector and toggle_on_recon_att_selector):
+        if recon_gate_opt not in _RECON_GATE_OPTS:
             raise ValueError(
-                "struct_att_selector_init='recon' requires both "
-                "toggle_on_struct_att_selector and toggle_on_recon_att_selector.")
-        if shared_att_selector:
-            if not (toggle_on_recon_att_selector or toggle_on_struct_att_selector):
-                raise ValueError(
-                    "shared_att_selector=True with both selector toggles off: "
-                    "the shared G would never be trained.")
+                f"recon gate_opt must be one of {_RECON_GATE_OPTS}, got {recon_gate_opt!r}.")
+        if struct_gate_opt not in _STRUCT_GATE_OPTS:
+            raise ValueError(
+                f"structure gate_opt must be one of {_STRUCT_GATE_OPTS}, got {struct_gate_opt!r}.")
+        # Both 'none' is the order-only ablation (graph = full DAG of the order).
+        recon_on = recon_gate_opt != "none"
+        struct_on = struct_gate_opt != "none"
+        if shared_att_selector and not (recon_on or struct_on):
+            raise ValueError(
+                "shared_att_selector with both gate_opt 'none': the shared G "
+                "would never be trained.")
+        if struct_att_selector_init == "recon" and not (struct_on and recon_on):
+            raise ValueError(
+                "struct_att_selector_init='recon' requires recon.gate_opt != "
+                "'none' and structure.gate_opt == 'gated'.")
+        if shared_att_selector and struct_gate_opt == "none":
+            raise ValueError("shared_att_selector requires structure.gate_opt='gated'.")
+        if shared_att_selector and recon_gate_opt == "softmax":
+            raise ValueError(
+                "shared_att_selector is incompatible with recon.gate_opt="
+                "'softmax' (the shared G is a multiplicative gate).")
+        if struct_att_selector_init == "recon" and recon_gate_opt == "softmax":
+            raise ValueError(
+                "struct_att_selector_init='recon' is incompatible with "
+                "recon.gate_opt='softmax': softmax scores are not existence "
+                "logits and cannot seed G_S.")
 
         self.num_nodes = N
         self.dropout = nn.Dropout(attention_dropout)
@@ -306,8 +336,13 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.detach_exclusion = bool(order_detach_exclusion)
         self.exclusion_tnorm = str(order_exclusion_tnorm)
         self.exclusion_existence = str(order_exclusion_existence)
-        self.recon_selector_on = bool(toggle_on_recon_att_selector)
-        self.struct_selector_on = bool(toggle_on_struct_att_selector)
+        self.recon_gate_opt = str(recon_gate_opt)
+        self.struct_gate_opt = str(struct_gate_opt)
+        self.recon_selector_on = recon_on
+        self.struct_selector_on = struct_on
+        # softmax: G_R is a row softmax of S_sym over the AVAILABLE parents
+        # (order / BKD masks renormalize); G_S still multiplies afterwards.
+        self.recon_softmax = self.recon_gate_opt == "softmax"
         # Shared mode: ONE existence matrix (struct_gate_logits) applied in
         # every forward; the toggles then select WHICH stages train it
         # (recon loss / structural loss) instead of which selector exists.
@@ -317,7 +352,6 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         # After the handoff only the structural loss trains G_S; recon
         # forwards apply it detached.
         self.handoff = self.shared_selector and str(struct_att_selector_init) == "recon"
-        self.straight_through = bool(order_straight_through)
         self.gate_mode = "hard"
         self.struct_gate_mode = "soft"     # gate of relaxed (structure) forwards
         self._init_bkd(batch_key_dropout, batch_key_dropout_p_final,
@@ -350,7 +384,10 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.register_buffer("mu", (N + 1) / 2.0 - k, persistent=False)
         self.register_buffer("T", torch.triu(torch.ones(N, N), diagonal=1), persistent=False)
 
-        self.order_path = "relaxed"
+        # Stage policy (set_stage_policy): which selector / order mask the
+        # forward applies.  Default = structure stage, soft order.
+        self.stage = "structure"
+        self.order_sampling = "soft"
         # Gumbel scale of the APPLIED hard order in recon forwards
         # (None = use noise_scale; see set_recon_noise_scale).
         self.recon_noise_scale: Optional[float] = None
@@ -369,33 +406,51 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
     # Phase / noise control
     # ------------------------------------------------------------------
     def set_recon_noise_scale(self, value: Optional[float]) -> None:
-        """Gumbel scale of the applied hard order (order_path="hard",
-        training only).  None restores the structural ``noise_scale``."""
+        """Gumbel scale of the applied order with ``order_sampling=
+        "oriented"`` (training only).  None = structural ``noise_scale``."""
         if value is not None and value < 0.0:
             raise ValueError(f"recon_noise_scale must be >= 0, got {value}.")
         self.recon_noise_scale = None if value is None else float(value)
 
-    def set_order_path(self, mode: str) -> None:
-        """Order mask of the applied weight: ``"relaxed"``, ``"hard"`` or
-        ``"none"``."""
-        if mode not in _ORDER_PATHS:
-            raise ValueError(f"order_path must be one of {_ORDER_PATHS}, got {mode!r}.")
-        self.order_path = mode
+    def set_stage_policy(
+        self,
+        stage: str,
+        gate_sampling: Optional[str] = None,
+        order_sampling: Optional[str] = None,
+    ) -> None:
+        """Select the forward of a training stage.
 
-    def set_gate_mode(self, mode: str) -> None:
-        """Existence gate of non-relaxed forwards: ``"hard"`` (straight-
-        through Bernoulli) or ``"soft"`` (Hard-Concrete)."""
-        if mode not in _GATE_MODES:
-            raise ValueError(f"gate_mode must be one of {_GATE_MODES}, got {mode!r}.")
-        self.gate_mode = mode
-
-    def set_struct_gate_mode(self, mode: str) -> None:
-        """Existence gate of relaxed (structure) forwards: ``"soft"``
-        (Hard-Concrete, default) or ``"hard"`` (straight-through Bernoulli
-        of the learned ``pi``)."""
-        if mode not in _GATE_MODES:
-            raise ValueError(f"struct_gate_mode must be one of {_GATE_MODES}, got {mode!r}.")
-        self.struct_gate_mode = mode
+        Args:
+            stage: ``"recon"`` or ``"structure"``.  Decides which selector
+                is applied / trained (see module docstring).
+            gate_sampling: ``"hard"`` (straight-through Bernoulli) or
+                ``"soft"`` (Hard-Concrete) gate of THIS stage; None keeps
+                the stage's current value.  Ignored by ``gate_opt="softmax"``
+                (deterministic weights).
+            order_sampling: applied order mask of this stage; None keeps the
+                current value.  recon: none | hard | soft | oriented;
+                structure: soft | hard | hard_st | none.
+        """
+        if stage not in _STAGES:
+            raise ValueError(f"stage must be one of {_STAGES}, got {stage!r}.")
+        if gate_sampling is not None and gate_sampling not in _GATE_MODES:
+            raise ValueError(
+                f"gate_sampling must be one of {_GATE_MODES}, got {gate_sampling!r}.")
+        if order_sampling is None:
+            order_sampling = self.order_sampling if stage == self.stage else (
+                "none" if stage == "recon" else "soft")
+        if order_sampling not in _ORDER_SAMPLING[stage]:
+            raise ValueError(
+                f"{stage} order_sampling must be one of {_ORDER_SAMPLING[stage]}, "
+                f"got {order_sampling!r}.")
+        self.stage = stage
+        if gate_sampling is not None:
+            if stage == "recon":
+                self.gate_mode = gate_sampling
+            else:
+                self.struct_gate_mode = gate_sampling
+        if order_sampling is not None:
+            self.order_sampling = order_sampling
 
     def set_orientation(self, mode: str) -> None:
         """Select the applied orientation: ``"causal"`` (G * M) or
@@ -488,6 +543,36 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         """Hard-Concrete inclusion probability ``P(z > 0)``."""
         return torch.sigmoid(S_sym - self._l0_offset - self.edge_offset)
 
+    @staticmethod
+    def _masked_softmax(
+        scores: torch.Tensor,
+        avail: torch.Tensor,
+        prior: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Row softmax over the available entries, with an optional prior.
+
+        ``W_ij = avail_ij * prior_ij * exp(s_ij) / sum_k avail_ik * prior_ik * exp(s_ik)``,
+        i.e. ``softmax_j(s_ij + log prior_ij)`` with ``avail == 0`` as -inf.
+        Log-domain normalization avoids underflow from unavailable maxima.
+        Exact zero priors have zero gradient by convention; positive priors
+        retain the log-prior gradient. Rows with no mass are zero.
+
+        Args:
+            scores: ``(N, N)`` logits (child <- parent).
+            avail: ``(N, N)`` binary availability (0 = hard-masked).
+            prior: optional ``(N, N)`` soft mask in [0, 1] (e.g. relaxed order).
+        """
+        is_av = avail > 0
+        logits = scores
+        if prior is not None:
+            is_av = is_av & (prior > 0)
+            safe_prior = torch.where(is_av, prior, torch.ones_like(prior))
+            logits = logits + safe_prior.log()
+        has_mass = is_av.any(dim=-1, keepdim=True)
+        logits = logits.masked_fill(~is_av, float("-inf"))
+        logits = torch.where(has_mass, logits, torch.zeros_like(logits))
+        return torch.softmax(logits, dim=-1).masked_fill(~is_av, 0.0)
+
     def _struct_logits(self) -> torch.Tensor:
         """Symmetric ``G_S`` logits (strict upper triangle mirrored)."""
         return self._mirror_upper(self.struct_gate_logits)
@@ -500,19 +585,18 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         return S_sym, self.inclusion_prob(S_sym) * off
 
     def structural_pi(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
-        """Existence probability of the LEARNED graph: ``pi_S`` if the
-        structural selector is on, else ``pi_R`` (zero diagonal)."""
+        """Existence of the EDGE: ``pi_S`` (or the shared G) when the
+        structural selector is on, else all-ones (edge = full DAG of the
+        order).  ``pi_R`` never enters the edge: ``G_R`` is a reconstruction
+        mixing weight, not an edge existence."""
         off = 1.0 - torch.eye(self.num_nodes, device=query.device, dtype=query.dtype)
-        if self.handoff and not self.shared_active:
-            return self._recon_pi(query, key, off)[1]     # pre-handoff: G_R
-        if self.shared_selector:
+        if self.shared_active:
             # No edge_offset: the shared G is the learned existence in every
             # phase and its gate is centred at the l0 offset only.
             return torch.sigmoid(self._struct_logits() - self._l0_offset) * off
-        if self.struct_selector_on:
-            # No edge_offset: the drift offset belongs to G_R only.
+        if self.struct_selector_on and not (self.handoff and not self.shared_active):
             return torch.sigmoid(self._struct_logits() - self._l0_offset) * off
-        return self._recon_pi(query, key, off)[1]
+        return off
 
 
     # ------------------------------------------------------------------
@@ -548,12 +632,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             )
 
         off = 1.0 - torch.eye(N, device=query.device, dtype=query.dtype)
-        # pi_R: reconstruction selector (all-ones when toggled off).  pi_S:
-        # structural selector.  ``pi`` = existence of the LEARNED graph.
-        # Shared mode: ONE G (struct_gate_logits) everywhere; the stage's
-        # toggle decides whether this forward is attached (training stage)
-        # or detached (the other stage merely applies the current G).
-        relaxed = self.order_path == "relaxed"
+        # pi_R: G_R inclusion probability of the MIXING gate only (never the
+        # edge).  pi_S / shared G: existence of the EDGE (posterior, exclusion
+        # graph, L0); without G_S the edge is the full DAG of the order
+        # (pi = off), so nothing from reconstruction enters the structure.
+        is_struct = self.stage == "structure"
         if self._struct_sync_pending:
             # One-off G_S <- G_R: identical existence (pi_S = pi_R) and, with
             # G_S's offset fixed at 0, the identical relaxed gate.  Done
@@ -574,9 +657,9 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             if self.handoff:
                 # Post-handoff: only the structural loss trains G_S; recon
                 # forwards apply it detached.
-                train_stage = relaxed
+                train_stage = is_struct
             else:
-                train_stage = self.struct_selector_on if relaxed else self.recon_selector_on
+                train_stage = self.struct_selector_on if is_struct else self.recon_selector_on
             L_use = L_S if train_stage else L_S.detach()
             pi = torch.sigmoid(L_use - self._l0_offset) * off
         else:
@@ -588,7 +671,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
                 L_S = self._struct_logits()
                 pi = torch.sigmoid(L_S - self._l0_offset) * off
             else:
-                pi = pi_R
+                pi = off
         theta = self.theta()
         noise = self._get_noise() if self.training else None
         perturbed = theta + self.noise_scale * noise["gumbel"] if self.training else theta
@@ -599,25 +682,47 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         M = self.order_mask(P)                              # source -> target
         M_hard = self.order_mask(hard_assignment(perturbed))
 
-        # Straight-through order (training only): forward value = the step's
-        # hard order, gradient = that of the relaxed Sinkhorn mask.
-        M_fwd = (M_hard + M - M.detach()) if (self.straight_through and self.training) else M
-        # Applied orientation: the anti-causal pass flips every selected edge
-        # (each node then attends to its selected LATER nodes).
-        # Oriented recon sampling (docs/ideas/ORIENTED_RECON_SAMPLING.md):
-        # on the hard path the APPLIED order may use a dedicated Gumbel scale
-        # (same noise draw).  The structural M_hard (posterior / exclusion)
-        # is unchanged.
-        if (self.training and self.order_path == "hard"
-                and self.recon_noise_scale is not None):
+        # Applied order (source -> target) of this stage, as a pair
+        # (M_soft, M_hard_app): M_soft carries the gradient (None = no
+        # gradient path), M_hard_app the forward value of hard sampling.
+        #   soft     -> (M, None)            relaxed Sinkhorn mask
+        #   hard     -> (None, M_hard)       sampled hard order, detached
+        #   hard_st  -> (M, M_hard)          hard forward, relaxed gradient
+        #   oriented -> (None, M_rec)        hard order at the recon Gumbel
+        #               scale (docs/ideas/ORIENTED_RECON_SAMPLING.md)
+        #   none     -> (None, None)         no order mask
+        # Recon forwards never train the order: their M is detached.
+        # The structural M_hard (posterior / exclusion) is unchanged.
+        osamp = self.order_sampling
+        if osamp == "oriented" and self.training and self.recon_noise_scale is not None:
             M_rec = self.order_mask(hard_assignment(
                 theta + self.recon_noise_scale * noise["gumbel"]))
         else:
             M_rec = M_hard
-        if self.orientation == "anticausal":
-            M_fwd, M_app_hard = M_fwd.transpose(0, 1), M_rec.transpose(0, 1)
+        M_rel = M if is_struct else M.detach()
+        if osamp == "soft":
+            M_soft, M_hard_app = M_rel, None
+        elif osamp == "hard_st":
+            # Eval keeps the relaxed mask (as the former straight-through flag).
+            M_soft, M_hard_app = (M_rel, M_hard) if self.training else (M_rel, None)
+        elif osamp in ("hard", "oriented"):
+            M_soft, M_hard_app = None, M_rec
         else:
-            M_app_hard = M_rec
+            M_soft, M_hard_app = None, None
+        # Applied orientation: the anti-causal pass flips every selected edge
+        # (each node then attends to its selected LATER nodes).
+        if self.orientation == "anticausal":
+            M_soft = None if M_soft is None else M_soft.transpose(0, 1)
+            M_hard_app = None if M_hard_app is None else M_hard_app.transpose(0, 1)
+        # Multiplicative applied order (gated mode): ST combination for hard_st.
+        if M_soft is not None and M_hard_app is not None:
+            M_mult = M_hard_app + M_soft - M_soft.detach()
+        elif M_soft is not None:
+            M_mult = M_soft
+        elif M_hard_app is not None:
+            M_mult = M_hard_app
+        else:
+            M_mult = off
 
         def _relaxed_gate(logits, noise_key, offset):
             if self.training:
@@ -629,23 +734,34 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             return (s_e * (self.zeta - self.gamma) + self.gamma).clamp(0.0, 1.0) * off
 
         # Step's Bernoulli draws (train only, same uniforms): of pi_R for the
-        # hard reconstruction gate, of the learned pi for the exclusion graph.
-        # Shared mode: both draws come from the shared pi.
+        # hard reconstruction MIXING gate, of the EDGE existence pi for the
+        # exclusion graph (all-ones without G_S).
         if self.training:
             base_draw = pi.detach() if shared else pi_R.detach()
             B_draw = self._mirror_upper((noise["bern"] < base_draw).to(pi.dtype))
-            B_learn = (self._mirror_upper((noise["bern"] < pi.detach()).to(pi.dtype))
-                       if (struct_on or shared) else B_draw)
+            B_learn = self._mirror_upper((noise["bern"] < pi.detach()).to(pi.dtype))
         else:
             B_draw = B_learn = None
 
-        # 1) Applied gate: ONE selector per forward, never both.
-        #    structure (relaxed order path): G_S if on, else G_R (soft, or
-        #    ST Bernoulli of the learned pi when struct_gate_mode == "hard");
-        #    reconstruction (hard / none): G_R per gate_mode.
+        # 1) Structural or shared gate, followed by separate G_R composition.
+        #    structure: G_S if on, else G_R (soft, or ST Bernoulli of the
+        #    learned pi when struct_gate_mode == "hard");
+        #    reconstruction: G_R per gate_mode.
         #    Shared mode: the shared G everywhere, per the stage's gate mode.
-        if shared:
-            if relaxed:
+        #    recon gate_opt="softmax": G_R is NOT a multiplicative gate; it
+        #    is the row softmax W built in step 2, so G = 1 except for G_S
+        #    in structure forwards (multiplies W, no renormalization).
+        if self.recon_softmax:
+            if is_struct and struct_on:
+                if self.struct_gate_mode == "hard":
+                    G = (B_learn + pi - pi.detach()) if self.training else \
+                        (pi.detach() > self.existence_threshold).to(pi.dtype)
+                else:
+                    G = _relaxed_gate(L_S, "hc_s", 0.0)
+            else:
+                G = off
+        elif shared:
+            if is_struct:
                 if self.struct_gate_mode == "hard":
                     G = (B_learn + pi - pi.detach()) if self.training else \
                         (pi.detach() > self.existence_threshold).to(pi.dtype)
@@ -656,35 +772,73 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
                     (pi.detach() > self.existence_threshold).to(pi.dtype)
             else:
                 G = _relaxed_gate(L_use, "hc", self.edge_offset)
-        elif relaxed and self.struct_gate_mode == "hard" and (
+        elif is_struct and self.struct_gate_mode == "hard" and (
                 self.struct_selector_on or self.recon_selector_on):
-            # Hard structure gates (structure.struct_gates: hard): ST Bernoulli
-            # of the LEARNED existence (pi_S if on, else pi_R), same draw as
-            # the exclusion graph; eval thresholds it.
+            # Hard structure gates: ST Bernoulli of the MIXING gate: the edge
+            # existence pi_S when G_S is on, else the G_R inclusion pi_R.
+            # Eval thresholds it.
+            pi_mix = pi if struct_on else pi_R
+            B_mix = B_learn if struct_on else B_draw
             if self.training:
-                G = B_learn + pi - pi.detach()
+                G = B_mix + pi_mix - pi_mix.detach()
             else:
-                G = (pi.detach() > self.existence_threshold).to(pi.dtype)
-        elif relaxed and struct_on:
+                G = (pi_mix.detach() > self.existence_threshold).to(pi_mix.dtype)
+        elif is_struct and struct_on:
             G = _relaxed_gate(L_S, "hc_s", 0.0)
         elif not self.recon_selector_on:
             G = off
-        elif not relaxed and self.gate_mode == "hard":
+        elif not is_struct and self.gate_mode == "hard":
             if self.training:
                 G = B_draw + pi_R - pi_R.detach()           # straight-through
             else:
                 G = (pi_R.detach() > self.existence_threshold).to(pi.dtype)
         else:
             G = _relaxed_gate(S_sym, "hc", self.edge_offset)
-        # 2) Order mask: relaxed (with gradient), hard (detached) or none.
-        if relaxed:
-            Z = G * M_fwd
-        elif self.order_path == "hard":
-            Z = G * M_app_hard
-        else:
-            Z = G * off
+        # Separate G_R and G_S compose multiplicatively in structure forwards.
+        # Shared/handoff gates are applied once, never squared.
+        if is_struct and struct_on and not shared and not self.recon_softmax:
+            if not self.recon_selector_on:
+                G_R = off
+            elif self.gate_mode == "hard":
+                G_R = B_draw if self.training else (
+                    pi_R.detach() > self.existence_threshold).to(pi.dtype)
+            else:
+                G_R = _relaxed_gate(S_sym.detach(), "hc", self.edge_offset)
+            G = G * G_R.detach()
+        # Batch-key dropout: constant per-key mask (no gradient to dropped
+        # keys).  Drawn once per forward; diagnostics stay BKD-free.
+        keep = self._bkd_keep(N, query.device)
+        hm = None
+        if hard_mask is not None:
+            hm = (hard_mask[0] if hard_mask.dim() == 3 else hard_mask).to(query.dtype)
 
-        A = Z.transpose(0, 1)                               # child <- parent
+        # 2) Applied weight (child <- parent layout).
+        if self.recon_softmax:
+            # Row softmax of the symmetric score over the AVAILABLE parents:
+            # hard masks (diagonal, hard order, BKD, hard_mask) act as -inf,
+            # the soft order as the log-prior log M (zero gradient at exact
+            # zero priors). G_S multiplies afterwards (no renorm).
+            avail = off
+            if keep is not None:
+                avail = avail * keep.to(avail.dtype).view(1, N)
+            if hm is not None:
+                avail = avail * hm
+            Mt_soft = None if M_soft is None else M_soft.transpose(0, 1)
+            Mt_hard = None if M_hard_app is None else M_hard_app.transpose(0, 1)
+            # Scores are owned by reconstruction: detached in structure forwards.
+            S_w = S_sym.detach() if is_struct else S_sym
+            if Mt_soft is not None and Mt_hard is not None:
+                W_soft = self._masked_softmax(S_w, avail, Mt_soft)
+                W_hard = self._masked_softmax(S_w, avail * Mt_hard, None)
+                W = W_hard + W_soft - W_soft.detach()
+            elif Mt_hard is not None:
+                W = self._masked_softmax(S_w, avail * Mt_hard, None)
+            else:
+                W = self._masked_softmax(S_w, avail, Mt_soft)
+            A = G.transpose(0, 1) * W
+        else:
+            # Gated: multiplicative gate x order (masking removes mass).
+            A = (G * M_mult).transpose(0, 1)
         # Returned posterior (child <- parent).  Train: relaxed pi * M.  Eval:
         # pi * M_hard with the NOISELESS order, so threshold-at-0.5 DAG
         # extraction reads the learned DAG (pi * M stays below 0.5 while the
@@ -698,14 +852,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         else:
             B_ex = (pi.detach() > self.existence_threshold).to(pi.dtype)
         excl = (B_ex * M_hard).transpose(0, 1)
-        # L0 base: the recon selector normally; the shared G in shared mode.
-        pi_l0 = pi if shared else pi_R
-        if hard_mask is not None:
-            hm = (hard_mask[0] if hard_mask.dim() == 3 else hard_mask).to(A.dtype)
+        # L0 of the EDGE: expected open undirected pairs of G_S (or the
+        # shared G), not masked by the order.  Without G_S there is no
+        # learned existence: zero L0.  G_R is never L0-penalized.
+        pi_l0 = pi if (shared or struct_on) else torch.zeros_like(off)
+        if hm is not None:
             A, posterior, excl, pi_l0 = A * hm, posterior * hm, excl * hm, pi_l0 * hm
 
-        # L0 of the RECONSTRUCTION selector: expected open UNDIRECTED pairs,
-        # not masked by the order (consumed by lambda_l0_selector).
+        # L0: expected open undirected pairs (structural lambda_l0).
         l0_penalty = torch.triu(pi_l0, diagonal=1).sum()
 
         self.score_tensor_for_sparsity = excl.detach()      # hard DAG
@@ -717,9 +871,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             r_sorted = torch.sort(self.order_scores.detach()).values
             self.last_score_gap = float((r_sorted[1:] - r_sorted[:-1]).min())
 
-        # 3) Batch-key dropout: constant per-key mask (no gradient to dropped
-        # keys).  Diagnostics (posterior / exclusion graph) stay BKD-free.
-        keep = self._bkd_keep(N, A.device)
+        # 3) Batch-key dropout on the applied weight (no-op for softmax,
+        # already excluded there).
         if keep is not None:
             A = A * keep.to(A.dtype).view(1, N)
         A_b = self.dropout(A.unsqueeze(0).expand(B, N, N))
@@ -826,13 +979,12 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         return (
             f"OrderFactorizedSelfAttention(N={self.num_nodes}, beta={self.beta}, "
             f"noise_scale={self.noise_scale}, tau={self.perm_tau}, "
-            f"order_path={self.order_path}, detach_exclusion={self.detach_exclusion}, "
+            f"stage={self.stage}, order_sampling={self.order_sampling}, "
+            f"recon_gate_opt={self.recon_gate_opt}, struct_gate_opt={self.struct_gate_opt}, "
+            f"detach_exclusion={self.detach_exclusion}, "
             f"exclusion_existence={self.exclusion_existence}, "
-            f"recon_selector={self.recon_selector_on}, "
-            f"struct_selector={self.struct_selector_on}, "
             f"shared_selector={self.shared_selector}, "
             f"struct_init={self.struct_init}, "
-            f"straight_through={self.straight_through}, "
             f"gate_mode={self.gate_mode}, "
             f"orientation={self.orientation})"
         )

@@ -27,7 +27,8 @@ class Probe(nn.Module):
     def __init__(self):
         super().__init__()
         self.order_scores = nn.Parameter(torch.zeros(3))
-        self.order_path = 'hard'
+        self.stage, self.order_sampling = 'recon', 'hard'
+        self.gate_mode, self.struct_gate_mode = 'hard', 'soft'
         self.model = SimpleNamespace(order_attention=lambda: self)
         self.homogeneous_nodes = True
         self.val_idx = 0
@@ -37,11 +38,11 @@ class Probe(nn.Module):
         self.nhsic_epsilon = 0.01
         self.hsic_kernel_source = 'rbf'
 
-    def set_order_path(self, mode):
-        self.order_path = mode
+    def set_stage_policy(self, stage, gate_sampling=None, order_sampling=None):
+        self.stage, self.order_sampling = stage, order_sampling
 
     def forward(self, data_source, data_intermediate):
-        assert not self.training and self.order_path == 'relaxed'
+        assert not self.training and (self.stage, self.order_sampling) == ('structure', 'soft')
         target = torch.cat([data_source[:, :, 0], data_intermediate[:, :, 0]], 1)
         return torch.zeros_like(target).unsqueeze(-1), None, None
 
@@ -57,7 +58,7 @@ def test_probe_once_and_restore(tmp_path):
     report = initialize_order_from_hsic(f, loader, dict(batch_size=16, n_batches=2), path)
     assert report['status'] == 'applied'
     assert report['batch_sizes'] == [16, 16]
-    assert f.training and f.order_path == 'hard'
+    assert f.training and (f.stage, f.order_sampling) == ('recon', 'hard')
     assert torch.equal(state, torch.random.get_rng_state())
     assert json.loads(path.read_text()) == report
     before = f.order_scores.clone()
@@ -86,6 +87,6 @@ def test_probe_failure_restores_modes(tmp_path, monkeypatch):
     monkeypatch.setattr(init, 'hsic_cross_per_pair', fail)
     with pytest.raises(RuntimeError, match='probe failure'):
         initialize_order_from_hsic(f, loader, {}, tmp_path / 'report.json')
-    assert f.training and f.order_path == 'hard'
+    assert f.training and (f.stage, f.order_sampling) == ('recon', 'hard')
     assert not hasattr(f, '_order_initialization_report')
     assert torch.equal(f.order_scores, torch.zeros(3))

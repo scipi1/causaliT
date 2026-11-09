@@ -168,6 +168,7 @@ from pytorch_lightning.callbacks import Callback
 from torch.utils.data import DataLoader
 
 from causaliT.training.callbacks import KFoldResultsTracker
+from causaliT.training.stage_policy import parse_stage_policy
 
 # Plain-container coercion, score-margin helper, cross-fit partitioner and JSON
 # serializer shared with the rest of the staged-training utilities.
@@ -624,49 +625,15 @@ class PhaseController(Callback):
                 f"adaptive_training.bkd_ladder_phases must be a subset of "
                 f"{_all_phases}, got {sorted(self._bkd_ladder_phases)}.")
 
-        # Reconstruction-forward settings of the order-factorized selector
-        # (global default, overridable per warmup / reconstruct / final block).
-        # Structure phases always use soft gates on the relaxed order.
-        #   recon_gates: hard (straight-through Bernoulli) | soft (Hard-Concrete)
-        #   use_order_in_recon: apply the step's hard order mask (detached)
-        self._recon_gates_default = str(ad.get("recon_gates", "hard"))
-        self._use_order_in_recon_default = bool(ad.get("use_order_in_recon", False))
-        for _blk in (self.warmup_cfg, self.recon_cfg, self.final_cfg, {"recon_gates": self._recon_gates_default}):
-            if _blk.get("recon_gates", "hard") not in ("hard", "soft"):
-                raise ValueError(
-                    "adaptive_training.recon_gates must be 'hard' or 'soft', "
-                    f"got {_blk.get('recon_gates')!r}.")
-        #   recon_order_sampling: {enabled, p_anticausal, noise_scale}; train
-        #   recon on the one-sided hard-order subsets queried by the structural
-        #   stage (docs/ideas/ORIENTED_RECON_SAMPLING.md).  Block keys
-        #   override the global ones key by key.
-        self._recon_order_sampling_default = {
-            "enabled": False, "p_anticausal": 0.5, "noise_scale": 1.0,
-            **dict(ad.get("recon_order_sampling", None) or {})}
-        for _name in ("warmup", "reconstruct", "final_reconstruct"):
-            _ros = self._recon_order_sampling_cfg(_name)
-            if not _ros["enabled"]:
-                continue
-            if self._phase_cfg(_name).get("use_order_in_recon", self._use_order_in_recon_default):
-                raise ValueError(
-                    f"adaptive_training: recon_order_sampling and use_order_in_recon "
-                    f"are distinct methods; both enabled for '{_name}'.")
-            if not 0.0 <= float(_ros["p_anticausal"]) <= 1.0:
-                raise ValueError(
-                    f"recon_order_sampling.p_anticausal must be in [0, 1], got {_ros['p_anticausal']!r}.")
-            if float(_ros["noise_scale"]) < 0.0:
-                raise ValueError(
-                    f"recon_order_sampling.noise_scale must be >= 0, got {_ros['noise_scale']!r}.")
-        #   structure.struct_gates: soft (Hard-Concrete, default) | hard (ST
-        #   Bernoulli of the learned pi): pair with recon_gates for
-        #   hard-hard / soft-soft runs.
-        if self.struct_cfg.get("struct_gates", "soft") not in ("hard", "soft"):
-            raise ValueError(
-                "adaptive_training.structure.struct_gates must be 'hard' or 'soft', "
-                f"got {self.struct_cfg.get('struct_gates')!r}.")
+        # Stage policy of the order-factorized selector (see
+        # causaliT/training/stage_policy.py): recon.{gate_opt, gate_sampling,
+        # order_sampling, oriented}, structure.{gate_opt, gate_sampling,
+        # order_sampling}; recon sampling keys overridable per recon phase.
+        self._stage_policy = parse_stage_policy(ad)
         for _old in ("reconstruct_gate", "dense_gate_mode"):
             if _old in ad:
-                raise ValueError(f"adaptive_training.{_old} is not a key: use recon_gates.")
+                raise ValueError(
+                    f"adaptive_training.{_old} is not a key: use recon.gate_sampling.")
 
         # Per-phase direction-gate bias (GatedSelfAttention direction gate).
         # Managed only when at least one phase block sets ``dir_bias``:
@@ -854,59 +821,51 @@ class PhaseController(Callback):
         return {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
                 "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})
 
-    def _recon_order_sampling_cfg(self, phase: str) -> dict:
-        """recon_order_sampling of ``phase``: global default updated by the block."""
-        default = getattr(self, "_recon_order_sampling_default", None) or {
-            "enabled": False, "p_anticausal": 0.5, "noise_scale": 1.0}
-        return {**default,
-                **dict(self._phase_cfg(phase).get("recon_order_sampling", None) or {})}
-
     def _apply_recon_forward_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
-        """Order-factorized selector forward for ``phase`` (no-op otherwise).
+        """Order-factorized selector stage policy for ``phase`` (no-op otherwise).
 
-        structure: soft gates x relaxed order (gradient to the order).
-        warmup / reconstruct / final_reconstruct: ``recon_gates`` x (hard
-        detached order if ``use_order_in_recon`` else no order mask).
+        structure: ``structure.{gate,order}_sampling``.
+        warmup / reconstruct / final_reconstruct: the phase's effective
+        ``recon.{gate,order}_sampling`` (``oriented`` also sets the recon
+        Gumbel scale and the per-step orientation draw).
         """
         model = getattr(pl_module, "model", None)
-        if model is None or not callable(getattr(model, "set_order_path", None)):
+        if model is None or not callable(getattr(model, "set_stage_policy", None)):
             return
+        pol = self._stage_policy
         if phase == "structure":
-            ok = model.set_order_path("relaxed")
-            gates = str(getattr(self, "struct_cfg", {}).get("struct_gates", "soft"))
-            model.set_gate_mode("soft")
-            if callable(getattr(model, "set_struct_gate_mode", None)):
-                model.set_struct_gate_mode(gates)
-            use_order = True
+            sp = pol["structure"]
+            gates, osamp = sp["gate_sampling"], sp["order_sampling"]
+            ok = model.set_stage_policy("structure", gate_sampling=gates,
+                                        order_sampling=osamp)
             # One-off G_S <- G_R copy (struct_att_selector_init='recon'),
             # applied at the next forward; no-op once synced.
             if callable(getattr(model, "request_struct_selector_sync", None)) \
                     and model.request_struct_selector_sync():
                 logger.info("[adaptive] structural selector G_S initialised "
                             "from G_R at the next forward.")
-            ros_on = False
+            oriented = False
             if callable(getattr(model, "set_recon_noise_scale", None)):
                 model.set_recon_noise_scale(None)
             if callable(getattr(pl_module, "set_recon_order_sampling", None)):
                 pl_module.set_recon_order_sampling(False)
         else:
-            cfg = self._phase_cfg(phase)
-            gates = str(cfg.get("recon_gates", self._recon_gates_default))
-            use_order = bool(cfg.get("use_order_in_recon", self._use_order_in_recon_default))
-            ros = self._recon_order_sampling_cfg(phase)
-            ros_on = bool(ros["enabled"])
-            # Oriented recon sampling: detached hard order at a constant recon
-            # Gumbel scale; orientation drawn per step by the forecaster.
-            ok = model.set_order_path("hard" if (use_order or ros_on) else "none")
-            model.set_gate_mode(gates)
+            sp = pol["phases"].get(phase, pol["phases"]["reconstruct"])
+            gates, osamp = sp["gate_sampling"], sp["order_sampling"]
+            oriented = osamp == "oriented"
+            ok = model.set_stage_policy("recon", gate_sampling=gates,
+                                        order_sampling=osamp)
             if callable(getattr(model, "set_recon_noise_scale", None)):
-                model.set_recon_noise_scale(float(ros["noise_scale"]) if ros_on else None)
+                model.set_recon_noise_scale(
+                    sp["oriented"]["noise_scale"] if oriented else None)
             if callable(getattr(pl_module, "set_recon_order_sampling", None)):
-                pl_module.set_recon_order_sampling(ros_on, float(ros["p_anticausal"]))
+                pl_module.set_recon_order_sampling(
+                    oriented, sp["oriented"]["p_anticausal"])
         if ok:
-            pl_module.log("recon_order_sampling", float(ros_on), on_step=False, on_epoch=True)
-            pl_module.log("recon_gates_hard", float(gates == "hard"), on_step=False, on_epoch=True)
-            pl_module.log("use_order_in_recon", float(use_order), on_step=False, on_epoch=True)
+            pl_module.log("policy/gate_sampling_hard", float(gates == "hard"),
+                          on_step=False, on_epoch=True)
+            pl_module.log("policy/order_sampling_" + osamp, 1.0,
+                          on_step=False, on_epoch=True)
             if (phase == "structure" and self._bkd_managed
                     and not getattr(pl_module, "hsic_bkd_exclude_dropped", True)):
                 bkd_on = any(getattr(m, "_bkd_phase_active", False)

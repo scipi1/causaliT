@@ -52,13 +52,13 @@ def initialize_order_from_hsic(forecaster, loader, config, report_path):
                        num_workers=0, collate_fn=loader.collate_fn,
                        generator=torch.Generator().manual_seed(0))
     modes = [(m, m.training) for m in forecaster.modules()]
-    old_mode = oa.order_path
+    old_mode = (oa.stage, oa.order_sampling, oa.gate_mode, oa.struct_gate_mode)
     device = oa.order_scores.device
     rows, mse, pred_var, target_var = [], [], [], []
     sizes = []
     try:
         forecaster.eval()
-        oa.set_order_path("relaxed")
+        oa.set_stage_policy("structure", order_sampling="soft")
         with torch.random.fork_rng(devices=([device.index] if device.type == "cuda" else [])):
             for index, batch in enumerate(probe):
                 if index >= n_batches:
@@ -84,7 +84,7 @@ def initialize_order_from_hsic(forecaster, loader, config, report_path):
                 target_var.append(target.var(0, unbiased=False).cpu())
                 sizes.append(len(s))
     finally:
-        oa.set_order_path(old_mode)
+        oa.stage, oa.order_sampling, oa.gate_mode, oa.struct_gate_mode = old_mode
         for module, training in modes:
             module.training = training
     if not rows:

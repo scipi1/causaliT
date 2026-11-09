@@ -71,17 +71,25 @@ adaptive_training:
   order_tau_anneal_end: null       # (null -> 0.8 * total_epoch_budget)
   order_noise_final: null          # optional noise target, same window
 
-  # --- Oriented recon sampling (order-factorized selector, optional) --------
-  # Recon forwards (warmup / reconstruct / final) use the step's detached hard
-  # order at a CONSTANT Gumbel scale, with ONE orientation per step
-  # (anticausal w.p. p_anticausal): trains the regressor on the one-sided
-  # subsets queried by the structural stage.  Overridable per block.
-  # Incompatible with use_order_in_recon.  See
-  # docs/ideas/ORIENTED_RECON_SAMPLING.md.
-  recon_order_sampling:
-    enabled: false
-    p_anticausal: 0.5
-    noise_scale: 1.0
+  # --- Stage policy of the order-factorized selector -------------------------
+  # (causaliT/training/stage_policy.py).  gate_opt decides which selector
+  # EXISTS (global); the *_sampling keys decide how it is applied.  The recon
+  # sampling keys (gate_sampling / order_sampling / oriented) can be
+  # overridden per warmup / reconstruct / final_reconstruct block.
+  recon:
+    gate_opt: gated                # gated   : Hard-Concrete G_R (L0)
+                                   # softmax : row softmax of the symmetric
+                                   #           score over the AVAILABLE parents;
+                                   #           order / BKD masks renormalize
+                                   # none    : G_R = 1 (queries frozen)
+    gate_sampling: hard            # hard (ST Bernoulli) | soft (Hard-Concrete)
+    order_sampling: none           # none | hard (detached sampled order) |
+                                   # soft (detached Sinkhorn, log-prior) |
+                                   # oriented (see docs/ideas/
+                                   # ORIENTED_RECON_SAMPLING.md)
+    oriented:                      # used only with order_sampling: oriented
+      p_anticausal: 0.5
+      noise_scale: 1.0
 
   start_phase: reconstruct         # "reconstruct" (warm up predictor first) or
                                    # "structure"
@@ -154,6 +162,11 @@ adaptive_training:
   # --- STRUCTURE phase ------------------------------------------------------
   structure:
     max_epochs: 200                # per-phase safety cap (struct_budget trigger)
+
+    # Stage policy (order-factorized selector; see recon block above).
+    gate_opt: none                 # gated (G_S, Hard-Concrete) | none
+    gate_sampling: soft            # soft | hard (ST Bernoulli of learned pi)
+    order_sampling: soft           # soft (Sinkhorn) | hard | hard_st | none
 
     # Loss weights applied when ENTERING the structure phase.  Any key starting
     # with "lambda" is set as an attribute on the module.  For

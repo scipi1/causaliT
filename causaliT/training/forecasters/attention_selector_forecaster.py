@@ -164,6 +164,7 @@ from causaliT.utils.query_norm import (
 
 
 from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.stage_policy import resolve_gate_opts
 from causaliT.training.nodewise_update import NodewiseQuerySelector
 from causaliT.training.centroid_commit import CentroidCommitController
 from causaliT.training.interference_utils import (
@@ -196,19 +197,17 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # oracle_shd GT buffer); None on the checkpoint-loading path.
         self._data_dir = data_dir
 
-        # Build model.  Removed key order_existence_mode: checkpoints / old
-        # configs are mapped onto the selector toggles ("full" == G_R off).
+        # Build model.  The selector options (which parameters exist) come
+        # from adaptive_training.{recon,structure}.gate_opt.
         mkw = dict(config["model"]["kwargs"])
-        if "order_existence_mode" in mkw:
-            mode = mkw.pop("order_existence_mode")
-            if mode not in ("learned", "full"):
+        for _old in ("order_existence_mode", "toggle_on_recon_att_selector",
+                     "toggle_on_struct_att_selector", "order_straight_through",
+                     "recon_gate_opt", "struct_gate_opt"):
+            if _old in mkw:
                 raise ValueError(
-                    "order_existence_mode was removed: use "
-                    "toggle_on_recon_att_selector / toggle_on_struct_att_selector.")
-            logger.warning(
-                "model.kwargs.order_existence_mode is deprecated: mapped %r to "
-                "toggle_on_recon_att_selector=%s.", mode, mode == "learned")
-            mkw["toggle_on_recon_att_selector"] = mode == "learned"
+                    f"model.kwargs.{_old} is not a key: use adaptive_training."
+                    "recon.gate_opt / structure.gate_opt / structure.order_sampling.")
+        mkw.update(resolve_gate_opts(config))
         self.model = AttentionSelectorLayer(**mkw)
 
         # ----------------------------------------------------------------
@@ -496,15 +495,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.hsic_softmax = self.hsic_aggregation == "attw_softmax"
         self.hsic_direction = self.hsic_aggregation == "direction"
         # ---- Order-factorized selector ------------------------------------
-        #   Two symmetric selectors with fixed owners (model kwargs
-        #   toggle_on_recon_att_selector / toggle_on_struct_att_selector):
-        #     G_R -> reconstruction loss (+ lambda_l0_selector), applied in
+        #   Two symmetric selectors with fixed owners
+        #   (adaptive_training.recon.gate_opt / structure.gate_opt):
+        #     G_R -> reconstruction loss only, applied in
         #            reconstruction forwards (and in structure forwards as a
         #            plain weight when G_S is off)
         #     G_S -> structural loss, applied in structure forwards only
-        #   The order is always structural.  (Gate type / order mask of
-        #   reconstruction forwards: adaptive_training.recon_gates /
-        #   use_order_in_recon.)
+        #   The order is always structural.  (Gate / order sampling per
+        #   stage: adaptive_training.{recon,structure}.{gate,order}_sampling.)
         #   anti_adjacency_lambda: a > 0 replaces the plain HSIC by the causal /
         #     anti-causal log-ratio on the order
         #       L = mean_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)]
@@ -2894,17 +2892,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         alpha = self.lambda_struct_recon
         struct_recon_reg = alpha * loss_x
-        # Order-factorized selector: G_R is a reconstruction parameter, so its
-        # L0 budget rides on the RECON loss with its own coefficient (not
-        # overwritten by per-phase lambda_l0).
-        loss_recon_routed = loss_x
-        if self._order_selector:
-            sel_l0 = self.lambda_l0_selector * l0_penalty
-            loss_recon_routed = loss_x + sel_l0
-            self.log(f"{stage}_l0_selector_reg", sel_l0.detach(),
-                     on_step=False, on_epoch=True)
+        # G_S sparsity belongs exclusively to the structural l0_reg above.
         self._last_loss_components = {
-            "loss_recon": loss_recon_routed,
+            "loss_recon": loss_x,
             "loss_structural": (
                 (1.0 - alpha) * hsic_reg
                 + struct_recon_reg
@@ -5400,8 +5390,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # ------------------------------------------------------------------
     # Order-factorized selector: config + causal / anti-causal log-ratio
     # ------------------------------------------------------------------
-    _SELECTOR_TOGGLES = ("model.kwargs.toggle_on_recon_att_selector / "
-                         "toggle_on_struct_att_selector")
+    _SELECTOR_TOGGLES = ("adaptive_training.recon.gate_opt / "
+                         "structure.gate_opt")
     _LEGACY_ORDER_KEYS = {
         "variable_selection_objective": _SELECTOR_TOGGLES,
         "dual_selector_routing": _SELECTOR_TOGGLES,
@@ -5425,7 +5415,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             logger.warning(
                 "training.variable_selection_objective is deprecated and "
                 "ignored: 'recon' is now the fixed owner of the reconstruction "
-                "selector (see toggle_on_struct_att_selector).")
+                "selector (see adaptive_training.structure.gate_opt).")
             tr = {k: v for k, v in tr.items() if k != "variable_selection_objective"}
         for old, new in self._LEGACY_ORDER_KEYS.items():
             if old in tr:
@@ -5448,7 +5438,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # detach_order_mask: the order weight M of the log-ratio is detached
         # (ablation); the order then learns only through the residuals.
         self.detach_order_mask = bool(tr.get("detach_order_mask", False))
-        self.lambda_l0_selector = float(tr.get("lambda_l0_selector", 0.0))
+        if "lambda_l0_selector" in tr:
+            raise ValueError("lambda_l0_selector was removed: use structural lambda_l0.")
 
     def _order_residuals(self, S, X, overrides=None, orientation="causal"):
         """(target, residuals) of ONE forward under the given orientation.
@@ -5571,10 +5562,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # and later probes measure the same map.
         oa = self.model.order_attention() if (
             gate_mode == "relaxed" and hasattr(self.model, "order_attention")) else None
-        oa_saved = (oa.order_path, oa.gate_mode) if oa is not None else None
+        oa_saved = ((oa.stage, oa.order_sampling, oa.gate_mode, oa.struct_gate_mode)
+                    if oa is not None else None)
         if oa is not None:
-            oa.set_order_path("relaxed")
-            oa.set_gate_mode("soft")
+            oa.set_stage_policy("structure", gate_sampling="soft", order_sampling="soft")
 
         device = next(self.parameters()).device
         total_sum = 0.0
@@ -5600,8 +5591,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             for mod, active, eval_flag in saved:
                 mod.set_dense_gate_mode(active, eval_mode=eval_flag)
             if oa_saved is not None:
-                oa.set_order_path(oa_saved[0])
-                oa.set_gate_mode(oa_saved[1])
+                oa.stage, oa.order_sampling, oa.gate_mode, oa.struct_gate_mode = oa_saved
 
         return total_sum / max(total_count, 1)
 

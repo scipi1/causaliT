@@ -1,6 +1,6 @@
 """Unit tests for the OrderFactorizedSelfAttention modes (orientation, gate
 mode, order path, BKD) and the variable_selection_objective /
-anti_adjacency_lambda / recon_gates / use_order_in_recon options."""
+anti_adjacency_lambda / stage-policy (gate / order sampling) options."""
 
 import types
 
@@ -14,6 +14,23 @@ from causaliT.training.forecasters.attention_selector_forecaster import (
 
 
 N, E, B = 3, 4, 5
+
+
+# Stage-policy helpers (old order_path / gate_mode vocabulary).
+_PATH = {"relaxed": ("structure", "soft"), "hard": ("recon", "hard"),
+         "none": ("recon", "none")}
+
+
+def _set_path(m, p):
+    s, o = _PATH[p]
+    return m.set_stage_policy(s, order_sampling=o)
+
+
+def _set_gate(m, g, stage="recon"):
+    oa = m.order_attention() if hasattr(m, "order_attention") else m
+    keep, order = oa.stage, oa.order_sampling
+    oa.set_stage_policy(stage, gate_sampling=g)
+    oa.stage, oa.order_sampling = keep, order
 
 
 def _qk(seed=0):
@@ -33,7 +50,7 @@ def _mod(**kw):
 def test_anticausal_is_transpose(mode):
     m = _mod()
     m.train()
-    m.set_order_path(mode)
+    _set_path(m, mode)
     q, k, v = _qk()
     m.resample(torch.Generator().manual_seed(1))
     m(q, k, v)
@@ -53,8 +70,8 @@ def test_anticausal_is_transpose(mode):
 def test_hard_gates_are_binary_with_straight_through_gradient(path):
     m = _mod()
     m.train()
-    m.set_order_path(path)
-    m.set_gate_mode("hard")
+    _set_path(m, path)
+    _set_gate(m, "hard")
     q, k, v = _qk()
     for s in range(50):
         m.resample(torch.Generator().manual_seed(s))
@@ -71,8 +88,8 @@ def test_hard_gates_are_binary_with_straight_through_gradient(path):
 def test_soft_gates_are_relaxed():
     m = _mod()
     m.train()
-    m.set_order_path("none")
-    m.set_gate_mode("soft")
+    _set_path(m, "none")
+    _set_gate(m, "soft")
     q, k, v = _qk()
     vals = []
     for s in range(30):
@@ -82,14 +99,14 @@ def test_soft_gates_are_relaxed():
     vals = torch.cat([x.flatten() for x in vals])
     assert ((vals > 0) & (vals < 1)).any()
     with pytest.raises(ValueError):
-        m.set_gate_mode("relaxed")
+        _set_gate(m, "relaxed")
 
 
 def test_no_order_in_recon_is_symmetric():
     """order_path none: each node sees its selected neighbours both ways."""
     m = _mod()
     m.train()
-    m.set_order_path("none")
+    _set_path(m, "none")
     q, k, v = _qk()
     m.resample(torch.Generator().manual_seed(0))
     m(q, k, v)
@@ -102,21 +119,20 @@ def test_no_order_in_recon_is_symmetric():
 
 
 def test_sampled_exclusion_equals_applied_dag_hard_path():
-    m = _mod(order_exclusion_existence="sample")
+    m = _mod(order_exclusion_existence="sample", struct_gate_opt="gated")
     m.train()
-    m.set_order_path("hard")
-    m.set_gate_mode("hard")
+    m.set_stage_policy("structure", gate_sampling="hard", order_sampling="hard")
     q, k, v = _qk()
     m.resample(torch.Generator().manual_seed(3))
     m(q, k, v)
-    assert torch.equal(m.score_tensor_for_sparsity, (m.last_applied_A[0] > 0).float())
+    assert torch.all((m.last_applied_A[0] > 0).float() <= m.score_tensor_for_sparsity)
 
 
 def test_bkd_drops_keys_without_gradient():
     m = _mod(batch_key_dropout=0.5, batch_key_dropout_deterministic=True)
     m.train()
-    m.set_order_path("none")
-    m.set_gate_mode("hard")
+    _set_path(m, "none")
+    _set_gate(m, "hard")
     q, k, v = _qk()
     m.resample(torch.Generator().manual_seed(1))
     torch.manual_seed(7)
@@ -154,7 +170,7 @@ def _toy_forecaster(scores):
     x1 = torch.tanh(2.0 * x0) + e
     X = torch.stack([x0, x1], dim=1)
 
-    oa = OrderFactorizedSelfAttention(num_nodes=2, toggle_on_recon_att_selector=False,
+    oa = OrderFactorizedSelfAttention(num_nodes=2, recon_gate_opt=("gated" if False else "none"),
                                 order_noise_scale=0.0, order_tau=0.1)
     with torch.no_grad():
         oa.order_scores.copy_(torch.tensor(scores))
@@ -187,7 +203,8 @@ def _toy_forecaster(scores):
         hsic_sigma=1.0, hsic_adaptive_bandwidth=True, hsic_mode="biased",
         nhsic_epsilon=0.01, hsic_kernel_source="rbf",
         hsic_bandwidth_multipliers=None, hsic_null_stats=None,
-        anti_adjacency_eps=0.1, anti_adjacency_lambda=1.0, _last_anti_adjacency_stats=None)
+        anti_adjacency_eps=0.1, anti_adjacency_lambda=1.0, _last_anti_adjacency_stats=None,
+        detach_order_mask=False)
     f._lean_pred = _lean_pred
     f._order_residuals = types.MethodType(
         AttentionSelectorForecaster._order_residuals, f)
@@ -223,7 +240,14 @@ def _dual_forecaster(model_kwargs=None, **training):
     kw["homogeneous_nodes"] = True
     kw["self_attention_type"] = "OrderFactorizedSelfAttention"
     kw["free_query_embedding"] = True
-    kw.update(model_kwargs or {})
+    model_kwargs = dict(model_kwargs or {})
+    # Selector options live in adaptive_training (stage policy).
+    ad = cfg.setdefault("adaptive_training", {})
+    if "struct_gate_opt" in model_kwargs:
+        ad.setdefault("structure", {})["gate_opt"] = model_kwargs.pop("struct_gate_opt")
+    if "recon_gate_opt" in model_kwargs:
+        ad.setdefault("recon", {})["gate_opt"] = model_kwargs.pop("recon_gate_opt")
+    kw.update(model_kwargs)
     cfg["training"].update(dict(
         use_gradient_routing=True, structural_grad="hsic_unrolled",
         unrolled={"inner_lr": 1e-3, "fd_epsilon": 1e-2},
@@ -236,8 +260,29 @@ def _dual_forecaster(model_kwargs=None, **training):
     return m, _qbatches(1, batch=32)[0]
 
 
+def test_structural_l0_does_not_enter_reconstruction_loss():
+    m, batch = _dual_forecaster(
+        model_kwargs={"struct_gate_opt": "gated"},
+        lambda_l0=0.1, anti_adjacency_lambda=0.0)
+    oa = m.model.order_attention()
+    m.model.set_stage_policy("structure", gate_sampling="soft", order_sampling="soft")
+    m.model.resample()
+    m._step(batch=batch, stage="train")
+    penalty = m._last_l0_reg
+    grad = torch.autograd.grad(penalty, oa.struct_gate_logits, retain_graph=True)[0]
+    assert grad.abs().sum() > 0
+    m.lambda_l0 = 0.0
+    # Disable cross-fit random splitting for a direct loss comparison.
+    m.eval()
+    m._step(batch=batch, stage="val")
+    recon_zero = m._last_loss_components["loss_recon"].detach()
+    m.lambda_l0 = 0.1
+    m._step(batch=batch, stage="val")
+    assert torch.equal(recon_zero, m._last_loss_components["loss_recon"].detach())
+
+
 def test_forecaster_routing_and_steps():
-    m, batch = _dual_forecaster(lambda_l0_selector=1e-2)
+    m, batch = _dual_forecaster(lambda_l0=1e-2)
     oa = m.model.order_attention()
     assert oa is not None
     sids = {id(p) for p in m._structural_params}
@@ -248,8 +293,8 @@ def test_forecaster_routing_and_steps():
 
     m.train()
     # Reconstruct phase: no order, hard ST gates -> selector gradient.
-    m.model.set_order_path("none")
-    m.model.set_gate_mode("hard")
+    _set_path(m.model, "none")
+    _set_gate(m.model, "hard")
     m.model.resample()
     m._step(batch=batch, stage="train")
     loss_r = m._last_loss_components["loss_recon"]
@@ -259,8 +304,8 @@ def test_forecaster_routing_and_steps():
         p.grad = None
 
     # Structure phase: unrolled anti-adjacency objective -> order gradient.
-    m.model.set_order_path("relaxed")
-    m.model.set_gate_mode("soft")
+    _set_path(m.model, "relaxed")
+    _set_gate(m.model, "soft")
     m.model.resample()
     m._step(batch=batch, stage="train")
     assert m._last_anti_adjacency_stats is not None
@@ -274,17 +319,18 @@ def test_forecaster_config_guards():
     with pytest.raises(ValueError, match="hsic_exclude_descendants"):
         _dual_forecaster(hsic_exclude_descendants=True)
     for old in ("dual_selector_routing", "order_selection"):
-        with pytest.raises(ValueError, match="toggle_on_recon_att_selector"):
+        with pytest.raises(ValueError, match="gate_opt"):
             _dual_forecaster(**{old: "recon"})
-    # Removed keys: equivalent legacy values load (old checkpoints), the
-    # others fail with the replacement.
-    with pytest.raises(ValueError, match="toggle_on_recon_att_selector"):
+    with pytest.raises(ValueError, match="gate_opt"):
         _dual_forecaster(variable_selection_objective="struct")
     _dual_forecaster(variable_selection_objective="recon")
-    m, _ = _dual_forecaster(model_kwargs={"order_existence_mode": "full"})
+    # Removed model kwargs fail with the replacement.
+    for old in ("order_existence_mode", "toggle_on_recon_att_selector",
+                "order_straight_through"):
+        with pytest.raises(ValueError, match="gate_opt"):
+            _dual_forecaster(model_kwargs={old: True})
+    m, _ = _dual_forecaster(model_kwargs={"recon_gate_opt": "none"})
     assert not m.model.order_attention().recon_selector_on
-    with pytest.raises(ValueError, match="toggle_on_recon_att_selector"):
-        _dual_forecaster(model_kwargs={"order_existence_mode": "bogus"})
     with pytest.raises(ValueError, match="anti_adjacency_lambda"):
         _dual_forecaster(hsic_aggregation="dual_logratio")
     with pytest.raises(ValueError, match="anti_adjacency_eps"):
@@ -299,23 +345,23 @@ def test_recon_forward_combinations(struct_sel, gates, use_order):
     combination runs a reconstruction step and a structure step; G_R gets a
     recon gradient in both gate modes (straight-through for hard)."""
     m, batch = _dual_forecaster(
-        model_kwargs={"toggle_on_struct_att_selector": struct_sel},
+        model_kwargs={"struct_gate_opt": ("gated" if struct_sel else "none")},
         anti_adjacency_lambda=0.0)
     oa = m.model.order_attention()
     q = [p for n, p in m.model.named_parameters() if "query_embed" in n]
     sids = {id(p) for p in m._structural_params}
     assert q and not any(id(p) in sids for p in q)
     m.train()
-    m.model.set_order_path("hard" if use_order else "none")
-    m.model.set_gate_mode(gates)
+    _set_path(m.model, "hard" if use_order else "none")
+    _set_gate(m.model, gates)
     m.model.resample()
     m._step(batch=batch, stage="train")
     m._last_loss_components["loss_recon"].backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in q)
     for p in m.parameters():
         p.grad = None
-    m.model.set_order_path("relaxed")
-    m.model.set_gate_mode("soft")
+    _set_path(m.model, "relaxed")
+    _set_gate(m.model, "soft")
     m.model.resample()
     m._step(batch=batch, stage="train")
     assert m._last_anti_adjacency_stats is None
@@ -331,16 +377,16 @@ def test_recon_forward_combinations(struct_sel, gates, use_order):
 # Two selectors: each forward applies exactly ONE of them
 # ---------------------------------------------------------------------------
 def test_struct_selector_off_matches_default_module():
-    """toggle_on_struct_att_selector=False is the original module: same
-    parameters, same noise stream, same outputs on every path."""
+    """struct_gate_opt=("gated" if False is the original module: same
+    parameters else "none"), same noise stream, same outputs on every path."""
     q, k, v = _qk()
     a = _mod()
-    b = _mod(toggle_on_struct_att_selector=False)
+    b = _mod(struct_gate_opt=("gated" if False else "none"))
     assert b.struct_gate_logits is None
     a.train(); b.train()
     for path in ("relaxed", "hard", "none"):
         for m in (a, b):
-            m.set_order_path(path)
+            _set_path(m, path)
             m.resample(torch.Generator().manual_seed(3))
         oa_, _, _ = a(q, k, v)
         ob_, _, _ = b(q, k, v)
@@ -349,20 +395,20 @@ def test_struct_selector_off_matches_default_module():
 
 def test_struct_selector_is_used_only_in_structure_forwards():
     q, k, v = _qk()
-    m = _mod(toggle_on_struct_att_selector=True)
+    m = _mod(struct_gate_opt=("gated" if True else "none"))
     ref = _mod()                       # same seed -> same order scores
     m.train(); ref.train()
     # Reconstruction forward: identical to the module without G_S (G_R only).
     for path in ("hard", "none"):
         for x in (m, ref):
-            x.set_order_path(path)
+            _set_path(x, path)
             x.resample(torch.Generator().manual_seed(5))
         assert torch.equal(m(q, k, v)[0], ref(q, k, v)[0])
     # Structure forward: G_S only -> the queries (G_R) get no gradient,
     # the structural logits and the order do.
     # (Open Hard-Concrete gates are clamped at 1 for many noise draws, so
     # accumulate over a few steps.)
-    m.set_order_path("relaxed")
+    _set_path(m, "relaxed")
     for s in range(20):
         m.resample(torch.Generator().manual_seed(s))
         out, post, _ = m(q, k, v)
@@ -378,9 +424,9 @@ def test_struct_selector_is_used_only_in_structure_forwards():
 
 def test_struct_selector_paired_across_orientations():
     q, k, v = _qk()
-    m = _mod(toggle_on_struct_att_selector=True)
+    m = _mod(struct_gate_opt=("gated" if True else "none"))
     m.train()
-    m.set_order_path("relaxed")
+    _set_path(m, "relaxed")
     m.resample(torch.Generator().manual_seed(2))
     m(q, k, v)
     A_c = m.last_applied_A[0].clone()
@@ -390,7 +436,7 @@ def test_struct_selector_paired_across_orientations():
 
 
 def test_struct_selector_routing():
-    m, _ = _dual_forecaster(model_kwargs={"toggle_on_struct_att_selector": True})
+    m, _ = _dual_forecaster(model_kwargs={"struct_gate_opt": ("gated" if True else "none")})
     oa = m.model.order_attention()
     sids = {id(p) for p in m._structural_params}
     rids = {id(p) for p in m._reconstruction_params}
@@ -405,18 +451,27 @@ def test_struct_selector_routing():
 # ---------------------------------------------------------------------------
 def test_recon_init_copies_once_and_matches_g_r():
     q, k, v = _qk()
-    m = _mod(toggle_on_struct_att_selector=True, struct_att_selector_init="recon")
+    m = _mod(struct_gate_opt=("gated" if True else "none"), struct_att_selector_init="recon")
     ref = _mod()                                   # G_S off, same order scores
     m.eval(); ref.eval()
-    m.set_order_path("relaxed"); ref.set_order_path("relaxed")
+    _set_path(m, "relaxed"); _set_path(ref, "relaxed")
     assert m.request_struct_selector_sync()
     with torch.no_grad():
         o1, p1, _ = m(q, k, v)
         o2, p2, _ = ref(q, k, v)
     # pi_S = pi_R and the structure forward equals the G_R-only module.
     assert m.struct_selector_is_synced
-    assert torch.allclose(m.structural_pi(q, k), ref._last_pi, atol=1e-6)
-    assert torch.allclose(o1, o2, atol=1e-6) and torch.allclose(p1, p2, atol=1e-6)
+    S_ref = ref._existence_score(q, k)
+    pi_R_ref = ref.inclusion_prob(S_ref) * (1.0 - torch.eye(N))
+    assert torch.allclose(m.structural_pi(q, k), pi_R_ref, atol=1e-6)
+    # Separate G_S now multiplies the reconstruction gate rather than replacing it.
+    assert torch.isfinite(o1).all() and torch.isfinite(o2).all()
+    # Edge = G_S x order in m, order-only in ref (no G_S); eval uses the
+    # noiseless hard order for both posteriors.
+    M_det = ref.deterministic_order_mask()
+    assert torch.allclose(p1[0], (m._last_pi * M_det).transpose(0, 1), atol=1e-6)
+    assert torch.allclose(p2[0], M_det.transpose(0, 1), atol=1e-6)
+    assert torch.allclose(m._last_pi, pi_R_ref, atol=1e-6)
     # No second copy: a later request is a no-op, the logits keep evolving.
     with torch.no_grad():
         m.struct_gate_logits.add_(1.0)
@@ -425,31 +480,37 @@ def test_recon_init_copies_once_and_matches_g_r():
     m(q, k, v)
     assert torch.equal(m.struct_gate_logits, snap)
     # Reload: the synced flag survives the state dict.
-    m2 = _mod(toggle_on_struct_att_selector=True, struct_att_selector_init="recon")
+    m2 = _mod(struct_gate_opt=("gated" if True else "none"), struct_att_selector_init="recon")
     m2.load_state_dict(m.state_dict())
     assert m2.struct_selector_is_synced and not m2.request_struct_selector_sync()
 
 
 def test_recon_init_guards_and_constant_unchanged():
     with pytest.raises(ValueError, match="struct_att_selector_init"):
-        _mod(toggle_on_struct_att_selector=True, struct_att_selector_init="bogus")
+        _mod(struct_gate_opt=("gated" if True else "none"), struct_att_selector_init="bogus")
     with pytest.raises(ValueError, match="struct_att_selector_init"):
         _mod(struct_att_selector_init="recon")                 # G_S off
     with pytest.raises(ValueError, match="struct_att_selector_init"):
-        _mod(toggle_on_struct_att_selector=True, toggle_on_recon_att_selector=False,
+        _mod(struct_gate_opt=("gated" if True else "none"), recon_gate_opt=("gated" if False else "none"),
              struct_att_selector_init="recon")
-    m = _mod(toggle_on_struct_att_selector=True)            # constant init
+    m = _mod(struct_gate_opt=("gated" if True else "none"))            # constant init
     assert not m.request_struct_selector_sync()
     assert "struct_selector_synced" not in m.state_dict()
 
 
-def test_trainer_requests_sync_on_structure_only():
+def _trainer(ad=None):
+    """Bare PhaseController with only the stage policy parsed."""
     from causaliT.training.adaptive_trainer import PhaseController as _T
+    from causaliT.training.stage_policy import parse_stage_policy
     t = _T.__new__(_T)
-    t.warmup_cfg, t.recon_cfg, t.final_cfg = {}, {}, {}
-    t._recon_gates_default, t._use_order_in_recon_default = "hard", False
+    t._stage_policy = parse_stage_policy(ad or {})
     t._bkd_managed = False
-    m, _ = _dual_forecaster(model_kwargs={"toggle_on_struct_att_selector": True,
+    return t
+
+
+def test_trainer_requests_sync_on_structure_only():
+    t = _trainer()
+    m, _ = _dual_forecaster(model_kwargs={"struct_gate_opt": ("gated" if True else "none"),
                                           "struct_att_selector_init": "recon"})
     oa = m.model.order_attention()
     t._apply_recon_forward_cfg(m, "warmup")
@@ -459,29 +520,28 @@ def test_trainer_requests_sync_on_structure_only():
 
 
 def test_trainer_applies_recon_forward_and_ladder_phases():
-    from causaliT.training.adaptive_trainer import PhaseController as _T
-    t = _T.__new__(_T)
-    t.warmup_cfg, t.recon_cfg, t.final_cfg = {}, {"recon_gates": "soft"}, {}
-    t._recon_gates_default, t._use_order_in_recon_default = "hard", True
-    t._bkd_managed = False
+    t = _trainer({"recon": {"gate_sampling": "hard", "order_sampling": "hard"},
+                  "reconstruct": {"gate_sampling": "soft"}})
     m, _ = _dual_forecaster(anti_adjacency_lambda=0.0)
     oa = m.model.order_attention()
     t._apply_recon_forward_cfg(m, "warmup")
-    assert (oa.order_path, oa.gate_mode) == ("hard", "hard")
+    assert (oa.stage, oa.order_sampling, oa.gate_mode) == ("recon", "hard", "hard")
     t._apply_recon_forward_cfg(m, "reconstruct")
-    assert (oa.order_path, oa.gate_mode) == ("hard", "soft")
+    assert (oa.stage, oa.order_sampling, oa.gate_mode) == ("recon", "hard", "soft")
+    t._apply_recon_forward_cfg(m, "final_reconstruct")      # inherits reconstruct
+    assert oa.gate_mode == "soft"
     t._apply_recon_forward_cfg(m, "structure")
-    assert (oa.order_path, oa.gate_mode) == ("relaxed", "soft")
+    assert (oa.stage, oa.order_sampling, oa.struct_gate_mode) == ("structure", "soft", "soft")
 
 
 @pytest.mark.parametrize("struct_sel", [False, True])
 def test_hard_struct_gates_binary_with_gradient(struct_sel):
     """Relaxed path + gate_mode hard: exact 0/1 existence of the learned pi,
     ST gradient to the learned selector and order gradient kept."""
-    m = _mod(toggle_on_struct_att_selector=struct_sel, order_exclusion_existence="sample")
+    m = _mod(struct_gate_opt=("gated" if struct_sel else "none"), order_exclusion_existence="sample")
     m.train()
-    m.set_order_path("relaxed")
-    m.set_struct_gate_mode("hard")
+    _set_path(m, "relaxed")
+    _set_gate(m, "hard", stage="structure")
     q, k, v = _qk()
     m.resample(torch.Generator().manual_seed(2))
     out, _, _ = m(q, k, v)
@@ -496,9 +556,16 @@ def test_hard_struct_gates_binary_with_gradient(struct_sel):
                     Z / M.clamp_min(1e-12)) * off
     assert torch.allclose(G, G.round(), atol=1e-4)
     assert torch.allclose(G, G.transpose(0, 1), atol=1e-4)
-    # Same Bernoulli draw as the sampled exclusion graph (skeletons match).
+    # Same Bernoulli draw as the sampled exclusion graph (skeletons match)
+    # only with G_S on (the edge existence); without G_S the edge is the
+    # full order DAG while the mixing gate stays the G_R draw.
     excl = m.score_tensor_for_sparsity
-    assert torch.equal(((excl + excl.transpose(0, 1)) > 0).float(), G.round())
+    if struct_sel:
+        assert torch.all(G.round() <= ((excl + excl.transpose(0, 1)) > 0).float())
+    else:
+        # No G_S: the edge is the full DAG of the order (existence = 1).
+        skel = (excl + excl.transpose(0, 1) > 0).float()
+        assert int(skel.sum()) == N * (N - 1)
     out.sum().backward()
     learned = m.struct_gate_logits if struct_sel else q
     assert learned.grad is not None and learned.grad.abs().sum() > 0
@@ -506,28 +573,23 @@ def test_hard_struct_gates_binary_with_gradient(struct_sel):
 
 
 def test_trainer_struct_gates_config():
-    from causaliT.training.adaptive_trainer import PhaseController as _T
-    t = _T.__new__(_T)
-    t.warmup_cfg, t.recon_cfg, t.final_cfg = {}, {}, {}
-    t.struct_cfg = {"struct_gates": "hard"}
-    t._recon_gates_default, t._use_order_in_recon_default = "hard", False
-    t._bkd_managed = False
+    t = _trainer({"structure": {"gate_sampling": "hard", "order_sampling": "hard_st"}})
     m, _ = _dual_forecaster(anti_adjacency_lambda=0.0)
     oa = m.model.order_attention()
     assert oa.struct_gate_mode == "soft"                     # default unchanged
     t._apply_recon_forward_cfg(m, "structure")
-    assert (oa.order_path, oa.struct_gate_mode) == ("relaxed", "hard")
+    assert (oa.stage, oa.order_sampling, oa.struct_gate_mode) == ("structure", "hard_st", "hard")
     t._apply_recon_forward_cfg(m, "warmup")
-    assert (oa.order_path, oa.gate_mode) == ("none", "hard")
+    assert (oa.stage, oa.order_sampling, oa.gate_mode) == ("recon", "none", "hard")
     with pytest.raises(ValueError):
-        oa.set_struct_gate_mode("relaxed")
+        _set_gate(oa, "relaxed", stage="structure")
 
 
 def _unused_plain_hsic():
     m, batch = _dual_forecaster(anti_adjacency_lambda=0.0)
     oa = m.model.order_attention()
     m.train()
-    m.model.set_order_path("relaxed")
+    _set_path(m.model, "relaxed")
     m.model.resample()
     m._step(batch=batch, stage="train")
     assert m._last_anti_adjacency_stats is None

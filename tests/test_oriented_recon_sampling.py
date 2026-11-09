@@ -27,8 +27,7 @@ def _mod():
     torch.manual_seed(0)
     m = OrderFactorizedSelfAttention(num_nodes=N, order_r_init="random")
     m.train()
-    m.set_order_path("hard")
-    m.set_gate_mode("hard")
+    m.set_stage_policy("recon", gate_sampling="hard", order_sampling="oriented")
     return m
 
 
@@ -55,7 +54,7 @@ def test_none_reproduces_default():
 def test_anticausal_row_is_transposed_order():
     m = _mod()
     m.set_recon_noise_scale(1.0)
-    m.set_gate_mode("soft")
+    m.set_stage_policy("recon", gate_sampling="soft")
     _, A_c = _run(m, orientation="causal")
     _, A_a = _run(m, orientation="anticausal")
     # Recon order of the step (same noise draw).
@@ -114,14 +113,17 @@ def _controller(tmp_path, **ad_overrides):
                            save_dir=str(tmp_path), cluster=True)
 
 
-def test_config_conflict_raises(tmp_path):
-    with pytest.raises(ValueError):
-        _controller(tmp_path, use_order_in_recon=True,
-                    recon_order_sampling={"enabled": True})
+def test_removed_keys_raise(tmp_path):
+    for old in ({"use_order_in_recon": True}, {"recon_order_sampling": {"enabled": True}},
+                {"recon_gates": "hard"}):
+        with pytest.raises(ValueError, match="adaptive_training"):
+            _controller(tmp_path, **old)
 
 
 def test_config_block_override(tmp_path):
-    ctrl = _controller(tmp_path, recon_order_sampling={"enabled": True},
-                       reconstruct={"recon_order_sampling": {"p_anticausal": 0.2}})
-    ros = ctrl._recon_order_sampling_cfg("reconstruct")
-    assert ros["enabled"] and ros["p_anticausal"] == 0.2 and ros["noise_scale"] == 1.0
+    ctrl = _controller(tmp_path, recon={"order_sampling": "oriented"},
+                       reconstruct={"oriented": {"p_anticausal": 0.2}})
+    ph = ctrl._stage_policy["phases"]
+    assert ph["reconstruct"]["order_sampling"] == "oriented"
+    assert ph["reconstruct"]["oriented"] == {"p_anticausal": 0.2, "noise_scale": 1.0}
+    assert ph["warmup"]["oriented"]["p_anticausal"] == 0.5

@@ -682,12 +682,13 @@ class AttentionSelectorLayer(nn.Module):
         order_detach_exclusion: bool = True,
         order_exclusion_tnorm: str = "min",
         order_exclusion_existence: str = "threshold",
-        toggle_on_recon_att_selector: bool = True,
-        toggle_on_struct_att_selector: bool = False,
+        # Selector options; injected by the forecaster from
+        # adaptive_training.{recon,structure}.gate_opt.
+        recon_gate_opt: str = "gated",
+        struct_gate_opt: str = "none",
         struct_att_selector_init_logit: float = 2.0,
         struct_att_selector_init: str = "constant",
         shared_att_selector: bool = False,
-        order_straight_through: bool = False,
     ):
 
 
@@ -707,12 +708,11 @@ class AttentionSelectorLayer(nn.Module):
             order_detach_exclusion=order_detach_exclusion,
             order_exclusion_tnorm=order_exclusion_tnorm,
             order_exclusion_existence=order_exclusion_existence,
-            toggle_on_recon_att_selector=toggle_on_recon_att_selector,
-            toggle_on_struct_att_selector=toggle_on_struct_att_selector,
+            recon_gate_opt=recon_gate_opt,
+            struct_gate_opt=struct_gate_opt,
             struct_att_selector_init_logit=struct_att_selector_init_logit,
             struct_att_selector_init=struct_att_selector_init,
             shared_att_selector=shared_att_selector,
-            order_straight_through=order_straight_through,
         )
 
 
@@ -1775,7 +1775,7 @@ class AttentionSelectorLayer(nn.Module):
 
         # Reconstruction selector off: the queries carry no role; freeze them
         # explicitly (no weight-decay drift).
-        if not toggle_on_recon_att_selector:
+        if recon_gate_opt == "none":
             for tab in (self.query_embed_X, self.query_embed_S):
                 if tab is not None:
                     for p in tab.parameters():
@@ -3049,13 +3049,15 @@ class AttentionSelectorLayer(nn.Module):
         if oa is not None:
             oa.resample(generator)
 
-    def set_order_path(self, mode: str) -> bool:
-        """Order mask of the order-factorized block ("relaxed" | "hard" |
-        "none").  Returns False when the selector is not in use."""
+    def set_stage_policy(self, stage: str, gate_sampling=None, order_sampling=None) -> bool:
+        """Stage policy of the order-factorized block (see
+        ``OrderFactorizedSelfAttention.set_stage_policy``).  Returns False
+        when the selector is not in use."""
         oa = self.order_attention()
         if oa is None:
             return False
-        oa.set_order_path(mode)
+        oa.set_stage_policy(stage, gate_sampling=gate_sampling,
+                            order_sampling=order_sampling)
         return True
 
     def request_struct_selector_sync(self) -> bool:
@@ -3064,24 +3066,6 @@ class AttentionSelectorLayer(nn.Module):
         pending, False otherwise (not in use, other init, already synced)."""
         oa = self.order_attention()
         return False if oa is None else oa.request_struct_selector_sync()
-
-    def set_gate_mode(self, mode: str) -> bool:
-        """Existence gate of non-relaxed forwards ("hard" | "soft").
-        Returns False when the selector is not in use."""
-        oa = self.order_attention()
-        if oa is None:
-            return False
-        oa.set_gate_mode(mode)
-        return True
-
-    def set_struct_gate_mode(self, mode: str) -> bool:
-        """Existence gate of relaxed (structure) forwards ("soft" | "hard").
-        Returns False when the selector is not in use."""
-        oa = self.order_attention()
-        if oa is None:
-            return False
-        oa.set_struct_gate_mode(mode)
-        return True
 
     def set_order_temperature(self, tau=None, noise_scale=None) -> bool:
         """Anneal the order Sinkhorn temperature / Gumbel noise scale.

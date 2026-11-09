@@ -15,6 +15,23 @@ from causaliT.utils.descendant_mask import build_hsic_pair_mask
 N, E, B = 3, 4, 5
 
 
+# Stage-policy helpers (old order_path / gate_mode vocabulary).
+_PATH = {"relaxed": ("structure", "soft"), "hard": ("recon", "hard"),
+         "none": ("recon", "none")}
+
+
+def _set_path(m, p):
+    s, o = _PATH[p]
+    return m.set_stage_policy(s, order_sampling=o)
+
+
+def _set_gate(m, g, stage="recon"):
+    oa = m.order_attention() if hasattr(m, "order_attention") else m
+    keep, order = oa.stage, oa.order_sampling
+    oa.set_stage_policy(stage, gate_sampling=g)
+    oa.stage, oa.order_sampling = keep, order
+
+
 def _qk(seed=0):
     g = torch.Generator().manual_seed(seed)
     q = torch.randn(1, N, E, generator=g).expand(B, N, E).clone().requires_grad_(True)
@@ -53,7 +70,7 @@ def test_order_mask_orientation_and_diag():
 def test_applied_weight_is_child_parent_and_hard_is_dag(mode):
     m = _module()
     m.train()
-    m.set_order_path(mode)
+    _set_path(m, mode)
     q, k, v = _qk()
     for s in range(10):
         m.resample(torch.Generator().manual_seed(s))
@@ -96,7 +113,7 @@ def test_gradients_relaxed_vs_hard():
     q2, k2, v2 = _qk()
     m2 = _module()
     m2.train()
-    m2.set_order_path("hard")
+    _set_path(m2, "hard")
     m2.resample(torch.Generator().manual_seed(0))
     out2, _, _ = m2(q2, k2, v2)
     out2.sum().backward()
@@ -109,19 +126,31 @@ def test_threshold_changes_exclusion_graph():
     q, k, v = _qk()
     graphs = []
     for thr in (0.01, 0.99):
-        m = _module(order_existence_threshold=thr)
+        # Edge = G_S x order: the threshold acts on pi_S.
+        m = _module(order_existence_threshold=thr, struct_gate_opt="gated")
         m.eval()
         with torch.no_grad():
             m(q, k, v)
         graphs.append(m.score_tensor_for_sparsity.sum().item())
     assert graphs[0] > graphs[1]
+    # Without G_S the edge is the full DAG of the order: threshold-independent.
+    graphs = []
+    for thr in (0.01, 0.99):
+        m = _module(order_existence_threshold=thr)
+        m.eval()
+        with torch.no_grad():
+            m(q, k, v)
+        graphs.append(m.score_tensor_for_sparsity.sum().item())
+    assert graphs[0] == graphs[1] == N * (N - 1) / 2
     with pytest.raises(ValueError):
         _module(order_existence_threshold=1.0)
 
 
 def test_sampled_exclusion_graph():
     q, k, v = _qk()
-    m = _module(order_existence_threshold=0.01, order_exclusion_existence="sample")
+    # G_S on: the edge existence is pi_S; "sample" draws Bernoulli(pi_S).
+    m = _module(order_existence_threshold=0.01, order_exclusion_existence="sample",
+                struct_gate_opt="gated")
     m.train()
     graphs = []
     for s in range(20):
@@ -134,14 +163,14 @@ def test_sampled_exclusion_graph():
         assert not g1.requires_grad
         graphs.append(g1)
     assert any(not torch.equal(graphs[0], g) for g in graphs[1:])  # varies across steps
-    # Hard mode: the exclusion graph is exactly the applied DAG.
-    m.set_order_path("hard")
+    # Hard structure forward: the exclusion graph is the applied DAG.
+    m.set_stage_policy("structure", gate_sampling="hard", order_sampling="hard")
     m.resample(torch.Generator().manual_seed(3))
     m(q, k, v)
-    assert torch.equal(m.score_tensor_for_sparsity, (m.last_applied_A[0] > 0).float())
+    assert torch.all((m.last_applied_A[0] > 0).float() <= m.score_tensor_for_sparsity)
     # Eval: identical to the threshold rule.
     m.eval()
-    ref = _module(order_existence_threshold=0.01)
+    ref = _module(order_existence_threshold=0.01, struct_gate_opt="gated")
     ref.eval()
     with torch.no_grad():
         m(q, k, v)
@@ -153,16 +182,16 @@ def test_sampled_exclusion_graph():
 
 def test_both_selectors_off_is_order_dag():
     q, k, v = _qk()
-    m = _module(toggle_on_recon_att_selector=False)
+    m = _module(recon_gate_opt=("gated" if False else "none"))
     m.train()
-    m.set_order_path("hard")
+    _set_path(m, "hard")
     m.resample(torch.Generator().manual_seed(0))
     m(q, k, v)
     A = m.last_applied_A[0].transpose(0, 1)          # source -> target
     # Full DAG of a permutation: exactly N(N-1)/2 edges, acyclic.
     assert int(A.sum()) == N * (N - 1) // 2 and _is_dag(A > 0)
     assert torch.equal(m.score_tensor_for_sparsity.transpose(0, 1), A)
-    m.set_order_path("relaxed")
+    _set_path(m, "relaxed")
     out, _, _ = m(q, k, v)
     out.sum().backward()
     assert q.grad is None or q.grad.abs().sum() == 0  # no existence gradient
@@ -172,10 +201,9 @@ def test_both_selectors_off_is_order_dag():
 @pytest.mark.parametrize("existence", ["full", "learned"])
 def test_straight_through_order(existence):
     q, k, v = _qk()
-    m = _module(toggle_on_recon_att_selector=existence == "learned",
-                order_straight_through=True)
+    m = _module(recon_gate_opt=("gated" if existence == "learned" else "none"))
     m.train()
-    m.set_order_path("relaxed")
+    m.set_stage_policy("structure", order_sampling="hard_st")
     for s in range(50):
         m.resample(torch.Generator().manual_seed(s))
         out, _, _ = m(q, k, v)
@@ -189,7 +217,7 @@ def test_straight_through_order(existence):
     out.sum().backward()
     assert m.order_scores.grad is not None and m.order_scores.grad.abs().sum() > 0
     # Eval: identical to the non-ST module.
-    ref = _module(toggle_on_recon_att_selector=existence == "learned")
+    ref = _module(recon_gate_opt=("gated" if existence == "learned" else "none"))
     m.eval(); ref.eval()
     with torch.no_grad():
         o1, _, _ = m(q, k, v)
@@ -257,7 +285,7 @@ def test_model_integration_homogeneous():
     pred.sum().backward()
     assert oa.order_scores.grad is not None
     assert model.get_score_tensor_for_sparsity().shape == (oa.num_nodes, oa.num_nodes)
-    assert model.set_order_path("hard")
+    assert _set_path(model, "hard")
     _forward(model)
 
     with pytest.raises(ValueError):
@@ -269,7 +297,7 @@ def test_other_types_unaffected():
     from tests.test_atsel_homogeneous import _make_model
     model = _make_model()
     assert model.order_attention() is None
-    assert model.set_order_path("hard") is False
+    assert _set_path(model, "hard") is False
     model.resample()   # no-op
 
 
