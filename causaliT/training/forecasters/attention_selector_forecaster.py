@@ -5222,6 +5222,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self._nodewise.reset_stats()
 
     def on_train_epoch_end(self):
+        # Learnable Sinkhorn temperature of the order (order_tau_learnable).
+        oa_get = getattr(self.model, "order_attention", None)
+        oa = oa_get() if callable(oa_get) else None
+        if oa is not None and getattr(oa, "tau_learnable", False):
+            self.log("order/tau", float(oa.perm_tau.detach()), on_step=False, on_epoch=True)
         if self._commit is not None:
             sizes = self._commit.assignment_sizes().float()
             self.log("struct/commit_mean_subset", float(sizes.mean()),

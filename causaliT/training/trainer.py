@@ -545,6 +545,9 @@ def trainer(
     plot_pred_check: bool = False,
     debug: bool = False,
     best: bool = False,
+    folds: Optional[List[int]] = None,
+    fold_hooks=None,
+    after_fold=None,
 ) -> pd.DataFrame:
     """
     Training function with k-fold cross-validation.
@@ -575,6 +578,13 @@ def trainer(
         debug:           Enable debug mode (anomaly detection, memory logging).
         best:            If True, use metrics from best checkpoint; otherwise
                          use final-epoch metrics.
+        folds:           Optional subset of fold indices to train (default all).
+        fold_hooks:      Optional ``f(fold) -> (callbacks, resume_ckpt)``; the
+                         callbacks are added to the fold's Trainer and a
+                         non-None resume_ckpt overrides ``resume_ckpt``
+                         (used by euler_funs for pause/resume).
+        after_fold:      Optional ``f(fold)`` called after each fold; may raise
+                         to abort the remaining folds (e.g. on a pause).
 
     Returns:
         pd.DataFrame: Metrics for each fold (one row per fold).
@@ -612,6 +622,9 @@ def trainer(
     kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
 
     for fold, (train_local_idx, val_local_idx) in enumerate(fold_splits):
+        if folds is not None and fold not in folds:
+            continue
+        fold_callbacks, fold_resume = (fold_hooks(fold) if fold_hooks else (None, None))
         # Reset seed before each fold so model initialization is identical
         seed_everything(seed)
         model = create_model_instance(config, data_dir)
@@ -631,13 +644,17 @@ def trainer(
             save_dir=save_dir,
             trainable_params=trainable_params,
             cluster=cluster,
-            resume_ckpt=resume_ckpt,
-            warm_start_ckpt=warm_start_ckpt,
+            resume_ckpt=fold_resume or resume_ckpt,
+            # A full resume restores the weights; warm start would conflict.
+            warm_start_ckpt=None if fold_resume else warm_start_ckpt,
             experiment_tag=experiment_tag,
             debug=debug,
             best=best,
+            extra_callbacks=fold_callbacks,
             data_dir=data_dir,
         )
+        if after_fold is not None:
+            after_fold(fold)
 
         metrics_dict[fold] = fold_metrics
 

@@ -117,6 +117,9 @@ STRUCTURAL_PATTERNS = [
     # OrderFactorizedSelfAttention node order scores (structural, trained by
     # the routed independence loss).
     "order_scores",
+    # OrderFactorizedSelfAttention learnable Sinkhorn temperature
+    # (order_tau_learnable=True), trained by the structural loss only.
+    "order_log_tau",
     # OrderFactorizedSelfAttention structural selector G_S (free symmetric
     # logits, trained by the structural loss only).
     "struct_gate_logits",

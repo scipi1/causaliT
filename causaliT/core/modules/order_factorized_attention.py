@@ -185,7 +185,15 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         init_tau: Hard-Concrete existence temperature (beta).
         gamma, zeta: Hard-Concrete stretch bounds (gamma < 0 < 1 < zeta).
         order_noise_scale: Gumbel noise scale on the order scores.
-        order_tau: Sinkhorn relaxation temperature.
+        order_tau: Sinkhorn relaxation temperature (initial value when learnable).
+        order_tau_learnable: Learn tau with the structural loss. The
+            parameter ``order_log_tau`` (structural group) is log tau; the
+            forward uses tau = exp(clamp(log_tau, log min, log max)) with a
+            straight-through clamp (the gradient always reaches the
+            parameter), so tau stays in [order_tau_min, order_tau_max], Adam
+            moves log tau by about lr per step and tau cannot get stuck at a
+            bound.  The parameter itself may drift beyond a bound.
+        order_tau_min, order_tau_max: Bounds of the learnable tau.
         order_sinkhorn_iters: Sinkhorn sweeps.
         order_r_init: ``"flat"`` (zeros) or ``"random"`` (N(0, 0.01^2)).
         order_existence_threshold: ``pi`` threshold, in (0, 1), for the hard
@@ -234,6 +242,9 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         zeta: float = DEFAULT_GATE_ZETA,
         order_noise_scale: float = 1.0,
         order_tau: float = 1.0,
+        order_tau_learnable: bool = False,
+        order_tau_min: float = 0.1,
+        order_tau_max: float = 1.0,
         order_sinkhorn_iters: int = 20,
         order_r_init: str = "flat",
         order_existence_threshold: float = 0.5,
@@ -266,6 +277,12 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             raise ValueError(f"order_noise_scale must be >= 0, got {order_noise_scale}.")
         if order_tau <= 0.0:
             raise ValueError(f"order_tau must be > 0, got {order_tau}.")
+        if order_tau_learnable and not (0.0 < order_tau_min < order_tau_max
+                                        and order_tau_min <= order_tau <= order_tau_max):
+            raise ValueError(
+                "order_tau_learnable requires 0 < order_tau_min < order_tau_max and "
+                "order_tau in [order_tau_min, order_tau_max], got "
+                f"min={order_tau_min}, tau={order_tau}, max={order_tau_max}.")
         if int(order_sinkhorn_iters) < 1:
             raise ValueError(f"order_sinkhorn_iters must be >= 1, got {order_sinkhorn_iters}.")
         if order_r_init not in _R_INITS:
@@ -330,7 +347,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.edge_offset = 0.0
 
         self.noise_scale = float(order_noise_scale)
-        self.perm_tau = float(order_tau)
+        # Sinkhorn temperature: plain float, or learnable log tau clamped to
+        # [log min, log max] with a straight-through gradient (see perm_tau).
+        self.tau_learnable = bool(order_tau_learnable)
+        if self.tau_learnable:
+            self.tau_min, self.tau_max = float(order_tau_min), float(order_tau_max)
+            self.order_log_tau = nn.Parameter(torch.tensor(math.log(order_tau)))
+        else:
+            self._perm_tau = float(order_tau)
         self.sinkhorn_iters = int(order_sinkhorn_iters)
         self.existence_threshold = float(order_existence_threshold)
         self.detach_exclusion = bool(order_detach_exclusion)
@@ -956,6 +980,26 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             "order_freq": torch.stack(orders).mean(dim=0),
         }
 
+    @property
+    def perm_tau(self):
+        """Sinkhorn temperature: a float, or a 0-d tensor carrying the
+        gradient to ``order_log_tau`` when ``tau_learnable``."""
+        if self.tau_learnable:
+            s = self.order_log_tau
+            s_clamped = s.clamp(math.log(self.tau_min), math.log(self.tau_max))
+            # Straight-through: forward value clamped, gradient d tau / d s
+            # of the unclamped exp (never zero at or beyond a bound).
+            return torch.exp(s + (s_clamped - s).detach())
+        return self._perm_tau
+
+    @perm_tau.setter
+    def perm_tau(self, value) -> None:
+        if self.tau_learnable:
+            raise RuntimeError(
+                "perm_tau is learnable (order_tau_learnable=True): it cannot be set; "
+                "a tau anneal is incompatible with a learnable tau.")
+        self._perm_tau = float(value)
+
     def set_order_temperature(
         self,
         tau: Optional[float] = None,
@@ -965,6 +1009,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
 
         Plain attribute writes (both are re-read at every forward), exposed
         as a setter so the adaptive trainer can anneal them over training.
+        Setting tau raises when tau is learnable.
         """
         if tau is not None:
             if tau <= 0.0:
@@ -978,7 +1023,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
     def __repr__(self):
         return (
             f"OrderFactorizedSelfAttention(N={self.num_nodes}, beta={self.beta}, "
-            f"noise_scale={self.noise_scale}, tau={self.perm_tau}, "
+            f"noise_scale={self.noise_scale}, tau={float(torch.as_tensor(self.perm_tau).detach()):.4g}"
+            f"{' (learnable)' if self.tau_learnable else ''}, "
             f"stage={self.stage}, order_sampling={self.order_sampling}, "
             f"recon_gate_opt={self.recon_gate_opt}, struct_gate_opt={self.struct_gate_opt}, "
             f"detach_exclusion={self.detach_exclusion}, "

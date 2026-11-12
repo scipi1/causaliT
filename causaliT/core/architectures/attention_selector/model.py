@@ -676,6 +676,9 @@ class AttentionSelectorLayer(nn.Module):
         # self_attention_type="OrderFactorizedSelfAttention".
         order_noise_scale: float = 1.0,
         order_tau: float = 1.0,
+        order_tau_learnable: bool = False,
+        order_tau_min: float = 0.1,
+        order_tau_max: float = 1.0,
         order_sinkhorn_iters: int = 20,
         order_r_init: str = "flat",
         order_existence_threshold: float = 0.5,
@@ -702,6 +705,9 @@ class AttentionSelectorLayer(nn.Module):
         self._order_kwargs = dict(
             order_noise_scale=order_noise_scale,
             order_tau=order_tau,
+            order_tau_learnable=order_tau_learnable,
+            order_tau_min=order_tau_min,
+            order_tau_max=order_tau_max,
             order_sinkhorn_iters=order_sinkhorn_iters,
             order_r_init=order_r_init,
             order_existence_threshold=order_existence_threshold,

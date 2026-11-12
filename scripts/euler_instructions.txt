@@ -1,0 +1,87 @@
+EULER CLUSTER INSTRUCTIONS
+==========================
+
+Confirmed restrictions
+----------------------
+- Memory requests must use --mem-per-cpu, for example:
+  #SBATCH --mem-per-cpu=4g
+- Per-node memory requests (--mem) are NOT supported. The cluster rejects
+  them with: Requesting memory by node is not supported. Use --mem-per-cpu.
+- Save shell scripts with Unix LF line endings, not Windows CRLF (DOS).
+- Use UTF-8 without a BOM. Keep each command on one line; do not use
+  backslash line continuations. These are project launcher conventions.
+
+Existing resource request conventions
+-------------------------------------
+- Use #SBATCH --ntasks=1 for the current single-worker jobs.
+- Lightweight submission jobs use --mem-per-cpu=4g.
+- Existing training jobs use --mem-per-cpu=10g; Optuna workers use 23g.
+  Choose memory for the workload; these values are not cluster limits.
+- Existing GPU scripts request --gpus=1 and --gres=gpumem:24g.
+- GPU_TYPE may optionally restrict the model, for example
+  --gpus=rtx_4090:1. Leaving it empty avoids pinning a GPU model.
+- CPU-only probes do not need a GPU allocation.
+
+Environment setup
+-----------------
+Follow the existing shell launchers. Load these modules, one command per line:
+module load stack/2024-06
+module load gcc/12.2.0
+module load python_cuda/3.11.6
+
+Activate the virtual environment before calling Python:
+source "$HOME/myenv/bin/activate"
+
+Check that VIRTUAL_ENV is set, call python from the activated environment,
+and deactivate when finished. Some existing scripts instead use
+"$HOME/proT/venv"; make the environment path configurable rather than
+assuming these two environments are interchangeable.
+
+Paths and execution conventions
+------------------------------
+- The usual project root on Euler is "$HOME/proT".
+- Start from experiment inputs in HOME and copy them to SCRATCH.
+- Resume from the existing SCRATCH run, not the original HOME inputs.
+- Continuation jobs must retain the same run identity and scientific
+  output folders even when their Slurm job IDs change.
+- Preserve both last.ckpt and best_checkpoint.ckpt, together with the
+  configuration and best-selection state, when moving or exporting a run.
+- Do not overwrite active SCRATCH state by copying HOME inputs again.
+- Submit shell launchers using sbatch, not sh: SBATCH directives are only
+  interpreted by Slurm when submitted.
+
+Reported queue behavior
+-----------------------
+- The user reports many available GPUs in the 4-hour queue and far fewer
+  in the 120-hour queue. Long jobs can therefore wait much longer.
+- Short allocations with checkpoint/resume are the planned approach.
+- Do not assume --time=04:00:00 alone selects the desired partition/QoS;
+  the exact routing and continuation policy still need confirmation.
+
+Not yet fully verified on this cluster
+-------------------------------------
+- The CPU signal probe is provisionally successful per the user; its logs
+  and the production --signal=B:USR1@600 setup have not yet been reviewed.
+- Compute-node job submission and the planned continuation dependencies.
+- End-to-end Lightning checkpoint restoration across short allocations.
+- Exact queue selection and scheduling priority for dependent jobs.
+
+Signal probe
+------------
+Submit the probe with this single-line command:
+sbatch "$HOME/proT/scripts/test_slurm_signal.sh"
+
+The probe activates the environment, copies test_slurm_signal.py to
+SCRATCH, and requests one CPU, 4g per CPU, no GPU, and three minutes.
+It uses --signal=B:USR1@60. The B flag targets the batch shell; the shell
+must explicitly forward USR1 to Python. Python writes a simulated
+checkpoint outside its signal handler and exits cleanly.
+
+Expected success message:
+PASS: Slurm -> shell -> Python -> simulated checkpoint -> clean exit
+
+The memory directive has been corrected after a cluster rejection.
+The user reports that the CPU signal probe appears to have passed.
+Treat signal delivery as provisionally verified; the actual log has not
+been reviewed. This does not verify Lightning checkpoint continuation.
+Update this document when cluster test results become available.

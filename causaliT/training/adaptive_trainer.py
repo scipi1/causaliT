@@ -1846,10 +1846,38 @@ class PhaseController(Callback):
     # ------------------------------------------------------------------
     # Lightning hooks
     # ------------------------------------------------------------------
+    # Runtime state persisted in Lightning checkpoints (pause/resume support).
+    _STATE_KEYS = (
+        "current_phase", "_phase_start_epoch", "_phase_best", "_phase_entry_monitor",
+        "_plateau_counter", "_drop_counter", "_hsic_best", "_hsic_plateau_counter",
+        "_cycle_count", "_phase_index", "_struct_phase_count", "_l0_base",
+        "_l0_active", "_kappa_base", "_kappa_active", "_hsic_run_best",
+        "_hsic_stall_cycles", "_hsic_phase_best_gate", "_active_split_key",
+        "_order_tau_init", "_order_noise_init", "transitions", "phase_rows",
+    )
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {key: copy.deepcopy(getattr(self, key)) for key in self._STATE_KEYS}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self._restored_state = dict(state_dict)
+        for key, value in state_dict.items():
+            setattr(self, key, value)
+
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         # Apply the initial phase after optimizers exist and after the module's
         # own on_fit_start (which honours config freeze flags — left False here).
-        self._apply_phase(trainer, pl_module, self.start_phase)
+        restored = getattr(self, "_restored_state", None)
+        if restored is None:
+            self._apply_phase(trainer, pl_module, self.start_phase)
+            return
+        # Resumed from a checkpoint: re-apply the active phase (freezing,
+        # lambdas, split, model stage), then undo the per-phase resets and
+        # counters that _apply_phase performs on a fresh phase entry.
+        self._apply_phase(trainer, pl_module, restored["current_phase"])
+        for key, value in restored.items():
+            setattr(self, key, value)
+        self._restored_state = None
 
     def _capture_dag(self, trainer, pl_module, label: str) -> Dict[str, Any]:
         """Capture DAG diagnostics + score margin without corrupting train mode."""
@@ -2373,6 +2401,8 @@ def adaptive_trainer(
     experiment_tag: str = "NA",
     debug: bool = False,
     best: bool = False,
+    extra_callbacks: Optional[List] = None,
+    resume_ckpt: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Adaptive alternating trainer: metric-driven Structure/Reconstruct schedule.
@@ -2392,6 +2422,11 @@ def adaptive_trainer(
         experiment_tag:  Passed to ``train_single_fold`` for the run manifest.
         debug:           Enable anomaly detection, memory logger, etc.
         best:            If True, collect best-checkpoint metrics.
+        extra_callbacks: Optional callbacks added after the PhaseController
+                         (e.g. euler_funs pause/resume checkpointing).
+        resume_ckpt:     Optional full-state checkpoint to resume from; the
+                         PhaseController state is restored from it and the
+                         dropout pre-flight is skipped (its choice is reused).
 
     Returns:
         pd.DataFrame: One row per completed phase with end metrics and DAG
@@ -2561,7 +2596,14 @@ def adaptive_trainer(
     # Pre-flight epochs are selection overhead and do NOT count against
     # total_epoch_budget.
     ds_cfg = _to_plain_container(ad_cfg.get("dropout_selection", {})) or {}
-    if bool(ds_cfg.get("enabled", False)):
+    choice_path = Path(save_dir) / "dropout_selection_choice.json"
+    if bool(ds_cfg.get("enabled", False)) and resume_ckpt is not None:
+        # Resuming: rebuild the model with the dropout chosen before the pause.
+        from causaliT.training.dropout_selection import _set_regressor_dropout
+        best_dropout = json.loads(choice_path.read_text())["dropout"]
+        if best_dropout is not None:
+            _set_regressor_dropout(config, best_dropout)
+    elif bool(ds_cfg.get("enabled", False)):
         from causaliT.training.dropout_selection import (
             run_dropout_selection,
             _set_regressor_dropout,
@@ -2571,6 +2613,8 @@ def adaptive_trainer(
             config=config, data_dir=data_dir, dm=dm, save_dir=save_dir,
             cluster=cluster, seed=seed,
         )
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        choice_path.write_text(json.dumps({"dropout": best_dropout}))
         if best_dropout is not None:
             _set_regressor_dropout(config, best_dropout)
             if starting_ckpt is not None:
@@ -2648,12 +2692,13 @@ def adaptive_trainer(
         save_dir=str(save_dir),
         trainable_params=0,
         cluster=cluster,
-        resume_ckpt=None,
-        warm_start_ckpt=starting_ckpt,
+        resume_ckpt=resume_ckpt,
+        # Full resume restores weights; warm start applies to fresh runs only.
+        warm_start_ckpt=None if resume_ckpt else starting_ckpt,
         experiment_tag=f"{experiment_tag}_adaptive",
         debug=debug,
         best=best,
-        extra_callbacks=[controller],
+        extra_callbacks=[controller, *(extra_callbacks or [])],
         reload_dataloaders_every_n_epochs=reload_every_n,
         # data_dir is required for the PeriodicDAGMetrics callback
         # (training.log_dag_metrics): without it the dag/auroc_* columns
