@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
-from causaliT.training.stage_policy import resolve_gate_opts
+from causaliT.training.adaptive_utils.stage_policy import resolve_gate_opts
 
 
 def make(recon='none'):

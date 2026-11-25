@@ -399,7 +399,7 @@ def test_skew_query_attention_layer_wiring():
 
 def test_skew_query_gradient_routing_classifies_generators_as_structural():
     """direction_proj_a/b must be routed to the STRUCTURAL group."""
-    from causaliT.training.gradient_routing import classify_parameters
+    from causaliT.training.core.gradient_routing import classify_parameters
 
     layer = AttentionLayer(
         attention=CommutatorSelfAttention,

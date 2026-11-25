@@ -5,6 +5,8 @@ import logging
 import torch
 from pytorch_lightning import Callback, Trainer, LightningModule
 
+from causaliT import metrics as M
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +84,7 @@ class PeriodicDAGMetrics(Callback):
 
     SHD AND SOURCE RECALL: in addition to the threshold-free quantities above
     the callback also logs the THRESHOLDED metrics, using the exact
-    ``_compute_standard_shd`` convention of the end-of-run
+    ``metrics.standard_shd`` convention of the end-of-run
     ``eval_attention_scores`` (missing + extra + reversed, binarised at
     ``evaluation.dag_threshold``, default 0.5) so training trajectories are
     directly comparable with the final eval numbers.  Read them with care: a
@@ -123,6 +125,10 @@ class PeriodicDAGMetrics(Callback):
     ``on_train_end``), so short runs still produce the full column set.
     Never interrupts training: every failure path degrades to a warning.
 
+    Coding Assistant: this class only loads masks, splits blocks and logs.
+    All metric math lives in ``causaliT.metrics`` (imported as ``M``); add or
+    change metrics there.
+
     Args:
         config:         Configuration dictionary (needs ``data.dataset``).
         data_dir:       Root data directory holding the true DAG masks.
@@ -142,51 +148,9 @@ class PeriodicDAGMetrics(Callback):
         self._dag_threshold = float(
             self.config.get("evaluation", {}).get("dag_threshold", 0.5)
         )
-        self._ancestor_masks = {}  # lazily derived {block: ndarray | None}
-        self._descendant_masks = {}  # lazily derived {block: ndarray | None}
         self._warned_no_att = False
         self._warned_skip = set()  # blocks already warned about (one-shot)
         self._last_logged_epoch = None  # for the on_train_end fallback
-
-    @staticmethod
-    def _ancestor_not_parent_mask(true: "np.ndarray") -> "np.ndarray":
-        """Transitive-closure-minus-parents mask of a square DAG mask.
-
-        ``true[i, j] = 1`` means ``j -> i``; the returned mask marks cells
-        where j is an ANCESTOR of i but not a direct parent.  Boolean
-        fixpoint iteration; all-zero (never wrong) if the input is not
-        square or already equals its closure.
-        """
-        import numpy as np
-        g = np.asarray(true) > 0.5
-        if g.ndim != 2 or g.shape[0] != g.shape[1]:
-            return np.zeros_like(g)
-        tc = g.copy()
-        for _ in range(g.shape[0]):
-            new = tc | (tc @ g)
-            if (new == tc).all():
-                break
-            tc = new
-        return tc & ~g
-
-    @staticmethod
-    def _descendant_mask(true):
-        # Mask of cells (i, j) where j is a DESCENDANT of i (anti-causal
-        # mass).  true[i, j] = 1 means j -> i; j descendant of i iff i is an
-        # ancestor of j, i.e. the TRANSPOSE of the ancestor relation.
-        # Direct children are kept (a child IS a descendant); the diagonal
-        # is absent by construction.  All-zero for non-square input.
-        import numpy as np
-        g = np.asarray(true) > 0.5
-        if g.ndim != 2 or g.shape[0] != g.shape[1]:
-            return np.zeros_like(g)
-        tc = g.copy()
-        for _ in range(g.shape[0]):
-            new = tc | (tc @ g)
-            if (new == tc).all():
-                break
-            tc = new
-        return tc.T.copy()  # (i, j): i ancestor of j <=> j descendant of i
 
     # -- helpers ---------------------------------------------------------
     def _load_true_masks(self):
@@ -227,51 +191,20 @@ class PeriodicDAGMetrics(Callback):
                     f"dag/*_{block} columns will be absent from metrics.csv."
                 )
 
-    @staticmethod
-    def _auroc(scores: "np.ndarray", labels: "np.ndarray") -> float:
-        """Rank-based AUROC via the Mann-Whitney U identity (ties averaged).
-
-        Local implementation to avoid a hard sklearn dependency in the training
-        loop; identical to ``roc_auc_score`` for binary labels.
-        """
-        import numpy as np
-        pos = scores[labels > 0.5]
-        neg = scores[labels <= 0.5]
-        if pos.size == 0 or neg.size == 0:
-            return float("nan")
-        order = np.argsort(np.concatenate([pos, neg]), kind="mergesort")
-        ranks = np.empty(order.size, dtype=float)
-        ranks[order] = np.arange(1, order.size + 1, dtype=float)
-        # Average ranks within tie groups so a constant matrix scores exactly .5
-        vals = np.concatenate([pos, neg])[order]
-        i = 0
-        while i < vals.size:
-            j = i
-            while j + 1 < vals.size and vals[j + 1] == vals[i]:
-                j += 1
-            if j > i:
-                ranks[order[i:j + 1]] = ranks[order[i:j + 1]].mean()
-            i = j + 1
-        return float((ranks[:pos.size].sum() - pos.size * (pos.size + 1) / 2.0)
-                     / (pos.size * neg.size))
+    def _log(self, pl_module: LightningModule, name: str, value) -> None:
+        """Epoch-level log shorthand."""
+        pl_module.log(name, float(value), on_step=False, on_epoch=True)
 
     # -- thresholded metrics (SHD) ---------------------------------------
     def _log_shd(self, pl_module: LightningModule, learned: "np.ndarray",
                  true: "np.ndarray", tag: str, is_cross: bool) -> int:
-        """Log standard SHD + decomposition for one (block) matrix.
+        """Log ``metrics.standard_shd`` + decomposition for one block.
 
-        Uses ``_compute_standard_shd`` from the eval helpers so the numbers
-        are exactly comparable with the end-of-run ``eval_attention_scores``.
-        Returns the integer SHD (for the ``dag/shd_total`` accumulation).
+        Same function as the end-of-run eval, so numbers are comparable.
+        Returns the integer SHD (for ``dag/shd_total``).
         """
-        from causaliT.evaluation.eval_funs.helpers.eval_utils import (
-            _compute_standard_shd,
-        )
-        res = _compute_standard_shd(
-            learned, true,
-            threshold=self._dag_threshold,
-            is_cross_attention=is_cross,
-        )
+        res = M.standard_shd(learned, true, threshold=self._dag_threshold,
+                             is_cross=is_cross)
         pl_module.log(f"dag/shd_{tag}", float(res["shd"]),
                       on_step=False, on_epoch=True)
         pl_module.log(f"dag/shd_missing_{tag}", float(res["missing"]),
@@ -321,7 +254,7 @@ class PeriodicDAGMetrics(Callback):
                               float(true_src[pred_src].mean()),
                               on_step=False, on_epoch=True)
                 pl_module.log("dag/source_auroc",
-                              self._auroc(-sc, true_src),
+                              M.auroc(-sc, true_src),
                               on_step=False, on_epoch=True)
 
         # --- full-matrix SHD --------------------------------------------
@@ -358,72 +291,6 @@ class PeriodicDAGMetrics(Callback):
                 )
 
     # -- causal-order agreement ------------------------------------------
-    @staticmethod
-    def _order_agreement(upstreamness: "np.ndarray", true_full: "np.ndarray"):
-        """Agreement between an upstreamness score and the true causal order.
-
-        ``upstreamness[j]`` larger = node j estimated more upstream (the
-        posterior's outgoing-edge mass, or a RESIT-style HSIC score).
-        ``true_full[i, j] = 1`` means ``j -> i``.
-
-        Returns ``(pair_acc, kendall)``:
-        * ``pair_acc`` -- fraction of TRUE ancestor pairs (j -> ... -> i)
-          with upstreamness[j] > upstreamness[i] (ties count 1/2); 1.0 =
-          perfectly ordered, 0.5 = chance.
-        * ``kendall`` -- Kendall-tau-style concordance of the score against
-          the true topological depth (longest path from a source), computed
-          over node pairs with DISTINCT true depth; +1 = score decreases
-          monotonically downstream, 0 = no agreement.
-        """
-        import numpy as np
-        g = np.asarray(true_full) > 0.5
-        n = g.shape[0]
-        # GT ancestor relation: anc[i, j] = True iff j -> ... -> i.
-        anc = g.copy()
-        for _ in range(n):
-            new = anc | (anc @ g)
-            if (new == anc).all():
-                break
-            anc = new
-        np.fill_diagonal(anc, False)
-        # GT topological depth (longest path from a source).
-        depth = np.zeros(n, dtype=float)
-        for _ in range(n):
-            new_depth = depth.copy()
-            for i in range(n):
-                pa = np.where(g[i])[0]
-                if pa.size:
-                    new_depth[i] = max(new_depth[i], depth[pa].max() + 1)
-            if np.array_equal(new_depth, depth):
-                break
-            depth = new_depth
-
-        u = np.asarray(upstreamness, dtype=float).ravel()
-        ii, jj = np.where(anc)
-        if ii.size:
-            d = u[jj] - u[ii]          # j ancestor of i: should be positive
-            pair_acc = float((np.sum(d > 0) + 0.5 * np.sum(d == 0)) / ii.size)
-        else:
-            pair_acc = float("nan")
-
-        concordant = discordant = 0
-        for a in range(n):
-            for b in range(a + 1, n):
-                if depth[a] == depth[b]:
-                    continue
-                true_sign = 1.0 if depth[a] < depth[b] else -1.0
-                s = np.sign(u[a] - u[b])
-                if s == 0:
-                    concordant += 0.5
-                    discordant += 0.5
-                elif s == true_sign:
-                    concordant += 1
-                else:
-                    discordant += 1
-        tot = concordant + discordant
-        kendall = float((concordant - discordant) / tot) if tot else float("nan")
-        return pair_acc, kendall
-
     def _log_order_metrics(self, pl_module: LightningModule,
                            att_full: "np.ndarray"):
         """Log causal-order agreement of the posterior (and of the diagnostic
@@ -440,7 +307,7 @@ class PeriodicDAGMetrics(Callback):
         import numpy as np
         try:
             up_post = att_full.sum(axis=0)      # outgoing-edge mass
-            pair_acc, kendall = self._order_agreement(up_post, self._true_full)
+            pair_acc, kendall = M.order_agreement(up_post, self._true_full)
             pl_module.log("dag/order_pair_acc_full", pair_acc,
                           on_step=False, on_epoch=True)
             pl_module.log("dag/order_kendall_full", kendall,
@@ -458,7 +325,7 @@ class PeriodicDAGMetrics(Callback):
             s = scores.detach().cpu().numpy().astype(float).ravel()
             if s.shape[0] != self._true_full.shape[0]:
                 return
-            pair_acc, kendall = self._order_agreement(s, self._true_full)
+            pair_acc, kendall = M.order_agreement(s, self._true_full)
             pl_module.log("dag/order_pair_acc_hsic", pair_acc,
                           on_step=False, on_epoch=True)
             pl_module.log("dag/order_kendall_hsic", kendall,
@@ -540,85 +407,17 @@ class PeriodicDAGMetrics(Callback):
                 )
                 continue
 
-            s, y = arr.ravel(), true.ravel()
-            on, off = s[y > 0.5], s[y <= 0.5]
-            if on.size == 0 or off.size == 0:
+            # Threshold-free quality (see metrics.attention_mass_metrics).
+            mass = M.attention_mass_metrics(arr, true)
+            if not mass:
                 continue
-
-            pl_module.log(f"dag/auroc_{block}", self._auroc(s, y),
-                          on_step=False, on_epoch=True)
-            pl_module.log(f"dag/contrast_{block}",
-                          float(on.mean() - off.mean()),
-                          on_step=False, on_epoch=True)
-            # Thresholded SHD (same convention as the end-of-run eval):
-            # noisy on a near-uniform posterior early in training, but
-            # directly comparable with eval_attention_scores.
+            for key, value in mass.items():
+                self._log(pl_module, f"dag/{key}_{block}", value)
+            # Thresholded SHD: noisy on a near-uniform posterior early in
+            # training, but directly comparable with eval_attention_scores.
             shd_total += self._log_shd(pl_module, arr, true, block,
                                        is_cross=(block == "cross"))
             n_shd_blocks += 1
-
-            total = float(s.sum())
-            anc_mass = 0.0  # filled below; used for the mass_on_others residual
-            dsc_mass = 0.0
-            if total > 1e-12:
-                pl_module.log(f"dag/mass_on_edges_{block}",
-                              float(on.sum() / total),
-                              on_step=False, on_epoch=True)
-                # Same quantity under the causal naming (true-edge cells ARE
-                # the direct-parent cells) so the parents/ancestors/
-                # descendants/others partition appears in every metrics.csv.
-                pl_module.log(f"dag/mass_on_parents_{block}",
-                              float(on.sum() / total),
-                              on_step=False, on_epoch=True)
-
-            # Ancestor-vs-parent split (square blocks only, i.e. X->X):
-            # where the non-parent mass actually sits.  HSIC cannot reach its
-            # zero floor through ancestors, so this tracks whether the
-            # structural signal is being spent on transitive proxies.
-            anc = self._ancestor_masks.get(block)
-            if anc is None:
-                anc = self._ancestor_not_parent_mask(true)
-                self._ancestor_masks[block] = anc
-            anc_flat = anc.ravel()
-            if anc_flat.any():
-                sa = s[anc_flat]
-                anc_mass = float(sa.sum())
-                if total > 1e-12:
-                    pl_module.log(f"dag/mass_on_ancestors_{block}",
-                                  float(anc_mass / total),
-                                  on_step=False, on_epoch=True)
-                pl_module.log(f"dag/parent_vs_ancestor_contrast_{block}",
-                              float(on.mean() - sa.mean()),
-                              on_step=False, on_epoch=True)
-
-            # Descendant mass (square blocks only): the anti-causal channel -
-            # fraction of mass on cells (i, j) with j a DESCENDANT of i
-            # (reversed-direction edges).  Children are strong predictors of
-            # their parents, so a rising share is the signature of the
-            # posterior collapsing onto the anti-causal solution.
-            dsc = self._descendant_masks.get(block)
-            if dsc is None:
-                dsc = self._descendant_mask(true)
-                self._descendant_masks[block] = dsc
-            dsc_flat = dsc.ravel()
-            if dsc_flat.any():
-                dsc_mass = float(s[dsc_flat].sum())
-                if total > 1e-12:
-                    pl_module.log(f"dag/mass_on_descendants_{block}",
-                                  float(dsc_mass / total),
-                                  on_step=False, on_epoch=True)
-
-            # "Others": cells that are neither parents/edges, ancestors, nor
-            # descendants -- the unrelated residual.  For non-square (cross)
-            # blocks anc/dsc are all-zero and this equals the non-edge mass;
-            # for square (self) blocks the diagonal is excluded as well.
-            if total > 1e-12:
-                others = total - float(on.sum()) - anc_mass - dsc_mass
-                if arr.shape[0] == arr.shape[1]:
-                    others -= float(np.diag(arr).sum())
-                pl_module.log(f"dag/mass_on_others_{block}",
-                              float(others / total),
-                              on_step=False, on_epoch=True)
 
         # Aggregate SHD over the blocks that produced one.
         if n_shd_blocks:
@@ -741,30 +540,10 @@ class HSICClassMetrics(PeriodicDAGMetrics):
                         f"{mat.shape} vs true {true.shape}; skipping."
                     )
                 continue
-            finite = np.isfinite(mat)
-            parents = true > 0.5
-            if mat.shape[0] == mat.shape[1]:
-                anc = self._ancestor_not_parent_mask(true)
-                dsc = self._descendant_mask(true)
-                others = ~(parents | anc | dsc) & ~np.eye(
-                    mat.shape[0], dtype=bool
-                )
-                classes = {"parents": parents, "ancestors": anc,
-                           "descendants": dsc, "others": others}
-            else:
-                classes = {"parents": parents, "others": ~parents}
-            for cls, m in classes.items():
-                sel = m & finite
-                vals = mat[sel]
-                if vals.size == 0:
-                    continue
-                pl_module.log(f"hsic_class/{cls}_{block}",
-                              float(vals.mean()),
-                              on_step=False, on_epoch=True)
+            for cls, (mean, count) in M.class_means(mat, true).items():
+                self._log(pl_module, f"hsic_class/{cls}_{block}", mean)
                 if not self._counts_logged:
-                    pl_module.log(f"hsic_class/n_{cls}_{block}",
-                                  float(int(sel.sum())),
-                                  on_step=False, on_epoch=True)
+                    self._log(pl_module, f"hsic_class/n_{cls}_{block}", count)
         self._counts_logged = True
 
 

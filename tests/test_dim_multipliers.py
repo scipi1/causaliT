@@ -1,6 +1,6 @@
 """
 Smoke test for d_ff_mult / d_qk_mult resolution in
-``causaliT.training.experiment_control.update_config``.
+``causaliT.training.core.experiment_control.update_config``.
 
 These tests pin the affine-multiplier convention introduced after the
 1:1:1 ``d_model_set / d_ff / d_qk`` default:
@@ -16,7 +16,7 @@ import pytest
 
 OmegaConf = pytest.importorskip("omegaconf").OmegaConf
 
-from causaliT.training.experiment_control import update_config
+from causaliT.training.core.experiment_control import update_config
 
 
 def _make_cfg(d_model_set=24, d_ff_mult=2.0, d_qk_mult=0.5,

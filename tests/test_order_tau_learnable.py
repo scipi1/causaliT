@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
-from causaliT.training.gradient_routing import _is_structural_param
+from causaliT.training.core.gradient_routing import _is_structural_param
 
 N, E, B = 4, 4, 3
 

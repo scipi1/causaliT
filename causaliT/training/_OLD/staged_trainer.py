@@ -1,23 +1,14 @@
 """
-Staged Training Orchestrator: Coordinates calibration -> causal_init -> score_cv -> training.
+Staged training orchestrator: calibration -> causal_init -> training.
 
-Pipeline stages (each independently toggleable):
-- Stage 0: Calibration         (use_calibration)      → λ_group, λ_hsic
-- Stage 1: Causal Init         (use_causal_init)      → structural checkpoint
-- Stage 2: Score Sparsity CV   (use_score_sparsity_cv)→ λ_score
-- Stage 3: Main Training       (always)               → final model
+Stages (each toggleable in ``staged_training``):
+- Stage 0: Calibration  (use_calibration)  -> lambda_group, lambda_hsic
+- Stage 1: Causal init  (use_causal_init)  -> structural checkpoint
+- Stage 3: Main training (always)          -> final model
 
-Pipeline combinations (all 8 combinations are valid):
-- cal ON  + init ON  + cv ON  -> cal -> init -> cv -> train
-- cal ON  + init ON  + cv OFF -> cal -> init -> train
-- cal ON  + init OFF + cv ON  -> cal -> cv -> train
-- cal ON  + init OFF + cv OFF -> cal -> train
-- cal OFF + init ON  + cv ON  -> init -> cv -> train
-- cal OFF + init ON  + cv OFF -> init -> train
-- cal OFF + init OFF + cv ON  -> cv -> train
-- cal OFF + init OFF + cv OFF -> train (standard)
-
-All config changes are delegated to pure functions in config_operations.py.
+The score-sparsity CV stage (2) was retired with the noise-aware model
+(code in training/_OLD); ``use_score_sparsity_cv: true`` raises.
+Config changes are delegated to pure functions in config_operations.py.
 """
 
 import json
@@ -42,17 +33,13 @@ def staged_trainer(
     best: bool = False,
 ) -> pd.DataFrame:
     """
-    Run the staged training pipeline (calibration -> causal_init -> score_cv -> training).
+    Run the staged training pipeline (calibration -> causal_init -> training).
 
     Stage 0 -- Calibration (staged_training.use_calibration):
         Binary search for lambda_group s.t. ||grad_Recon|| ~ ||grad_HSIC||.
 
     Stage 1 -- Causal Init (staged_training.use_causal_init):
         Pre-trains with HSIC-dominated loss to break symmetry.
-
-    Stage 2 -- Score Sparsity CV (staged_training.use_score_sparsity_cv):
-        Selects optimal λ_score via k-fold cross-validation.
-        Uses the same lambda for cross- and self-attention score sparsity.
 
     Stage 3 -- Main Training:
         Standard k-fold training. HSIC annealing auto-configured after init.
@@ -73,7 +60,6 @@ def staged_trainer(
     """
     from causaliT.training.calibration import calibrate_group_l1
     from causaliT.training.causal_initialization import run_causal_initialization
-    from causaliT.training.score_sparsity_cv import run_score_sparsity_cv
     from causaliT.training.config_operations import (
         apply_calibration_to_config,
         configure_main_training_from_staged,
@@ -84,7 +70,9 @@ def staged_trainer(
     staged_config = config.get("staged_training", {})
     use_calibration = staged_config.get("use_calibration", False)
     use_causal_init = staged_config.get("use_causal_init", False)
-    use_score_sparsity_cv = staged_config.get("use_score_sparsity_cv", False)
+    if staged_config.get("use_score_sparsity_cv", False):
+        raise ValueError("staged_training.use_score_sparsity_cv was retired "
+                         "(noise-aware only, see training/_OLD).")
     seed = config["training"].get("seed", 42)
 
     # Resume checkpoint skips Stages 0-1 and does a full Lightning resume
@@ -109,7 +97,6 @@ def staged_trainer(
     staged_summary = {
         "use_calibration": use_calibration,
         "use_causal_init": use_causal_init,
-        "use_score_sparsity_cv": use_score_sparsity_cv,
         "resume_from": resume_ckpt,
         "stages_completed": [],
     }
@@ -190,34 +177,6 @@ def staged_trainer(
             print("Causal initialization complete")
 
     # =========================================================================
-    # STAGE 2: SCORE SPARSITY CROSS-VALIDATION
-    # =========================================================================
-    if use_score_sparsity_cv:
-        if not cluster:
-            print("\n" + "=" * 70)
-            print("STAGED TRAINING: STAGE 2 - SCORE SPARSITY CV")
-            print("=" * 70)
-
-        best_lambda_score = run_score_sparsity_cv(
-            config=config,
-            data_dir=data_dir,
-            save_dir=save_dir,
-            starting_checkpoint=starting_checkpoint,
-            seed=seed,
-            cluster=cluster,
-        )
-
-        # Store the suggested value in staged_training config
-        # (configure_main_training_from_staged will propagate it)
-        config["staged_training"]["lambda_score_suggested"] = best_lambda_score
-
-        staged_summary["stages_completed"].append("score_sparsity_cv")
-        staged_summary["best_lambda_score"] = best_lambda_score
-
-        if not cluster:
-            print(f"Score sparsity CV complete: λ_score = {best_lambda_score}")
-
-    # =========================================================================
     # STAGE 3: MAIN TRAINING
     # =========================================================================
     if not cluster:
@@ -238,11 +197,6 @@ def staged_trainer(
             print(f"HSIC annealing over {anneal_epochs} epochs:")
             print(f"  Cross: {cross_start:.4f} -> {cross_end:.4f}")
             print(f"  Self:  {self_start:.4f} -> {self_end:.4f}")
-
-    if use_score_sparsity_cv and not cluster:
-        lambda_cs = config_main["training"].get("lambda_cross_score_sparse", 0)
-        lambda_ss = config_main["training"].get("lambda_self_score_sparse", 0)
-        print(f"Score sparsity: λ_cross={lambda_cs}, λ_self={lambda_ss}")
 
     df_metrics = trainer(
         config=config_main,
@@ -312,7 +266,6 @@ def check_staged_training_config(config: dict) -> dict:
 
     use_calibration = staged.get("use_calibration", False)
     use_causal_init = staged.get("use_causal_init", False)
-    use_score_cv = staged.get("use_score_sparsity_cv", False)
     lambda_hsic = training.get("lambda_hsic_cross", training.get("lambda_hsic", 0))
 
     if use_calibration and lambda_hsic == 0:
@@ -344,28 +297,5 @@ def check_staged_training_config(config: dict) -> dict:
         result["info"].append(
             "HSIC annealing will be auto-enabled for smooth transition from causal init."
         )
-    if use_score_cv:
-        cv_folds = staged.get("score_sparsity_cv_folds", 5)
-        cv_epochs = staged.get("score_sparsity_cv_epochs", 20)
-        candidates = staged.get(
-            "score_sparsity_lambda_candidates",
-            [0.0, 0.001, 0.005, 0.01, 0.05, 0.1],
-        )
-        n_candidates = len(candidates)
-        total_runs = n_candidates * cv_folds
-        result["info"].append(
-            f"Score sparsity CV: {n_candidates} lambdas × {cv_folds} folds "
-            f"= {total_runs} runs, {cv_epochs} epochs each"
-        )
-        if cv_epochs < 5:
-            result["warnings"].append(
-                f"score_sparsity_cv_epochs={cv_epochs} may be too few for "
-                "reliable score sparsity selection."
-            )
-        if n_candidates < 2:
-            result["warnings"].append(
-                f"score_sparsity_lambda_candidates has only {n_candidates} "
-                "value(s). Need at least 2 for meaningful cross-validation."
-            )
 
     return result

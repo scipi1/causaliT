@@ -101,8 +101,8 @@ Requirements
 ------------
 The controller performs a *true* freeze via ``requires_grad_(False)`` on the
 pre-classified parameter groups, so it requires ``use_gradient_routing=True``
-(both ``SingleCausalForecaster`` and ``AttentionSelectorForecaster`` expose
-``_structural_params`` / ``_reconstruction_params`` in that mode).
+(``AttentionSelectorForecaster`` exposes ``_structural_params`` /
+``_reconstruction_params`` in that mode).
 
 Example ``config['adaptive_training']`` block::
 
@@ -208,11 +208,11 @@ from pytorch_lightning.callbacks import Callback
 from torch.utils.data import DataLoader
 
 from causaliT.training.callbacks import KFoldResultsTracker
-from causaliT.training.stage_policy import parse_stage_policy
+from causaliT.training.adaptive_utils.stage_policy import parse_stage_policy
 
 # Plain-container coercion, score-margin helper, cross-fit partitioner and JSON
 # serializer shared with the rest of the staged-training utilities.
-from causaliT.training.staging_utils import (
+from causaliT.training.adaptive_utils.staging_utils import (
     _to_plain_container,
     _compute_score_margin,
     _json_default,
@@ -976,7 +976,7 @@ class PhaseController(Callback):
         Inheritance:
           * final_reconstruct: reconstruct block + final block (always);
           * warmup: reconstruct block + warmup block when ``warmup_inherits``
-            (descendant / LOO / bandwidth / dir_bias knobs), the warmup block
+            (descendant / bandwidth / dir_bias knobs), the warmup block
             alone otherwise (BKD and dense-gate curricula, which are designed
             per warmup);
           * structure / joint / reconstruct: their own block.
@@ -1239,22 +1239,6 @@ class PhaseController(Callback):
         "hsic_descendant_confident_score",
     )
 
-    # LOO conditional-HSIC gate knobs that may be overridden PER PHASE.
-    # See AttentionSelectorForecaster._compute_loo_gamma and
-    # docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md.  Same rationale as the
-    # descendant mask: gamma is measured against the CURRENT predictor and
-    # adjacency, so it should typically stay OFF during warmup / high-BKD
-    # phases and switch ON in later structure phases (under BKD the
-    # "redundant" twins are functionally load-bearing - see the BKD
-    # interaction discussion in the counter-proposal).
-    _LOO_GATE_KEYS = (
-        "use_loo_gamma_gate",
-        "loo_gamma_topk",
-        "loo_gamma_refresh",
-        "loo_gamma_permutations",
-        "loo_gamma_ema",
-    )
-
     def _gated_struct_cfg(self, pl_module: pl.LightningModule) -> Dict[str, Any]:
         """Structure-phase loss weights with the HSIC-progress gates applied.
 
@@ -1343,52 +1327,12 @@ class PhaseController(Callback):
 
         logger.info("[adaptive] descendant-HSIC overrides applied: %s", applied)
 
-    def _apply_loo_gate_cfg(
-        self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
-    ) -> None:
-        """Apply per-phase LOO-gamma-gate overrides (no-op when unspecified).
-
-        Mirrors :meth:`_apply_descendant_mask_cfg`.  Changing the gate
-        settings invalidates the cached EMA, so ``_loo_gamma_cache`` is reset
-        at the switch.
-        """
-        if not any(k in phase_cfg for k in self._LOO_GATE_KEYS):
-            return
-        if not hasattr(pl_module, "use_loo_gamma_gate"):
-            logger.warning(
-                "[adaptive] LOO-gamma keys present in the phase config but "
-                "the forecaster (%s) does not support them - ignoring.",
-                type(pl_module).__name__,
-            )
-            return
-
-        applied: Dict[str, Any] = {}
-        for key in self._LOO_GATE_KEYS:
-            if key not in phase_cfg:
-                continue
-            raw = phase_cfg[key]
-            if key == "use_loo_gamma_gate":
-                val: Any = bool(raw)
-            elif key == "loo_gamma_ema":
-                val = float(raw)
-            elif key == "loo_gamma_topk":
-                val = None if raw is None else int(raw)
-            else:
-                val = int(raw)
-            setattr(pl_module, key, val)
-            applied[key] = val
-
-        if hasattr(pl_module, "_loo_gamma_cache"):
-            setattr(pl_module, "_loo_gamma_cache", None)
-
-        logger.info("[adaptive] LOO-gamma overrides applied: %s", applied)
-
     def _apply_hsic_bw_cfg(
         self, pl_module: pl.LightningModule, phase_cfg: Dict[str, Any]
     ) -> None:
         """Per-phase HSIC bandwidth freeze (``hsic_freeze_bandwidth: true``).
 
-        Mirrors :meth:`_apply_loo_gate_cfg`.  When a phase block enables it
+        Mirrors :meth:`_apply_descendant_mask_cfg`.  When a phase block enables it
         (typically ``structure``), the forecaster lazily latches the
         per-variable median-heuristic bandwidths on the phase's first train
         batch and runs the whole phase with them fixed (restores the
@@ -1698,7 +1642,7 @@ class PhaseController(Callback):
         # weights of the previous one.
         self._apply_phase_lambdas(trainer, pl_module, phase)
 
-        # Descendant-HSIC / LOO / bandwidth overrides (honoured in every
+        # Descendant-HSIC / bandwidth overrides (honoured in every
         # phase; warmup and final inherit the reconstruct block).
         phase_cfg = self._phase_cfg(phase)
         if train_struct and not resume:
@@ -1706,7 +1650,6 @@ class PhaseController(Callback):
             if phase == "structure":
                 self._struct_phase_count += 1
         self._apply_descendant_mask_cfg(pl_module, phase_cfg)
-        self._apply_loo_gate_cfg(pl_module, phase_cfg)
         self._apply_hsic_bw_cfg(pl_module, phase_cfg)
         if train_struct:
             # Anchor AFTER the overrides so the warmup value logged/compared
@@ -1782,7 +1725,7 @@ class PhaseController(Callback):
                 if (not self.warmup_enabled or self._struct_entry_count != 1
                         or self._phase_index != 1):
                     raise ValueError("Order initialization requires the first post-warmup structure entry.")
-                from causaliT.training.order_initialization import initialize_order_from_hsic
+                from causaliT.training.adaptive_utils.order_initialization import initialize_order_from_hsic
                 get_loader = getattr(self.dm, "hsic_cross_fit_eval_dataloader", None)
                 loader = get_loader("b") if callable(get_loader) else None
                 report = initialize_order_from_hsic(
@@ -2159,7 +2102,7 @@ class PhaseController(Callback):
         self._stopped = True
 
     def _capture_dag(self, trainer, pl_module, label: str) -> Dict[str, Any]:
-        """Capture DAG diagnostics + score margin without corrupting train mode."""
+        """Capture the score margin at a phase switch (train mode preserved)."""
         result: Dict[str, Any] = {
             "phase": self.current_phase,
             "phase_index": self._phase_index,
@@ -2171,19 +2114,6 @@ class PhaseController(Callback):
 
         was_training = pl_module.training
         try:
-            try:
-                from causaliT.training.causal_initialization import (
-                    evaluate_dag_from_model,
-                )
-                dag_metrics = evaluate_dag_from_model(
-                    pl_module, self.config, self.data_dir
-                )
-                for k, v in dag_metrics.items():
-                    if not isinstance(v, np.ndarray):
-                        result[k] = v
-            except Exception as exc:
-                logger.debug(f"PhaseController: evaluate_dag_from_model failed: {exc}")
-
             margin = _compute_score_margin(pl_module, self.config, self.data_dir)
             result["score_margin_cross"] = margin.get("cross")
             result["score_margin_self"] = margin.get("self")
@@ -2774,8 +2704,8 @@ def adaptive_trainer(
         _run_post_training_evaluations,
         resolve_seeds,
     )
-    from causaliT.training.config_utils import populate_seq_lengths_from_dataset
-    from causaliT.training.experiment_control import update_config
+    from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
+    from causaliT.training.core.experiment_control import update_config
 
     ad_cfg = _to_plain_container(config.get("adaptive_training", {})) or {}
     if not ad_cfg:
@@ -2924,12 +2854,12 @@ def adaptive_trainer(
     choice_path = Path(save_dir) / "dropout_selection_choice.json"
     if bool(ds_cfg.get("enabled", False)) and resume_ckpt is not None:
         # Resuming: rebuild the model with the dropout chosen before the pause.
-        from causaliT.training.dropout_selection import _set_regressor_dropout
+        from causaliT.training.adaptive_utils.dropout_selection import _set_regressor_dropout
         best_dropout = json.loads(choice_path.read_text())["dropout"]
         if best_dropout is not None:
             _set_regressor_dropout(config, best_dropout)
     elif bool(ds_cfg.get("enabled", False)):
-        from causaliT.training.dropout_selection import (
+        from causaliT.training.adaptive_utils.dropout_selection import (
             run_dropout_selection,
             _set_regressor_dropout,
         )

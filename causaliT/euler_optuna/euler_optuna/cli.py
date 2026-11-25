@@ -6,15 +6,7 @@ transformer models.  Only causal transformer models are supported.
 
 SUPPORTED MODELS
 ----------------
-- proT
-- SingleCausalLayer / SingleCausalLayerRes
-- NoiseAwareSingleCausalLayer / NoiseAwareSingleCausalLayerRes
 - AttentionSelectorLayer
-- SelfSelectorLayer
-
-Note: StageCausaliT is intentionally excluded from the current Optuna scope
-because it uses a different metric naming convention (``val_mae_X`` instead
-of ``val_x_mae``).  Add it in a future iteration.
 
 OPTIMISED PARAMETERS (capacity-focused)
 ----------------------------------------
@@ -22,9 +14,6 @@ All models share the same ``experiment.*`` config path convention:
 
   experiment.d_model_set  — embedding / model dimension
   experiment.n_heads      — number of attention heads (sampled from {1, 2, 4})
-  experiment.dec_layers   — decoder depth  (Single* / NoiseAware*)
-  experiment.e_layers     — encoder depth  (proT)
-  experiment.d_layers     — decoder depth  (proT)
   training.lr             — learning rate
   experiment.dropout      — dropout rate
 
@@ -90,7 +79,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 # ── causaliT imports ──────────────────────────────────────────────────────────
 from causaliT.training.trainer import trainer
-from causaliT.training.experiment_control import update_config
+from causaliT.training.core.experiment_control import update_config
 from causaliT.euler_optuna.euler_optuna.optuna_opt import OptunaStudy
 from causaliT.euler_optuna.euler_optuna.optuna_parallel import run_parallel_optuna
 
@@ -407,75 +396,6 @@ SAMPLING_BOUNDS = BASELINE_SAMPLING_BOUNDS
 # MODEL-SPECIFIC SAMPLING FUNCTIONS
 # =============================================================================
 
-def proT_sample_params(trial):
-    """
-    Capacity sampling for ``proT`` (TransformerForecaster).
-
-    Config keys used (all under ``experiment.*``):
-      - d_model_set  : embedding / model dimension
-      - e_layers     : encoder depth
-      - d_layers     : decoder depth
-      - n_heads      : attention heads (categorical from {1, 2, 4})
-      - dropout      : dropout rate
-      - training.lr  : learning rate
-    """
-    return {
-        "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
-        "experiment.e_layers":    trial.suggest_int("e_layers",      **SAMPLING_BOUNDS["n_layers"]),
-        "experiment.d_layers":    trial.suggest_int("d_layers",      **SAMPLING_BOUNDS["n_layers"]),
-        "experiment.n_heads":     trial.suggest_categorical("n_heads", N_HEADS_CHOICES),
-        "experiment.dropout":     trial.suggest_float("dropout",     **SAMPLING_BOUNDS["dropout"]),
-        "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
-    }
-
-
-def StageCausaliT_sample_params(trial):
-    """
-    Capacity sampling for ``StageCausaliT``.
-
-    Config keys used (all under ``experiment.*``):
-      - d_model_set  : shared embedding dimension
-      - d1_layers    : decoder-1 (structure pathway) depth
-      - d2_layers    : decoder-2 (reconstruction pathway) depth
-      - n_heads      : attention heads (categorical from {1, 2, 4})
-      - dropout      : dropout rate
-      - training.lr  : learning rate
-
-    Note: StageCausaliT is currently excluded from the Optuna capacity study
-    scope (it logs ``val_mae_X`` instead of ``val_x_mae``).  This function is
-    kept for future use.
-    """
-    return {
-        "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
-        "experiment.d1_layers":   trial.suggest_int("d1_layers",     **SAMPLING_BOUNDS["n_layers"]),
-        "experiment.d2_layers":   trial.suggest_int("d2_layers",     **SAMPLING_BOUNDS["n_layers"]),
-        "experiment.n_heads":     trial.suggest_categorical("n_heads", N_HEADS_CHOICES),
-        "experiment.dropout":     trial.suggest_float("dropout",     **SAMPLING_BOUNDS["dropout"]),
-        "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
-    }
-
-
-def SingleCausal_sample_params(trial):
-    """
-    Capacity sampling for ``SingleCausalLayer``, ``SingleCausalLayerRes``,
-    ``NoiseAwareSingleCausalLayer``, and ``NoiseAwareSingleCausalLayerRes``.
-
-    Config keys used (all under ``experiment.*``):
-      - d_model_set  : embedding dimension
-      - dec_layers   : decoder depth
-      - n_heads      : attention heads (categorical from {1, 2, 4})
-      - dropout      : dropout rate
-      - training.lr  : learning rate
-    """
-    return {
-        "experiment.d_model_set": trial.suggest_int("d_model_set",   **SAMPLING_BOUNDS["d_model_set"]),
-        "experiment.dec_layers":  trial.suggest_int("dec_layers",    **SAMPLING_BOUNDS["n_layers"]),
-        "experiment.n_heads":     trial.suggest_categorical("n_heads", N_HEADS_CHOICES),
-        "experiment.dropout":     trial.suggest_float("dropout",     **SAMPLING_BOUNDS["dropout"]),
-        "training.lr":            trial.suggest_float("lr",          **SAMPLING_BOUNDS["lr"]),
-    }
-
-
 def AttentionSelector_sample_params(trial):
     """
     Capacity sampling for ``AttentionSelectorLayer``.
@@ -516,12 +436,6 @@ def AttentionSelector_sample_params(trial):
 
 #: Map from model_object string → sampling function
 _SAMPLING_DISPATCH = {
-    "proT":                           proT_sample_params,
-    "StageCausaliT":                  StageCausaliT_sample_params,
-    "SingleCausalLayer":              SingleCausal_sample_params,
-    "SingleCausalLayerRes":           SingleCausal_sample_params,
-    "NoiseAwareSingleCausalLayer":    SingleCausal_sample_params,
-    "NoiseAwareSingleCausalLayerRes": SingleCausal_sample_params,
     "AttentionSelectorLayer":         AttentionSelector_sample_params,
 }
 

@@ -14,11 +14,11 @@ import numpy as np
 import pytest
 import torch
 
-from causaliT.training.dataloader import ProcessDataModule
+from causaliT.training.dataloader_sx import SXDataModule
 
 
 def _dm(n=64, batch_size=8):
-    dm = ProcessDataModule.__new__(ProcessDataModule)      # no file I/O
+    dm = SXDataModule.__new__(SXDataModule)      # no file I/O
     dm.batch_size = batch_size
     dm.num_workers = 0
     dm.persistent_workers = False

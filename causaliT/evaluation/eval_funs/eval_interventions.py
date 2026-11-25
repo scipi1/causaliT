@@ -23,11 +23,12 @@ from typing import Dict, List, Optional
 from pathlib import Path
 
 # Import shared utilities
+from causaliT.metrics import ate_errors
 from .helpers.eval_utils import root_path, load_dataset_metadata
 
 # Import from project modules
 from causaliT.evaluation.predict import create_predictor
-from causaliT.training.experiment_control import update_config
+from causaliT.training.core.experiment_control import update_config
 
 # Import from the local support layer
 from .helpers.eval_lib import find_config_file, find_best_or_last_checkpoint
@@ -767,7 +768,6 @@ def compute_ate_metrics(
                 treated_mean_raw = denormalize_value(treated_mean_norm, norm_stats, "input")
                 baseline_mean_raw = denormalize_value(baseline_mean_norm, norm_stats, "input")
                 
-                model_ate = treated_mean_raw - baseline_mean_raw
                 
                 # Ground truth ATE lookup
                 true_ate = ground_truth_ate.get(intervention, {}).get(var_name)
@@ -780,9 +780,9 @@ def compute_ate_metrics(
                 true_baseline = ground_truth_baseline.get(source_var, {}).get(var_name)
                 true_treatment = ground_truth_treated.get(intervention, {}).get(var_name)
                 
-                # Compute errors
-                abs_error = abs(model_ate - true_ate) if true_ate is not None else None
-                rel_error = abs_error / abs(true_ate) if (true_ate and abs(true_ate) > 1e-10) else None
+                err = ate_errors(treated_mean_raw, baseline_mean_raw, true_ate)
+                model_ate, abs_error, rel_error = (
+                    err["model_ate"], err["abs_error"], err["rel_error"])
                 
                 ate_records.append({
                     "intervention": intervention,
@@ -1153,16 +1153,15 @@ def compute_ate_metrics_mc(
                 treated_mean_raw = denormalize_value(treated_mean_norm, norm_stats, "input")
                 baseline_mean_raw = denormalize_value(baseline_mean_norm, norm_stats, "input")
                 
-                model_ate = treated_mean_raw - baseline_mean_raw
                 
                 # Ground truth lookup
                 true_ate = ground_truth_ate.get(intervention, {}).get(var_name)
                 true_baseline = ground_truth_baseline.get(source_var, {}).get(var_name)
                 true_treatment = ground_truth_treated.get(intervention, {}).get(var_name)
                 
-                # Compute errors
-                abs_error = abs(model_ate - true_ate) if true_ate is not None else None
-                rel_error = abs_error / abs(true_ate) if (true_ate and abs(true_ate) > 1e-10) else None
+                err = ate_errors(treated_mean_raw, baseline_mean_raw, true_ate)
+                model_ate, abs_error, rel_error = (
+                    err["model_ate"], err["abs_error"], err["rel_error"])
                 
                 ate_records.append({
                     "intervention": intervention,

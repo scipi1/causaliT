@@ -61,7 +61,7 @@ from causaliT.core.architectures.attention_selector import AttentionSelectorLaye
 from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 from causaliT.core.modules.gated_self_attention import GatedSelfAttention
 from causaliT.core.modules.orthogonal_linear import OrthogonalLinear
-from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.core.gradient_routing import classify_parameters
 from causaliT.utils.query_norm import collect_query_norm_penalty
 
 

@@ -36,7 +36,7 @@ sys.path.insert(0, str(project_root))
 
 from omegaconf import OmegaConf
 from causaliT.training.trainer import trainer
-from causaliT.training.experiment_control import find_yml_files, update_config
+from causaliT.training.core.experiment_control import find_yml_files, update_config
 
 
 # ============================================================================

@@ -29,7 +29,7 @@ import pandas as pd
 import pytest
 from omegaconf import OmegaConf
 
-from causaliT.benchmarks import metrics as M
+from causaliT import metrics as M
 from causaliT.benchmarks.base import (
     EXCLUDED_METHODS,
     METHOD_REQUIREMENTS,
@@ -618,7 +618,7 @@ class TestMetrics:
     """Hand-checked values; ground truth must score perfectly on every metric."""
 
     def test_ground_truth_scores_perfectly(self):
-        m = M.compute_structure_metrics(T_TRUE, T_TRUE, order=[0, 1, 2, 3, 4])
+        m = M.structure_metrics(T_TRUE, T_TRUE, order=[0, 1, 2, 3, 4])
         assert m["shd"] == 0 and m["sid"] == 0 and m["order_divergence"] == 0
         assert m["f1"] == 1.0 and m["skeleton_f1"] == 1.0
         assert m["order_accuracy"] == 1.0 and m["auprc"] == 1.0
@@ -635,7 +635,7 @@ class TestMetrics:
     def test_cpdag_gets_shd_but_no_sid(self):
         pred = T_TRUE.copy()
         pred[2, 0] = 1  # 0 -- 2 undirected
-        m = M.compute_structure_metrics(T_TRUE, pred)
+        m = M.structure_metrics(T_TRUE, pred)
         assert m["shd"] == 1
         assert m["sid"] is None and m["sid_note"] == "prediction is not a DAG"
 
@@ -700,7 +700,7 @@ class TestMetrics:
         assert d["var_sortability"] == pytest.approx(1.0)
 
     def test_aggregate_skips_missing_values(self):
-        out = M.aggregate({"a": {"shd": 1, "sid": None}, "b": {"shd": 3, "sid": None}})
+        out = M.aggregate_seeds({"a": {"shd": 1, "sid": None}, "b": {"shd": 3, "sid": None}})
         assert out["mean"]["shd"] == 2.0 and out["mean"]["sid"] is None
 
 

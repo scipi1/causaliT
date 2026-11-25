@@ -14,7 +14,7 @@ import json
 
 import pytest
 
-from causaliT.training.training_summary import (
+from causaliT.training.core.training_summary import (
     LEGACY_SUMMARY_FILE,
     TRAINING_SUMMARY_FILE,
     TrainingSummaryWriter,

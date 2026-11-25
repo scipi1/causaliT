@@ -1,5 +1,5 @@
 """
-Unit tests for causaliT.training.interference_utils.
+Unit tests for causaliT.training.forecaster_utils.interference_utils.
 
 Covers:
   * build_interference_blocks selects ONLY structural params (Q/K,
@@ -17,7 +17,7 @@ import math
 import torch
 import torch.nn as nn
 
-from causaliT.training.interference_utils import (
+from causaliT.training.forecaster_utils.interference_utils import (
     build_interference_blocks,
     compute_l0_hsic_interference,
 )

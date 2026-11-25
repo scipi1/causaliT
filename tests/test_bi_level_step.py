@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from test_bilevel_probe import _model, _qbatches
 
-from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.core.gradient_routing import classify_parameters
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )

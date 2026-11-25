@@ -1,11 +1,8 @@
 """
-ProT Core Model Package
-
-This package contains the pure transformer model architecture,
-independent of training infrastructure.
+Core model code (architectures and building-block modules), independent of
+the training infrastructure.
 """
 
-from .model import ProT
-from .architectures.stage_causal import StageCausaliT
+from .architectures import AttentionSelectorLayer
 
-__all__ = ['ProT', 'StageCausaliT']
+__all__ = ['AttentionSelectorLayer']

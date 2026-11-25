@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
+from causaliT.training.structural_losses import AntiAdjacencyConfig
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )
@@ -209,8 +210,8 @@ def _toy_forecaster(scores):
         hsic_sigma=1.0, hsic_adaptive_bandwidth=True, hsic_mode="biased",
         nhsic_epsilon=0.01, hsic_kernel_source="rbf",
         hsic_bandwidth_multipliers=None, hsic_null_stats=None,
-        anti_adjacency_eps=0.1, anti_adjacency_lambda=1.0, _last_anti_adjacency_stats=None,
-        detach_order_mask=False)
+        anti_adjacency=AntiAdjacencyConfig(lam=1.0, eps=0.1),
+        _last_anti_adjacency_stats=None)
     f._lean_pred = _lean_pred
     f._order_residuals = types.MethodType(
         AttentionSelectorForecaster._order_residuals, f)
@@ -509,7 +510,7 @@ def test_recon_init_guards_and_constant_unchanged():
 def _trainer(ad=None):
     """Bare PhaseController with only the stage policy parsed."""
     from causaliT.training.adaptive_trainer import PhaseController as _T
-    from causaliT.training.stage_policy import parse_stage_policy
+    from causaliT.training.adaptive_utils.stage_policy import parse_stage_policy
     t = _T.__new__(_T)
     t._stage_policy = parse_stage_policy(ad or {})
     t._bkd_managed = False

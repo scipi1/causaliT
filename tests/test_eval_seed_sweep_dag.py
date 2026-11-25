@@ -53,7 +53,7 @@ def _make_dag_metrics(sh_cross: float, sh_self: float,
     """Synthetic dag_metrics.json payload mirroring eval_attention_scores."""
     return {
         "dataset": "synthetic_scm",
-        "architecture": "SingleCausalForecaster",
+        "architecture": "AttentionSelectorForecaster",
         "soft_hamming_cross": {
             "best": sh_cross, "mean": sh_cross, "worst": sh_cross,
             "std": 0.0, "per_fold": {"k_0": sh_cross},
@@ -116,7 +116,7 @@ def _make_learned_edges(seed_offset: float) -> dict:
 
     return {
         "dataset": "synthetic_scm",
-        "architecture": "SingleCausalForecaster",
+        "architecture": "AttentionSelectorForecaster",
         "blocks": {
             "dec_cross": {
                 "att_key": "dec_cross",

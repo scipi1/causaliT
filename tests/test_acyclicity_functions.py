@@ -1,5 +1,5 @@
 """Unit tests for the configurable acyclicity functionals in
-``AttentionSelectorForecaster`` (``training.acyclicity_fn``):
+``structural_losses.acyclicity`` (``training.acyclicity_fn``):
 
 * ``notears``   : h(A) = tr(exp(A @ A)) - d         (legacy default)
 * ``logdet``    : h(A) = -log det(sI - A) + d log s (DAGMA-style)
@@ -19,9 +19,7 @@ The mathematical properties under test:
 import pytest
 import torch
 
-from causaliT.training.forecasters.attention_selector_forecaster import (
-    AttentionSelectorForecaster as F,
-)
+from causaliT.training.structural_losses import acyclicity as F
 
 
 def _dag(d: int = 5) -> torch.Tensor:
@@ -43,9 +41,9 @@ def _k_cycle(k: int, w: float = 0.9) -> torch.Tensor:
 
 def _backends(A: torch.Tensor) -> dict:
     return {
-        "notears": F._notears_acyclicity(A),
-        "logdet": F._logdet_acyclicity(A, "adaptive"),
-        "nilpotent": F._nilpotent_acyclicity(A),
+        "notears": F.notears(A),
+        "logdet": F.logdet(A, "adaptive"),
+        "nilpotent": F.nilpotent(A),
     }
 
 
@@ -76,18 +74,18 @@ class TestLogDetAdaptiveShift:
         # All-ones-ish matrix: rho(A) ~ d >> 1.  Fixed s = 1 (pure DAGMA)
         # is singular here; the adaptive shift must stay finite.
         A = torch.full((8, 8), 0.99)
-        h = F._logdet_acyclicity(A, "adaptive")
+        h = F.logdet(A, "adaptive")
         assert torch.isfinite(h)
         assert float(h) > 0.0
 
     def test_fixed_s_raises_when_singular(self):
         A = torch.full((8, 8), 0.99)  # rho(A) ~= 7.9 >> 1
         with pytest.raises(FloatingPointError):
-            F._logdet_acyclicity(A, 1.0)
+            F.logdet(A, 1.0)
 
     def test_adaptive_s_is_stop_grad(self):
         A = _k_cycle(4, 0.5).double().requires_grad_(True)
-        h = F._logdet_acyclicity(A, "adaptive")
+        h = F.logdet(A, "adaptive")
         h.backward()
         # Gradient must come ONLY from the log-det term: with M = sI - A,
         # dh/dA = +(M^-1)^T (the two minus signs in M and -logdet cancel);
@@ -106,7 +104,7 @@ class TestLogDetAdaptiveShift:
             torch.trace(torch.linalg.matrix_power(A, k)) / (k * s_val ** k)
             for k in range(1, 40)
         )
-        h = F._logdet_acyclicity(A, "adaptive")
+        h = F.logdet(A, "adaptive")
         assert float(h) == pytest.approx(float(series), rel=1e-4)
 
 
@@ -114,17 +112,17 @@ class TestLongCycleSensitivity:
     def test_notears_blinds_long_cycles_logdet_does_not(self):
         # Unit-weight k-cycle: NOTEARS contributes k/k! (factorially
         # damped), log-det counts it ~once regardless of length.
-        h_nt2 = float(F._notears_acyclicity(_k_cycle(2, 1.0)))
-        h_nt12 = float(F._notears_acyclicity(_k_cycle(12, 1.0)))
-        h_ld2 = float(F._logdet_acyclicity(_k_cycle(2, 1.0), "adaptive"))
-        h_ld12 = float(F._logdet_acyclicity(_k_cycle(12, 1.0), "adaptive"))
+        h_nt2 = float(F.notears(_k_cycle(2, 1.0)))
+        h_nt12 = float(F.notears(_k_cycle(12, 1.0)))
+        h_ld2 = float(F.logdet(_k_cycle(2, 1.0), "adaptive"))
+        h_ld12 = float(F.logdet(_k_cycle(12, 1.0), "adaptive"))
         assert h_nt12 < 0.1 * h_nt2          # NOTEARS collapses with k
         assert h_ld12 > 0.25 * h_ld2         # log-det stays comparable
 
     def test_nilpotent_counts_each_cycle_exactly(self):
         # Unit k-cycle: tr(A^k) = k, all other powers traceless.
         for k in (2, 5, 9):
-            h = float(F._nilpotent_acyclicity(_k_cycle(k, 1.0)))
+            h = float(F.nilpotent(_k_cycle(k, 1.0)))
             assert h == pytest.approx(float(k), rel=1e-5)
 
 
@@ -133,9 +131,9 @@ class TestGradients:
     def test_gradient_flows_and_pushes_cycle_edges_down(self, backend):
         A = _k_cycle(5, 0.8).requires_grad_(True)
         h = {
-            "notears": F._notears_acyclicity,
-            "logdet": lambda a: F._logdet_acyclicity(a, "adaptive"),
-            "nilpotent": F._nilpotent_acyclicity,
+            "notears": F.notears,
+            "logdet": lambda a: F.logdet(a, "adaptive"),
+            "nilpotent": F.nilpotent,
         }[backend](A)
         h.backward()
         assert A.grad is not None and torch.isfinite(A.grad).all()
@@ -149,9 +147,9 @@ class TestGradients:
         # finite (never NaN).
         A = _dag().requires_grad_(True)
         for fn in (
-            F._notears_acyclicity,
-            lambda a: F._logdet_acyclicity(a, "adaptive"),
-            F._nilpotent_acyclicity,
+            F.notears,
+            lambda a: F.logdet(a, "adaptive"),
+            F.nilpotent,
         ):
             fn(A).backward()
         assert torch.isfinite(A.grad).all()

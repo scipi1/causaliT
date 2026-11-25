@@ -13,7 +13,7 @@ from causaliT.core.modules.gated_self_attention import GatedSelfAttention
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
 from causaliT.core.modules.commutator_self_attention import CommutatorSelfAttention
 
-from causaliT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
+from causaliT.utils.entropy_utils import register_attention_entropy
 from causaliT.utils.query_geometry import assert_orthonormal_frame, transitive_weights
 from causaliT.utils.query_norm import (
     DEFAULT_DIR_TAU,
@@ -1285,7 +1285,11 @@ def build_causal_mask(p: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
 
 def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
-    Calculate entropy of attention weights.
+    Entropy of attention rows used INSIDE the model (score sparsity).
+
+    Coding Assistant: differs from ``causaliT.metrics.attention_entropy``
+    (uses raw, not clamped, weights as the p factor).  It feeds the
+    training loss, so do not swap it for the metric without retesting.
     """
     att_clamped = torch.clamp(att_weights, min=eps)
     log_att = torch.log(att_clamped)

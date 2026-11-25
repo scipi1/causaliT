@@ -12,15 +12,15 @@ These tests verify the correctness of:
 import numpy as np
 import pytest
 
-from causaliT.evaluation.eval_funs.helpers.eval_utils import (
-    _dag_to_skeleton,
-    _find_v_structures,
-    _combine_attention_to_full_dag,
-    _soft_skeleton_distance,
-    _soft_v_structure_distance,
-    _compute_mec_distance,
-    _check_mec_membership,
-    _compute_mec_threshold,
+from causaliT.evaluation.eval_funs.helpers.eval_utils import _combine_attention_to_full_dag
+from causaliT.metrics import (
+    dag_to_skeleton as _dag_to_skeleton,
+    find_v_structures as _find_v_structures,
+    soft_skeleton_distance as _soft_skeleton_distance,
+    soft_v_structure_distance as _soft_v_structure_distance,
+    mec_distance as _compute_mec_distance,
+    mec_membership as _check_mec_membership,
+    mec_threshold as _compute_mec_threshold,
 )
 
 

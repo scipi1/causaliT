@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from causaliT.training.forecasters.attention_selector_forecaster import AttentionSelectorForecaster
-from causaliT.training.order_path_training import graph_supports
+from causaliT.training.forecaster_utils.order_path_training import graph_supports
+from causaliT.training.structural_losses import AntiAdjacencyConfig
 from causaliT.utils.hsic_utils import hsic_cross_per_pair, hsic_permutation_null_matrix
 
 
@@ -39,14 +40,19 @@ def test_graph_supports_closure_and_cycle():
 
 
 def _fm(oa, **overrides):
+    aa = dict(mode='legacy_anticausal', eps=0.1, lam=0.7, terms='both')
+    for key in list(overrides):
+        if key.startswith('anti_adjacency_'):
+            aa[key[len('anti_adjacency_'):]] = overrides.pop(key)
+    if 'anticausal_selector_grad' in overrides:
+        aa['selector_grad'] = overrides.pop('anticausal_selector_grad')
     base = dict(
         model=SimpleNamespace(training=True, order_attention=lambda: oa, modules=lambda: [oa]),
-        separate_structure_forward=False, config={}, detach_order_mask=False,
+        separate_structure_forward=False, config={},
         _hsic_bw_frozen_sigmas=None, hsic_sigma=1.0, hsic_adaptive_bandwidth=True,
         hsic_mode='biased', nhsic_epsilon=0.01, hsic_kernel_source='rbf',
-        hsic_bandwidth_multipliers=None, anti_adjacency_detach_c_residuals=False,
-        anti_adjacency_detach_a_residuals=False, anti_adjacency_mode='legacy_anticausal',
-        anti_adjacency_eps=0.1, anti_adjacency_lambda=0.7, anti_adjacency_terms='both',
+        hsic_bandwidth_multipliers=None,
+        anti_adjacency=AntiAdjacencyConfig(**aa),
         order_path_surgery=True, order_anticausal_surgery=True)
     base.update(overrides)
     return SimpleNamespace(**base)

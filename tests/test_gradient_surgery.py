@@ -1,4 +1,4 @@
-"""Tests for causaliT.training.gradient_surgery (per-block PCGrad).
+"""Tests for causaliT.training.forecaster_utils.gradient_surgery (per-block PCGrad).
 
 Run with:  pytest tests/test_gradient_surgery.py -v
 
@@ -25,8 +25,8 @@ import torch.nn as nn
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from causaliT.training.gradient_surgery import pcgrad_reconcile
-from causaliT.training.interference_utils import build_interference_blocks
+from causaliT.training.forecaster_utils.gradient_surgery import pcgrad_reconcile
+from causaliT.training.forecaster_utils.interference_utils import build_interference_blocks
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )

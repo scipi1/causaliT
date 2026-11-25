@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from test_bilevel_probe import _model, _qbatches
 
-from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.core.gradient_routing import classify_parameters
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )
@@ -166,7 +166,7 @@ class TestUnrolledStep:
         torch.manual_seed(0)
         m2 = AttentionSelectorForecaster(m2_cfg)   # routing -> dual optimizers
         m2.log = lambda *a, **k: None
-        from causaliT.training.gradient_routing import classify_parameters as cp
+        from causaliT.training.core.gradient_routing import classify_parameters as cp
         sp, rp = cp(m2.model, verbose=False)
         opt_r = torch.optim.SGD(rp, lr=1e-3)
         opt_s = torch.optim.SGD(sp, lr=1e-3)

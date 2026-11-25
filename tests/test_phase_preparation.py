@@ -13,11 +13,11 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from causaliT.training.adaptive_trainer import PhaseController
-from causaliT.training.stage_causal_dataloader import StageCausalDataModule
+from causaliT.training.dataloader_sx import SXDataModule
 
 
 def test_xfit_folds_track_current_train_ds():
-    dm = StageCausalDataModule.__new__(StageCausalDataModule)
+    dm = SXDataModule.__new__(SXDataModule)
     dm.batch_size = 4
     dm.num_workers = 0
     dm.persistent_workers = False

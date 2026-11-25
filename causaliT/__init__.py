@@ -1,7 +1,5 @@
 """
-ProT - Process Transformer Package
-
-A transformer-based model for sequence prediction in process chains.
+causaliT - causal discovery with attention selectors.
 """
 
 # Import version info
@@ -18,10 +16,9 @@ from causaliT.paths import (
 )
 
 # Export main components
-from causaliT.core.model import ProT
-from causaliT.core.architectures.stage_causal import StageCausaliT
-from causaliT.training.forecasters import TransformerForecaster, StageCausalForecaster
-from causaliT.training.dataloader import ProcessDataModule
+from causaliT.core.architectures import AttentionSelectorLayer
+from causaliT.training.forecasters import AttentionSelectorForecaster
+from causaliT.training.dataloader_sx import SXDataModule
 
 __all__ = [
     # Paths
@@ -32,9 +29,7 @@ __all__ = [
     'CONFIG_DIR',
     'get_dirs',
     # Core components
-    'ProT',
-    'StageCausaliT',
-    'TransformerForecaster',
-    'StageCausalForecaster',
-    'ProcessDataModule',
+    'AttentionSelectorLayer',
+    'AttentionSelectorForecaster',
+    'SXDataModule',
 ]

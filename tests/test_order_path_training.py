@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from causaliT.training.order_path_training import forward_policy, protect_weight
+from causaliT.training.forecaster_utils.order_path_training import forward_policy, protect_weight
 
 
 def test_projection():

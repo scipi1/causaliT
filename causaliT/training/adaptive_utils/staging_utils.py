@@ -1,4 +1,4 @@
-"""Shared helpers for the staged / adaptive trainers.
+"""Shared helpers of the adaptive trainer.
 
 Trainer-agnostic building blocks used by
 ``causaliT.training.adaptive_trainer``:
@@ -8,8 +8,6 @@ Trainer-agnostic building blocks used by
 * ``_partition_train_indices`` - honest (cross-fit) recon/struct split;
 * ``_json_default``            - JSON fallback for numpy / torch scalars.
 
-They used to live in ``anm_staged_trainer`` (the rigid ANM stage schedule,
-removed in favour of the metric-driven ``adaptive_trainer``).
 """
 
 import logging
@@ -65,15 +63,9 @@ def _compute_score_margin(
 
         from causaliT.evaluation.eval_funs.helpers.eval_utils import _load_true_dag_mask
 
-        # ------------------------------------------------------------------
-        # AttentionSelectorLayer branch
-        # Single combined cross-attention block; no ``decoder`` attribute.
-        # The attention module lives at ``inner_model.attention`` and its
-        # inner_attention exposes a combined (L_X, L_S+L_X) score tensor.
-        # We split it into the S→X (cross) and X→X (self) sub-matrices and
-        # compute separate margins against the respective GT DAG masks.
-        # ------------------------------------------------------------------
-        if hasattr(inner_model, "attention") and not hasattr(inner_model, "decoder"):
+        # The combined (L_X, L_S+L_X) score tensor is split into the S->X
+        # (cross) and X->X (self) blocks, each compared to its GT mask.
+        if hasattr(inner_model, "attention"):
             combined_inner = inner_model.attention.inner_attention
             # Accept both public and private attribute names for robustness.
             combined_score_t = getattr(combined_inner, "score_tensor_for_sparsity", None)
@@ -137,48 +129,6 @@ def _compute_score_margin(
                                 self_scores_np[true_mask].mean()
                                 - self_scores_np[false_mask].mean()
                             )
-            return result
-
-        # ------------------------------------------------------------------
-        # SingleCausalLayer (and related) branch
-        # Separate cross- and self-attention blocks inside ``decoder.layers``.
-        # ------------------------------------------------------------------
-        if not hasattr(inner_model, "decoder"):
-            return result
-
-        layer = inner_model.decoder.layers[0]
-
-        # --- Cross-attention score margin ---
-        true_cross = _load_true_dag_mask(data_dir, dataset_name, "dec_cross")
-        cross_inner = layer.global_cross_attention.inner_attention
-        cross_score_t = getattr(cross_inner, "_score_tensor_for_sparsity", None)
-        if cross_score_t is not None and true_cross is not None:
-            scores_np = cross_score_t.detach().cpu().numpy()
-            if scores_np.shape == true_cross.shape:
-                true_mask = true_cross.astype(bool)
-                false_mask = ~true_mask
-                if true_mask.any() and false_mask.any():
-                    result["cross"] = float(
-                        scores_np[true_mask].mean() - scores_np[false_mask].mean()
-                    )
-
-        # --- Self-attention score margin ---
-        true_self = _load_true_dag_mask(data_dir, dataset_name, "dec_self")
-        self_inner = layer.global_self_attention.inner_attention
-        # ToeplitzAttention exposes P_edge_for_reg; others use _score_tensor_for_sparsity
-        self_score_t = getattr(self_inner, "P_edge_for_reg", None)
-        if self_score_t is None:
-            self_score_t = getattr(self_inner, "_score_tensor_for_sparsity", None)
-        if self_score_t is not None and true_self is not None:
-            scores_np = self_score_t.detach().cpu().numpy()
-            if scores_np.ndim == 2 and scores_np.shape == true_self.shape:
-                true_mask = true_self.astype(bool)
-                false_mask = ~true_mask
-                np.fill_diagonal(false_mask, False)   # exclude diagonal (no self-loops)
-                if true_mask.any() and false_mask.any():
-                    result["self"] = float(
-                        scores_np[true_mask].mean() - scores_np[false_mask].mean()
-                    )
 
     except Exception as exc:
         logger.debug(f"_compute_score_margin failed (non-critical): {exc}")

@@ -52,11 +52,7 @@ from causaliT.benchmarks.base import (
     resolve_method,
 )
 from causaliT.benchmarks.data import load_benchmark_data
-from causaliT.benchmarks.metrics import (
-    aggregate,
-    compute_structure_metrics,
-    data_diagnostics,
-)
+from causaliT.metrics import aggregate_seeds, data_diagnostics, structure_metrics
 from causaliT.benchmarks.postprocess import (
     adjacency_to_blocks,
     count_edges,
@@ -445,7 +441,7 @@ def run_benchmark_method(
         }
         if true_paper is not None and true_paper.shape == np.shape(result.W):
             pred, edge_scores = _predicted_graph(result, w_threshold, L_S, forbid_into_sources)
-            per_seed_structure[key] = compute_structure_metrics(
+            per_seed_structure[key] = structure_metrics(
                 true_paper,
                 pred,
                 scores=edge_scores,
@@ -527,7 +523,7 @@ def run_benchmark_method(
     if per_seed_structure:
         dag_metrics["structure"] = {
             "per_seed": per_seed_structure,
-            **aggregate(per_seed_structure),
+            **aggregate_seeds(per_seed_structure),
         }
         raw = data if not data.standardized else load_benchmark_data(
             datadir_path=datadir_path, dataset_name=dataset_name, split=split,

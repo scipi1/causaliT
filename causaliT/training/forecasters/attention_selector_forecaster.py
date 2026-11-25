@@ -145,11 +145,18 @@ from causaliT.utils.hsic_utils import (
     hsic_attention_weighted,
     hsic_attention_softmax,
     hsic_direction_weighted,
-    row_entropy_stats,
-    hsic_null_calibration,
-    bayes_multiplier,
     dhsic_residual_independence,
     _median_bandwidth,
+)
+from causaliT.metrics import per_node_mse, r2, row_entropy_stats
+from causaliT.training.structural_losses import (
+    AntiAdjacencyConfig,
+    KernelOpts,
+    anti_adjacency_loss,
+    build_acyclicity_penalty,
+    dhsic_residual_loss,
+    joint_nd_loss,
+    resolve_hsic_objective,
 )
 from causaliT.utils.causal_order import estimate_hsic_causal_order
 from causaliT.utils.descendant_mask import (
@@ -163,15 +170,15 @@ from causaliT.utils.query_norm import (
 )
 
 
-from causaliT.training.gradient_routing import classify_parameters
-from causaliT.training.stage_policy import resolve_gate_opts
-from causaliT.training.nodewise_update import NodewiseQuerySelector
-from causaliT.training.centroid_commit import CentroidCommitController
-from causaliT.training.interference_utils import (
+from causaliT.training.core.gradient_routing import classify_parameters
+from causaliT.training.adaptive_utils.stage_policy import resolve_gate_opts
+from causaliT.training.forecaster_utils.nodewise_update import NodewiseQuerySelector
+from causaliT.training.forecaster_utils.centroid_commit import CentroidCommitController
+from causaliT.training.forecaster_utils.interference_utils import (
     build_interference_blocks,
     compute_l0_hsic_interference,
 )
-from causaliT.training.gradient_surgery import pcgrad_reconcile
+from causaliT.training.forecaster_utils.gradient_surgery import pcgrad_reconcile
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +341,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # This estimator is intentionally separate from the scalar HSIC loss:
         # it uses the unweighted off-diagonal pair matrix, retains descendants
         # (the RESIT-style source signal) and is fully detached.  Loss masks /
-        # attention / direction / LOO weights remain loss-specific and never
+        # attention / direction weights remain loss-specific and never
         # enter this ordering score.
         _co = config["training"].get("causal_order", None) or {}
         self.causal_order_enabled = bool(_co.get("enabled", False))
@@ -519,22 +526,22 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_anti_adjacency_stats: Optional[Dict[str, Any]] = None
         _sat = config["model"]["kwargs"].get("self_attention_type")
         self._order_selector = self.model.order_attention() is not None
-        if self.anti_adjacency_on:
+        if self.anti_adjacency.on:
             if _sat != "OrderFactorizedSelfAttention" or not self.homogeneous_nodes:
                 raise ValueError(
                     "anti_adjacency_lambda > 0 "
                     "requires self_attention_type='OrderFactorizedSelfAttention' "
                     f"and homogeneous_nodes=True (got {_sat!r}, "
                     f"homogeneous_nodes={self.homogeneous_nodes}).")
-        if self.anti_adjacency_on:
+        if self.anti_adjacency.on:
             if bool(config["training"].get("hsic_exclude_descendants", False)):
                 raise ValueError(
                     "anti_adjacency_lambda > 0 (log-ratio) tests each residual only "
                     "against its own oriented inputs: set "
                     "training.hsic_exclude_descendants: false.")
-            if self.anti_adjacency_eps <= 0.0:
+            if self.anti_adjacency.eps <= 0.0:
                 raise ValueError(
-                    f"anti_adjacency_eps must be > 0, got {self.anti_adjacency_eps}.")
+                    f"anti_adjacency_eps must be > 0, got {self.anti_adjacency.eps}.")
         self._dir_bias_warned = False
         if self.hsic_direction:
             if not self.homogeneous_nodes:
@@ -589,14 +596,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         #                     calibration, logging, gradient routing) is
         #                     unchanged.  With ``lambda_recon: 0`` this mimics
         #                     NOTIME's sole fitting objective.
-        self.hsic_objective = str(
-            config["training"].get("hsic_objective", "pairwise")
-        )
-        if self.hsic_objective not in ("pairwise", "dhsic_residual"):
-            raise ValueError(
-                "training.hsic_objective must be 'pairwise' or "
-                f"'dhsic_residual', got {self.hsic_objective!r}."
-            )
+        self.hsic_objective = resolve_hsic_objective(config["training"])
 
         # ---- Log-transformed structural objective -----------------------
         # When enabled, the FIXED-lambda structural term becomes
@@ -694,23 +694,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             config["training"].get("hsic_bkd_exclude_dropped", False)
         )
 
-        # LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md):
-        # per-edge leave-one-out Bayes multiplier gamma, computed from masked
-        # EVAL-mode forward passes (BKD is gated on self.training, so it is
-        # inactive during measurement) and applied as a DETACHED multiplicative
-        # gate on the per-pair HSIC weights.  Default False keeps the legacy
-        # behaviour exactly.
-        self.use_loo_gamma_gate = bool(
-            config["training"].get("use_loo_gamma_gate", False)
-        )
-        self.loo_gamma_topk = config["training"].get("loo_gamma_topk", None)
-        if self.loo_gamma_topk is not None:
-            self.loo_gamma_topk = int(self.loo_gamma_topk)
-        self.loo_gamma_ema = float(config["training"].get("loo_gamma_ema", 0.9))
-        self.loo_gamma_refresh = int(config["training"].get("loo_gamma_refresh", 1))
-        self.loo_gamma_permutations = int(
-            config["training"].get("loo_gamma_permutations", 50)
-        )
+        # The LOO conditional-HSIC gate was removed: reject its keys.
+        _loo = [k for k in config["training"]
+                if k.startswith("loo_gamma") or k == "use_loo_gamma_gate"]
+        if _loo:
+            raise ValueError(f"LOO gamma gate was removed; drop training keys {_loo}.")
 
         # ----------------------------------------------------------------
         # Descendant-excluding HSIC (see causaliT.utils.descendant_mask)
@@ -857,11 +845,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self._last_hsic_desc_first_order = False
         self._last_hsic_desc_edge_dropout = 0.0
         self._last_hsic_bkd_kept_frac = 1.0
-        # LOO gamma gate state (detached, EMA-smoothed across refreshes).
-        self._loo_gamma_cache: Optional[torch.Tensor] = None
-        self._loo_gamma_step = 0
-        self._last_loo_gamma_mean = 1.0
-        self._last_loo_gamma_min = 1.0
 
 
         # ----------------------------------------------------------------
@@ -926,7 +909,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # Stash for the two reg tensors so training_step can probe them while
         # the autograd graph is still alive.
         self._last_hsic_reg: Optional[torch.Tensor] = None
-        # Structural pair weights (descendant x LOO, no BKD) stashed by _step
+        # Structural pair weights (descendant mask, no BKD) stashed by _step
         # for the bilevel probe and the unrolled shadow (None when unused).
         self._last_probe_pair_mask: Optional[torch.Tensor] = None
         self._last_l0_reg: Optional[torch.Tensor] = None
@@ -942,43 +925,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if self.kappa < 0.0:
             raise ValueError(f"kappa must be non-negative, got {self.kappa}")
 
-        # Acyclicity functional applied to the (nonnegative) gate-posterior
-        # score matrix.  "notears" (default, backward compatible):
-        # h(A) = tr(exp(A Ã¢Å â„¢ A)) - d (Zheng et al., 2018).  "logdet" (DAGMA-
-        # style, Bello et al., 2022): h(A) = -log det(sI - A) + d*log s.
-        # Because the gate posterior has entries in (0, 1), the adaptive
-        # scale s = max-row-sum(A) guarantees sI - A nonsingular at EVERY
-        # iterate (rho(A) <= max row sum), removing the determinant
-        # singularity that destabilises log-det on unbounded weights.
-        # "nilpotent": h(A) = sum_{k=1..d} tr(A^k) Ã¢â‚¬â€ an exact acyclicity
-        # characterisation for nonnegative A (all terms >= 0, zero iff the
-        # graph has no closed walk of any length <= d).
-        self.acyclicity_fn = str(
-            config["training"].get("acyclicity_fn", "notears")
-        )
-        if self.acyclicity_fn not in ("notears", "logdet", "nilpotent"):
-            raise ValueError(
-                f"acyclicity_fn must be one of 'notears' | 'logdet' | "
-                f"'nilpotent', got {self.acyclicity_fn!r}"
-            )
-        # DAGMA shift for the log-det backend: "adaptive" (default) uses the
-        # (stop-grad) max row sum of the current score matrix; a positive
-        # float fixes s globally (pure DAGMA uses s = 1).
-        _acy_s = config["training"].get("acyclicity_s", "adaptive")
-        if isinstance(_acy_s, str):
-            if _acy_s != "adaptive":
-                raise ValueError(
-                    f"acyclicity_s must be 'adaptive' or a positive float, "
-                    f"got {_acy_s!r}"
-                )
-            self.acyclicity_s: object = "adaptive"
-        else:
-            _acy_s = float(_acy_s)
-            if _acy_s <= 0.0:
-                raise ValueError(
-                    f"acyclicity_s must be positive, got {_acy_s}"
-                )
-            self.acyclicity_s = _acy_s
+        # Acyclicity penalty h(A) (training.acyclicity_fn / acyclicity_s);
+        # definitions in causaliT.training.structural_losses.acyclicity.
+        self.acyclicity = build_acyclicity_penalty(config["training"])
 
         # ----------------------------------------------------------------
         # Augmented-Lagrangian acyclicity constraint (canonical NOTEARS
@@ -2173,7 +2122,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     def _log_nodewise_validation_mse(self, pred_x, x_target, n_source):
         """Log sample-weighted MSE by one-based position in the S/X tensors."""
-        mse = (pred_x.detach().squeeze(-1) - x_target).square().mean(dim=0)
+        mse = per_node_mse(pred_x.detach().squeeze(-1), x_target)
         for i, value in enumerate(mse):
             label = f"S{i + 1}" if i < n_source else f"X{i - n_source + 1}"
             self.log(
@@ -2197,7 +2146,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         # Forward Ã¢â‚¬â€ returns (pred_x, attention_weights, aux_dict)
         if getattr(self, 'separate_structure_forward', False):
-            from causaliT.training.order_path_training import forward_policy
+            from causaliT.training.forecaster_utils.order_path_training import forward_policy
             with forward_policy(self.model, structural=False):
                 pred_x, attention_weights, aux = self.forward(S, X)
         else:
@@ -2221,7 +2170,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if getattr(self.model, 'dual_order_regressors', False):
             # The causal prediction remains the source of legacy fit metrics.
             # Both full heads train by MSE; HSIC never trains either head.
-            from causaliT.training.order_path_training import forward_policy
+            from causaliT.training.forecaster_utils.order_path_training import forward_policy
             oa = self.model.order_attention()
             previous_orientation = oa.orientation
             try:
@@ -2233,11 +2182,9 @@ class AttentionSelectorForecaster(pl.LightningModule):
             loss_a = self.loss_fn(pred_a.squeeze(), x_target.squeeze()).mean()
             for name, value in (('causal', loss_x), ('anticausal', loss_a)):
                 self.log(f'{stage}_recon_mse_{name}', value, on_step=False, on_epoch=True)
-            target_flat = x_target.reshape(-1)
-            sst = (target_flat - target_flat.mean()).square().sum().clamp_min(1e-12)
             for name, prediction in (('causal', pred_x), ('anticausal', pred_a)):
-                r2 = 1 - (prediction.reshape(-1) - target_flat).square().sum() / sst
-                self.log(f'{stage}_recon_r2_{name}', r2, on_step=False, on_epoch=True)
+                self.log(f'{stage}_recon_r2_{name}', r2(prediction, x_target),
+                         on_step=False, on_epoch=True)
             loss_x = 0.5 * (loss_x + loss_a)
         if stage == "val":
             self._log_nodewise_validation_mse(
@@ -2292,7 +2239,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             if self.homogeneous_nodes:
                 x_val_h = torch.cat([S_h[:, :, self.val_idx], x_val_h], dim=1)
             if getattr(self, 'separate_structure_forward', False):
-                from causaliT.training.order_path_training import forward_policy
+                from causaliT.training.forecaster_utils.order_path_training import forward_policy
                 sampling = self.config.get('adaptive_training', {}).get(
                     'structure', {}).get('order_sampling', 'soft')
                 with forward_policy(self.model, structural=True, order_sampling=sampling):
@@ -2341,7 +2288,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             score_tensor
         )
         # Bilevel machinery: the probe/virtual-pass pair weights are the
-        # STRUCTURAL mask only (descendant x LOO) Ã¢â‚¬â€ BKD excluded, since probes
+        # STRUCTURAL mask only (descendant mask) Ã¢â‚¬â€ BKD excluded, since probes
         # run with key dropout off.  Captured before the BKD multiply below.
         _probe_mask_base = hsic_pair_mask
 
@@ -2371,31 +2318,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             else 1.0
         )
 
-        # --- LOO conditional-HSIC gate (counter-proposal Ã‚Â§5, option (c)) ------
-        # Detached per-edge multiplier applied to the pair weights BEFORE the
-        # HSIC average: conditionally-redundant pairs are downweighted out of
-        # the marginal mean; load-bearing pairs keep full weight.  Same
-        # (n_targets, n_sources) layout as the pair mask / attention matrix.
-        loo_gamma = None
-        if self.use_loo_gamma_gate:
-            loo_gamma = self._maybe_update_loo_gamma(S, X, x_target, stage)
-        if loo_gamma is not None:
-            loo_gamma = loo_gamma.to(combined_source.device)
-            if self.use_attention_weighted_hsic:
-                pass  # applied to att_mean in the branch below
-            elif hsic_pair_mask is not None:
-                if hsic_pair_mask.shape == loo_gamma.shape:
-                    hsic_pair_mask = hsic_pair_mask * loo_gamma
-                else:
-                    logger.warning(
-                        "LOO gamma shape %s != pair-mask shape %s; skipping gate.",
-                        tuple(loo_gamma.shape), tuple(hsic_pair_mask.shape),
-                    )
-                    loo_gamma = None
-            else:
-                hsic_pair_mask = loo_gamma
-
-        # Stash the probe/virtual-pass pair weights (descendant x LOO, no BKD)
+        # Stash the probe/virtual-pass pair weights (descendant mask, no BKD)
         # for the bilevel gate, unrolled shadow and unrolled structural loss.
         # Train stage only;
         # None when the attention-weighted HSIC variant is in use (the probe
@@ -2405,11 +2328,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 or self.structural_grad == "hsic_unrolled"):
             if self.use_attention_weighted_hsic:
                 self._last_probe_pair_mask = None
-            elif loo_gamma is not None and not self.use_attention_weighted_hsic:
-                self._last_probe_pair_mask = (
-                    loo_gamma.detach() if _probe_mask_base is None
-                    else (_probe_mask_base * loo_gamma).detach()
-                )
             else:
                 self._last_probe_pair_mask = (
                     None if _probe_mask_base is None
@@ -2421,13 +2339,13 @@ class AttentionSelectorForecaster(pl.LightningModule):
         )
         if self.hsic_objective == "dhsic_residual":
             # NOTIME objective: dHSIC over the residual columns only.  No
-            # pair structure exists, so the descendant/BKD/LOO masks and the
+            # pair structure exists, so the descendant/BKD masks and the
             # attention-weighted aggregations above do not apply; the pair
             # diagnostics are explicitly empty in this mode.
             hsic_value = self._dhsic_residual_hsic(residuals)
             self._last_hsic_pair_mat = None
             self._last_hsic_row_means = None
-        elif self.anti_adjacency_on:
+        elif self.anti_adjacency.on:
             # Causal / anti-causal log-ratio objective.  Reuses the
             # causal residuals of this step (cross-fit fold when active) and
             # adds ONE anti-causal forward on the same rows and noise.  The
@@ -2459,8 +2377,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # The weight is the RAW direction gate, NOT z_edge * d: since
             # d[i,j] + d[j,i] == 1 (dir_bias == 0), every pair pays one of its
             # two HSIC terms in full -- no trivial all-zero-weight solution.
-            # No descendant mask and no LOO gamma: the direction weighting
-            # replaces both (it IS a soft, learnable descendant assignment).
+            # No descendant mask: the direction weighting
+            # replaces it (it IS a soft, learnable descendant assignment).
             inner_self = self._direction_gate_module()
             dir_w = getattr(inner_self, "last_direction_deterministic", None)
             if dir_w is None:
@@ -2525,8 +2443,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     att_mean = att_mean.masked_fill(
                         bkd_keep_mask == 0, float("-inf")
                     )
-            if loo_gamma is not None:
-                att_mean = att_mean * loo_gamma
 
             if self.hsic_softmax:
                 # SOFTMAX COMPETITION: row-wise softmax pair weights, self-edge
@@ -2655,7 +2571,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 hsic_value = hsic_out
         # Diagnostic causal order / downstream key prior: computed from the
         # RAW off-diagonal pair matrix, independently of the loss aggregation
-        # selected above (mask, attention, direction, BKD and LOO weights).
+        # selected above (mask, attention, direction, BKD weights).
         self._maybe_apply_causal_order(combined_source, residuals, stage)
 
         # Constraint source switch: the monitored quantity is the HSIC
@@ -2756,7 +2672,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # flipped the sign of the capped coefficients.  Anchor instead on the
         # non-negative plain HSIC magnitude lambda_hsic * (C + A).
         ref_term = hsic_reg
-        if self.anti_adjacency_on and self._last_anti_adjacency_stats is not None:
+        if self.anti_adjacency.on and self._last_anti_adjacency_stats is not None:
             st = self._last_anti_adjacency_stats
             ref_term = torch.as_tensor(
                 self.lambda_hsic * (float(st["C"]) + float(st["A"]))
@@ -2795,11 +2711,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 with torch.no_grad():
                     self.log(
                         f"{stage}_h_raw",
-                        float(self._acyclicity_penalty(A_cyc.detach())),
+                        float(self.acyclicity(A_cyc.detach())),
                         on_step=False, on_epoch=True,
                     )
                 A_cyc = torch.relu(A_cyc - self.acy_threshold)
-            notears_raw = self._acyclicity_penalty(A_cyc)
+            notears_raw = self.acyclicity(A_cyc)
             if acy_constrained:
                 # Augmented Lagrangian: alpha * h + (rho/2) * h^2 (canonical
                 # NOTEARS protocol).  h >= 0 for every backend, so the
@@ -2976,7 +2892,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         self.log(f"{stage}_score_sparse", score_sparse_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic", hsic_value, on_step=False, on_epoch=True)
         self.log(f"{stage}_hsic_reg", hsic_reg, on_step=False, on_epoch=True)
-        if self.anti_adjacency_on and self._last_anti_adjacency_stats is not None:
+        if self.anti_adjacency.on and self._last_anti_adjacency_stats is not None:
             self.log(f"{stage}_hsic_causal", self._last_anti_adjacency_stats["C"],
                      on_step=False, on_epoch=True)
             self.log(f"{stage}_hsic_anticausal", self._last_anti_adjacency_stats["A"],
@@ -3037,17 +2953,6 @@ class AttentionSelectorForecaster(pl.LightningModule):
             self.log(
                 f"{stage}_hsic_desc_edge_dropout",
                 float(self._last_hsic_desc_edge_dropout),
-                on_step=False, on_epoch=True,
-            )
-        if self.use_loo_gamma_gate:
-            self.log(
-                f"{stage}_loo_gamma_mean",
-                float(self._last_loo_gamma_mean),
-                on_step=False, on_epoch=True,
-            )
-            self.log(
-                f"{stage}_loo_gamma_min",
-                float(self._last_loo_gamma_min),
                 on_step=False, on_epoch=True,
             )
         if self.hsic_bkd_exclude_dropped:
@@ -3435,175 +3340,11 @@ class AttentionSelectorForecaster(pl.LightningModule):
             return None
         return col.unsqueeze(0).expand(n_targets, n_sources)
 
-    # ------------------------------------------------------------------
-    # LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md)
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _loo_measure_forward(self, S, X, mask):
-        """Eval-mode forward for LOO measurement.
-
-        BKD is gated on ``self.training``, so under ``model.eval()`` the
-        measurement passes see the full candidate set with no key dropout Ã¢â‚¬â€
-        the two worlds (baseline vs. masked) then differ ONLY in the masked
-        edge, as the Delta contrast requires.  ``mask`` is an
-        ``(n_targets, n_sources)`` 1=allowed / 0=forbidden combined mask
-        routed to ``forward_with_actual`` as ``oracle_combined_mask`` (it is
-        intersected with the structural mask, so forbidden pairs stay
-        forbidden), or None for the baseline pass.
-        """
-        x_blanked = X.clone()
-        x_blanked[:, :, self.val_idx] = 0.0
-        s_blanked = None
-        if self.homogeneous_nodes:
-            s_blanked = S.clone()
-            s_blanked[:, :, self.val_idx] = 0.0
-        out = self.model.forward_with_actual(
-            source_tensor=S,
-            x_blanked=x_blanked,
-            x_actual=X,
-            oracle=False,
-            oracle_combined_mask=mask,
-            s_blanked=s_blanked,
-        )
-        return out[0].squeeze()  # pred_x (B, n_targets)
-
-    @torch.no_grad()
-    def _compute_loo_gamma(self, S, X, x_target):
-        """Per-edge Bayes multiplier gamma, shape (n_targets, n_sources).
-
-        For each candidate source column i, one masked forward pass yields
-        the leave-one-out residual eps^{-i}; gamma-null-calibrated HSIC of
-        (X_i, eps^{+}) and (X_i, eps^{-i}) feeds ``bayes_multiplier`` with
-        prior P_m = current (detached) score tensor.  Rows that would become
-        fully masked by dropping column i are left unmasked and keep
-        gamma = 1 (edge i is the row's only allowed key Ã¢â‚¬â€ no measurement is
-        possible there).
-
-        Cost: one kernel build per calibration call, so O(T x S) kernel
-        matrices per refresh Ã¢â‚¬â€ control with ``loo_gamma_topk`` /
-        ``loo_gamma_refresh`` / ``loo_gamma_permutations``.
-        """
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            pred_plus = self._loo_measure_forward(S, X, None)
-            resid_plus = x_target.squeeze() - pred_plus          # (B, T)
-            if self.homogeneous_nodes:
-                combined = x_target.squeeze()                    # (B, N)
-            else:
-                combined = torch.cat(
-                    [S[:, :, self.val_idx], x_target.squeeze()], dim=1
-                )                                                # (B, L_S+T)
-            n_targets = resid_plus.shape[-1]
-            n_sources = combined.shape[-1]
-            device = combined.device
-
-            gamma = torch.ones(n_targets, n_sources, device=device)
-
-            # Prior P_m: current structural score tensor (detached), else 0.5.
-            p_m = torch.full((n_targets, n_sources), 0.5, device=device)
-            get_score = getattr(self.model, "get_score_tensor_for_sparsity", None)
-            if callable(get_score):
-                s = get_score()
-                if s is not None and tuple(s.shape) == (n_targets, n_sources):
-                    p_m = s.detach().clamp(0.0, 1.0)
-
-            return self._loo_gamma_loop(
-                S, X, x_target, resid_plus, combined, p_m, device
-            )
-        finally:
-            if was_training:
-                self.model.train()
-
-    @torch.no_grad()
-    def _loo_gamma_loop(self, S, X, x_target, resid_plus, combined, p_m, device):
-        """Masked-forward loop of ``_compute_loo_gamma`` (split for size)."""
-        n_targets = resid_plus.shape[-1]
-        n_sources = combined.shape[-1]
-        gamma = torch.ones(n_targets, n_sources, device=device)
-
-        # Candidate columns: top-k per row by P_m, or all (full LOO).
-        cols_per_row = None
-        if self.loo_gamma_topk is not None and self.loo_gamma_topk < n_sources:
-            cols_per_row = torch.topk(p_m, k=self.loo_gamma_topk, dim=1).indices
-
-        base_mask = torch.ones(n_targets, n_sources, device=device)
-        measured_cols = (
-            sorted(set(torch.unique(cols_per_row).tolist()))
-            if cols_per_row is not None
-            else list(range(n_sources))
-        )
-        for i in measured_cols:
-            mask = base_mask.clone()
-            mask[:, i] = 0.0
-            dead_rows = mask.sum(dim=1) == 0
-            if bool(dead_rows.any()):
-                mask[dead_rows, i] = 1.0  # no measurement possible there
-            pred_minus = self._loo_measure_forward(S, X, mask)
-            resid_minus = x_target.squeeze() - pred_minus
-            for j in range(n_targets):
-                if cols_per_row is not None and not bool(
-                    (cols_per_row[j] == i).any()
-                ):
-                    continue
-                if bool(dead_rows[j]):
-                    continue
-                cal_plus = hsic_null_calibration(
-                    combined[:, i], resid_plus[:, j],
-                    adaptive_bandwidth=True,
-                    n_permutations=self.loo_gamma_permutations,
-                )
-                cal_minus = hsic_null_calibration(
-                    combined[:, i], resid_minus[:, j],
-                    adaptive_bandwidth=True,
-                    n_permutations=self.loo_gamma_permutations,
-                )
-                gamma[j, i] = bayes_multiplier(
-                    cal_plus["log_q0"], cal_minus["log_q0"], p_m[j, i]
-                ).to(device)
-        return gamma
-
-    def _maybe_update_loo_gamma(self, S, X, x_target, stage: str):
-        """Return the detached (n_targets, n_sources) gamma gate, or None.
-
-        Recomputes on train steps every ``loo_gamma_refresh`` steps and
-        EMA-smooths; validation/test reuse the cached EMA.  Any failure is
-        logged and degrades to no gating (matching the descendant-mask
-        robustness pattern).
-        """
-        if stage == "train":
-            self._loo_gamma_step += 1
-            if self._loo_gamma_step % self.loo_gamma_refresh == 0:
-                try:
-                    new = self._compute_loo_gamma(S, X, x_target)
-                except Exception as exc:  # never break training on the gate
-                    logger.warning(
-                        "LOO gamma computation failed (%s); gating skipped "
-                        "for this refresh.", exc,
-                    )
-                    new = None
-                if new is not None:
-                    prev = self._loo_gamma_cache
-                    if prev is None or prev.shape != new.shape:
-                        self._loo_gamma_cache = new
-                    else:
-                        a = self.loo_gamma_ema
-                        self._loo_gamma_cache = (
-                            a * prev.to(new.device) + (1.0 - a) * new
-                        )
-        g = self._loo_gamma_cache
-        if g is None:
-            return None
-        self._last_loo_gamma_mean = float(g.mean())
-        self._last_loo_gamma_min = float(g.min())
-        return g
-
     def _next_cross_fit_batch(self):
         """Next fold-B batch (moved to the module device), or ``None``.
 
         Fold B is an independent, permanently-disjoint subset of the training
-        set (see ``ProcessDataModule.set_hsic_cross_fit``).  Its loader is
+        set (see ``SXDataModule.set_hsic_cross_fit``).  Its loader is
         cycled independently of the Lightning train loader: the two folds differ
         in size and shuffle order, so the iterator is simply restarted whenever
         it is exhausted rather than being tied to the epoch boundary.
@@ -4049,113 +3790,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
     # Acyclicity helper (mirrors SingleCausalForecaster)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _notears_acyclicity(A: torch.Tensor) -> torch.Tensor:
-        """NOTEARS acyclicity penalty h(A) = tr(exp(A Ã¢Å â„¢ A)) - d.
-
-        Zero iff A induces a directed acyclic graph (Zheng et al., 2018).
-        Applied to the XÃ¢â€ â€™X sub-block (square, L_X Ãƒâ€” L_X) of the combined
-        score tensor.  Caller must ensure A is 2-D (shape (L_X, L_X)).
-        """
-        d = A.shape[-1]
-        return torch.trace(torch.matrix_exp(A * A)) - d
-
-    @staticmethod
-    def _logdet_acyclicity(A: torch.Tensor, s: object = "adaptive"):
-        """DAGMA-style log-det penalty h(A) = -log det(sI - A) + d*log s
-        (Bello et al., 2022).
-
-        ``A`` is the NONNEGATIVE gate-posterior score matrix (entries in
-        (0, 1)), so no elementwise squaring is applied (in NOTEARS the
-        elementwise square only exists to make signed linear weights
-        nonnegative; on a posterior it would attenuate exactly the
-        uncertain edges).
-
-        ``s`` selects the DAGMA shift:
-
-        * ``"adaptive"``: s = max_i sum_j A_ij (STOP-GRAD) + eps.  Since
-          rho(A) <= max row sum for any matrix, sI - A is guaranteed
-          nonsingular at every iterate -- the determinant singularity /
-          NaN region of fixed-s log-det is unreachable.  With
-          h = -log det(I - A/s) and rho(A/s) < 1, h >= 0 with equality
-          iff A is nilpotent (DAG).
-        * positive float: fixed global shift (pure DAGMA uses s = 1).
-          Raises if sI - A is not positive-determinant.
-
-        Caller must ensure A is 2-D (shape (d, d)).
-        """
-        d = A.shape[-1]
-        if isinstance(s, str):
-            assert s == "adaptive"
-            # Stop-grad: s is a per-step conditioning constant, not part of
-            # the penalty landscape.  The eps margin keeps sI - A strictly
-            # nonsingular even in the (measure-zero) Perron-equality case
-            # and makes h(0) = 0 exact.
-            s_val = A.detach().sum(dim=-1).max() + 1e-4
-        else:
-            s_val = torch.as_tensor(float(s), dtype=A.dtype, device=A.device)
-        eye = torch.eye(d, dtype=A.dtype, device=A.device)
-        sign, logabsdet = torch.linalg.slogdet(s_val * eye - A)
-        sign_f = float(sign.detach())
-        if not torch.isfinite(logabsdet.detach()) or sign_f <= 0.0:
-            raise FloatingPointError(
-                f"log-det acyclicity: det(sI - A) non-positive "
-                f"(sign={sign_f}); rho(A) >= s.  Use "
-                f"acyclicity_s='adaptive' or a larger fixed shift."
-            )
-        return -logabsdet + d * torch.log(s_val)
-
-    @staticmethod
-    def _nilpotent_acyclicity(A: torch.Tensor) -> torch.Tensor:
-        """Exact nilpotency penalty h(A) = sum_{k=1..d} tr(A^k).
-
-        For NONNEGATIVE A every term is >= 0, and tr(A^k) = 0 iff the graph
-        has no closed walk of length k; a d-node graph is acyclic iff it has
-        no closed walk of any length <= d.  Hence h(A) = 0 iff A induces a
-        DAG -- an exact characterisation (no factorial down-weighting of
-        long cycles as in NOTEARS, no determinant as in log-det).  Computed
-        by explicit powers; cheap at the node counts in use.
-
-        Caller must ensure A is 2-D (shape (d, d)).
-        """
-        d = A.shape[-1]
-        h = torch.zeros((), dtype=A.dtype, device=A.device)
-        Ak = A
-        for _ in range(d):
-            h = h + torch.trace(Ak)
-            Ak = Ak @ A
-        return h
-
-    def _acyclicity_penalty(self, A: torch.Tensor) -> torch.Tensor:
-        """Dispatch to the configured acyclicity functional
-        (``training.acyclicity_fn``: notears | logdet | nilpotent)."""
-        if self.acyclicity_fn == "logdet":
-            return self._logdet_acyclicity(A, self.acyclicity_s)
-        if self.acyclicity_fn == "nilpotent":
-            return self._nilpotent_acyclicity(A)
-        return self._notears_acyclicity(A)
-
-
     # ------------------------------------------------------------------
     # Structural-regularizer safeguard helpers
     # ------------------------------------------------------------------
 
     def _dhsic_residual_hsic(self, residuals: torch.Tensor) -> torch.Tensor:
-        """NOTIME objective on the current residuals, honouring bandwidths.
-
-        Bandwidth policy mirrors the pairwise path: phase-frozen per-column
-        bandwidths when latched (``_hsic_bw_frozen_sigmas``), the NOTIME
-        per-column median heuristic when ``hsic_adaptive_bandwidth`` is on,
-        otherwise the fixed scalar ``hsic_sigma`` for all columns.
-        """
+        """``structural_losses.dhsic_residual_loss`` with this step's bandwidths
+        (phase-frozen > median heuristic > fixed ``hsic_sigma``)."""
         if self._hsic_bw_frozen_sigmas is not None:
             sigma = self._hsic_bw_frozen_sigmas[1]  # per-column residual sigmas
         elif self.hsic_adaptive_bandwidth:
-            sigma = None  # NOTIME median heuristic per column
+            sigma = None
         else:
-            sigma = float(self.hsic_sigma) if not torch.is_tensor(
-                self.hsic_sigma) else self.hsic_sigma
-        return dhsic_residual_independence(residuals, sigma=sigma)
+            sigma = (float(self.hsic_sigma) if not torch.is_tensor(self.hsic_sigma)
+                     else self.hsic_sigma)
+        return dhsic_residual_loss(residuals, sigma=sigma)
 
     def freeze_hsic_bandwidth(self, combined_source, residuals) -> None:
         """Latch per-variable median-heuristic bandwidths for this phase.
@@ -4959,7 +4608,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         existing weight-protected residual rule; temperature retains raw C.
         The signed A gradient is auxiliary, projected against that reference.
         """
-        from causaliT.training.order_path_training import protect_weight
+        from causaliT.training.forecaster_utils.order_path_training import protect_weight
         oa = self.model.order_attention()
         params = [oa.order_scores]
         labels = ['scores']
@@ -5013,7 +4662,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         * the HSIC term (``(1 - alpha) * hsic_reg``) is the reference;
         * the L0 and NOTEARS terms are projected per block against it
           (conflicting components removed, see
-          :func:`causaliT.training.gradient_surgery.pcgrad_reconcile`);
+          :func:`causaliT.training.forecaster_utils.gradient_surgery.pcgrad_reconcile`);
         * the remaining structural terms (struct-recon mix, score sparsity,
           group L1, query norm) are bundled untouched.
 
@@ -5031,7 +4680,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             if getattr(self, 'order_anticausal_surgery', False):
                 self._causal_reference_backward(loss_structural)
                 return
-            from causaliT.training.order_path_training import protect_weight
+            from causaliT.training.forecaster_utils.order_path_training import protect_weight
             scores = self.model.order_attention().order_scores
             gw, = torch.autograd.grad(self._c_weight_loss, scores, retain_graph=True)
             gr, = torch.autograd.grad(self._c_residual_loss, scores, retain_graph=True)
@@ -5556,7 +5205,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
     def _lean_hsic(self, S, X, overrides=None):
         """HSIC term of ONE grad-enabled forward, using the stashed
-        structural pair mask (descendant x LOO, no BKD) and, when latched,
+        structural pair mask (descendant mask, no BKD) and, when latched,
         the phase's frozen bandwidths.
 
         When the attention-weighted aggregation is active
@@ -5602,7 +5251,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             and getattr(self, "hsic_softmax", False)
             and att is not None
             and att.dim() == 3
-            and self._last_probe_pair_mask is None  # no descendant/LOO mask
+            and self._last_probe_pair_mask is None  # no descendant mask
         ):
             return hsic_attention_softmax(
                 source_values=combined,
@@ -5707,125 +5356,48 @@ class AttentionSelectorForecaster(pl.LightningModule):
             raise ValueError(
                 "hsic_aggregation='dual_logratio' was removed: set "
                 "hsic_aggregation: plain and training.anti_adjacency_lambda > 0.")
-        self.anti_adjacency_lambda = float(tr.get("anti_adjacency_lambda", 0.0))
-        if self.anti_adjacency_lambda < 0.0:
-            raise ValueError(
-                f"anti_adjacency_lambda must be >= 0, got {self.anti_adjacency_lambda}.")
-        self.anti_adjacency_on = self.anti_adjacency_lambda > 0.0
-        if self.anti_adjacency_on and self.hsic_aggregation != "plain":
+        # Order log-ratio settings: parsed / validated in
+        # structural_losses.independence.AntiAdjacencyConfig.
+        self.anti_adjacency = AntiAdjacencyConfig.from_config(tr)
+        aa = self.anti_adjacency
+        if aa.on and self.hsic_aggregation != "plain":
             raise ValueError(
                 "anti_adjacency_lambda > 0 replaces the HSIC aggregation: set "
                 f"hsic_aggregation: plain (got {self.hsic_aggregation!r}).")
-        self.anti_adjacency_eps = float(tr.get("anti_adjacency_eps", 0.1))
-        # anti_adjacency_mode: causal_only (A from the causal residuals,
-        # default) | legacy_anticausal (A from a separate anti-causal
-        # forward, pre-ORDER_FIRST_3 behaviour; counterfactual).
-        self.anti_adjacency_mode = str(tr.get("anti_adjacency_mode", "causal_only"))
-        if self.anti_adjacency_mode not in ("causal_only", "legacy_anticausal"):
-            raise ValueError(
-                f"anti_adjacency_mode must be causal_only or legacy_anticausal, "
-                f"got {self.anti_adjacency_mode!r}.")
-        # anti_adjacency_terms: both (C - a log A, default) | causal (C only,
-        # A still logged for monitoring).
-        self.anti_adjacency_terms = str(tr.get("anti_adjacency_terms", "both"))
+        # Training-protocol switches around the loss (not part of its math).
         self.separate_structure_forward = bool(tr.get('separate_structure_forward', False))
         self.order_path_surgery = bool(tr.get('order_path_surgery', False))
         self.order_anticausal_surgery = bool(tr.get('order_anticausal_surgery', False))
         if getattr(self.model, 'dual_order_regressors', False):
-            if (not self.separate_structure_forward or self.anti_adjacency_terms != 'both'
-                    or self.anti_adjacency_mode != 'legacy_anticausal'):
+            if (not self.separate_structure_forward or aa.terms != 'both'
+                    or aa.mode != 'legacy_anticausal'):
                 raise ValueError('Dual regressors require separate forwards and both '
                                  'terms with legacy_anticausal regression.')
         if self.order_anticausal_surgery:
-            if (not self.order_path_surgery or self.anti_adjacency_terms != 'both'
-                    or self.anti_adjacency_mode != 'legacy_anticausal'
-                    or tr.get('anti_adjacency_detach_a_residuals', False)):
+            if (not self.order_path_surgery or aa.terms != 'both'
+                    or aa.mode != 'legacy_anticausal' or aa.detach_a):
                 raise ValueError('Anticausal surgery requires path surgery, both terms, '
                                  'legacy_anticausal and active A residuals.')
         if self.separate_structure_forward:
             if (not tr.get('use_gradient_routing', False)
                     or not tr.get('hsic_cross_fit', False)
                     or tr.get('structural_grad', 'hsic') not in ('hsic', 'hsic_unrolled')
-                    or not self.anti_adjacency_on):
+                    or not aa.on):
                 raise ValueError('Separate forwards require routing, cross-fitting, hsic and active order loss.')
             if (tr.get('structural_grad', 'hsic') == 'hsic_unrolled'
-                    and (self.anti_adjacency_terms != 'causal'
-                         or self.anti_adjacency_mode != 'causal_only')):
+                    and (aa.terms != 'causal' or aa.mode != 'causal_only')):
                 # The unrolled path split covers the causal term only.
                 raise ValueError('hsic_unrolled with separate forwards requires '
                                  'anti_adjacency_terms=causal and mode=causal_only.')
         if self.order_path_surgery:
             if (not self.separate_structure_forward
-                    or (self.anti_adjacency_terms != 'causal' and not self.order_anticausal_surgery)
-                    or tr.get('detach_order_mask', False)
-                    or tr.get('anti_adjacency_detach_c_residuals', False)
+                    or (aa.terms != 'causal' and not self.order_anticausal_surgery)
+                    or aa.detach_order_mask or aa.detach_c
                     or tr.get('gradient_surgery', False)):
                 raise ValueError('Path surgery requires separate forwards and both C paths active.')
-        if self.anti_adjacency_terms not in ("both", "causal"):
-            raise ValueError(
-                f"anti_adjacency_terms must be both or causal, "
-                f"got {self.anti_adjacency_terms!r}.")
-        # anti_adjacency_detach_a_residuals: the A term loses its residual
-        # path and contributes only through M.
-        self.anti_adjacency_detach_a_residuals = bool(
-            tr.get("anti_adjacency_detach_a_residuals", False))
-        # anti_adjacency_detach_c_residuals: the C term loses its residual
-        # path (mirror of the A flag; with terms=causal the order learns
-        # only through the M weighting).
-        self.anti_adjacency_detach_c_residuals = bool(
-            tr.get("anti_adjacency_detach_c_residuals", False))
-        # anti_adjacency_support: order (all pairs, legacy) | graph (C adds
-        # both directions of pairs unconnected in the step's hard edge
-        # closure; A restricted to selected pairs).  Identical without G_S.
-        self.anti_adjacency_support = str(tr.get("anti_adjacency_support", "order"))
-        if self.anti_adjacency_support not in ("order", "graph"):
-            raise ValueError("anti_adjacency_support must be order or graph.")
-        # anti_adjacency_nd: soft (legacy: pair tests weighted by the relaxed
-        # order M) | hard (tests use the step's hard order, the same one the
-        # regressor conditions on, with a straight-through soft gradient;
-        # pair weights ignore G_S so ND(i) = all earlier nodes, while the
-        # regression set Pa(i) = earlier AND selected).
-        self.anti_adjacency_nd = str(tr.get("anti_adjacency_nd", "soft"))
-        if self.anti_adjacency_nd not in ("soft", "hard"):
-            raise ValueError("anti_adjacency_nd must be soft or hard.")
-        # anti_adjacency_test: pairwise (legacy: HSIC(x_j, r_i) per pair) |
-        # joint (RESIT: one HSIC per node between r_i and the JOINT set of
-        # its hard non-descendants; product-RBF kernel, per-node null).
-        self.anti_adjacency_test = str(tr.get("anti_adjacency_test", "pairwise"))
-        if self.anti_adjacency_test not in ("pairwise", "joint"):
-            raise ValueError("anti_adjacency_test must be pairwise or joint.")
-        if self.anti_adjacency_test == "joint" and (
-                self.anti_adjacency_nd != "hard"
-                or self.anti_adjacency_terms != "causal"
-                or self.anti_adjacency_mode != "causal_only"
-                or str(tr.get("hsic_mode", "biased")) != "biased"):
-            raise ValueError("anti_adjacency_test=joint requires anti_adjacency_nd=hard, "
-                             "terms=causal, mode=causal_only and hsic_mode=biased.")
-        # anti_adjacency_null: global (scalar nu) | per_pair (exact closed-form
-        # permutation-null mean of each pair, biased HSIC only).
-        self.anti_adjacency_null = str(tr.get("anti_adjacency_null", "global"))
-        if self.anti_adjacency_null not in ("global", "per_pair"):
-            raise ValueError("anti_adjacency_null must be global or per_pair.")
-        if self.anti_adjacency_null == "per_pair" and str(tr.get("hsic_mode", "biased")) != "biased":
-            raise ValueError("anti_adjacency_null=per_pair requires hsic_mode: biased.")
-        # Ratio clipping: floor C/nu at 1 (no gradient below the null),
-        # cap A/nu at kappa (no gain beyond clear dependence).
-        self.anti_adjacency_ratio_floor = bool(tr.get("anti_adjacency_ratio_floor", False))
-        cap = tr.get("anti_adjacency_ratio_cap", None)
-        self.anti_adjacency_ratio_cap = None if cap is None else float(cap)
-        if self.anti_adjacency_ratio_cap is not None and self.anti_adjacency_ratio_cap <= 0:
-            raise ValueError("anti_adjacency_ratio_cap must be > 0 or null.")
-        # anticausal_selector_grad: raw (A trains G_S too) | none (G_S
-        # detached in the anti-causal pass; A trains the order only).
-        self.anticausal_selector_grad = str(tr.get("anticausal_selector_grad", "raw"))
-        if self.anticausal_selector_grad not in ("raw", "none"):
-            raise ValueError("anticausal_selector_grad must be raw or none.")
         # order_tau_lr_mult: lr multiplier of the learnable Sinkhorn log tau
         # (own param group of the structural optimizer).
         self.order_tau_lr_mult = float(tr.get("order_tau_lr_mult", 1.0))
-        # detach_order_mask: the order weight M of the log-ratio is detached
-        # (ablation); the order then learns only through the residuals.
-        self.detach_order_mask = bool(tr.get("detach_order_mask", False))
         if "lambda_l0_selector" in tr:
             raise ValueError("lambda_l0_selector was removed: use structural lambda_l0.")
 
@@ -5842,273 +5414,81 @@ class AttentionSelectorForecaster(pl.LightningModule):
         return target, target - pred.squeeze()
 
     def _anti_adjacency_hsic(self, S, X, overrides=None, causal=None, keep=None):
-        """Causal / anti-causal log-ratio objective (lower = better order).
-        Active only for anti_adjacency_lambda > 0.
+        """Order log-ratio of this step (lower = better order).
 
-        ONE causal forward: every node regresses on its EARLIER nodes only.
-        For every unordered pair e = (i, j), with M[i, j] = P(i before j)
-        (relaxed, gradient-carrying) and residual matrix
-        H[t, s] = HSIC(x_s, r_t):
-
-            C_e = M_ij H[j, i] + M_ji H[i, j]   (later residual vs earlier
-                                                  node: low)
-            A_e = M_ij H[i, j] + M_ji H[j, i]   (earlier residual vs later
-                                                  node: high for descendants,
-                                                  via innovation propagation)
-
-        Regressing on LATER nodes (former anti-causal forward) is not used:
-        the regressors carry their own innovations, which then enter the
-        residual and make A high regardless of the true graph.
-            L   = sum_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)] / sum_e w_e
-
-        a = anti_adjacency_lambda (> 0).
-        w_e = detached selector probability pi_e (1 with full existence);
-        nu = permutation-null mean of the current phase (1.0 before the first
-        calibration).  ``causal`` optionally passes precomputed causal
-        ``(target, residuals)`` (the cross-fit forward of ``_step``).
-        ``keep`` optionally passes the (N,) BKD keep vector of this step: a
-        pair counts only if BOTH nodes were kept (w_e *= keep_i * keep_j),
-        so dropped nodes neither pay nor push the order and the C/A
-        symmetry is preserved.  With < 2 kept nodes the loss is an exact 0.
-        Full derivation and gradient flow: docs/documentation/ANTI_ADJACENCY_LOSS.md.
+        Gathers model state (residuals, order mask M, selector pi, bandwidths,
+        null scale, graph supports) and calls
+        ``structural_losses.anti_adjacency_loss`` (or ``joint_nd_loss``).
+        ``causal``: precomputed ``(target, residuals)``; ``keep``: BKD keep
+        vector.  Stores stats in ``_last_anti_adjacency_stats`` and surgery
+        paths in ``_c_*_loss`` / ``_a_*_loss``.
         """
+        cfg = self.anti_adjacency
         if causal is None:
             target, r_c = self._order_residuals(S, X, overrides, "causal")
         else:
             target, r_c = causal
         oa = self.model.order_attention()
         M = oa._last_M                      # causal relaxed order, same noise
-        hard_nd = getattr(self, 'anti_adjacency_nd', 'soft') == 'hard'
+        hard_nd = cfg.nd == "hard"
         if hard_nd:
-            # Forward value = hard order of this step (the regressor's order);
-            # gradient = relaxed order (straight-through).
+            # Hard order of this step forward, relaxed order backward (ST).
             M = oa._last_M_hard.to(M) + M - M.detach()
-        if self.detach_order_mask:
-            M = M.detach()                  # ablation: no gradient via weights
-        pi = oa._last_pi.detach()
-        if hard_nd:
-            # ND(i) is every earlier node, selected or not: G_S must not
-            # censor the independence tests (it only defines Pa(i)).
-            pi = torch.ones_like(pi)
-        if getattr(self, 'anti_adjacency_test', 'pairwise') == 'joint':
-            return self._joint_nd_hsic(target, r_c, M, keep)
-
+        if cfg.detach_order_mask:
+            M = M.detach()
+        # nd=hard: ND(i) = every earlier node; G_S must not censor the tests.
+        pi = torch.ones_like(oa._last_pi) if hard_nd else oa._last_pi.detach()
         if self._hsic_bw_frozen_sigmas is not None:
             sigma, adaptive = self._hsic_bw_frozen_sigmas, False
         else:
             sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
-        kw = dict(sigma=sigma, adaptive_bandwidth=adaptive, mode=self.hsic_mode,
-                  nhsic_epsilon=self.nhsic_epsilon,
-                  source_kernel=self.hsic_kernel_source,
-                  bandwidth_multipliers=self.hsic_bandwidth_multipliers,
-                  return_matrix=True)
-        H_c = torch.nan_to_num(hsic_cross_per_pair(target, r_c, **kw)[1])
+        surgery = getattr(self, "order_path_surgery", False)
 
-        # anti_adjacency_detach_c_residuals: C keeps its M (weight) path
-        # but loses its residual path (mirror of the A-detach flag).
-        H_c_C = H_c.detach() if self.anti_adjacency_detach_c_residuals else H_c
-        # anti_adjacency_mode = legacy_anticausal restores the pre-patch A
-        # term built from a separate anti-causal forward (regress on LATER
-        # nodes); default causal_only reuses the causal residuals.
-        support = getattr(self, 'anti_adjacency_support', 'order')
-        if self.anti_adjacency_mode == "legacy_anticausal":
-            # anticausal_selector_grad = none: G_S is detached in this pass.
-            oa.anticausal_detach_direction = (
-                getattr(self, 'anticausal_selector_grad', 'raw') == 'none')
-            try:
-                if getattr(self, 'separate_structure_forward', False):
-                    # _step has already exited the causal forward's policy context.
-                    # Match its sampling and BKD policy, not the ambient recon state.
-                    from causaliT.training.order_path_training import forward_policy
-                    sampling = self.config.get('adaptive_training', {}).get(
-                        'structure', {}).get('order_sampling', 'soft')
-                    with forward_policy(self.model, structural=True, order_sampling=sampling):
-                        _, r_a = self._order_residuals(S, X, overrides, "anticausal")
-                else:
-                    _, r_a = self._order_residuals(S, X, overrides, "anticausal")
-            finally:
-                oa.anticausal_detach_direction = False
-            if self.anti_adjacency_detach_a_residuals:
-                r_a = r_a.detach()
-            H_a = torch.nan_to_num(hsic_cross_per_pair(target, r_a, **kw)[1])
+        if cfg.test == "joint":
+            loss, stats, paths = joint_nd_loss(target, r_c, M, cfg, sigma, adaptive,
+                                               keep=keep, surgery=surgery)
         else:
-            # anti_adjacency_detach_a_residuals: A keeps its M (weight) path
-            # but loses its residual path; C is untouched.
-            r_a = r_c
-            H_a = H_c.detach() if self.anti_adjacency_detach_a_residuals else H_c
-
-        # Null scale.  global: scalar nu (permutation-null mean of the phase,
-        # 1.0 before calibration).  per_pair: exact closed-form permutation
-        # null of every pair on this batch (detached).
-        if getattr(self, 'anti_adjacency_null', 'global') == 'per_pair':
-            from causaliT.utils.hsic_utils import hsic_permutation_null_matrix
-            nkw = dict(sigma=sigma, adaptive_bandwidth=adaptive,
-                       source_kernel=self.hsic_kernel_source,
-                       bandwidth_multipliers=self.hsic_bandwidth_multipliers)
-            nu_c = hsic_permutation_null_matrix(target, r_c, **nkw).clamp_min(1e-12)
-            nu_a = (nu_c if r_a is r_c else
-                    hsic_permutation_null_matrix(target, r_a, **nkw).clamp_min(1e-12))
-            nu = float(nu_c.mean())
-        else:
-            stats = getattr(self, "hsic_null_stats", None)
-            nu = float(stats["mean"]) if stats and float(stats.get("mean", 0.0)) > 0.0 else 1.0
-            nu_c = nu_a = None
-
-        # Supports (detached).  order: every pair, order-weighted.  graph:
-        # pairs unconnected in the closure of the step's hard edge draw add
-        # both directed C tests; A only on selected pairs.
-        N = M.shape[0]
-        off = 1.0 - torch.eye(N, device=M.device, dtype=M.dtype)
-        U = sel = None
-        has_cycle = False
-        if support == 'graph':
-            from causaliT.training.order_path_training import graph_supports
-            U, sel, has_cycle = graph_supports(
-                oa.last_M_actual_hard.to(device=M.device, dtype=M.dtype))
-        eps = self.anti_adjacency_eps
-        floor = getattr(self, 'anti_adjacency_ratio_floor', False)
-        cap = getattr(self, 'anti_adjacency_ratio_cap', None)
-
-        def pair_ratios(Mw, Hc, Ha):
-            """(C, A) pair ratios [i, j] (symmetric).  Directed entries are
-            divided by their own null before the pair sum (global: scalar)."""
-            rc = Hc.transpose(0, 1) / (nu if nu_c is None else nu_c.transpose(0, 1))
-            ra = Ha / (nu if nu_a is None else nu_a)
-            Cd = Mw * rc                    # [i, j]: M_ij HSIC(x_i, r_j) / nu
-            Ad = Mw * ra                    # [i, j]: M_ij HSIC(x_j, r^a_i) / nu
-            C_ = (Cd + Cd.transpose(0, 1)).clamp_min(0.0)
-            A_ = (Ad + Ad.transpose(0, 1)).clamp_min(0.0)
-            if U is not None:
-                # Unconnected pairs: each node is a non-descendant of the
-                # other, so both directed C tests hold (no order weight).
-                C_ = (1.0 - U) * C_ + U * (rc + rc.transpose(0, 1)).clamp_min(0.0)
-            if floor:
-                C_ = C_.clamp_min(1.0)
-            if cap is not None:
-                A_ = A_.clamp_max(cap)
-            return C_, A_
-
-        C, A = pair_ratios(M, H_c_C, H_a)
-        causal_log_term = torch.log(eps + C)
-        anticausal_log_term = -self.anti_adjacency_lambda * torch.log(eps + A)
-        # anti_adjacency_terms = causal drops the A term from the loss; A is
-        # still computed for the logged stats.
-        if self.anti_adjacency_terms == "causal":
-            anticausal_log_term = torch.zeros_like(causal_log_term)
-        lr = causal_log_term + anticausal_log_term
-        w = pi * off
-        if keep is not None:
-            k = keep.detach().to(device=w.device, dtype=w.dtype)
-            if k.dim() == 2:
-                # Per-pair keep (child <- parent): a pair survives only if
-                # neither direction was dropped.
-                w = w * k * k.transpose(0, 1)
-            else:
-                k = k.view(-1)
-                w = w * k.view(-1, 1) * k.view(1, -1)
-        triu = torch.triu(off, diagonal=1).bool()
-        # Separate supports: C on every (kept) pair, A on selected pairs only
-        # (graph); each term is averaged over its own support.  With the
-        # order support both weights coincide and this equals the legacy
-        # single average of (C - a A).
-        w_c = w
-        w_a = w if sel is None else w * sel
-        wc_sum = w_c[triu].sum().clamp_min(1e-12)
-        wa_sum = w_a[triu].sum().clamp_min(1e-12)
-        # Empty support (e.g. BKD kept < 2 nodes, or no selected pair): the
-        # term is an exact 0 with zero gradient.
-        c_loss = (w_c[triu] * causal_log_term[triu]).sum() / wc_sum
-        a_loss = (w_a[triu] * anticausal_log_term[triu]).sum() / wa_sum
-        loss = c_loss + a_loss
-
-        if getattr(self, 'order_path_surgery', False) and torch.is_grad_enabled():
-            def c_path(Mw, Hc):
-                return (w_c[triu] * torch.log(eps + pair_ratios(Mw, Hc, H_a.detach())[0][triu])).sum() / wc_sum
-
-            def a_path(Mw, Ha):
-                return (w_a[triu] * torch.log(eps + pair_ratios(Mw, H_c.detach(), Ha)[1][triu])).sum() / wa_sum
-            self._c_path_loss = loss
-            self._c_weight_loss = c_path(M, H_c.detach())
-            self._c_residual_loss = c_path(M.detach(), H_c)
-            if getattr(self, 'order_anticausal_surgery', False):
-                # Signed coefficient of the A term included.
-                self._a_weight_loss = -self.anti_adjacency_lambda * a_path(M, H_a.detach())
-                self._a_residual_loss = -self.anti_adjacency_lambda * a_path(M.detach(), H_a)
-
-        with torch.no_grad():
-            rows = ((w_c * causal_log_term).sum(dim=1) / w_c.sum(dim=1).clamp_min(1e-12)
-                    + (w_a * anticausal_log_term).sum(dim=1) / w_a.sum(dim=1).clamp_min(1e-12))
-            # C / A are null-normalised ratios (raw HSIC when nu = 1).
-            self._last_anti_adjacency_stats = {
-                "C": float((w_c[triu] * C[triu]).sum() / wc_sum),
-                "A": float((w_a[triu] * A[triu]).sum() / wa_sum),
-                "causal_log_term": float(c_loss),
-                "anticausal_log_term": float(a_loss),
-                "nu": nu,
-                "nu_a": nu if nu_a is None else float(nu_a.mean()),
-                "c_pairs": float((w_c[triu] > 0).sum()),
-                "a_pairs": float((w_a[triu] > 0).sum()),
-                "unconnected_pairs": 0.0 if U is None else float(U[triu].sum()),
-                "cycle": float(has_cycle),
-                "c_floor_frac": float((C[triu] <= 1.0).float().mean()) if floor else 0.0,
-                "a_cap_frac": (float((A[triu][w_a[triu] > 0] >= cap).float().mean())
-                               if cap is not None and bool((w_a[triu] > 0).any()) else 0.0),
-                "rows": rows,
-            }
+            r_a = None
+            if cfg.mode == "legacy_anticausal":
+                r_a = AttentionSelectorForecaster._anticausal_residuals(
+                    self, S, X, overrides)
+            null = getattr(self, "hsic_null_stats", None)
+            nu = (float(null["mean"]) if null and float(null.get("mean", 0.0)) > 0.0
+                  else 1.0)
+            graph = None
+            if cfg.support == "graph":
+                from causaliT.training.forecaster_utils.order_path_training import graph_supports
+                graph = graph_supports(
+                    oa.last_M_actual_hard.to(device=M.device, dtype=M.dtype))
+            kernel = KernelOpts(
+                sigma=sigma, adaptive=adaptive, mode=self.hsic_mode,
+                nhsic_epsilon=self.nhsic_epsilon, source_kernel=self.hsic_kernel_source,
+                bandwidth_multipliers=self.hsic_bandwidth_multipliers)
+            loss, stats, paths = anti_adjacency_loss(
+                target, r_c, M, pi, cfg, kernel, r_a=r_a, nu_global=nu, keep=keep,
+                graph=graph, surgery=surgery,
+                anticausal_surgery=getattr(self, "order_anticausal_surgery", False))
+        for key, value in paths.items():
+            setattr(self, f"_{key}_loss", value)
+        self._last_anti_adjacency_stats = stats
         return loss
 
-    def _joint_nd_hsic(self, target, r_c, M, keep=None):
-        """Joint RESIT objective: one test per node, residual r_i vs the
-        JOINT set of its non-descendants X_ND(i) (hard order, ST gradient).
-
-            L = mean_i log(eps + T_i / nu_i),  i with |ND(i)| >= 1,
-
-        T_i = joint HSIC (product-RBF set kernel, see hsic_joint_masked),
-        nu_i = its exact permutation-null mean (detached).  Surgery paths:
-        weight = set weights live, residuals detached; residual = reverse.
-        """
-        from causaliT.utils.hsic_utils import hsic_joint_masked
-        if self._hsic_bw_frozen_sigmas is not None:
-            sigma, adaptive = self._hsic_bw_frozen_sigmas, False
-        else:
-            sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
-        eps = self.anti_adjacency_eps
-        N = M.shape[0]
-        off = 1.0 - torch.eye(N, device=M.device, dtype=M.dtype)
-        W = M.transpose(0, 1) * off           # [t, s]: s earlier than t
-        if keep is not None:
-            k = keep.detach().to(W)
-            W = W * (k if k.dim() == 2 else k.view(1, -1) * k.view(-1, 1))
-
-        def node_loss(Wm, r):
-            T, nu, count = hsic_joint_masked(target, r, Wm, sigma=sigma,
-                                             adaptive_bandwidth=adaptive)
-            ratio = T / nu.clamp_min(1e-12)
-            if getattr(self, 'anti_adjacency_ratio_floor', False):
-                ratio = ratio.clamp_min(1.0)
-            valid = (count > 0.5).to(ratio.dtype)
-            loss = (valid * torch.log(eps + ratio.clamp_min(0.0))).sum() \
-                / valid.sum().clamp_min(1.0)
-            return loss, ratio, valid
-
-        loss, ratio, valid = node_loss(W, r_c)
-        if getattr(self, 'order_path_surgery', False) and torch.is_grad_enabled():
-            self._c_path_loss = loss
-            self._c_weight_loss = node_loss(W, r_c.detach())[0]
-            self._c_residual_loss = node_loss(W.detach(), r_c)[0]
-        with torch.no_grad():
-            rows = torch.where(valid > 0, torch.log(eps + ratio.clamp_min(0.0)),
-                               torch.zeros_like(ratio))
-            mean_ratio = float((valid * ratio).sum() / valid.sum().clamp_min(1.0))
-            self._last_anti_adjacency_stats = {
-                "C": mean_ratio, "A": 0.0,
-                "causal_log_term": float(loss), "anticausal_log_term": 0.0,
-                "nu": 1.0, "nu_a": 1.0,
-                "c_pairs": float(valid.sum()), "a_pairs": 0.0,
-                "unconnected_pairs": 0.0, "cycle": 0.0,
-                "c_floor_frac": 0.0, "a_cap_frac": 0.0, "rows": rows,
-            }
-        return loss
+    def _anticausal_residuals(self, S, X, overrides=None):
+        """Residuals of the legacy anti-causal forward (regress on LATER nodes)."""
+        oa = self.model.order_attention()
+        oa.anticausal_detach_direction = self.anti_adjacency.selector_grad == "none"
+        try:
+            if getattr(self, "separate_structure_forward", False):
+                # _step already left the causal forward's policy context:
+                # match its sampling and BKD policy, not the ambient recon state.
+                from causaliT.training.forecaster_utils.order_path_training import forward_policy
+                sampling = self.config.get("adaptive_training", {}).get(
+                    "structure", {}).get("order_sampling", "soft")
+                with forward_policy(self.model, structural=True, order_sampling=sampling):
+                    return self._order_residuals(S, X, overrides, "anticausal")[1]
+            return self._order_residuals(S, X, overrides, "anticausal")[1]
+        finally:
+            oa.anticausal_detach_direction = False
 
     def _lean_recon(self, S, X, overrides=None):
         """MSE of ONE grad-enabled forward (same target layout as _step)."""
@@ -6268,7 +5648,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # conditioning sets of the first-order structural pass.  The stored
         # step noise is reused (no resample), so all passes share one mask.
         if getattr(self, 'separate_structure_forward', False):
-            from causaliT.training.order_path_training import forward_policy
+            from causaliT.training.forecaster_utils.order_path_training import forward_policy
             sampling = self.config.get('adaptive_training', {}).get(
                 'structure', {}).get('order_sampling', 'soft')
 
@@ -6385,7 +5765,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         if getattr(self, 'order_path_surgery', False):
             # Unrolled path surgery: scores get g_w + protect_weight(g_w, g_r)
             # (g_r = unrolled residual-path gradient); tau / G_S get g_w + g_r.
-            from causaliT.training.order_path_training import protect_weight
+            from causaliT.training.forecaster_utils.order_path_training import protect_weight
             g_w, g_r = self._darts_second_order_grads(batch[0], batch[1], struct, paths=True)
             scores = self.model.order_attention().order_scores
             g_hsic = []
@@ -6445,8 +5825,8 @@ class AttentionSelectorForecaster(pl.LightningModule):
         Without cached val batches the candidacy is DROPPED (not tabooed) -
         the shadow persists, so eligibility re-triggers on the next step.
         """
-        from causaliT.training.bilevel_probe import paired_refit_probe
-        from causaliT.training.centroid_commit import centroid_of
+        from causaliT.training.forecaster_utils.bilevel_probe import paired_refit_probe
+        from causaliT.training.forecaster_utils.centroid_commit import centroid_of
 
         cc = self._commit
         pending, cc.pending = cc.pending, []
@@ -6515,7 +5895,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         reconstruction settings (``optimizer``, ``lr``, ``weight_decay``,
         ``optimizer_kwargs``).
         """
-        from causaliT.training.optimizer_factory import (
+        from causaliT.training.core.optimizer_factory import (
             make_optimizer,
             get_recon_optimizer_config,
             get_structural_optimizer_config,

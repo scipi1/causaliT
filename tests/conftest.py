@@ -7,6 +7,9 @@ This file adds custom pytest options for configuring test directories.
 import pytest
 from pathlib import Path
 
+# Tests of deprecated code (reference only; their imports are broken).
+collect_ignore_glob = ["_OLD/*"]
+
 
 def pytest_addoption(parser):
     """Add custom command-line options to pytest."""

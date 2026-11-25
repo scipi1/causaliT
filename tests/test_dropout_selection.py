@@ -7,7 +7,7 @@ Background
 ``causaliT.utils.query_sensitivity.hsic_query_sensitivity`` measures how much
 the train HSIC reacts to a small perturbation of the free query embeddings —
 the probe that detects the "diluted" (flat-HSIC) regime.
-``causaliT.training.dropout_selection.run_dropout_selection`` uses it as a
+``causaliT.training.adaptive_utils.dropout_selection.run_dropout_selection`` uses it as a
 pre-flight stage of the adaptive trainer: one reconstruction-only warmup per
 candidate dropout, argmax sensitivity wins, the main run is built with the
 winning dropout and warm-started from the winner's weights.
@@ -49,7 +49,7 @@ from causaliT.utils.query_sensitivity import (
     scalar_hsic,
     _free_query_weights,
 )
-from causaliT.training import dropout_selection as ds
+from causaliT.training.adaptive_utils import dropout_selection as ds
 
 
 # ---------------------------------------------------------------------------

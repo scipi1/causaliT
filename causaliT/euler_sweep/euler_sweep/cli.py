@@ -7,7 +7,7 @@ with sequential or parallel execution modes.
 
 Wired to use:
 - Training function: causaliT.training.trainer.trainer
-- Config preprocessing: causaliT.training.experiment_control.update_config
+- Config preprocessing: causaliT.training.core.experiment_control.update_config
 """
 
 # Standard library imports
@@ -37,9 +37,8 @@ from causaliT.euler_sweep.euler_sweep.sweeper import (
 
 # Import causaliT training components
 from causaliT.training.trainer import trainer
-from causaliT.training.staged_trainer import staged_trainer
 from causaliT.training.adaptive_trainer import adaptive_trainer
-from causaliT.training.experiment_control import update_config
+from causaliT.training.core.experiment_control import update_config
 
 
 # =============================================================================
@@ -82,45 +81,6 @@ def train_function_for_sweep(
     )
 
 
-def staged_train_function_for_sweep(
-    config: OmegaConf,
-    save_dir: Path,
-    data_dir: Path,
-    cluster: bool,
-    **kwargs
-):
-    """
-    Staged training function wrapper for calibrated parameter sweeps.
-
-    Like ``train_function_for_sweep`` but delegates to
-    ``staged_trainer`` which runs:
-    1. (Optional) causal initialization
-    2. Main training with warm-start from init checkpoint
-
-    Use this for experiments that require score-sparsity CV or
-    causal initialization before the main training loop.
-
-    Args:
-        config: Configuration object (OmegaConf) with all hyperparameters
-        save_dir: Directory to save outputs (checkpoints, logs, results)
-        data_dir: Directory containing training data
-        cluster: Whether running on a cluster (affects num_workers, etc.)
-        **kwargs: Additional arguments passed to staged_trainer
-
-    Returns:
-        pd.DataFrame: DataFrame containing metrics for each fold
-    """
-    config_updated = update_config(config)
-
-    return staged_trainer(
-        config=config_updated,
-        save_dir=str(save_dir),
-        data_dir=str(data_dir),
-        cluster=cluster,
-        **kwargs
-    )
-
-
 def adaptive_train_function_for_sweep(
     config: OmegaConf,
     save_dir: Path,
@@ -131,7 +91,7 @@ def adaptive_train_function_for_sweep(
     """
     Adaptive alternating training function wrapper for parameter sweeps.
 
-    Like ``staged_train_function_for_sweep`` but delegates to
+    Like ``train_function_for_sweep`` but delegates to
     ``adaptive_trainer`` which runs the metric-driven reconstruct/structure
     schedule defined in ``config['adaptive_training']`` (a single in-memory
     ``pl.Trainer.fit()`` that switches phases automatically on ``val_x_mae``).
@@ -466,230 +426,7 @@ def sweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
 
 
 # =============================================================================
-# CALISWEEP COMMAND — mirrors `sweep` but uses staged_trainer
-# =============================================================================
-@click.command()
-@click.option(
-    "--exp_id",
-    required=True,
-    help="Experiment ID (folder name containing config.yaml and sweep.yaml)"
-)
-@click.option(
-    "--sweep_mode",
-    required=True,
-    type=click.Choice(['independent', 'combination']),
-    help="Sweep mode: 'independent' (one param at a time) or 'combination' (all combinations)"
-)
-@click.option(
-    "--parallel",
-    default=False,
-    is_flag=True,
-    help="Run in parallel using SLURM job arrays (cluster only)"
-)
-@click.option(
-    "--cluster",
-    default=False,
-    is_flag=True,
-    help="Running on cluster (affects paths and resource usage)"
-)
-@click.option(
-    "--scratch_path",
-    default=None,
-    help="Scratch path for cluster execution (e.g., $SCRATCH/my_exp)"
-)
-# SLURM parameters (only used with --parallel)
-@click.option(
-    "--max_concurrent_jobs",
-    default=6,
-    type=int,
-    help="Maximum concurrent SLURM jobs (default: 6)"
-)
-@click.option(
-    "--walltime",
-    default="4:00:00",
-    help="SLURM walltime limit (default: 4:00:00)"
-)
-@click.option(
-    "--gpu_mem",
-    default="11g",
-    help="GPU memory requirement (default: 11g; 'null' = CPU-only, no GPU requested)"
-)
-@click.option(
-    "--mem_per_cpu",
-    default="10g",
-    help="CPU memory requirement (default: 10g)"
-)
-@click.option(
-    "--submit_jobs",
-    default=True,
-    is_flag=True,
-    help="Actually submit jobs (False for dry run)"
-)
-def calisweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
-              max_concurrent_jobs, walltime, gpu_mem, mem_per_cpu, submit_jobs):
-    """
-    Run parameter sweeps using the staged trainer (causal init → main training).
-
-    Identical to the ``sweep`` command but uses ``staged_trainer`` instead of
-    ``trainer``.  The staged trainer runs:
-    1. (Optional) causal initialization stage
-    2. Main training with warm-start from the init checkpoint
-
-    Use this for experiments whose config includes staged training settings
-    (e.g. ``use_score_sparsity_cv``, ``causal_initialization``).
-
-    Sweep Modes:
-      - independent: Vary one parameter at a time (baseline comparison)
-      - combination: Explore all combinations (Cartesian product)
-
-    Execution Modes:
-      - Sequential (default): Run combinations one after another
-      - Parallel (--parallel): Use SLURM job arrays for cluster parallelization
-
-    Examples::
-
-      # Sequential combination sweep with staged trainer
-      python cli.py calisweep --exp_id my_exp --sweep_mode combination
-
-      # Parallel combination sweep on cluster
-      python cli.py calisweep --exp_id my_exp --sweep_mode combination \\
-          --parallel --cluster --scratch_path $SCRATCH/my_exp \\
-          --max_concurrent_jobs 10
-    """
-    print(f"Starting staged parameter sweep: exp_id={exp_id}, mode={sweep_mode}, parallel={parallel}")
-
-    # =============================================================================
-    # Validate execution mode
-    # =============================================================================
-    if parallel and not cluster:
-        raise ValueError(
-            "Parallel execution (--parallel) requires cluster mode (--cluster).\n"
-            "Parallel sweeps use SLURM job arrays which are only available on clusters.\n"
-            "For local execution, use sequential mode (omit --parallel flag)."
-        )
-
-    # =============================================================================
-    # Set up directories for causaliT project
-    # =============================================================================
-    if scratch_path is None:
-        exp_dir = join(ROOT_DIR, "experiments", exp_id)
-        home_exp_dir = exp_dir
-    else:
-        exp_dir = scratch_path
-        home_exp_dir = join(ROOT_DIR, "experiments", exp_id)
-
-    # Data directory
-    data_dir = join(ROOT_DIR, "data")
-
-    # Check if experiment directory exists
-    check_dir = home_exp_dir if scratch_path is not None else exp_dir
-    if not exists(check_dir):
-        raise ValueError(f"Experiment directory does not exist: {check_dir}")
-
-    # Check for required config files (supports config*.yaml pattern)
-    import glob
-    config_pattern = join(check_dir, "config*.yaml")
-    config_files = glob.glob(config_pattern)
-    sweeper_dir = join(check_dir, "sweeper")
-    sweep_path = join(sweeper_dir, "sweep.yaml")
-
-    if not config_files:
-        raise ValueError(
-            f"Config file not found in: {check_dir}\n"
-            "Create a config.yaml (or config_*.yaml) file in your experiment directory."
-        )
-
-    if not exists(sweeper_dir):
-        raise ValueError(
-            f"Sweeper directory not found: {sweeper_dir}\n"
-            "Create a 'sweeper' subdirectory in your experiment folder.\n"
-            f"Expected structure: {check_dir}/sweeper/sweep.yaml"
-        )
-
-    if not exists(sweep_path):
-        raise ValueError(
-            f"Sweep file not found: {sweep_path}\n"
-            "Create a sweep.yaml file in the sweeper subdirectory.\n"
-            f"Expected location: {check_dir}/sweeper/sweep.yaml"
-        )
-
-    print(f"Experiment directory: {exp_dir}")
-    print(f"Data directory: {data_dir}")
-    print(f"Config: {config_files[0]}")
-    print(f"Sweep: {sweep_path}")
-    print(f"Training function: staged_train_function_for_sweep (staged_trainer)")
-
-    # =============================================================================
-    # CausaliT training function — staged variant
-    # =============================================================================
-    train_fn = staged_train_function_for_sweep
-
-    # =============================================================================
-    # Execute sweep based on mode
-    # =============================================================================
-    if not parallel:
-        # Sequential sweep
-        print(f"\nRunning sequential {sweep_mode} sweep (staged trainer)...")
-        print("This will run combinations one after another.\n")
-
-        run_sequential_sweep(
-            exp_dir=exp_dir,
-            sweep_mode=sweep_mode,
-            train_fn=train_fn,
-            data_dir=data_dir,
-            cluster=cluster,
-            experiment_id=exp_id
-        )
-
-        print("\n" + "=" * 60)
-        print("Sequential staged sweep completed!")
-        print("=" * 60)
-
-        if sweep_mode == "independent":
-            print(f"Results: {exp_dir}/sweeps/")
-        else:
-            print(f"Results: {exp_dir}/combinations/")
-        print("=" * 60 + "\n")
-
-    else:
-        # Parallel sweep using SLURM job arrays
-        print(f"\nPreparing parallel {sweep_mode} sweep (staged trainer)...")
-        print(f"Max concurrent jobs: {max_concurrent_jobs}")
-        print(f"Walltime: {walltime}")
-        gpu_mem = normalize_gpu_mem(gpu_mem)  # 'null' -> None: CPU-only jobs
-        print(f"GPU memory: {gpu_mem if gpu_mem else 'none (CPU-only)'}")
-        print(f"CPU memory: {mem_per_cpu}\n")
-
-        # Prepare SLURM parameters
-        slurm_params = {
-            'max_concurrent_jobs': max_concurrent_jobs,
-            'walltime': walltime,
-            'gpu_mem': gpu_mem,
-            'mem_per_cpu': mem_per_cpu
-        }
-
-        # For parallel execution, specify the training function by module and name
-        # so it can be imported by worker jobs on cluster nodes
-        train_fn_module = "causaliT.euler_sweep.euler_sweep.cli"
-        train_fn_name = "staged_train_function_for_sweep"
-
-        run_parallel_sweep(
-            exp_dir=exp_dir,
-            home_exp_dir=home_exp_dir,
-            sweep_mode=sweep_mode,
-            train_fn_module=train_fn_module,
-            train_fn_name=train_fn_name,
-            experiment_id=exp_id,
-            data_dir=data_dir,
-            scratch_path=scratch_path,
-            slurm_params=slurm_params,
-            cluster=cluster,
-            submit_jobs=submit_jobs
-        )
-
-
-# =============================================================================
-# ADAPTIVESWEEP COMMAND — mirrors `calisweep` but uses adaptive_trainer
+# ADAPTIVESWEEP COMMAND — mirrors `sweep` but uses adaptive_trainer
 # =============================================================================
 @click.command()
 @click.option(
@@ -753,8 +490,8 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     """
     Run parameter sweeps using the adaptive alternating trainer.
 
-    Identical to the ``calisweep`` command but uses ``adaptive_trainer`` instead
-    of ``staged_trainer``.  The adaptive trainer runs the metric-driven
+    Identical to the ``sweep`` command but uses ``adaptive_trainer`` instead
+    of ``trainer``.  The adaptive trainer runs the metric-driven
     reconstruct/structure schedule defined in ``config['adaptive_training']``
     (single in-memory ``pl.Trainer.fit()`` switching phases on ``val_x_mae``).
 
@@ -1264,7 +1001,6 @@ def calibrate_batch_budget(safety, multiplicity, dtype_bytes, no_cache):
 
 
 cli.add_command(sweep)
-cli.add_command(calisweep)
 cli.add_command(adaptivesweep)
 cli.add_command(dagsweep)
 cli.add_command(dagsweep_status)

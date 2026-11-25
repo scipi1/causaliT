@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
-from causaliT.training.stage_policy import parse_stage_policy, resolve_gate_opts
+from causaliT.training.adaptive_utils.stage_policy import parse_stage_policy, resolve_gate_opts
 
 N, E, B = 4, 4, 3
 

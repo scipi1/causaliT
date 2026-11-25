@@ -41,7 +41,7 @@ from typing import Tuple, List, Dict, Callable, Optional, Any
 from omegaconf import OmegaConf
 
 # Local imports (deferred to avoid circular imports - see functions that need it)
-# from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+# from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
 
 
 def normalize_gpu_mem(value: Optional[str]) -> Optional[str]:
@@ -375,7 +375,7 @@ def run_sequential_sweep(
         # when interpolation references like ds_embed_S.num_variables: ${data.S_seq_len}
         # are resolved. Without this, these would resolve to null.
         if data_dir is not None:
-            from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+            from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
             logger.info(f"Populating dataset metadata from: {data_dir}")
             config_copy = populate_seq_lengths_from_dataset(config_copy, data_dir)
 
@@ -384,7 +384,7 @@ def run_sequential_sweep(
         # d_ff_mult * d_model_set) are written into the config BEFORE
         # ${experiment.d_ff} is resolved. Without this the interpolations
         # resolve to null and the saved config.yaml still contains null values.
-        from causaliT.training.experiment_control import update_config
+        from causaliT.training.core.experiment_control import update_config
         config_copy = update_config(config_copy)
 
         # Now resolve interpolations - references will use the updated parameter values

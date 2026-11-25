@@ -1,4 +1,6 @@
 import torch
+
+from causaliT.metrics import attention_entropy
 import threading
 from typing import Dict, List, Optional
 from collections import defaultdict
@@ -89,39 +91,6 @@ def get_entropy_registry() -> AttentionEntropyRegistry:
     return _global_entropy_registry
 
 
-def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    Calculate entropy of attention weights.
-    
-    Uses the clamped (non-negative) weights consistently to ensure entropy is
-    always non-negative.  This is a safety net: for softmax-based attention the
-    clamp is a no-op; for non-softmax attention (GeLU, Lie, etc.) it prevents
-    negative weights from producing spurious negative entropy values.
-    
-    Args:
-        att_weights: Attention weights tensor
-                    - Multi-head: (B, H, L, S) 
-                    - Single-head: (B, L, S)
-        eps: Small value to avoid log(0)
-    
-    Returns:
-        Entropy tensor:
-        - Multi-head: (B, H, L) - entropy for each query position in each head
-        - Single-head: (B, L) - entropy for each query position
-    """
-    # Clamp to avoid log(0) and to handle non-probability attention weights
-    # (e.g. GeLU-based attention can produce negative values)
-    att_clamped = torch.clamp(att_weights, min=eps)
-    
-    # Calculate entropy: -sum(p * log(p)) along the key dimension (last dimension)
-    log_att = torch.log(att_clamped)
-    entropy = -torch.sum(att_clamped * log_att, dim=-1)
-    
-    # Handle NaN values that might arise from 0 * log(0)
-    entropy = torch.nan_to_num(entropy, nan=0.0)
-    return entropy
-
-
 def register_attention_entropy(layer_name: str, att_weights: torch.Tensor):
     """
     Calculate and register attention entropy for a given layer.
@@ -130,5 +99,5 @@ def register_attention_entropy(layer_name: str, att_weights: torch.Tensor):
         layer_name: Name identifier for the attention layer
         att_weights: Attention weights tensor
     """
-    entropy = calculate_attention_entropy(att_weights)
+    entropy = attention_entropy(att_weights)
     get_entropy_registry().register_entropy(layer_name, entropy)

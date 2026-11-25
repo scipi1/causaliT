@@ -56,8 +56,8 @@ from causaliT.training.trainer import (
     create_model_instance,
     resolve_seeds,
 )
-from causaliT.training.config_utils import populate_seq_lengths_from_dataset
-from causaliT.training.experiment_control import update_config
+from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
+from causaliT.training.core.experiment_control import update_config
 
 
 # =============================================================================

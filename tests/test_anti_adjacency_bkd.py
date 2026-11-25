@@ -11,6 +11,7 @@ import torch
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )
+from causaliT.training.structural_losses import AntiAdjacencyConfig
 
 N, B = 4, 64
 
@@ -19,7 +20,6 @@ def _stub(M):
     oa = SimpleNamespace(_last_M=M, _last_pi=torch.ones(N, N))
     return SimpleNamespace(
         model=SimpleNamespace(order_attention=lambda: oa),
-        detach_order_mask=False,
         _hsic_bw_frozen_sigmas=None,
         hsic_sigma=1.0,
         hsic_adaptive_bandwidth=True,
@@ -28,8 +28,7 @@ def _stub(M):
         hsic_kernel_source="gaussian",
         hsic_bandwidth_multipliers=None,
         hsic_null_stats=None,
-        anti_adjacency_eps=0.1,
-        anti_adjacency_lambda=1.0,
+        anti_adjacency=AntiAdjacencyConfig(lam=1.0, eps=0.1),
     )
 
 

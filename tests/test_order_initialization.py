@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from causaliT.training.order_initialization import initialize_order_from_hsic, scores_from_hsic
+from causaliT.training.adaptive_utils.order_initialization import initialize_order_from_hsic, scores_from_hsic
 
 
 def test_scores_and_guards():
@@ -78,7 +78,7 @@ def test_checkpoint_report_hooks():
 
 
 def test_probe_failure_restores_modes(tmp_path, monkeypatch):
-    import causaliT.training.order_initialization as init
+    import causaliT.training.adaptive_utils.order_initialization as init
     f = Probe()
     data = torch.randn(8, 3, 1)
     loader = DataLoader(TensorDataset(data[:, :1], data[:, 1:]), batch_size=8)

@@ -1,10 +1,8 @@
 """
-StageCausalDataModule: DataLoader for StageCausaliT architecture.
+SXDataModule: data module of the attention-selector architecture.
 
-Handles loading two or three data streams (S, X, [Y]) from a single .npz file
-and provides DataLoaders compatible with the dual-decoder architecture.
-
-Supports datasets without Y (target variables) for S→X only training.
+Loads the (S, X, [Y]) streams from a single .npz file; Y is optional and
+ignored by the model.  Also provides the HSIC cross-fit fold loaders.
 """
 
 import numpy as np
@@ -15,9 +13,9 @@ import pytorch_lightning as pl
 from os.path import join
 
 
-class StageCausalDataModule(pl.LightningDataModule):
+class SXDataModule(pl.LightningDataModule):
     """
-    PyTorch Lightning DataModule for StageCausaliT.
+    PyTorch Lightning DataModule for (S, X, [Y]) datasets.
     
     Loads two or three data streams from a single .npz file:
     - S: Source nodes (required)

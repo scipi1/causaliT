@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, TensorDataset
 
 from causaliT.training.forecasters.attention_selector_forecaster import AttentionSelectorForecaster
-from causaliT.training import dropout_selection as ds
+from causaliT.training.adaptive_utils import dropout_selection as ds
 
 
 @pytest.mark.parametrize("n_source,labels", [(0, ["X1", "X2", "X3"]),

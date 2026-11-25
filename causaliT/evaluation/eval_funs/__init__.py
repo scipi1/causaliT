@@ -12,10 +12,12 @@ Entry points (this level):
     eval_fun_cli: Command-line interface
 
 Support modules (``helpers/``, see helpers/__init__.py):
-    helpers.eval_utils: Shared utilities (eval directories, true-DAG masks, metric helpers)
+    helpers.eval_utils: Shared utilities (eval directories, true-DAG masks)
     helpers.eval_lib: Checkpoint/config discovery
     helpers.eval_dag_query: Model-free, shape-based extraction of the canonical DAG blocks
-    helpers.eval_dag_scores: Shared metric core (soft Hamming, SHD, DAG confidence, MEC)
+    helpers.eval_dag_scores: DAG report assembly (per-fold aggregation of metrics)
+
+All metric functions live in ``causaliT.metrics``.
 
 Also still in ``_OLD/``: update_manifest (manifest and kfold_summary maintenance),
 which the CLI and wrappers continue to import from there.
@@ -35,11 +37,8 @@ from .helpers.eval_utils import (
     _save_readme,
     _save_variable_labels,
     _create_cline_template,
-    _compute_soft_hamming,
-    _compute_standard_shd,
     _load_true_dag_mask,
     load_dataset_metadata,
-    _compute_dag_confidence,
 )
 
 # Checkpoint/config discovery
@@ -99,11 +98,8 @@ __all__ = [
     "_save_readme",
     "_save_variable_labels",
     "_create_cline_template",
-    "_compute_soft_hamming",
-    "_compute_standard_shd",
     "_load_true_dag_mask",
     "load_dataset_metadata",
-    "_compute_dag_confidence",
     # Checkpoint / config discovery (helpers.eval_lib)
     "find_config_file",
     "find_best_or_last_checkpoint",

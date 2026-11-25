@@ -53,13 +53,8 @@ def _trainer(epoch, sanity=False, max_epochs=None):
 
 
 class TestSourceAndCadence:
-    def test_reads_attention_not_phi(self, monkeypatch):
-        """Must NOT call the dead phi path (it returns None at every epoch)."""
-        def boom(*a, **k):
-            raise AssertionError("evaluate_dag_from_model must not be called")
-        monkeypatch.setattr(
-            "causaliT.training.causal_initialization.evaluate_dag_from_model", boom
-        )
+    def test_reads_attention_not_phi(self):
+        """Metrics come from the stashed attention posterior (no phi path)."""
         mod = _module(TRUE_CROSS.copy(), TRUE_SELF.copy())
         _cb(every_n_epochs=1).on_train_epoch_end(_trainer(epoch=0), mod)
         assert mod._logged, "must log from the attention posterior"

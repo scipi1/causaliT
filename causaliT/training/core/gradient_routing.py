@@ -36,7 +36,7 @@ References:
     - GradNorm (Chen et al., ICML 2018): Adaptive gradient balancing
 
 Usage:
-    from causaliT.training.gradient_routing import classify_parameters
+    from causaliT.training.core.gradient_routing import classify_parameters
     
     structural, reconstruction = classify_parameters(model)
 """

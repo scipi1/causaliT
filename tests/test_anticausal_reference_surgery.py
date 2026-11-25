@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from causaliT.training.forecasters.attention_selector_forecaster import AttentionSelectorForecaster
-from causaliT.training.order_path_training import protect_weight
+from causaliT.training.forecaster_utils.order_path_training import protect_weight
+from causaliT.training.structural_losses import AntiAdjacencyConfig
 
 
 @pytest.mark.parametrize('aux', [2., -2.])
@@ -108,13 +109,13 @@ def test_anticausal_loss_owns_policy_and_logs_signed_terms(training, terms):
     fm = SimpleNamespace(
         model=model, separate_structure_forward=True,
         config={'adaptive_training': {'structure': {'order_sampling': 'hard_st'}}},
-        _order_residuals=reverse, detach_order_mask=False,
+        _order_residuals=reverse,
         _hsic_bw_frozen_sigmas=None, hsic_sigma=1.0, hsic_adaptive_bandwidth=True,
         hsic_mode='biased', nhsic_epsilon=0.01, hsic_kernel_source='rbf',
-        hsic_bandwidth_multipliers=None, anti_adjacency_detach_c_residuals=False,
-        anti_adjacency_detach_a_residuals=False, anti_adjacency_mode='legacy_anticausal',
-        anti_adjacency_eps=0.1, anti_adjacency_lambda=0.7,
-        anti_adjacency_terms=terms, order_path_surgery=False)
+        hsic_bandwidth_multipliers=None,
+        anti_adjacency=AntiAdjacencyConfig(mode='legacy_anticausal', eps=0.1,
+                                           lam=0.7, terms=terms),
+        order_path_surgery=False)
     loss = AttentionSelectorForecaster._anti_adjacency_hsic(
         fm, None, None, causal=(target, residual))
     stats = fm._last_anti_adjacency_stats

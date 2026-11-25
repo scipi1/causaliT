@@ -27,21 +27,10 @@ from causaliT.training.callbacks import (
     KFoldResultsTracker, GradientJacobianLogger, MemoryReportCallback,
     PeriodicDAGMetrics, HSICClassMetrics,
 )
-from causaliT.training.forecasters import (
-    TransformerForecaster,
-    StageCausalForecaster,
-    SingleCausalForecaster,
-    SingleCausalResForecaster,
-    NoiseAwareCausalForecaster,
-    NoiseAwareCausalResForecaster,
-    VarianceCausalForecaster,
-    AttentionSelectorForecaster,
-)
-
-from causaliT.training.dataloader import ProcessDataModule
-from causaliT.training.stage_causal_dataloader import StageCausalDataModule
-from causaliT.training.experiment_control import update_config
-from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+from causaliT.training.forecasters import AttentionSelectorForecaster
+from causaliT.training.dataloader_sx import SXDataModule
+from causaliT.training.core.experiment_control import update_config
+from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -688,75 +677,28 @@ def trainer(
 # REGISTRY HELPERS  (unchanged public API)
 # =============================================================================
 
-def get_model_class(config: dict):
-    """
-    Return the model class (not instance) from the MODEL_REGISTRY.
+#: Supported ``model.model_object`` values (deprecated ones are in _OLD/).
+SUPPORTED_MODELS = ("AttentionSelectorLayer",)
 
-    Args:
-        config: Configuration dictionary.
 
-    Returns:
-        LightningModule subclass.
-    """
+def _check_model_object(config: dict) -> None:
+    """Raise a clear error for removed / unknown ``model.model_object`` values."""
     model_obj = config["model"]["model_object"]
-    available_models = [
-        "proT", "StageCausaliT", "SingleCausalLayer",
-        "SingleCausalLayerRes",
-        "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes",
-        "VarianceCausalLayer",
-        "AttentionSelectorLayer",
-        "LSTM", "GRU", "TCN", "MLP",
-    ]
+    if model_obj not in SUPPORTED_MODELS:
+        raise ValueError(
+            f"model_object {model_obj!r} is not supported (deprecated models "
+            f"were moved to _OLD/). Supported: {list(SUPPORTED_MODELS)}")
 
-    assert model_obj in available_models, (
-        f"{model_obj} unavailable! Choose between {available_models}"
-    )
-    MODEL_REGISTRY = {
-        "proT": TransformerForecaster,
-        "StageCausaliT": StageCausalForecaster,
-        "SingleCausalLayer": SingleCausalForecaster,
-        "SingleCausalLayerRes": SingleCausalResForecaster,
-        "NoiseAwareSingleCausalLayer": NoiseAwareCausalForecaster,
-        "NoiseAwareSingleCausalLayerRes": NoiseAwareCausalResForecaster,
-        "VarianceCausalLayer": VarianceCausalForecaster,
-        "AttentionSelectorLayer": AttentionSelectorForecaster,
-    }
-    return MODEL_REGISTRY[model_obj]
 
+def get_model_class(config: dict):
+    """LightningModule class of ``config.model.model_object``."""
+    _check_model_object(config)
+    return AttentionSelectorForecaster
 
 
 def create_model_instance(config: dict, data_dir: str = None) -> pl.LightningModule:
-    """
-    Instantiate the model specified in the configuration.
-
-    Args:
-        config:   Configuration dictionary.
-        data_dir: Data directory (required for models that load hard masks).
-
-    Returns:
-        Instantiated LightningModule.
-    """
-    model_obj = config["model"]["model_object"]
-
-    if model_obj == "StageCausaliT":
-        return StageCausalForecaster(config, data_dir=data_dir)
-    elif model_obj == "SingleCausalLayer":
-        return SingleCausalForecaster(config, data_dir=data_dir)
-    elif model_obj == "SingleCausalLayerRes":
-        return SingleCausalResForecaster(config, data_dir=data_dir)
-    elif model_obj == "NoiseAwareSingleCausalLayer":
-        return NoiseAwareCausalForecaster(config, data_dir=data_dir)
-    elif model_obj == "NoiseAwareSingleCausalLayerRes":
-        return NoiseAwareCausalResForecaster(config, data_dir=data_dir)
-    elif model_obj == "VarianceCausalLayer":
-        return VarianceCausalForecaster(config, data_dir=data_dir)
-    elif model_obj == "AttentionSelectorLayer":
-        return AttentionSelectorForecaster(config, data_dir=data_dir)
-    elif model_obj == "proT":
-
-        return TransformerForecaster(config)
-    else:
-        return get_model_class(config)(config)
+    """Instantiate the forecaster of ``config`` (``data_dir`` loads hard masks)."""
+    return get_model_class(config)(config, data_dir=data_dir)
 
 
 def resolve_num_workers(config: dict, cluster: bool) -> int:
@@ -787,63 +729,19 @@ def resolve_num_workers(config: dict, cluster: bool) -> int:
 
 
 def get_dataloader(config: dict, data_dir: str, cluster: bool, seed: int):
-    """
-    Instantiate the appropriate DataModule for the model type.
-
-    Args:
-        config:   Configuration dictionary.
-        data_dir: Path to data directory.
-        cluster:  Whether running on cluster (affects num_workers).
-        seed:     Random seed.
-
-    Returns:
-        DataModule instance (ProcessDataModule or StageCausalDataModule).
-    """
-    model_obj = config["model"]["model_object"]
-
-    DATALOADER_REGISTRY = {
-        "proT": ProcessDataModule,
-        "StageCausaliT": StageCausalDataModule,
-        "SingleCausalLayer": StageCausalDataModule,
-        "SingleCausalLayerRes": StageCausalDataModule,
-        "NoiseAwareSingleCausalLayer": StageCausalDataModule,
-        "NoiseAwareSingleCausalLayerRes": StageCausalDataModule,
-        "VarianceCausalLayer": StageCausalDataModule,
-        "AttentionSelectorLayer": StageCausalDataModule,
-        "LSTM": ProcessDataModule,
-
-        "GRU": ProcessDataModule,
-        "TCN": ProcessDataModule,
-        "MLP": ProcessDataModule,
-    }
-    DataModuleClass = DATALOADER_REGISTRY.get(model_obj, ProcessDataModule)
-
-    if model_obj in ["StageCausaliT", "SingleCausalLayer", "SingleCausalLayerRes", "NoiseAwareSingleCausalLayer", "NoiseAwareSingleCausalLayerRes", "VarianceCausalLayer", "AttentionSelectorLayer"]:
-
-        return DataModuleClass(
-            data_dir=join(data_dir, config["data"]["dataset"]),
-            input_file=config["data"]["filename_input"],
-            batch_size=config["training"]["batch_size"],
-            num_workers=resolve_num_workers(config, cluster),
-            data_format="float32",
-            max_data_size=config["data"]["max_data_size"],
-            seed=seed,
-            train_file=config["data"].get("train_file", None),
-            test_file=config["data"].get("test_file", None),
-        )
-    else:
-        return DataModuleClass(
-            data_dir=join(data_dir, config["data"]["dataset"]),
-            input_file=config["data"]["filename_input"],
-            target_file=config["data"]["filename_target"],
-            batch_size=config["training"]["batch_size"],
-            num_workers=resolve_num_workers(config, cluster),
-            data_format="float32",
-            max_data_size=config["data"]["max_data_size"],
-            seed=seed,
-            train_file=config["data"].get("train_file", None),
-            test_file=config["data"].get("test_file", None),
-        )
+    """``SXDataModule`` of the configured dataset (seed fixes the splits)."""
+    _check_model_object(config)
+    return SXDataModule(
+        data_dir=join(data_dir, config["data"]["dataset"]),
+        input_file=config["data"]["filename_input"],
+        batch_size=config["training"]["batch_size"],
+        num_workers=resolve_num_workers(config, cluster),
+        data_format="float32",
+        max_data_size=config["data"]["max_data_size"],
+        seed=seed,
+        train_file=config["data"].get("train_file", None),
+        test_file=config["data"].get("test_file", None),
+    )
 
 
 # =============================================================================

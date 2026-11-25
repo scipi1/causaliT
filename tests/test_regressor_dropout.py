@@ -26,7 +26,7 @@ sys.path.insert(0, str(project_root))
 
 from causaliT.core.modules.embedding_layers import linear_per_node_emb
 from causaliT.core.modules.mlp_head import PerNodeMLPHead
-from causaliT.training import dropout_selection as ds
+from causaliT.training.adaptive_utils import dropout_selection as ds
 
 D_MODEL = 16
 X_SEQ_LEN = 4

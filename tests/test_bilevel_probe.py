@@ -9,7 +9,7 @@ import torch
 
 from test_dropout_selection import _make_batch, _make_forecaster_config
 
-from causaliT.training.bilevel_probe import (
+from causaliT.training.forecaster_utils.bilevel_probe import (
     node_locations,
     paired_refit_probe,
     query_tables_of,

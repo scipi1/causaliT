@@ -626,7 +626,7 @@ training:
   # Computes nodal upstreamness from the RAW off-diagonal pair matrix:
   # mean_j HSIC(source_j, residual_i), j != i.  Descendant terms are retained
   # (they carry the source signal); loss masks, attention/direction weights,
-  # BKD and LOO gates never enter this estimate.  Disabled by default unless
+  # BKD gates never enter this estimate.  Disabled by default unless
   # hsic_key_scale is enabled (which consumes this detached estimate).
   causal_order:
     enabled: false
@@ -703,19 +703,6 @@ training:
                                        # unmasked HSIC; logged as {stage}_hsic_desc_first_order
   hsic_descendant_ema: 0.0             # EMA on the adjacency in [0,1) to stop mask thrashing
 
-  # --- LOO conditional-HSIC gate (docs/ideas/CONDITIONAL_HSIC_COUNTERPROPOSAL.md)
-  # Per-edge leave-one-out Bayes multiplier gamma, measured with masked
-  # EVAL-mode forwards (BKD inactive during measurement) and applied as a
-  # DETACHED gate on the per-pair HSIC weights: conditionally-redundant pairs
-  # are downweighted out of the marginal mean, load-bearing pairs keep full
-  # weight.  All keys are per-phase overridable via adaptive_training phase
-  # blocks (recommended: OFF during warmup/high-BKD, ON in structure phases).
-  use_loo_gamma_gate: false            # master switch (false = legacy behaviour)
-  loo_gamma_topk: null                 # null = full LOO; k = shortlist per target by P_m
-  loo_gamma_refresh: 1                 # recompute every N train steps (cached otherwise)
-  loo_gamma_permutations: 50           # permutation stats for the gamma null fit
-  loo_gamma_ema: 0.9                   # EMA momentum across refreshes
-  # Logged diagnostics: {stage}_loo_gamma_mean, {stage}_loo_gamma_min.
   # Logged diagnostics: {stage}_hsic_desc_kept_frac, {stage}_hsic_desc_cyclic,
   # {stage}_hsic_desc_first_order.
   # NOTE: with masking ON, {stage}_hsic is a MASKED mean whose normalisation set

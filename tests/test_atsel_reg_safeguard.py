@@ -443,16 +443,16 @@ class TestGradientsFlow:
 class TestAcyclicityBackendSelection:
     def test_defaults_are_backward_compatible(self):
         model = AttentionSelectorForecaster(_make_forecaster_config())
-        assert model.acyclicity_fn == "notears"
-        assert model.acyclicity_s == "adaptive"
+        assert model.acyclicity.name == "notears"
+        assert model.acyclicity.s == "adaptive"
 
     def test_values_stored(self):
         cfg = _make_forecaster_config()
         cfg["training"]["acyclicity_fn"] = "logdet"
         cfg["training"]["acyclicity_s"] = 1.5
         model = AttentionSelectorForecaster(cfg)
-        assert model.acyclicity_fn == "logdet"
-        assert model.acyclicity_s == pytest.approx(1.5)
+        assert model.acyclicity.name == "logdet"
+        assert model.acyclicity.s == pytest.approx(1.5)
 
     @pytest.mark.parametrize("bad", ["logdett", "", "LOGDET"])
     def test_invalid_fn_raises(self, bad):

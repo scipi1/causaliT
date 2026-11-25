@@ -45,7 +45,7 @@ sys.path.insert(0, str(project_root))
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )
-from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.core.gradient_routing import classify_parameters
 
 
 # ---------------------------------------------------------------------------

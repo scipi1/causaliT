@@ -300,7 +300,7 @@ class CentroidCommitController:
 
         Bilevel gate (``defer=True``): eligible commits are NOT applied; they
         are stored in ``self.pending`` for the caller to probe (see
-        ``causaliT.training.bilevel_probe``) and then finalised via
+        ``causaliT.training.forecaster_utils.bilevel_probe``) and then finalised via
         :meth:`finalize`.  Tabooed (previously rejected) subsets are skipped
         during candidacy; a taboo lifts once the shadow's raw projection is
         neither the committed nor the tabooed subset.

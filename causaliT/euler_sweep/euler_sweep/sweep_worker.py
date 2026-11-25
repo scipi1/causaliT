@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 # Import sweep functions
 from causaliT.euler_sweep.euler_sweep.sweeper import run_single_combination
-from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
 
 
 @click.command()
@@ -94,7 +94,7 @@ def main(exp_dir, combinations_file, task_id):
     # d_ff_mult * d_model_set) are written into the config BEFORE
     # ${experiment.d_ff} is resolved.  Without this the saved config.yaml
     # still contains null for those fields.
-    from causaliT.training.experiment_control import update_config
+    from causaliT.training.core.experiment_control import update_config
     config = update_config(config)
 
     # Now resolve interpolations - references will use the updated parameter values

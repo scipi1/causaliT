@@ -922,8 +922,6 @@ def resolve_trainer(name: str) -> Tuple[Callable, str, str]:
 
     registry = {
         "standard": "train_function_for_sweep",
-        "staged": "staged_train_function_for_sweep",
-        "anm": "anm_train_function_for_sweep",
         "adaptive": "adaptive_train_function_for_sweep",
         # Not a trainer: fits the external baselines (NOTEARS / DAGMA / PC) on
         # the generated datasets, so a DAG sweep can produce baseline curves

@@ -24,7 +24,7 @@ def _resume_dir(save_dir, fold):
 def _resolve(config):
     """Same preprocessing as causaliT.cli: update_config on an OmegaConf object
     (it uses attribute access, so a plain dict fails)."""
-    from causaliT.training.experiment_control import update_config
+    from causaliT.training.core.experiment_control import update_config
     if not OmegaConf.is_config(config):
         config = OmegaConf.create(config)
     return update_config(config)
@@ -53,7 +53,7 @@ def check(config, data_dir, trainer="standard"):
     """Cheap pre-flight (CPU, no training): config preprocessing, dataset
     metadata, trainer requirements and one model build. Raises on problems."""
     import copy
-    from causaliT.training.config_utils import populate_seq_lengths_from_dataset
+    from causaliT.training.core.config_utils import populate_seq_lengths_from_dataset
     from causaliT.training.trainer import create_model_instance
     if trainer not in TRAINERS:
         raise ValueError(f"Unknown trainer {trainer!r}; expected one of {sorted(TRAINERS)}")

@@ -8,7 +8,7 @@ import torch
 from causaliT.core.architectures.attention_selector.model import AttentionSelectorLayer
 from causaliT.core.modules.mlp_head import PerNodeMLPHead
 from causaliT.core.modules.order_factorized_attention import OrderFactorizedSelfAttention
-from causaliT.training.gradient_routing import _is_structural_param
+from causaliT.training.core.gradient_routing import _is_structural_param
 
 
 @pytest.mark.parametrize('orientation', ['causal', 'anticausal'])

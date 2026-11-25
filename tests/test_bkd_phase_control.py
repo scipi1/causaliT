@@ -105,7 +105,7 @@ class _DummyModule(nn.Module):
 
 def _make_controller(work_dir, recon_cfg=None, struct_cfg=None):
     config = {
-        "model": {"model_object": "SingleCausalLayer"},
+        "model": {"model_object": "AttentionSelectorLayer"},
         "adaptive_training": {
             "reconstruct": recon_cfg or {},
             "structure": struct_cfg or {},
@@ -265,7 +265,7 @@ def test_set_sampling_validation():
 
 def _make_ladder_controller(work_dir, ladder, phase_cfg=None):
     config = {
-        "model": {"model_object": "SingleCausalLayer"},
+        "model": {"model_object": "AttentionSelectorLayer"},
         "adaptive_training": {
             "reconstruct": phase_cfg or {},
             "structure": {},
@@ -327,7 +327,7 @@ def test_min_keys_ladder_with_deterministic_keeps_exact_count(work_dir):
 
 def test_min_keys_ladder_mutually_exclusive_with_p_ladder(work_dir):
     config = {
-        "model": {"model_object": "SingleCausalLayer"},
+        "model": {"model_object": "AttentionSelectorLayer"},
         "adaptive_training": {
             "reconstruct": {},
             "structure": {},

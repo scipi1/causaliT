@@ -21,7 +21,7 @@ import torch
 import re
 
 from causaliT.paths import DATA_DIR
-from causaliT.training.training_summary import (
+from causaliT.training.core.training_summary import (
     TRAINED_RUN_MARKERS,
     load_training_summary,
 )
@@ -374,7 +374,7 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
         >>> # Result will have level_0, level_1, etc. columns added automatically
     """
     from causaliT.evaluation.predict import predict_test_from_ckpt
-    from causaliT.evaluation.metrics import compute_prediction_metrics
+    from causaliT.metrics import prediction_metrics
     
     # Default data directory path - use project-level DATA_DIR
     if datadir_path is None:
@@ -459,7 +459,7 @@ def eval_models_bottom_action(filepath: str, level_folders: List[str], s3: bool 
                 if "data" in config and "val_idx" in config["data"]:
                     val_idx = config["data"]["val_idx"]
                 
-                metrics_df = compute_prediction_metrics(
+                metrics_df = prediction_metrics(
                     results,
                     target_feature_idx=val_idx
                 )

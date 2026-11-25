@@ -255,20 +255,6 @@ def update_config(config: dict)->dict:
         dict: updated config
     """
 
-    if config.get("model", {}).get("model_object") == "proT":
-
-        if config.model.kwargs.comps_embed_enc == "concat":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden
-
-        if config.model.kwargs.comps_embed_dec == "concat":
-            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden
-
-        if config.model.kwargs.comps_embed_enc == "summation":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
-
-        if config.model.kwargs.comps_embed_dec == "summation":
-            config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
-
     # ------------------------------------------------------------------
     # Resolve d_ff / d_qk from d_model_set via multipliers (if provided).
     # ------------------------------------------------------------------

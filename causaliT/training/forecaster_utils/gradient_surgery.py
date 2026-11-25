@@ -4,7 +4,7 @@ regularizers (L0, NOTEARS).
 
 The L0 penalty and the NOTEARS acyclicity term back-propagate through the
 **same structural pathway** as HSIC (Q/K projections, structural embeddings --
-see :mod:`causaliT.training.interference_utils`).  When their gradients point
+see :mod:`causaliT.training.forecaster_utils.interference_utils`).  When their gradients point
 against the HSIC gradient they cancel the signal that pushes each query towards
 its true parent.  This module implements the standard remedy from the
 multi-task literature, **PCGrad** (Yu et al., NeurIPS 2020): for every
@@ -18,7 +18,7 @@ HSIC**.  Aligned or gradient-free blocks are left untouched, so with no
 conflict the update is bit-identical to the summed loss.
 
 Surgery is applied **per module block** (the grouping from
-:func:`causaliT.training.interference_utils.build_interference_blocks`), never
+:func:`causaliT.training.forecaster_utils.interference_utils.build_interference_blocks`), never
 on the flattened full-model gradient: conflict is localised in the structural
 pathway, and a global projection would let one conflicting block distort
 unrelated blocks.  A block where either gradient has (near-)zero norm is

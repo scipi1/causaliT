@@ -14,8 +14,8 @@ from causaliT.utils.hsic_utils import (
     hsic_evidence_max_pair_weights,
     hsic_posterior_pair_weights,
     hsic_softmax_pair_weights,
-    row_entropy_stats,
 )
+from causaliT.metrics import row_entropy_stats
 
 
 def _dep_data(batch=256, n=3, seed=0):

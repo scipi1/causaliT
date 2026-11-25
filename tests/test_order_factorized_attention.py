@@ -8,7 +8,7 @@ from causaliT.core.modules.order_factorized_attention import (
     hard_assignment,
     log_sinkhorn,
 )
-from causaliT.training.gradient_routing import _is_structural_param
+from causaliT.training.core.gradient_routing import _is_structural_param
 from causaliT.utils.descendant_mask import build_hsic_pair_mask
 
 
@@ -269,7 +269,7 @@ def test_order_scores_are_structural():
 
 def test_model_integration_homogeneous():
     from tests.test_atsel_homogeneous import _make_model, _forward
-    from causaliT.training.gradient_routing import classify_parameters
+    from causaliT.training.core.gradient_routing import classify_parameters
 
     model = _make_model(self_attention_type="OrderFactorizedSelfAttention",
                         order_existence_threshold=0.3)

@@ -3,7 +3,7 @@ Global results collector for benchmark sweeps.
 
 Walks benchmark arms (folders holding a ``dagsweep.yaml``), reloads the raw
 per-seed outputs (``benchmark_result_seed_<i>.npz``), re-scores them with
-``metrics.compute_structure_metrics`` and writes ONE long table::
+``causaliT.metrics.structure_metrics`` and writes ONE long table::
 
     arm, method, graph_type, degree, linearity, noise, normalization,
     n_nodes, n_samples, dag_seed, init_seed, status, metric, value, ...
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 from omegaconf import OmegaConf
 
-from causaliT.benchmarks.metrics import compute_structure_metrics
+from causaliT.metrics import structure_metrics
 from causaliT.benchmarks.runner import (
     BENCHMARK_RUN_FILENAME,
     EVAL_NAME_PREFIX,
@@ -106,7 +106,7 @@ def _score_files(files_dir: Path, datasets_dir: Path, record: dict) -> List[Dict
                 int(record.get("L_S", 0)),
                 bool(scoring.get("forbid_into_sources", False)),
             )
-            metrics = compute_structure_metrics(
+            metrics = structure_metrics(
                 true_paper, pred, scores=scores,
                 probabilistic=result.output_type == "samples",
                 order=result.order, graph_samples=result.graph_samples,

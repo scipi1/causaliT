@@ -44,8 +44,8 @@ sys.path.insert(0, str(project_root))
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.modules.free_query_embedding import FreeQueryEmbedding
-from causaliT.training.gradient_routing import classify_parameters
-from causaliT.training.interference_utils import (
+from causaliT.training.core.gradient_routing import classify_parameters
+from causaliT.training.forecaster_utils.interference_utils import (
     build_interference_blocks,
     _block_for_param,
 )

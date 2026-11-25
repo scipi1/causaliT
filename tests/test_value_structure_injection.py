@@ -59,7 +59,7 @@ sys.path.insert(0, str(project_root))
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
 from causaliT.core.modules.value_identity_embedding import ValueIdentityEmbedding
-from causaliT.training.gradient_routing import _is_structural_param
+from causaliT.training.core.gradient_routing import _is_structural_param
 
 
 # ---------------------------------------------------------------------------

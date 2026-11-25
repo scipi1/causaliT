@@ -36,7 +36,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from causaliT.core.architectures.attention_selector import AttentionSelectorLayer
-from causaliT.training.gradient_routing import classify_parameters
+from causaliT.training.core.gradient_routing import classify_parameters
 
 
 # ---------------------------------------------------------------------------

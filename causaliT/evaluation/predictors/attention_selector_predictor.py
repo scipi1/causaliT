@@ -9,21 +9,19 @@ standard evaluation workflow:
 
     checkpoint  ->  predictor  ->  attention/DAG query  ->  metrics
 
-Data format and prediction loop are identical to ``SingleCausalPredictor``
-(three-input ``(S, X, Y)`` npz, ``Y`` ignored, blanking of ``X`` handled inside
-the forecaster), so that class is reused as the base and only the
-architecture-specific hooks are overridden.
+Data module and prediction loop come from ``BasePredictor`` (``(S, X, [Y])``
+npz, ``Y`` ignored, blanking of ``X`` handled inside the forecaster).
 """
 
 from typing import Any, Dict
 
-from .single_causal_predictor import SingleCausalPredictor
+from .base_predictor import BasePredictor
 from causaliT.training.forecasters.attention_selector_forecaster import (
     AttentionSelectorForecaster,
 )
 
 
-class AttentionSelectorPredictor(SingleCausalPredictor):
+class AttentionSelectorPredictor(BasePredictor):
     """
     Predictor for ``AttentionSelectorForecaster`` (``AttentionSelectorLayer``).
 
@@ -92,9 +90,8 @@ class AttentionSelectorPredictor(SingleCausalPredictor):
             X: Intermediate tensor ``(B, L_X, F)`` with actual values; the value
                column is blanked internally for the query path.
             Y: Ignored (kept for signature compatibility).
-            disable_hard_masks: Accepted for interface compatibility with
-               ``SingleCausalPredictor.predict()``.  When True the oracle mask
-               buffer is bypassed by temporarily clearing the loaded flag.
+            disable_hard_masks: When True the oracle mask buffer is bypassed
+               by temporarily clearing the loaded flag (ablation).
 
         Returns:
             Tuple ``(pred_x, attention_weights, aux)``.

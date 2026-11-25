@@ -47,6 +47,7 @@ from pytorch_lightning import seed_everything, Trainer
 from pytorch_lightning.callbacks import Callback
 from omegaconf import OmegaConf
 
+from causaliT.metrics import attention_entropy
 from causaliT.training.calibration import _find_last_checkpoint
 
 logger = logging.getLogger(__name__)
@@ -282,10 +283,8 @@ def _evaluate_dag_from_model_impl(
     dataset_name = config.get("data", {}).get("dataset")
     if dataset_name and data_dir:
         try:
-            from causaliT.evaluation.eval_funs.helpers.eval_utils import (
-                _compute_soft_hamming,
-                _load_true_dag_mask,
-            )
+            from causaliT.evaluation.eval_funs.helpers.eval_utils import _load_true_dag_mask
+            from causaliT.metrics import soft_hamming
             datadir_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                 "data",
@@ -299,7 +298,7 @@ def _evaluate_dag_from_model_impl(
             if true_cross is not None and metrics["phi_cross"] is not None:
                 if metrics["phi_cross"].shape == true_cross.shape:
                     metrics["soft_hamming_cross"] = float(
-                        _compute_soft_hamming(metrics["phi_cross"], true_cross)
+                        soft_hamming(metrics["phi_cross"], true_cross)
                     )
                 else:
                     metrics["soft_hamming_cross"] = None
@@ -311,7 +310,7 @@ def _evaluate_dag_from_model_impl(
             if true_self is not None and metrics["phi_self"] is not None:
                 if metrics["phi_self"].shape == true_self.shape:
                     metrics["soft_hamming_self"] = float(
-                        _compute_soft_hamming(metrics["phi_self"], true_self)
+                        soft_hamming(metrics["phi_self"], true_self)
                     )
                 else:
                     metrics["soft_hamming_self"] = None
@@ -1225,7 +1224,7 @@ def verify_causal_init_effectiveness(
     att_entropy = None
     if attention_weights and attention_weights[0] is not None:
         att = attention_weights[0][0]
-        att_entropy = -(att * (att + 1e-10).log()).sum(dim=-1).mean().item()
+        att_entropy = attention_entropy(att, eps=1e-10).mean().item()
 
     metrics = {
         "prediction_variance": pred_variance,

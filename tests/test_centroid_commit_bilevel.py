@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from causaliT.training.centroid_commit import (
+from causaliT.training.forecaster_utils.centroid_commit import (
     CentroidCommitController,
     best_subset,
     best_subset_excluding,

@@ -16,7 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from causaliT.training.nodewise_update import NodewiseQuerySelector
+from causaliT.training.forecaster_utils.nodewise_update import NodewiseQuerySelector
 
 D = 8
 N_S, N_X = 2, 3          # 2 + 3 = 5 nodes

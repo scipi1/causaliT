@@ -31,8 +31,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from causaliT.training.gradient_routing import classify_parameters
-from causaliT.training.optimizer_factory import (
+from causaliT.training.core.gradient_routing import classify_parameters
+from causaliT.training.core.optimizer_factory import (
     get_recon_optimizer_config,
     make_optimizer,
 )
@@ -131,7 +131,7 @@ def hsic_rows_eval(model, S, X, sigma, adaptive_bandwidth,
     """Per-row (per-node) HSIC in eval mode with explicit bandwidths.
 
     ``pair_mask``: optional detached (n_targets, n_sources) structural pair
-    weights (descendant x LOO, no BKD) shared by both probe arms.
+    weights (descendant mask, no BKD) shared by both probe arms.
     """
     model.eval()
     with torch.no_grad():
@@ -303,7 +303,7 @@ def paired_refit_probe(
         accept_margin:    delta threshold; accept iff cand < inc - margin.
         seed:             torch seed for the (paired) refit of each arm.
         pair_mask:        optional detached structural pair weights
-                          (descendant x LOO, NO BKD factor) stashed by the
+                          (descendant mask, NO BKD factor) stashed by the
                           forecaster's ``_step``; shared by both arms so the
                           acceptance test measures the training objective.
 

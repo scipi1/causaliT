@@ -1,10 +1,10 @@
 """
-Shared DAG-recovery metric core.
+DAG-recovery report assembly (per block, per fold, aggregated).
 
 Consumes the canonical blocks produced by ``eval_dag_query.query_dag_blocks``
-(``{fold_name: {"cross": (L_X, L_S), "self": (L_X, L_X), ...}}``) and computes
-every DAG metric the project reports, independently of how the model stores its
-attention:
+(``{fold_name: {"cross": (L_X, L_S), "self": (L_X, L_X), ...}}``) and
+aggregates the metrics of ``causaliT.metrics`` into ``dag_metrics.json``.
+Metric math lives in ``causaliT.metrics``; this module only orchestrates:
 
 - soft Hamming distance          (continuous, per block)
 - standard SHD + TPR/FDR         (thresholded, literature-comparable)
@@ -21,19 +21,8 @@ from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 
-from .eval_utils import (
-    _compute_soft_hamming,
-    _compute_standard_shd,
-    _compute_zeroness_metrics,
-    _load_true_dag_mask,
-    _compute_dag_confidence,
-    _load_full_true_dag,
-    _compute_mec_distance,
-    _check_mec_membership,
-    _compute_mec_threshold,
-    _find_v_structures,
-    _dag_to_skeleton,
-)
+from causaliT import metrics as M
+from .eval_utils import _load_true_dag_mask, _load_full_true_dag
 from .eval_dag_query import (
     CROSS,
     SELF,
@@ -123,11 +112,9 @@ def _metric_block(
             per_fold_zero[fold_name] = None
             continue
 
-        sh = _compute_soft_hamming(learned, true_mask)
-        shd = _compute_standard_shd(
-            learned, true_mask, threshold=dag_threshold, is_cross_attention=is_cross
-        )
-        zero = _compute_zeroness_metrics(learned, true_mask)
+        sh = M.soft_hamming(learned, true_mask)
+        shd = M.standard_shd(learned, true_mask, threshold=dag_threshold, is_cross=is_cross)
+        zero = M.zeroness_metrics(learned, true_mask)
 
         per_fold_sh[fold_name] = sh
         per_fold_shd[fold_name] = shd
@@ -195,7 +182,7 @@ def _metric_block(
         metrics[f"zeroness_{block}"] = agg
 
     if len(valid_matrices) >= 2:
-        confidence = _compute_dag_confidence(valid_matrices)
+        confidence = M.dag_confidence(valid_matrices)
         metrics[f"dag_confidence_{block}"] = confidence
         if verbose:
             print(f"    DAG Confidence [{block}]: {confidence:.4f}")
@@ -225,8 +212,8 @@ def _mec_metrics(
         return {}
 
     if verbose:
-        skeleton = _dag_to_skeleton(true_full_dag)
-        v_structures = _find_v_structures(true_full_dag)
+        skeleton = M.dag_to_skeleton(true_full_dag)
+        v_structures = M.find_v_structures(true_full_dag)
         print(f"  True DAG: {len(skeleton)} edges, {len(v_structures)} v-structures")
 
     distances, memberships, per_fold = [], [], {}
@@ -238,9 +225,9 @@ def _mec_metrics(
             per_fold[fold_name] = None
             continue
 
-        mec_dist, details = _compute_mec_distance(full_learned, true_full_dag)
-        in_mec, _ = _check_mec_membership(full_learned, true_full_dag)
-        mec_thresh, _ = _compute_mec_threshold(full_learned, true_full_dag)
+        mec_dist, details = M.mec_distance(full_learned, true_full_dag)
+        in_mec, _ = M.mec_membership(full_learned, true_full_dag)
+        mec_thresh, _ = M.mec_threshold(full_learned, true_full_dag)
 
         distances.append(mec_dist)
         memberships.append(in_mec)
@@ -278,7 +265,7 @@ def _mec_metrics(
             "per_fold": per_fold,
         },
         "mec_membership_rate": float(np.mean(memberships)),
-        "n_true_v_structures": len(_find_v_structures(true_full_dag)),
+        "n_true_v_structures": len(M.find_v_structures(true_full_dag)),
     }
 
     thresh_vals = [

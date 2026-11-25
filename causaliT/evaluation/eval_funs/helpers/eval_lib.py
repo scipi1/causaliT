@@ -147,31 +147,12 @@ def get_architecture_type(config: dict) -> str:
         config: OmegaConf configuration
 
     Returns:
-        str: e.g. "TransformerForecaster", "SingleCausalForecaster",
-        "NoiseAwareCausalForecaster", "AttentionSelectorForecaster"
+        str: "AttentionSelectorForecaster" (only supported architecture).
     """
     model_obj = config["model"]["model_object"]
-
-    if model_obj == "proT":
-        return "TransformerForecaster"
-    elif model_obj == "StageCausaliT":
-        return "StageCausalForecaster"
-    elif model_obj == "SingleCausalLayer":
-        return "SingleCausalForecaster"
-    elif model_obj == "SingleCausalLayerRes":
-        # Treated identically to SingleCausalForecaster except for the
-        # checkpoint loader (different forecaster class wraps the dual-
-        # residual model). Returning a distinct tag keeps the loader
-        # branches readable.
-        return "SingleCausalResForecaster"
-    elif model_obj == "NoiseAwareSingleCausalLayer":
-        return "NoiseAwareCausalForecaster"
-    elif model_obj == "NoiseAwareSingleCausalLayerRes":
-        return "NoiseAwareCausalResForecaster"
-    elif model_obj == "AttentionSelectorLayer":
+    if model_obj == "AttentionSelectorLayer":
         return "AttentionSelectorForecaster"
-    else:
-        raise ValueError(f"Unknown model type: {model_obj}")
+    raise ValueError(f"Unsupported model type {model_obj!r} (deprecated models are in _OLD/).")
 
 
 # =============================================================================
