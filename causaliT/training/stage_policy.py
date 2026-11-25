@@ -4,12 +4,12 @@ Stage policy of the order-factorized selector (single source of truth).
 Schema (``adaptive_training``)::
 
     recon:
-      gate_opt: gated | softmax | none      # what G_R IS (model construction)
+      gate_opt: gated | softmax | softmax_prenorm | none   # what G_R IS
       gate_sampling: hard | soft            # ST Bernoulli | Hard-Concrete
       order_sampling: none | hard | soft | oriented
       oriented: {p_anticausal: 0.5, noise_scale: 1.0}   # order_sampling=oriented
     structure:
-      gate_opt: gated | none                # what G_S IS (model construction)
+      gate_opt: gated | directional_free | none  # G_S architecture
       gate_sampling: soft | hard
       order_sampling: soft | hard | hard_st | none
 
@@ -21,8 +21,8 @@ names.  Removed keys raise with the replacement.
 
 from typing import Any, Dict, Optional
 
-RECON_GATE_OPTS = ("gated", "softmax", "none")
-STRUCT_GATE_OPTS = ("gated", "none")
+RECON_GATE_OPTS = ("gated", "softmax", "softmax_prenorm", "none")
+STRUCT_GATE_OPTS = ("gated", "directional_free", "none")
 GATE_SAMPLING = ("hard", "soft")
 RECON_ORDER_SAMPLING = ("none", "hard", "soft", "oriented")
 STRUCT_ORDER_SAMPLING = ("soft", "hard", "hard_st", "none")

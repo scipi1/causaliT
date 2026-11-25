@@ -26,45 +26,46 @@ forwards of a step).
 
 ## 2. Two paired forwards
 
-Same batch, same noise, same $G$; only the orientation of the order differs
-(`set_orientation`):
-
-$$
-Z^{c} = G \odot M, \qquad Z^{a} = G \odot M^\top
-$$
-
-- causal pass: each node regresses on its selected EARLIER nodes,
-  residual $r^{c}_t = x_t - \hat{x}^{c}_t$;
-- anti-causal pass: each node regresses on its selected LATER nodes,
-  residual $r^{a}_t = x_t - \hat{x}^{a}_t$.
-
-The causal residuals are reused from the training step (cross-fit fold when
-`hsic_cross_fit` is active); the anti-causal pass is one extra forward.
-Per-pair HSIC matrices (estimator per `hsic_mode`, bandwidth adaptive or
+ONE causal forward with $Z = G \odot M$: each node regresses on its selected
+EARLIER nodes only, residual $r_t = x_t - \hat{x}_t$. The residuals are reused
+from the training step (cross-fit fold when `hsic_cross_fit` is active).
+Per-pair HSIC matrix (estimator per `hsic_mode`, bandwidth adaptive or
 phase-frozen):
 
 $$
-H^{c}_{ts} = \mathrm{HSIC}(x_s, r^{c}_t), \qquad
-H^{a}_{ts} = \mathrm{HSIC}(x_s, r^{a}_t)
+H_{ts} = \mathrm{HSIC}(x_s, r_t)
 $$
+
+Why no anti-causal regression (changed 2026-11). An earlier version ran a
+second forward with $Z^{a} = G \odot M^\top$ (regression on LATER nodes) and
+used its residual in $A$. With $i \to j$, $\hat{x}_i = \hat f(x_j)$ and
+$x_j = f(x_i) + \varepsilon_j$, so $r^{a}_i$ contains a function of the
+innovation $\varepsilon_j$ and is dependent on $x_j$ by construction, also
+when the true parent of $j$ is another node. $A$ was then high for almost
+any order and rewarded any non-constant fit. Regressing on earlier nodes
+only, $r_i \approx \varepsilon_i$ under the correct order, and its
+dependence on a later node is caused only by innovation propagation to
+descendants.
 
 ## 3. Order-weighted scores
 
 For each unordered pair $e = \{i, j\}$:
 
 $$
-C_e = M_{ij}\,H^{c}_{ji} + M_{ji}\,H^{c}_{ij}
-\qquad \text{(later causal residual vs earlier node: should be LOW)}
+C_e = M_{ij}\,H_{ji} + M_{ji}\,H_{ij}
+\qquad \text{(later residual vs earlier node: should be LOW)}
 $$
 
 $$
-A_e = M_{ij}\,H^{a}_{ij} + M_{ji}\,H^{a}_{ji}
-\qquad \text{(earlier anti-causal residual vs later node: should be HIGH)}
+A_e = M_{ij}\,H_{ij} + M_{ji}\,H_{ji}
+\qquad \text{(earlier residual vs later node: HIGH for descendants)}
 $$
 
-Both are clamped at $\ge 0$. $C$ softly weights the PREDECESSORS of each
-residual: a descendant $k$ of $j$ enters $C$ with weight $M_{kj}$, small only
-when the order is correct and sharp. $A$ softly weights the SUCCESSORS.
+Both are clamped at $\ge 0$. $C$ and $A$ are the order-weighted lower and
+upper triangles of the same matrix $H$. $C$ softly weights the PREDECESSORS
+of each residual: a descendant $k$ of $j$ enters $C$ with weight $M_{kj}$,
+small only when the order is correct and sharp. $A$ softly weights the
+SUCCESSORS; it is non-zero only for successors that are descendants.
 
 ## 4. Loss
 
@@ -88,9 +89,8 @@ Only $r$ (`order_scores`) is updated, via two paths:
    coefficients of $C$ and $A$. Per pair it compares the two orientations,
    e.g. a large $H^{c}_{jk}$ (residual of $j$ vs its child $k$) pushes
    $M_{kj}$ down, i.e. $j$ before $k$.
-2. **Residual path:** $r^{c}, r^{a}$ depend on $M$ through $Z^{c}, Z^{a}$
-   (relaxed order path in structure phases): the order changes which inputs
-   each regression sees.
+2. **Residual path:** $r$ depends on $M$ through $Z$ (relaxed order path in
+   structure phases): the order changes which inputs each regression sees.
 
 Detached / not updated by this loss:
 
@@ -102,9 +102,11 @@ Detached / not updated by this loss:
   causal orientation); the gradient is written into structural params only;
 - $\nu$ and the HSIC bandwidths.
 
-Consequence: the loss cannot be lowered by degrading the regressor (e.g.
-inflating $A$ through a poor anti-causal fit), nor by switching edges off
-($w$ is detached and normalized).
+Consequence: the loss cannot be lowered by degrading the regressor, nor by
+switching edges off ($w$ is detached and normalized). Note: a trivial fit
+($r = x$) gives $C_e = A_e = \mathrm{HSIC}(x_i, x_j)$ and a pair term
+$(1 - \lambda_a)\log(\cdot)$; this is prevented by the frozen, reconstruction-
+trained regressor, not by the loss itself.
 
 ## 6. Pair mass and partial collapse
 
@@ -116,7 +118,8 @@ M_{ij} + M_{ji} = 1 - \langle P_{i\cdot}, P_{j\cdot} \rangle \in \left[\tfrac12,
 $$
 
 - hard permutation: exactly 1, each pair term is a convex combination of the
-  two orientations, so the trivial "all weights zero" solution does not exist;
+  two triangle entries $H_{ij}, H_{ji}$, so the trivial "all weights zero"
+  solution does not exist;
 - flat order (`order_r_init: flat`): $1 - 1/N$;
 - lower bound $1/2$ from column-stochasticity ($p_{ik} + p_{jk} \le 1$).
 
@@ -134,8 +137,8 @@ Derived from the code, not measured.
 - `hsic_exclude_descendants: true` is rejected at init. The order weighting
   already down-weights descendants softly in $C$ (exactly only for a hard
   order). A graph-based hard descendant mask must never be applied to $A$
-  (it would delete the anti-causal signal); a C-only mask is conceivable but
-  not implemented. The `hsic_descendant_*` keys are ignored.
+  ($A$ IS the descendant signal); a C-only mask is conceivable but not
+  implemented. The `hsic_descendant_*` keys are ignored.
 - Validation stage computes the loss as a no-grad probe.
 
 ## 8. Two selectors (reconstruction / structural)

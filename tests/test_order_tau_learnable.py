@@ -80,3 +80,41 @@ def test_learnable_tau_invalid_bounds():
         _module(order_tau=2.0, order_tau_learnable=True, order_tau_min=0.1, order_tau_max=1.0)
     with pytest.raises(ValueError):
         _module(order_tau=0.5, order_tau_learnable=True, order_tau_min=1.0, order_tau_max=0.1)
+
+
+@pytest.mark.parametrize('tau0', [0.1001, 1.0, 2.0, 100.0])
+def test_softplus_initialization_and_roundtrip(tau0):
+    kw = dict(order_tau=tau0, order_tau_learnable=True,
+              order_tau_parameterization='softplus')
+    m = _module(**kw)
+    assert float(m.perm_tau.detach()) == pytest.approx(tau0, rel=1e-6)
+    copy = _module(**kw)
+    copy.load_state_dict(m.state_dict(), strict=True)
+    torch.testing.assert_close(copy.perm_tau, m.perm_tau)
+    assert _is_structural_param('model.attention.inner_attention.order_tau_rho')
+
+
+def test_softplus_no_upper_plateau_and_true_gradient():
+    m = _module(order_tau_learnable=True, order_tau_parameterization='softplus')
+    with torch.no_grad():
+        m.order_tau_rho.fill_(3)
+    before = m.perm_tau.detach().clone()
+    m.perm_tau.backward()
+    torch.testing.assert_close(m.order_tau_rho.grad, m.order_tau_rho.detach().sigmoid())
+    assert before > 1
+    with torch.no_grad():
+        m.order_tau_rho.sub_(.1)
+    assert m.perm_tau < before
+
+
+def test_softplus_hard_st_gradient_and_legacy_mismatch():
+    m = _module(order_tau_learnable=True, order_tau_parameterization='softplus')
+    m.train()
+    m.set_stage_policy('structure', order_sampling='hard_st')
+    m.resample(torch.Generator().manual_seed(10))
+    _forward(m)[0].square().sum().backward()
+    assert m.order_tau_rho.grad.isfinite() and m.order_tau_rho.grad.abs() > 0
+    with pytest.raises(RuntimeError):
+        m.load_state_dict(_module(order_tau_learnable=True).state_dict())
+    with pytest.raises(ValueError, match='Softplus'):
+        _module(order_tau=.1, order_tau_learnable=True, order_tau_parameterization='softplus')

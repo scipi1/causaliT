@@ -791,6 +791,14 @@ if [[ -z "${{VIRTUAL_ENV:-}}" ]]; then
 fi
 echo "[$(date)] Python env: $VIRTUAL_ENV"
 
+# External DAGuerreotype build (benchmarks/install_daguerreo/install_daguerreo.sh).
+# Added to PYTHONPATH only if present, so other machines are unaffected.
+for _d in "$HOME/ext/DAGuerreotype" "$HOME/ext/lp-sparsemap-master"; do
+    if [[ -d "$_d" ]]; then
+        export PYTHONPATH="$_d${{PYTHONPATH:+:$PYTHONPATH}}"
+    fi
+done
+
 # ───────────────────────────────────────────────────────────────────────────
 # RUN COMBINATION
 # ───────────────────────────────────────────────────────────────────────────

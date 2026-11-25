@@ -15,6 +15,15 @@ Two symmetric selectors, each owned by ONE stage and chosen by
   free symmetric Hard-Concrete logits (``struct_gate_logits``, structural
   group), initialised open (``struct_att_selector_init_logit``).
 
+* ``struct_gate_opt="directional_free"``: one zero-initialized logit per
+  unordered pair, sigmoid probabilities with G_ij + G_ji = 1. No existence
+  factor or L0 penalty. Structural ``hard_st`` automatically samples a
+  categorical edge from M * G (forward/reverse/absent), using the product
+  for the backward surrogate. Samples may contain longer cycles, but not
+  two-cycles. Reconstruction still uses G_R only. Loss pair existence
+  remains one and its order weights remain M. Hard evaluation applies
+  the continuous directional gate to the noiseless hard order.
+
 SHARED selector (``shared_att_selector``, gated only): ONE existence matrix
 (``struct_gate_logits``) applied in EVERY forward; the two gate_opts then
 select which stages TRAIN it (recon loss / structural loss) instead of
@@ -91,6 +100,13 @@ key mask.
   forwards, if on) multiplies afterwards without renormalization.  Rows
   with no available parent are zero.  ``S_sym`` is detached in structure
   forwards (owned by reconstruction).
+* softmax_prenorm: ``W_ij = M_ij * softmax_j(S_ij)``, softmax over the
+  available parents WITHOUT the order (BKD / hard_mask still renormalize),
+  then multiplied by the order (soft, hard, or ``M_hard + M_soft -
+  M_soft.detach()``).  No renormalization over the order: row mass
+  ``sum_j M_ij p_ij <= 1`` shrinks for early nodes (a first-placed node
+  gets zero input), so the order is visible in the row scale and in the
+  gradient, while the softmax keeps competition and does not grow with N.
 
 Noise is GLOBAL: drawn once per gradient step by :meth:`resample` (called by
 the forecaster at the start of each training step) and reused by every
@@ -133,8 +149,8 @@ __all__ = ["OrderFactorizedSelfAttention", "log_sinkhorn", "hard_assignment"]
 
 _STAGES = ("recon", "structure")
 _GATE_MODES = ("hard", "soft")
-_RECON_GATE_OPTS = ("gated", "softmax", "none")
-_STRUCT_GATE_OPTS = ("gated", "none")
+_RECON_GATE_OPTS = ("gated", "softmax", "softmax_prenorm", "none")
+_STRUCT_GATE_OPTS = ("gated", "directional_free", "none")
 # Order sampling per stage.  "oriented" is the hard order with a dedicated
 # Gumbel scale and a per-step orientation (driven by trainer / forecaster).
 _ORDER_SAMPLING = {
@@ -207,7 +223,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         recon_gate_opt: Reconstruction selector ``G_R``
             (``adaptive_training.recon.gate_opt``): ``"gated"`` (Hard-Concrete
             gate), ``"softmax"`` (row softmax of ``S_sym`` over the available
-            parents) or ``"none"`` (all-ones; queries frozen).
+            parents), ``"softmax_prenorm"`` (softmax without the order,
+            then multiplied by it) or ``"none"`` (all-ones; queries frozen).
         struct_gate_opt: Structural selector ``G_S``
             (``adaptive_training.structure.gate_opt``): ``"gated"`` or
             ``"none"``.  Applied in structure forwards only.
@@ -245,6 +262,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         order_tau_learnable: bool = False,
         order_tau_min: float = 0.1,
         order_tau_max: float = 1.0,
+        order_tau_parameterization: str = "clamped_exp",
         order_sinkhorn_iters: int = 20,
         order_r_init: str = "flat",
         order_existence_threshold: float = 0.5,
@@ -263,6 +281,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         batch_key_dropout_deterministic: bool = False,
         batch_key_dropout_eval: bool = False,
         batch_key_dropout_eval_seed: int = 12345,
+        bkd_order_guided: Optional[Dict] = None,
+        order_sinkhorn_window: Optional[int] = None,
     ):
         super().__init__()
         N = int(num_nodes)
@@ -277,7 +297,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             raise ValueError(f"order_noise_scale must be >= 0, got {order_noise_scale}.")
         if order_tau <= 0.0:
             raise ValueError(f"order_tau must be > 0, got {order_tau}.")
-        if order_tau_learnable and not (0.0 < order_tau_min < order_tau_max
+        if order_tau_parameterization not in ('clamped_exp', 'softplus'):
+            raise ValueError('order_tau_parameterization must be clamped_exp or softplus.')
+        self.tau_parameterization = order_tau_parameterization
+        if order_tau_learnable and order_tau_parameterization == 'softplus' and not (
+                math.isfinite(order_tau) and math.isfinite(order_tau_min)
+                and 0 < order_tau_min < order_tau):
+            raise ValueError('Softplus requires finite order_tau > order_tau_min > 0.')
+        if order_tau_learnable and order_tau_parameterization == 'clamped_exp' and not (0.0 < order_tau_min < order_tau_max
                                         and order_tau_min <= order_tau <= order_tau_max):
             raise ValueError(
                 "order_tau_learnable requires 0 < order_tau_min < order_tau_max and "
@@ -313,6 +340,10 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         # Both 'none' is the order-only ablation (graph = full DAG of the order).
         recon_on = recon_gate_opt != "none"
         struct_on = struct_gate_opt != "none"
+        self.directional_free = struct_gate_opt == "directional_free"
+        self.selector_transition_m = 0.0
+        if self.directional_free and (shared_att_selector or struct_att_selector_init == "recon"):
+            raise ValueError("directional_free requires an independent selector with constant init.")
         if shared_att_selector and not (recon_on or struct_on):
             raise ValueError(
                 "shared_att_selector with both gate_opt 'none': the shared G "
@@ -323,11 +354,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
                 "'none' and structure.gate_opt == 'gated'.")
         if shared_att_selector and struct_gate_opt == "none":
             raise ValueError("shared_att_selector requires structure.gate_opt='gated'.")
-        if shared_att_selector and recon_gate_opt == "softmax":
+        if shared_att_selector and recon_gate_opt in ("softmax", "softmax_prenorm"):
             raise ValueError(
                 "shared_att_selector is incompatible with recon.gate_opt="
                 "'softmax' (the shared G is a multiplicative gate).")
-        if struct_att_selector_init == "recon" and recon_gate_opt == "softmax":
+        if struct_att_selector_init == "recon" and recon_gate_opt in ("softmax", "softmax_prenorm"):
             raise ValueError(
                 "struct_att_selector_init='recon' is incompatible with "
                 "recon.gate_opt='softmax': softmax scores are not existence "
@@ -352,7 +383,14 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.tau_learnable = bool(order_tau_learnable)
         if self.tau_learnable:
             self.tau_min, self.tau_max = float(order_tau_min), float(order_tau_max)
-            self.order_log_tau = nn.Parameter(torch.tensor(math.log(order_tau)))
+            if self.tau_parameterization == 'softplus':
+                delta = order_tau - order_tau_min
+                # Stable inverse softplus; a distinct key prevents silent
+                # reinterpretation of legacy log-temperature checkpoints.
+                rho = delta + math.log(-math.expm1(-delta))
+                self.order_tau_rho = nn.Parameter(torch.tensor(rho))
+            else:
+                self.order_log_tau = nn.Parameter(torch.tensor(math.log(order_tau)))
         else:
             self._perm_tau = float(order_tau)
         self.sinkhorn_iters = int(order_sinkhorn_iters)
@@ -366,7 +404,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.struct_selector_on = struct_on
         # softmax: G_R is a row softmax of S_sym over the AVAILABLE parents
         # (order / BKD masks renormalize); G_S still multiplies afterwards.
-        self.recon_softmax = self.recon_gate_opt == "softmax"
+        # softmax_prenorm: softmax over the available parents WITHOUT the
+        # order, then multiplied by the order mask (no renormalization over
+        # the order: early rows lose mass, a first-placed node gets zero).
+        self.recon_softmax = self.recon_gate_opt in ("softmax", "softmax_prenorm")
+        self.softmax_prenorm = self.recon_gate_opt == "softmax_prenorm"
         # Shared mode: ONE existence matrix (struct_gate_logits) applied in
         # every forward; the toggles then select WHICH stages train it
         # (recon loss / structural loss) instead of which selector exists.
@@ -382,7 +424,21 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
                        batch_key_dropout_annealing_batches,
                        batch_key_dropout_min_keys, batch_key_dropout_deterministic,
                        batch_key_dropout_eval, batch_key_dropout_eval_seed)
+        # Order-guided BKD: per-pair drop probability annealed from the
+        # uniform BKD rate to p_selected / p_unselected weighted by the
+        # detached soft M_actual.  The ramp fraction is a persistent buffer
+        # (registered only when enabled) driven by set_bkd_guide_epoch.
+        self.bkd_guide = self._parse_bkd_guide(bkd_order_guided)
+        # Set by the forecaster (training.anticausal_selector_grad = none).
+        self.anticausal_detach_direction = False
+        if self.bkd_guide is not None:
+            if batch_key_dropout is None:
+                raise ValueError("bkd_order_guided requires batch_key_dropout (uniform rate).")
+            self.register_buffer("bkd_guide_frac", torch.zeros(()))
         self.orientation = "causal"
+        # Banded (top-k) Sinkhorn half-width; None = dense (default).
+        self.order_window: Optional[int] = None
+        self.set_order_window(order_sinkhorn_window)
 
         # Learnable node scores (larger = earlier).  The name ``order_scores``
         # is matched by gradient_routing.STRUCTURAL_PATTERNS.
@@ -394,7 +450,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         # by gradient_routing.STRUCTURAL_PATTERNS.  In shared mode this is THE
         # selector, so it exists whenever shared_selector is on.
         self.struct_gate_logits = (
-            nn.Parameter(torch.full((N, N), float(struct_att_selector_init_logit)))
+            nn.Parameter(torch.zeros(N * (N - 1) // 2) if self.directional_free else
+                         torch.full((N, N), float(struct_att_selector_init_logit)))
             if (self.struct_selector_on or self.shared_selector) else None)
         # One-off copy from G_R ("recon" init).  The buffer is registered only
         # in that mode, so "constant" state dicts are unchanged.
@@ -424,6 +481,103 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.last_score_gap: float = 0.0
         self._last_pi: Optional[torch.Tensor] = None
         self._last_M: Optional[torch.Tensor] = None
+        self._last_M_hard: Optional[torch.Tensor] = None
+        # M_actual of the last forward (source -> target, detached): soft
+        # (relaxed order x G_S existence) and the step's hard sample.
+        self.last_M_actual: Optional[torch.Tensor] = None
+        self.last_M_actual_hard: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _parse_bkd_guide(cfg: Optional[Dict]) -> Optional[Dict[str, float]]:
+        """Validated order-guided BKD settings, or None when disabled."""
+        if cfg is None:
+            return None
+        cfg = dict(cfg)
+        unknown = set(cfg) - {"enabled", "p_selected", "p_unselected",
+                              "start_epoch", "anneal_epochs", "source"}
+        if unknown:
+            raise ValueError(f"bkd_order_guided: unknown keys {sorted(unknown)}.")
+        if not cfg.get("enabled", False):
+            return None
+        out = {"p_selected": float(cfg.get("p_selected", 0.05)),
+               "p_unselected": float(cfg.get("p_unselected", 0.85)),
+               "start_epoch": float(cfg.get("start_epoch", 0.0)),
+               "anneal_epochs": float(cfg.get("anneal_epochs", 0.0)),
+               # hard: the step's sampled M_actual (what the structural
+               # forward conditions on); soft: relaxed M_actual, which
+               # flattens towards 0.5 when tau is large.
+               "source": str(cfg.get("source", "hard"))}
+        if out["source"] not in ("hard", "soft"):
+            raise ValueError(f"bkd_order_guided.source must be hard or soft, got {out['source']!r}.")
+        if not 0.0 < out["p_selected"] < out["p_unselected"] < 1.0:
+            raise ValueError("bkd_order_guided needs 0 < p_selected < p_unselected < 1, "
+                             f"got {out['p_selected']}, {out['p_unselected']}.")
+        if out["start_epoch"] < 0 or out["anneal_epochs"] < 0:
+            raise ValueError("bkd_order_guided start_epoch / anneal_epochs must be >= 0.")
+        return out
+
+    def set_order_window(self, window: Optional[int]) -> None:
+        """Half-width w of the banded Sinkhorn (None = full, dense)."""
+        if window is not None and int(window) < 1:
+            raise ValueError(f"order window must be >= 1 or None, got {window}.")
+        self.order_window = None if window is None else int(window)
+
+    def _window_band(self, P_hard: torch.Tensor) -> torch.Tensor:
+        """Bool (N, N) node-by-position band |k - rank_i| <= w around the
+        hard sample (always contains the sample, so Sinkhorn is feasible)."""
+        N = self.num_nodes
+        rank = P_hard.argmax(dim=1)
+        pos = torch.arange(N, device=P_hard.device)
+        return (pos.view(1, N) - rank.view(N, 1)).abs() <= self.order_window
+
+    def _order_actual(self, M, M_hard, pi, B_learn, direction, edge_draw):
+        """(soft, hard) M_actual, source -> target, no orientation applied.
+
+        * no G_S: soft = M (eval: noiseless M_hard), hard = M_hard;
+        * gated / shared G_S: soft = pi_S * M, hard = B_S * M_hard (eval:
+          thresholded existence), where pi = off without G_S;
+        * directional_free: soft = M * D, hard = the step's edge draw if
+          any, else thresholded D * M_hard.
+        Soft carries the gradient of M and pi; callers detach as needed.
+        """
+        M_ord = M if self.training else M_hard
+        if direction is not None:
+            soft = M_ord * direction
+            if edge_draw is not None:
+                hard = edge_draw
+            else:
+                hard = (direction.detach() > self.existence_threshold).to(M.dtype) * M_hard
+            return soft, hard
+        soft = pi * M_ord
+        if self.training and B_learn is not None:
+            hard = B_learn * M_hard
+        else:
+            hard = (pi.detach() > self.existence_threshold).to(M.dtype) * M_hard
+        return soft, hard
+
+    def set_bkd_guide_epoch(self, epoch: float) -> float:
+        """Set the guided-BKD ramp from the (fractional) training epoch;
+        returns the fraction s in [0, 1].  No-op (0) when disabled."""
+        if self.bkd_guide is None:
+            return 0.0
+        from causaliT.core.modules.extra_layers import bkd_guide_fraction
+        s = bkd_guide_fraction(epoch, self.bkd_guide["start_epoch"],
+                               self.bkd_guide["anneal_epochs"])
+        self.bkd_guide_frac.fill_(s)
+        return s
+
+    def bkd_guided_drop(self, p_uniform: float, m_actual: torch.Tensor) -> torch.Tensor:
+        """Per-pair drop probability (child <- parent) for guided BKD.
+
+        ``m_actual`` is M_actual (hard sample or soft, per ``source``) in
+        source -> target layout.
+        p = (1 - s) * p_uniform + s * (m * p_sel + (1 - m) * p_unsel).
+        """
+        g = self.bkd_guide
+        s = float(self.bkd_guide_frac)
+        m = m_actual.detach().transpose(0, 1).clamp(0.0, 1.0)
+        target = m * g["p_selected"] + (1.0 - m) * g["p_unselected"]
+        return (1.0 - s) * float(p_uniform) + s * target
 
 
     # ------------------------------------------------------------------
@@ -528,6 +682,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         # selector keep the exact same random stream.
         if self.struct_selector_on or self.shared_selector:
             self._noise["hc_s"] = _u()
+        if self.directional_free:
+            self._noise["edge"] = _u()
 
     def _get_noise(self) -> Dict[str, torch.Tensor]:
         if self._noise is None or self._noise["gumbel"].device != self.order_scores.device:
@@ -598,8 +754,41 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         return torch.softmax(logits, dim=-1).masked_fill(~is_av, 0.0)
 
     def _struct_logits(self) -> torch.Tensor:
-        """Symmetric ``G_S`` logits (strict upper triangle mirrored)."""
+        """Architecture-specific logits: symmetric existence or skew direction."""
+        if self.directional_free:
+            logits = self.struct_gate_logits.new_zeros(self.num_nodes, self.num_nodes)
+            i, j = torch.triu_indices(self.num_nodes, self.num_nodes, 1,
+                                     device=logits.device)
+            logits[i, j] = self.struct_gate_logits
+            return logits - logits.T
         return self._mirror_upper(self.struct_gate_logits)
+
+    def directional_gate(self) -> torch.Tensor:
+        """Complementary source-to-target probabilities; no existence factor."""
+        if not self.directional_free:
+            raise ValueError("directional_gate requires directional_free.")
+        logits = self._struct_logits()
+        return logits.sigmoid() * (1 - torch.eye(self.num_nodes, device=logits.device))
+
+    def effective_directional_gate(self):
+        """Anneal from no directional modulation to the learned selector."""
+        gate = self.directional_gate()
+        off = 1 - torch.eye(self.num_nodes, device=gate.device, dtype=gate.dtype)
+        m = self.selector_transition_m
+        return m * off + (1 - m) * gate
+
+    @staticmethod
+    def _sample_pair_edges(prob, uniform):
+        """One categorical draw per pair: forward, reverse, or absent.
+
+        Normalize only if finite Sinkhorn iterations produce pair mass > 1.
+        Return the draw and the probability used by the ST surrogate.
+        """
+        prob = prob / (prob + prob.T).clamp_min(1.0)
+        forward = torch.triu((uniform < prob).to(prob.dtype), diagonal=1)
+        reverse = torch.triu(((uniform >= prob) & (uniform < prob + prob.T)).to(
+            prob.dtype), diagonal=1)
+        return forward + reverse.T, prob
 
     def _recon_pi(self, query: torch.Tensor, key: torch.Tensor, off: torch.Tensor):
         """``(S_sym, pi_R)``; ``(None, off)`` with the selector off."""
@@ -614,6 +803,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         order).  ``pi_R`` never enters the edge: ``G_R`` is a reconstruction
         mixing weight, not an edge existence."""
         off = 1.0 - torch.eye(self.num_nodes, device=query.device, dtype=query.dtype)
+        if self.directional_free:
+            return off  # Pair existence stays one; direction must not censor the loss.
         if self.shared_active:
             # No edge_offset: the shared G is the learned existence in every
             # phase and its gate is centred at the l0 offset only.
@@ -691,7 +882,7 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             # trained by the reconstruction loss.
             S_sym, pi_R = self._recon_pi(query, key, off)
         if not shared:
-            if struct_on:
+            if struct_on and not self.directional_free:
                 L_S = self._struct_logits()
                 pi = torch.sigmoid(L_S - self._l0_offset) * off
             else:
@@ -702,9 +893,16 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
 
         # Relaxed order (also feeds the posterior / soft closure) and the
         # hard order of THIS step (same noise).
-        P = log_sinkhorn(perturbed / self.perm_tau, self.sinkhorn_iters)
+        P_hard = hard_assignment(perturbed)
+        logits = perturbed / self.perm_tau
+        if self.order_window is not None and self.order_window < N - 1:
+            # Banded (top-k) Sinkhorn: node i may only occupy positions
+            # within +-w of its rank in THIS step's hard sample, so pairs
+            # far apart in the sample get an exact 0/1 order entry.
+            logits = logits.masked_fill(~self._window_band(P_hard), float("-inf"))
+        P = log_sinkhorn(logits, self.sinkhorn_iters)
         M = self.order_mask(P)                              # source -> target
-        M_hard = self.order_mask(hard_assignment(perturbed))
+        M_hard = self.order_mask(P_hard)
 
         # Applied order (source -> target) of this stage, as a pair
         # (M_soft, M_hard_app): M_soft carries the gradient (None = no
@@ -775,7 +973,9 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         #    recon gate_opt="softmax": G_R is NOT a multiplicative gate; it
         #    is the row softmax W built in step 2, so G = 1 except for G_S
         #    in structure forwards (multiplies W, no renormalization).
-        if self.recon_softmax:
+        if is_struct and self.directional_free:
+            G = off  # G_S is composed with the order below, before sampling.
+        elif self.recon_softmax:
             if is_struct and struct_on:
                 if self.struct_gate_mode == "hard":
                     G = (B_learn + pi - pi.detach()) if self.training else \
@@ -829,9 +1029,49 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             else:
                 G_R = _relaxed_gate(S_sym.detach(), "hc", self.edge_offset)
             G = G * G_R.detach()
+        direction = self.effective_directional_gate() if self.directional_free else None
+        edge_draw = None
+        if is_struct and self.directional_free:
+            # Joint ST sampling, never a hard permutation followed by a gate.
+            # anticausal_detach_direction: the anti-causal pass applies the
+            # same draw but G_S receives no gradient from it (A trains the
+            # order only; G_S is owned by the causal term).
+            dir_used = (direction.detach() if self.orientation == "anticausal"
+                        and self.anticausal_detach_direction else direction)
+            applied_direction = dir_used.T if self.orientation == "anticausal" else dir_used
+            M_soft = None if M_soft is None else M_soft * applied_direction
+            M_hard_app = None if M_hard_app is None else M_hard_app * applied_direction
+            if self.training and osamp == "hard_st":
+                prob = M * dir_used
+                edge_draw, prob = self._sample_pair_edges(prob, noise["edge"])
+                M_soft, M_hard_app = prob, edge_draw
+                if self.orientation == "anticausal":
+                    M_soft, M_hard_app = M_soft.T, M_hard_app.T
+            elif osamp == "none":
+                M_soft = applied_direction
+            if M_soft is not None and M_hard_app is not None:
+                M_mult = M_hard_app + (M_soft - M_soft.detach())
+            else:
+                M_mult = M_soft if M_soft is not None else M_hard_app
         # Batch-key dropout: constant per-key mask (no gradient to dropped
         # keys).  Drawn once per forward; diagnostics stay BKD-free.
-        keep = self._bkd_keep(N, query.device)
+        # M_actual: the order as the structural network applies it
+        # (source -> target), G_S existence included when G_S is used.
+        M_act, M_act_hard = self._order_actual(M, M_hard, pi, B_learn, direction, edge_draw)
+        self.last_M_actual = M_act.detach()
+        self.last_M_actual_hard = M_act_hard.detach()
+        if self.bkd_guide is not None and float(self.bkd_guide_frac) > 0.0:
+            # Guided keep matrix (child <- parent) follows the applied
+            # orientation: anticausal rows regress on successors.
+            m_src = M_act_hard if self.bkd_guide["source"] == "hard" else M_act
+            m_or = m_src.T if self.orientation == "anticausal" else m_src
+            keep = self._bkd_keep_pairs(
+                lambda p: self.bkd_guided_drop(p, m_or), N, query.device)
+        else:
+            keep = self._bkd_keep(N, query.device)
+        keep_2d = None
+        if keep is not None:
+            keep_2d = keep if keep.dim() == 2 else keep.view(1, N).expand(N, N)
         hm = None
         if hard_mask is not None:
             hm = (hard_mask[0] if hard_mask.dim() == 3 else hard_mask).to(query.dtype)
@@ -843,15 +1083,26 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             # the soft order as the log-prior log M (zero gradient at exact
             # zero priors). G_S multiplies afterwards (no renorm).
             avail = off
-            if keep is not None:
-                avail = avail * keep.to(avail.dtype).view(1, N)
+            if keep_2d is not None:
+                avail = avail * keep_2d.to(avail.dtype)
             if hm is not None:
                 avail = avail * hm
             Mt_soft = None if M_soft is None else M_soft.transpose(0, 1)
             Mt_hard = None if M_hard_app is None else M_hard_app.transpose(0, 1)
             # Scores are owned by reconstruction: detached in structure forwards.
             S_w = S_sym.detach() if is_struct else S_sym
-            if Mt_soft is not None and Mt_hard is not None:
+            if self.softmax_prenorm:
+                # Normalize first, then apply the order: W = Mt * softmax(S)
+                # with Mt the stage's order (soft, hard, or hard forward with
+                # soft gradient).  Row mass sum_j Mt_ij p_ij <= 1.
+                W = self._masked_softmax(S_w, avail, None)
+                if Mt_soft is not None and Mt_hard is not None:
+                    W = W * (Mt_hard + Mt_soft - Mt_soft.detach())
+                elif Mt_hard is not None:
+                    W = W * Mt_hard
+                elif Mt_soft is not None:
+                    W = W * Mt_soft
+            elif Mt_soft is not None and Mt_hard is not None:
                 W_soft = self._masked_softmax(S_w, avail, Mt_soft)
                 W_hard = self._masked_softmax(S_w, avail * Mt_hard, None)
                 W = W_hard + W_soft - W_soft.detach()
@@ -868,6 +1119,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         # extraction reads the learned DAG (pi * M stays below 0.5 while the
         # relaxed order is flat, which would report an empty graph).
         posterior = (pi * (M if self.training else M_hard)).transpose(0, 1)
+        if direction is not None:
+            posterior = posterior * direction.T
         # Exclusion graph: existence from the threshold (deterministic) or
         # from the step's Bernoulli draw (stochastic mask, train only; it is
         # the applied DAG in hard mode).  Eval always thresholds.
@@ -876,10 +1129,15 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         else:
             B_ex = (pi.detach() > self.existence_threshold).to(pi.dtype)
         excl = (B_ex * M_hard).transpose(0, 1)
+        if direction is not None:
+            excl = (edge_draw.T if edge_draw is not None else
+                    ((direction.detach() > self.existence_threshold) * M_hard).T)
         # L0 of the EDGE: expected open undirected pairs of G_S (or the
         # shared G), not masked by the order.  Without G_S there is no
         # learned existence: zero L0.  G_R is never L0-penalized.
         pi_l0 = pi if (shared or struct_on) else torch.zeros_like(off)
+        if self.directional_free:
+            pi_l0 = torch.zeros_like(off)
         if hm is not None:
             A, posterior, excl, pi_l0 = A * hm, posterior * hm, excl * hm, pi_l0 * hm
 
@@ -889,6 +1147,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         self.score_tensor_for_sparsity = excl.detach()      # hard DAG
         self._last_pi = pi
         self._last_M = M
+        # Hard order of THIS step (same noise; eval: noiseless), detached.
+        self._last_M_hard = M_hard.detach()
         with torch.no_grad():
             self.last_sinkhorn_err = float(torch.maximum(
                 (P.sum(0) - 1).abs().max(), (P.sum(1) - 1).abs().max()))
@@ -897,8 +1157,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
 
         # 3) Batch-key dropout on the applied weight (no-op for softmax,
         # already excluded there).
-        if keep is not None:
-            A = A * keep.to(A.dtype).view(1, N)
+        if keep_2d is not None:
+            A = A * keep_2d.to(A.dtype)
         A_b = self.dropout(A.unsqueeze(0).expand(B, N, N))
         self.last_applied_A = A_b.detach()
         if value.dim() == 4:
@@ -936,6 +1196,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         if self._last_pi is None or self._last_M is None:
             raise RuntimeError("soft_descendant_scores() called before forward().")
         post = (self._last_pi * self._last_M).transpose(0, 1)
+        if self.directional_free:
+            post = post * self.effective_directional_gate().T
         return soft_transitive_closure(post, tnorm=self.exclusion_tnorm, hops=None)
 
     @torch.no_grad()
@@ -971,7 +1233,11 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
             M_h = self.order_mask(hard_assignment(
                 theta - self.noise_scale * torch.log(-torch.log(u))))
             ub = torch.rand(N, N, generator=gen).to(theta)
-            graphs.append(self._mirror_upper((ub < pi).to(pi.dtype)) * M_h)
+            if self.directional_free:
+                # DAG export: orient by the sampled total order, then thin.
+                graphs.append((ub < self.effective_directional_gate()).to(pi.dtype) * M_h)
+            else:
+                graphs.append(self._mirror_upper((ub < pi).to(pi.dtype)) * M_h)
             orders.append(M_h)
         graphs = torch.stack(graphs)
         return {
@@ -985,6 +1251,8 @@ class OrderFactorizedSelfAttention(BKDMixin, nn.Module):
         """Sinkhorn temperature: a float, or a 0-d tensor carrying the
         gradient to ``order_log_tau`` when ``tau_learnable``."""
         if self.tau_learnable:
+            if self.tau_parameterization == 'softplus':
+                return self.tau_min + torch.nn.functional.softplus(self.order_tau_rho)
             s = self.order_log_tau
             s_clamped = s.clamp(math.log(self.tau_min), math.log(self.tau_max))
             # Straight-through: forward value clamped, gradient d tau / d s

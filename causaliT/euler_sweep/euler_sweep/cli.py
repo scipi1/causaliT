@@ -974,7 +974,9 @@ def adaptivesweep(exp_id, sweep_mode, parallel, cluster, scratch_path,
     "--max_concurrent_jobs",
     default=6,
     type=int,
-    help="Maximum concurrent array tasks, for BOTH the trial and the train array",
+    help="Resource cap: max jobs running at once. The train stage keeps exactly "
+         "this many workers alive; each runs its share of the runs and "
+         "resubmits itself at walltime until done.",
 )
 @click.option(
     "--walltime",

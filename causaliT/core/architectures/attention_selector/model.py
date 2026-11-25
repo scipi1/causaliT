@@ -646,6 +646,7 @@ class AttentionSelectorLayer(nn.Module):
         # to the unconditioned decoder at step 0), without widening the
         # MLP input.  Requires per_node_output=True.
         per_node_adjacency_context: bool = False,
+        dual_order_regressors: bool = False,
         # Number of linear layers in each per-node decoder MLP (>=2).  2
         # (default) is the legacy shallow head; deeper heads pair with FiLM
         # conditioning at EVERY hidden activation (multi-layer FiLM, Perez
@@ -679,6 +680,7 @@ class AttentionSelectorLayer(nn.Module):
         order_tau_learnable: bool = False,
         order_tau_min: float = 0.1,
         order_tau_max: float = 1.0,
+        order_tau_parameterization: str = "clamped_exp",
         order_sinkhorn_iters: int = 20,
         order_r_init: str = "flat",
         order_existence_threshold: float = 0.5,
@@ -692,6 +694,11 @@ class AttentionSelectorLayer(nn.Module):
         struct_att_selector_init_logit: float = 2.0,
         struct_att_selector_init: str = "constant",
         shared_att_selector: bool = False,
+        # Order-guided BKD of the order-factorized block: {enabled,
+        # p_selected, p_unselected, start_epoch, anneal_epochs}.
+        bkd_order_guided: Optional[dict] = None,
+        # Banded (top-k) Sinkhorn half-width of the order (None = dense).
+        order_sinkhorn_window: Optional[int] = None,
     ):
 
 
@@ -708,6 +715,7 @@ class AttentionSelectorLayer(nn.Module):
             order_tau_learnable=order_tau_learnable,
             order_tau_min=order_tau_min,
             order_tau_max=order_tau_max,
+            order_tau_parameterization=order_tau_parameterization,
             order_sinkhorn_iters=order_sinkhorn_iters,
             order_r_init=order_r_init,
             order_existence_threshold=order_existence_threshold,
@@ -719,6 +727,9 @@ class AttentionSelectorLayer(nn.Module):
             struct_att_selector_init_logit=struct_att_selector_init_logit,
             struct_att_selector_init=struct_att_selector_init,
             shared_att_selector=shared_att_selector,
+            bkd_order_guided=(None if bkd_order_guided is None
+                              else dict(bkd_order_guided)),
+            order_sinkhorn_window=order_sinkhorn_window,
         )
 
 
@@ -1969,6 +1980,22 @@ class AttentionSelectorLayer(nn.Module):
                 bias=(output_mlp_layers > 1),
             )
 
+        self.dual_order_regressors = bool(dual_order_regressors)
+        if self.dual_order_regressors:
+            if (not self.per_node_output or self._adjacency_context_mode != 'film'
+                    or self.order_attention() is None or self.raw_value_adjacency):
+                raise ValueError('Dual order regressors require per-node FiLM, '
+                                 'order-factorized attention and the value-stream path.')
+            from copy import deepcopy
+            # Equal initialization, independent parameters and optimizer state.
+            self.anticausal_forecaster = deepcopy(self.forecaster)
+
+    def _order_prediction_head(self):
+        """Select the complete head bank using the conditioning orientation."""
+        if self.dual_order_regressors and self.order_attention().orientation == 'anticausal':
+            return self.anticausal_forecaster
+        return self.forecaster
+
     # ------------------------------------------------------------------
     # Forbidden-parents query projection (orthogonal key exclusion)
     # ------------------------------------------------------------------
@@ -2892,7 +2919,7 @@ class AttentionSelectorLayer(nn.Module):
                 if self.per_node_adjacency_context
                 else None
             )
-            pred_x = self.forecaster(x, var_ids, context=_ctx)
+            pred_x = self._order_prediction_head()(x, var_ids, context=_ctx)
         else:
             pred_x = self.forecaster(x)
 
@@ -3081,6 +3108,14 @@ class AttentionSelectorLayer(nn.Module):
             return False
         oa.set_order_temperature(tau=tau, noise_scale=noise_scale)
         return True
+
+    def set_bkd_guide_epoch(self, epoch: float) -> Optional[float]:
+        """Drive the order-guided BKD ramp; returns the fraction s, or None
+        when the order selector or guided BKD is not in use."""
+        oa = self.order_attention()
+        if oa is None or oa.bkd_guide is None:
+            return None
+        return oa.set_bkd_guide_epoch(epoch)
 
     def set_recon_noise_scale(self, value=None) -> bool:
         """Gumbel scale of the applied hard order in recon forwards (None =

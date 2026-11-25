@@ -91,8 +91,26 @@ adaptive_training:
       p_anticausal: 0.5
       noise_scale: 1.0
 
+  # Declarative schedule (optional).  Ordered subset of
+  # [warmup, joint, alternate, final_reconstruct]; null = legacy translation
+  # from start_phase / warmup.enabled / final_reconstruct.enabled.
+  schedule: null                   # e.g. [warmup, joint, alternate]
+  alternate_start: null            # first phase of 'alternate' (reconstruct |
+                                   # structure); null = structure after
+                                   # warmup/joint, else start_phase
+  joint:                           # structure + reconstruction in the SAME step
+    max_epochs: 200                # safety cap
+    min_epochs: 0                  # floor for the plateau exits
+    hsic_patience: 0               # exit on val_hsic plateau (0 = off)
+    hsic_min_delta: 1.0e-4
+    recon_patience: 0              # exit on monitor plateau (0 = off)
+    recon_min_delta: 1.0e-4
+    lambda_l0: 0.0                 # default 0: node selection waits for order
+                                   # (any lambda_* / kappa can be overridden;
+                                   # needs structural_grad != hsic_unrolled)
+
   start_phase: reconstruct         # "reconstruct" (warm up predictor first) or
-                                   # "structure"
+                                   # "structure" (legacy; ignored by schedule)
   max_cycles: null                 # OPTIONAL safety cap on completed structure
                                    # phases. null = unbounded (do as many cycles
                                    # as fit within total_epoch_budget). Set to an

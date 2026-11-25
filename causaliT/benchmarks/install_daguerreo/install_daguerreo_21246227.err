@@ -1,0 +1,74 @@
+Many modules are hidden in this stack. Use "module --show_hidden spider SOFTWARE" if you are not able to find the required software
+
+[notice] A new release of pip is available: 26.2.2 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+
+[notice] A new release of pip is available: 26.2.2 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/setuptools/__init__.py:238: SetuptoolsDeprecationWarning: The function `convert_path` is considered internal and not part of the public API.
+Its direct usage by 3rd-party packages is considered deprecated and the function
+may be removed in the future.
+  warnings.warn(cleandoc(msg), SetuptoolsDeprecationWarning)
+ad3qp/ad3/FactorGraph.cpp: In member function 'int AD3::FactorGraph::AddEvidence(std::vector<int>*, std::vector<int>*)':
+ad3qp/ad3/FactorGraph.cpp:248:21: warning: unused variable 'evidence_second' [-Wunused-variable]
+  248 |                 int evidence_second =
+      |                     ^~~~~~~~~~~~~~~
+In file included from ad3qp/ad3/FactorDense.h:22,
+                 from ad3qp/ad3/FactorGraph.h:22,
+                 from ad3qp/ad3/FactorGraph.cpp:20:
+In member function 'void AD3::GenericFactor::SetVerbosity(int)',
+    inlined from 'void AD3::FactorGraph::DeclareFactor(AD3::Factor*, const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:115:62,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:136:22,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:129:31,
+    inlined from 'void AD3::FactorGraph::FixMultiVariablesWithoutFactors()' at ad3qp/ad3/FactorGraph.cpp:43:28:
+ad3qp/ad3/GenericFactor.h:49:51: warning: array subscript 'AD3::GenericFactor[0]' is partly outside array bounds of 'unsigned char [344]' [-Warray-bounds]
+   49 |     void SetVerbosity(int verbosity) { verbosity_ = verbosity; }
+      |                                        ~~~~~~~~~~~^~~~~~~~~~~
+In member function 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)',
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:129:31,
+    inlined from 'void AD3::FactorGraph::FixMultiVariablesWithoutFactors()' at ad3qp/ad3/FactorGraph.cpp:43:28:
+ad3qp/ad3/FactorGraph.h:135:30: note: object of size 344 allocated by 'operator new'
+  135 |         Factor* factor = new FactorXOR;
+      |                              ^~~~~~~~~
+In member function 'void AD3::GenericFactor::SetVerbosity(int)',
+    inlined from 'void AD3::FactorGraph::DeclareFactor(AD3::Factor*, const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:115:62,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOROUT(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:161:22,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOROUT(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:147:34,
+    inlined from 'void AD3::FactorGraph::ConvertToBinaryFactorGraph(AD3::FactorGraph*)' at ad3qp/ad3/FactorGraph.cpp:112:60:
+ad3qp/ad3/GenericFactor.h:49:51: warning: array subscript 'AD3::GenericFactor[0]' is partly outside array bounds of 'unsigned char [344]' [-Warray-bounds]
+   49 |     void SetVerbosity(int verbosity) { verbosity_ = verbosity; }
+      |                                        ~~~~~~~~~~~^~~~~~~~~~~
+In member function 'AD3::Factor* AD3::FactorGraph::CreateFactorXOROUT(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)',
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOROUT(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:147:34,
+    inlined from 'void AD3::FactorGraph::ConvertToBinaryFactorGraph(AD3::FactorGraph*)' at ad3qp/ad3/FactorGraph.cpp:112:60:
+ad3qp/ad3/FactorGraph.h:154:30: note: object of size 344 allocated by 'operator new'
+  154 |         Factor* factor = new FactorXOR;
+      |                              ^~~~~~~~~
+In member function 'void AD3::GenericFactor::SetVerbosity(int)',
+    inlined from 'void AD3::FactorGraph::DeclareFactor(AD3::Factor*, const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:115:62,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)' at ad3qp/ad3/FactorGraph.h:136:22,
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:129:31,
+    inlined from 'void AD3::FactorGraph::ConvertToBinaryFactorGraph(AD3::FactorGraph*)' at ad3qp/ad3/FactorGraph.cpp:65:45:
+ad3qp/ad3/GenericFactor.h:49:51: warning: array subscript 'AD3::GenericFactor[0]' is partly outside array bounds of 'unsigned char [344]' [-Warray-bounds]
+   49 |     void SetVerbosity(int verbosity) { verbosity_ = verbosity; }
+      |                                        ~~~~~~~~~~~^~~~~~~~~~~
+In member function 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, const std::vector<bool>&, bool)',
+    inlined from 'AD3::Factor* AD3::FactorGraph::CreateFactorXOR(const std::vector<AD3::BinaryVariable*>&, bool)' at ad3qp/ad3/FactorGraph.h:129:31,
+    inlined from 'void AD3::FactorGraph::ConvertToBinaryFactorGraph(AD3::FactorGraph*)' at ad3qp/ad3/FactorGraph.cpp:65:45:
+ad3qp/ad3/FactorGraph.h:135:30: note: object of size 344 allocated by 'operator new'
+  135 |         Factor* factor = new FactorXOR;
+      |                              ^~~~~~~~~
+
+[notice] A new release of pip is available: 26.2.2 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+No CUDA runtime is found, using CUDA_HOME='/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/cuda-12.1.1-5znnrjb5x5xr26nojxp3yhh6v77il7ie'
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/setuptools/dist.py:530: UserWarning: Normalizing '0.1dev0' to '0.1.dev0'
+  warnings.warn(tmpl.format(**locals()))
+Emitting ninja build file /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/build.ninja...
+Compiling objects...
+Using envvar MAX_JOBS (4) as the number of workers...
+Emitting ninja build file /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/build.ninja...
+Compiling objects...
+Using envvar MAX_JOBS (4) as the number of workers...
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/pgmpy/estimators/__init__.py:4: FutureWarning: `pgmpy.estimators.StructureScore` is deprecated and will be removed in v1.3.0. Use `pgmpy.structure_score` instead.
+  from .StructureScore import (

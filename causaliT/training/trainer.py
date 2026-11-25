@@ -306,7 +306,19 @@ def train_single_fold(
         if "order_initialization" in checkpoint:
             model._order_initialization_report = checkpoint["order_initialization"]
         state_dict = checkpoint.get("state_dict", checkpoint)
+        current_keys = set(model.state_dict())
+        for key in state_dict:
+            if key.endswith('order_log_tau') and key[:-len('order_log_tau')] + 'order_tau_rho' in current_keys:
+                raise ValueError('Temperature parameterization changed: explicit effective-tau migration is required.')
+            if key.endswith('order_tau_rho') and key[:-len('order_tau_rho')] + 'order_log_tau' in current_keys:
+                raise ValueError('Temperature parameterization changed: explicit effective-tau migration is required.')
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if config['training'].get('warm_start_directional', False):
+            expected = {'model.attention.inner_attention.struct_gate_logits'}
+            if set(missing) != expected or unexpected:
+                raise ValueError(f'Unexpected directional warm-start mismatch: {missing}, {unexpected}')
+            model._query_centroid_init_done = True
+            logger_info.info('Directional warm start: inherited weights, zero logits, fresh optimizers.')
         if missing:
             logger_info.warning(f"Warm-start missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
         if unexpected:

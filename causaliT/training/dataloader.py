@@ -321,6 +321,22 @@ class ProcessDataModule(pl.LightningDataModule):
             test_idx=self._stage_test_idx,
         )
         return int(len(subset))
+
+    def stage_split_dataloader(self, phase: str):
+        """Shuffled loader over a registered cross-fit subset (side loader).
+
+        Used by the adaptive ``joint`` phase: the Lightning train loader serves
+        the reconstruct split (MSE) while this loader serves the structure
+        split (HSIC residuals), so both losses stay cross-fitted within one
+        step.  Returns None when no split is registered under ``phase``.
+        """
+        subset = (self._stage_splits or {}).get(phase)
+        if subset is None:
+            return None
+        X_tensor = self.X_train_tensor if self.X_train_tensor is not None else self.X_tensor
+        Y_tensor = self.Y_train_tensor if self.Y_train_tensor is not None else self.Y_tensor
+        ds = TensorDataset(X_tensor[subset], Y_tensor[subset])
+        return DataLoader(ds, batch_size=self.batch_size, num_workers=0, shuffle=True)
     
     
     def set_hsic_cross_fit(self, ratio: float = 0.5, seed: int = 0) -> tuple:

@@ -63,6 +63,54 @@ def test_masked_softmax_finite_gradient_at_zero_prior():
 
 
 # ---------------------------------------------------------------------------
+# Applied weight of gate_opt="softmax_prenorm" (normalize, then order)
+# ---------------------------------------------------------------------------
+def test_prenorm_soft_is_order_times_softmax():
+    q, k, v = _qk()
+    m = _mod(recon_gate_opt="softmax_prenorm")
+    m.train()
+    m.set_stage_policy("structure", order_sampling="soft")
+    out, A = _applied(m, q, k, v)
+    S = m._existence_score(q, k).detach()
+    Mt = m._last_M.transpose(0, 1).detach()
+    ref = Mt * _softmax_ref(S, 1.0 - torch.eye(N))
+    assert torch.allclose(A, ref, atol=1e-5)
+    assert torch.all(A.sum(-1) <= 1.0 + 1e-6)                # no renormalization
+    out.sum().backward()
+    assert m.order_scores.grad is not None and m.order_scores.grad.abs().sum() > 0
+
+
+def test_prenorm_hard_order_first_node_gets_zero_and_rows_shrink():
+    q, k, v = _qk()
+    m = _mod(recon_gate_opt="softmax_prenorm")
+    m.train()
+    m.set_stage_policy("recon", order_sampling="none")
+    _, A_full = _applied(m, q, k, v)
+    m.set_stage_policy("recon", order_sampling="hard")
+    _, A_ord = _applied(m, q, k, v)
+    n_par = (A_ord > 0).sum(-1)
+    assert (n_par == 0).sum() == 1                            # first-placed node
+    surv = A_ord > 0
+    assert torch.allclose(A_ord[surv], A_full[surv], atol=1e-6)   # values unchanged
+    assert torch.all(A_ord.sum(-1) <= A_full.sum(-1) + 1e-6)
+
+
+def test_prenorm_scale_gradient_not_zero():
+    """Plain softmax is invariant to scaling a row of the order (zero gradient
+    along it); prenorm is not."""
+    S = torch.randn(N, N)
+    avail = 1.0 - torch.eye(N)
+    m_row = (torch.rand(N, N) * 0.5 + 0.1).requires_grad_(True)
+    tgt = torch.randn(N, N)
+    W = OrderFactorizedSelfAttention._masked_softmax(S, avail, m_row)
+    g, = torch.autograd.grad((W * tgt).sum(), m_row)
+    assert torch.allclose((g * m_row).sum(-1), torch.zeros(N), atol=1e-5)
+    W2 = m_row * OrderFactorizedSelfAttention._masked_softmax(S, avail)
+    g2, = torch.autograd.grad((W2 * tgt).sum(), m_row)
+    assert (g2 * m_row).sum(-1).abs().max() > 1e-3
+
+
+# ---------------------------------------------------------------------------
 # Applied weight of gate_opt="softmax"
 # ---------------------------------------------------------------------------
 def test_softmax_rows_renormalize_and_preserve_ratios_under_hard_order():

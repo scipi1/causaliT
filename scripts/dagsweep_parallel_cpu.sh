@@ -12,10 +12,13 @@
 # This job only PLANS and SUBMITS (no DAG is generated, nothing is trained here).
 # The chain it creates is
 #
-#   prep  ->  trials[array]  ->  select  ->  train[array]  ->  cleanup
+#   prep  ->  trials[array]  ->  select  ->  train[workers]  ->  cleanup
 #
 # where `select` is the barrier that guarantees every training run reads the
 # winning trial of its group (why the two phases are not merged).
+# The train stage is a pool of exactly MAX_CONCURRENT_JOBS worker jobs: each
+# runs its share of the runs in sequence, resubmits itself before walltime,
+# and the last one to finish submits cleanup.  No rounds/array sizes to set.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -27,9 +30,13 @@ echo "Job ID: $SLURM_JOB_ID"
 # EXPERIMENT CONFIGURATION
 # ---------------------------------------------------------------------------
 EXPERIMENT_ID="dagma_nonlinear_nongaussian_ER4_10_80"
+# Resource cap: jobs held at once.  Total footprint of the sweep is
+# MAX_CONCURRENT_JOBS x CPUS_PER_TASK CPUs and x MEM_PER_CPU memory.
 MAX_CONCURRENT_JOBS=6
-# Walltime of ONE array task (a single Optuna trial / a single training run),
-# not of the whole sweep: the chain runs as long as it needs to.
+# Walltime of ONE worker job.  It must cover the LONGEST single fit (an Optuna
+# trial runs as one job); a train worker that cannot fit another run in the
+# remaining time resubmits itself.  Shorter (e.g. 4:00:00) schedules faster
+# and releases the group's resources regularly.
 WALLTIME="36:00:00"
 # Resource request for the generated stage scripts.  NOTE: Euler's job-submit
 # plugin REJECTS a total --mem ("Requesting memory by node is not supported.

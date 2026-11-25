@@ -120,6 +120,7 @@ STRUCTURAL_PATTERNS = [
     # OrderFactorizedSelfAttention learnable Sinkhorn temperature
     # (order_tau_learnable=True), trained by the structural loss only.
     "order_log_tau",
+    "order_tau_rho",
     # OrderFactorizedSelfAttention structural selector G_S (free symmetric
     # logits, trained by the structural loss only).
     "struct_gate_logits",

@@ -30,6 +30,18 @@ def _resolve(config):
     return update_config(config)
 
 
+def _resume_from(config, base_dir):
+    """Path of adaptive_training.resume_from (full-state start checkpoint,
+    relative to base_dir = the run folder) or None. Raises if missing."""
+    rel = OmegaConf.select(config, "adaptive_training.resume_from", default=None)
+    if not rel:
+        return None
+    path = Path(rel) if Path(rel).is_absolute() else Path(base_dir) / rel
+    if not path.is_file():
+        raise FileNotFoundError(f"adaptive_training.resume_from not found: {path}")
+    return str(path)
+
+
 def _prepare(config, save_dir):
     config = _resolve(config)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
@@ -88,8 +100,14 @@ def train(config, save_dir, data_dir, stop_event, folds=None, resources=None):
         raise_if_paused(pauses[fold])
         (_resume_dir(save_dir, fold) / DONE).touch()
 
+    warm = OmegaConf.select(config, 'training.warm_start_from', default=None)
+    if warm:
+        warm = Path(warm) if Path(warm).is_absolute() else Path(save_dir) / warm
+        if not warm.is_file():
+            raise FileNotFoundError(f'Warm-start checkpoint not found: {warm}')
     return trainer(config=config, data_dir=str(data_dir), save_dir=str(save_dir), cluster=True,
-                   folds=folds, fold_hooks=fold_hooks, after_fold=after_fold)
+                   folds=folds, fold_hooks=fold_hooks, after_fold=after_fold,
+                   warm_start_ckpt=str(warm) if warm else None)
 
 
 def adaptive_train(config, save_dir, data_dir, stop_event, folds=None, resources=None):
@@ -98,9 +116,11 @@ def adaptive_train(config, save_dir, data_dir, stop_event, folds=None, resources
     config = _prepare(config, save_dir)
     directory = _resume_dir(save_dir, 0)
     pause = PauseAtEpochEnd(stop_event)
+    # Own checkpoint wins (chain chunks); else the external full-state start.
+    ckpt = latest_checkpoint(directory) or _resume_from(config, save_dir)
     results = adaptive_trainer(config=config, data_dir=str(data_dir), save_dir=str(save_dir),
                                cluster=True, extra_callbacks=[ResumeCheckpoint(str(directory)), pause],
-                               resume_ckpt=latest_checkpoint(directory))
+                               resume_ckpt=ckpt)
     raise_if_paused(pause)
     (directory / DONE).touch()
     return results

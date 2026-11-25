@@ -741,6 +741,148 @@ def hsic_cross_per_pair(
     return (scalar, hsic_mat) if return_matrix else scalar
 
 
+def _centered_kernel_traces(
+    values: torch.Tensor,
+    sigma,
+    adaptive_bandwidth: bool,
+    bandwidth_multipliers: Optional[Sequence[float]],
+    side: int,
+    dirac: bool = False,
+) -> torch.Tensor:
+    """Per-variable ``tr(HKH) = tr(K) - 1^T K 1 / n`` with the SAME kernel
+    (bandwidth rule, multipliers, Dirac source) as :func:`hsic_pair_matrix`.
+
+    ``side`` selects the entry of a frozen ``(sigma_source, sigma_residual)``
+    tuple (0 = source, 1 = residual).  Detached.
+    """
+    n, n_vars = values.shape
+    out = []
+    for i in range(n_vars):
+        x = values[:, i].detach()
+        if dirac:
+            K = dirac_kernel(x)
+        else:
+            if adaptive_bandwidth:
+                s = _median_bandwidth(x)
+            elif isinstance(sigma, (list, tuple)):
+                s = sigma[side]
+                if isinstance(s, (list, tuple)) or (torch.is_tensor(s) and s.dim() > 0):
+                    s = s[i]
+            else:
+                s = sigma
+            K = rbf_multiscale_kernel(x, s, bandwidth_multipliers)
+        out.append(torch.diagonal(K).sum() - K.sum() / n)
+    return torch.stack(out)
+
+
+def _variable_sigma(x, sigma, adaptive_bandwidth, side, i):
+    """Bandwidth of variable ``i`` with the pairwise-path rule (detached)."""
+    if adaptive_bandwidth:
+        return _median_bandwidth(x)
+    s = sigma
+    if isinstance(s, (list, tuple)):
+        s = s[side]
+        if isinstance(s, (list, tuple)) or (torch.is_tensor(s) and s.dim() > 0):
+            s = s[i]
+    return torch.as_tensor(s, device=x.device, dtype=x.dtype)
+
+
+def hsic_joint_masked(
+    source_values: torch.Tensor,
+    residuals: torch.Tensor,
+    weights: torch.Tensor,
+    sigma=1.0,
+    adaptive_bandwidth: bool = True,
+):
+    """Joint HSIC between each residual and its (weighted) conditioning SET.
+
+    For residual t with set weights w_t (row t of ``weights``, shape
+    ``(N_res, N_src)``, entries in [0, 1], typically the hard ND mask with a
+    straight-through soft gradient), the set kernel is the product RBF
+
+        K_t(a, b) = exp(-sum_s w_ts d_s(a, b) / c_t),
+        d_s(a, b) = (x_as - x_bs)^2 / (2 sigma_s^2),
+        c_t = max(1, sum_s w_ts) (detached),
+
+    i.e. the joint distribution of the set (RESIT, Peters et al. 2014), with
+    the bandwidth scaled by the set size so the kernel does not collapse to
+    the identity for large sets.  w enters the exponent, so the statistic is
+    differentiable in the set weights.  A singleton set reduces exactly to
+    the pairwise RBF HSIC of that variable.
+
+    Returns ``(T, nu, count)``, each ``(N_res,)``: biased HSIC
+    ``tr(K~ L~) / (n-1)^2``, its exact permutation-null mean
+    ``tr(K~) tr(L~) / (n-1)^3`` (detached) and the detached set size.
+    An empty set gives K = 1 and T = 0.
+    """
+    n, n_src = source_values.shape
+    if n < 3:
+        raise ValueError("hsic_joint_masked needs at least 3 samples.")
+    w = weights.to(source_values.dtype)
+    # Per-source scaled squared distances, (N_src, n, n); no grad to data scale.
+    d = []
+    for s in range(n_src):
+        x = source_values[:, s]
+        sg = _variable_sigma(x.detach(), sigma, adaptive_bandwidth, 0, s)
+        d.append((x.unsqueeze(1) - x.unsqueeze(0)) ** 2 / (2.0 * sg ** 2))
+    D = torch.stack(d)
+    count = w.detach().sum(dim=1)
+    c = count.clamp_min(1.0)
+    E = torch.einsum("ts,sab->tab", w, D) / c.view(-1, 1, 1)
+    K = torch.exp(-E)                                            # (N_res, n, n)
+    Kc = K - K.mean(dim=1, keepdim=True) - K.mean(dim=2, keepdim=True) \
+        + K.mean(dim=(1, 2), keepdim=True)
+    ls = []
+    for t in range(residuals.shape[1]):
+        r = residuals[:, t]
+        sg = _variable_sigma(r.detach(), sigma, adaptive_bandwidth, 1, t)
+        ls.append(torch.exp(-(r.unsqueeze(1) - r.unsqueeze(0)) ** 2 / (2.0 * sg ** 2)))
+    L = torch.stack(ls)
+    Lc = L - L.mean(dim=1, keepdim=True) - L.mean(dim=2, keepdim=True) \
+        + L.mean(dim=(1, 2), keepdim=True)
+    T = (Kc * Lc).sum(dim=(1, 2)) / float((n - 1) ** 2)
+    with torch.no_grad():
+        tk = torch.diagonal(K, dim1=1, dim2=2).sum(-1) - K.sum(dim=(1, 2)) / n
+        tl = torch.diagonal(L, dim1=1, dim2=2).sum(-1) - L.sum(dim=(1, 2)) / n
+        nu = tk * tl / float((n - 1) ** 3)
+    return T, nu, count
+
+
+@torch.no_grad()
+def hsic_permutation_null_matrix(
+    source_values: torch.Tensor,
+    residuals: torch.Tensor,
+    sigma=1.0,
+    adaptive_bandwidth: bool = False,
+    mode: str = "biased",
+    source_kernel: str = "rbf",
+    bandwidth_multipliers: Optional[Sequence[float]] = None,
+) -> torch.Tensor:
+    """Exact permutation-null mean of the biased HSIC, per pair (closed form).
+
+    For a uniform permutation pi of the residual rows,
+    ``E_pi[tr(K~ P L~ P^T)] = tr(K~) tr(L~) / (n - 1)`` (K~, L~ centred), so
+    with the ``1 / (n - 1)^2`` normalisation of :func:`hsic`::
+
+        nu[t, s] = tr(K~_s) tr(L~_t) / (n - 1)^3
+
+    Same layout as :func:`hsic_pair_matrix` (row = residual, col = source).
+    Cost O(n^2) per VARIABLE (not per pair).  Detached: the null is a scale,
+    never a quantity to optimise.  Only the biased estimator is supported.
+    """
+    if mode != "biased":
+        raise ValueError("hsic_permutation_null_matrix supports mode='biased' only.")
+    n = source_values.shape[0]
+    if n < 3:
+        raise ValueError("Permutation null needs at least 3 samples.")
+    tk = _centered_kernel_traces(source_values, sigma, adaptive_bandwidth,
+                                 bandwidth_multipliers, side=0,
+                                 dirac=(source_kernel == "dirac"))
+    tl = _centered_kernel_traces(residuals, sigma, adaptive_bandwidth,
+                                 bandwidth_multipliers, side=1)
+    return torch.outer(tl, tk) / float((n - 1) ** 3)
+
+
 def hsic_per_token(
     s_values: torch.Tensor,
     residuals: torch.Tensor,

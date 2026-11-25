@@ -185,7 +185,13 @@ def _toy_forecaster(scores):
 
     model = types.SimpleNamespace()
     state = {"orient": "causal"}
-    model.set_order_orientation = lambda o: state.__setitem__("orient", o)
+    state["seen"] = []
+
+    def _set_orient(o):
+        state["orient"] = o
+        state["seen"].append(o)
+    model.set_order_orientation = _set_orient
+    model._orient_state = state
     model.order_attention = lambda: oa
 
     def _lean_pred(S, Xin, overrides=None):
@@ -223,6 +229,8 @@ def test_dual_logratio_prefers_true_order_and_has_order_gradient():
             assert oa.order_scores.grad is not None
             assert oa.order_scores.grad.abs().sum() > 0
         assert f._last_anti_adjacency_stats["A"] >= 0.0
+        # Parents-only regression: no anti-causal forward is ever run.
+        assert "anticausal" not in f.model._orient_state["seen"]
     assert vals["true"] < vals["rev"]
 
 

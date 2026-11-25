@@ -14,7 +14,7 @@ set -euo pipefail
 
 # ---- Paths --------------------------------------------------------------
 PROJ_HOME="$HOME/causaliT" # Absolute project root on Euler (causaliT installed with pip install -e .); on PYTHONPATH in jobs
-EXPERIMENT_ID="exp1" # Folder relative to $PROJ_HOME/experiments; flat or nested path
+EXPERIMENT_ID="${EXPERIMENT_ID:-exp1}" # Folder relative to $PROJ_HOME/experiments; flat or nested path; env var overrides
 INPUTS=("config*.yaml" "dagsweep*.yaml" "atesweep*.yaml" "sweeper/sweep.yaml") # Globs (relative to experiment) frozen into the run
 DATA_DIR="$PROJ_HOME/data" # Folder holding <data.dataset>/ (as causaliT.cli); never copied; ignored by dagsweep
 SCRATCH_ROOT="$SCRATCH" # A new run folder is created here

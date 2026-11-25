@@ -209,6 +209,14 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     "recon.gate_opt / structure.gate_opt / structure.order_sampling.")
         mkw.update(resolve_gate_opts(config))
         self.model = AttentionSelectorLayer(**mkw)
+        transition = config['training'].get('struct_selector_transition', {})
+        self._selector_transition_epochs = int(transition.get('epochs', 0))
+        if self._selector_transition_epochs < 0 or transition.get('schedule', 'linear') != 'linear':
+            raise ValueError('Selector transition requires nonnegative epochs and linear schedule.')
+        oa = self.model.order_attention()
+        if self._selector_transition_epochs and (oa is None or not oa.directional_free):
+            raise ValueError('Selector transition requires directional_free.')
+        self._set_selector_transition(0)
 
         # ----------------------------------------------------------------
         # Query centroid initialisation (see AttentionSelectorLayer
@@ -2188,7 +2196,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
             x_val = torch.cat([S[:, :, self.val_idx], x_val], dim=1)   # (B, N)
 
         # Forward Ã¢â‚¬â€ returns (pred_x, attention_weights, aux_dict)
-        pred_x, attention_weights, aux = self.forward(S, X)
+        if getattr(self, 'separate_structure_forward', False):
+            from causaliT.training.order_path_training import forward_policy
+            with forward_policy(self.model, structural=False):
+                pred_x, attention_weights, aux = self.forward(S, X)
+        else:
+            pred_x, attention_weights, aux = self.forward(S, X)
 
         # Soft adjacency for structure diagnostics (PeriodicDAGMetrics).
         # THE ONLY valid source on this architecture: phi/dag_mask are
@@ -2205,6 +2218,27 @@ class AttentionSelectorForecaster(pl.LightningModule):
         x_target = torch.nan_to_num(x_val)
         mse_per_elem = self.loss_fn(pred_x.squeeze(), x_target.squeeze())
         loss_x = mse_per_elem.mean()
+        if getattr(self.model, 'dual_order_regressors', False):
+            # The causal prediction remains the source of legacy fit metrics.
+            # Both full heads train by MSE; HSIC never trains either head.
+            from causaliT.training.order_path_training import forward_policy
+            oa = self.model.order_attention()
+            previous_orientation = oa.orientation
+            try:
+                self.model.set_order_orientation('anticausal')
+                with forward_policy(self.model, structural=False):
+                    pred_a = self.forward(S, X)[0]
+            finally:
+                self.model.set_order_orientation(previous_orientation)
+            loss_a = self.loss_fn(pred_a.squeeze(), x_target.squeeze()).mean()
+            for name, value in (('causal', loss_x), ('anticausal', loss_a)):
+                self.log(f'{stage}_recon_mse_{name}', value, on_step=False, on_epoch=True)
+            target_flat = x_target.reshape(-1)
+            sst = (target_flat - target_flat.mean()).square().sum().clamp_min(1e-12)
+            for name, prediction in (('causal', pred_x), ('anticausal', pred_a)):
+                r2 = 1 - (prediction.reshape(-1) - target_flat).square().sum() / sst
+                self.log(f'{stage}_recon_r2_{name}', r2, on_step=False, on_epoch=True)
+            loss_x = 0.5 * (loss_x + loss_a)
         if stage == "val":
             self._log_nodewise_validation_mse(
                 pred_x, x_target, S.shape[1] if self.homogeneous_nodes else 0,
@@ -2248,12 +2282,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # back silently to the in-batch residual when disabled or unavailable
         # (e.g. validation, or the fold loader was never installed).
         xfit = self._next_cross_fit_batch() if stage == "train" else None
+        if getattr(self, 'separate_structure_forward', False):
+            if stage == 'train' and xfit is None:
+                raise RuntimeError('Separate structure forward requires cross-fit data.')
+            xfit = xfit if xfit is not None else (S, X)
         if xfit is not None:
             S_h, X_h = xfit[0], xfit[1]
             x_val_h = X_h[:, :, self.val_idx]
             if self.homogeneous_nodes:
                 x_val_h = torch.cat([S_h[:, :, self.val_idx], x_val_h], dim=1)
-            pred_h = self.forward(S_h, X_h)[0]
+            if getattr(self, 'separate_structure_forward', False):
+                from causaliT.training.order_path_training import forward_policy
+                sampling = self.config.get('adaptive_training', {}).get(
+                    'structure', {}).get('order_sampling', 'soft')
+                with forward_policy(self.model, structural=True, order_sampling=sampling):
+                    pred_h = self.forward(S_h, X_h)[0]
+            else:
+                pred_h = self.forward(S_h, X_h)[0]
             target_h = torch.nan_to_num(x_val_h)
             residuals = target_h.squeeze() - pred_h.squeeze()
             if self.homogeneous_nodes:
@@ -2393,8 +2438,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 S_d, X_d = S, X
             ctx = torch.no_grad() if stage != "train" else torch.enable_grad()
             with ctx:
+                # BKD: restrict the pair set to nodes kept this step (row 0
+                # of the pair mask is the per-node keep vector).  None when
+                # BKD is off, in val, or hsic_bkd_exclude_dropped is false.
                 hsic_value = self._anti_adjacency_hsic(
-                    S_d, X_d, causal=(combined_source, residuals))
+                    S_d, X_d, causal=(combined_source, residuals),
+                    keep=None if bkd_keep_mask is None else bkd_keep_mask)
             self._last_hsic_row_means = (
                 self._last_anti_adjacency_stats["rows"] if self.log_hsic_rows else None)
         elif pair_mask_empty:
@@ -2932,8 +2981,19 @@ class AttentionSelectorForecaster(pl.LightningModule):
                      on_step=False, on_epoch=True)
             self.log(f"{stage}_hsic_anticausal", self._last_anti_adjacency_stats["A"],
                      on_step=False, on_epoch=True)
+            for component in ('causal', 'anticausal'):
+                self.log(f"{stage}_hsic_{component}_log_term",
+                         self._last_anti_adjacency_stats[component + '_log_term'],
+                         on_step=False, on_epoch=True)
             self.log(f"{stage}_anti_adjacency_obj", hsic_value.detach(),
                      on_step=False, on_epoch=True)
+            if (getattr(self, 'anti_adjacency_support', 'order') == 'graph'
+                    or getattr(self, 'anti_adjacency_null', 'global') == 'per_pair'):
+                for key in ('nu', 'nu_a', 'c_pairs', 'a_pairs', 'unconnected_pairs',
+                            'cycle', 'c_floor_frac', 'a_cap_frac'):
+                    self.log(f"{stage}_anti_adjacency_{key}",
+                             float(self._last_anti_adjacency_stats[key]),
+                             on_step=False, on_epoch=True)
         if self.hsic_weight_descendants_only:
             # Fraction of pairs currently classed as descendants, i.e. the only
             # pairs whose attention receives gradient.  Watch for drift: -> 0
@@ -3338,6 +3398,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
             return None
         if self.homogeneous_nodes:
             keeps = [k for k in (cross_keep, self_keep) if k is not None]
+            if any(k.dim() == 2 for k in keeps):
+                # Order-guided BKD: per-pair keep (child <- parent) already.
+                pair = torch.ones(n_targets, n_sources, device=device)
+                for k in keeps:
+                    k = k.to(device=device, dtype=torch.float32)
+                    k = k if k.dim() == 2 else k.view(1, -1).expand_as(pair)
+                    if k.shape != pair.shape:
+                        return None
+                    pair = torch.minimum(pair, k)
+                return pair.detach()
             col = keeps[0].to(device=device, dtype=torch.float32)
             for k in keeps[1:]:
                 col = torch.minimum(col, k.to(device=device, dtype=torch.float32))
@@ -3542,6 +3612,19 @@ class AttentionSelectorForecaster(pl.LightningModule):
         cross-fitting is off or no fold loader is installed -- e.g. under a
         trainer that never called ``set_hsic_cross_fit``.
         """
+        # Adaptive ``joint`` phase: the structure split (installed by the
+        # PhaseController) takes precedence over the HSIC fold B.
+        joint_loader = getattr(self, "_joint_struct_loader", None)
+        if joint_loader is not None:
+            try:
+                if self._joint_struct_iter is None:
+                    self._joint_struct_iter = iter(joint_loader)
+                batch = next(self._joint_struct_iter)
+            except StopIteration:
+                self._joint_struct_iter = iter(joint_loader)
+                batch = next(self._joint_struct_iter)
+            return [b.to(self.device) if torch.is_tensor(b) else b for b in batch]
+
         if not self.hsic_cross_fit:
             return None
 
@@ -4845,6 +4928,12 @@ class AttentionSelectorForecaster(pl.LightningModule):
         """
         self.model.reassert_frozen_query_rows()
 
+    def _set_selector_transition(self, epoch):
+        oa = self.model.order_attention()
+        if oa is not None and getattr(oa, 'directional_free', False):
+            n = self._selector_transition_epochs
+            oa.selector_transition_m = max(0.0, 1.0 - epoch / n) if n else 0.0
+
     def on_train_epoch_start(self):
         """Advance the fan-in squeeze and write ``mu(t)`` onto every module.
 
@@ -4852,9 +4941,67 @@ class AttentionSelectorForecaster(pl.LightningModule):
         clock increment, so the first epoch always sees ``mu(0) = 1`` and the
         centroid initialisation is untouched.
         """
+        self._set_selector_transition(self.current_epoch)
+        oa = self.model.order_attention()
+        if oa is not None and hasattr(oa, 'order_tau_rho'):
+            self.log('order/tau_rho', oa.order_tau_rho.detach(), on_epoch=True)
+        if oa is not None and getattr(oa, 'directional_free', False):
+            self.log('selector/transition_m', oa.selector_transition_m, on_epoch=True)
+            self.log('selector/direction_mean', oa.directional_gate().mean(), on_epoch=True)
         self.fanin_schedule.on_epoch_start(self.model)
         for name, value in self.fanin_schedule.metrics(self.model).items():
             self.log(name, value, on_step=False, on_epoch=True)
+
+    def _causal_reference_backward(self, loss_structural: torch.Tensor) -> None:
+        """Protect the causal score update and, separately, scalar temperature.
+
+        Other parameters retain ordinary gradients. C scores retain their
+        existing weight-protected residual rule; temperature retains raw C.
+        The signed A gradient is auxiliary, projected against that reference.
+        """
+        from causaliT.training.order_path_training import protect_weight
+        oa = self.model.order_attention()
+        params = [oa.order_scores]
+        labels = ['scores']
+        tau = getattr(oa, 'order_tau_rho', None)
+        if tau is None:
+            tau = getattr(oa, 'order_log_tau', None)
+        if tau is not None and tau.requires_grad:
+            params.append(tau)
+            labels.append('rho' if hasattr(oa, 'order_tau_rho') else 'log_tau')
+        paths = [self._c_weight_loss, self._c_residual_loss,
+                 self._a_weight_loss, self._a_residual_loss]
+        gradients = [torch.autograd.grad(loss, params, retain_graph=True) for loss in paths]
+        scale, = torch.autograd.grad(loss_structural, self._c_path_loss, retain_graph=True)
+        corrections = []
+        for i, label in enumerate(labels):
+            cw, cr, aw, ar = [g[i] for g in gradients]
+            reference = cw + protect_weight(cw, cr) if i == 0 else cw + cr
+            auxiliary = aw + ar
+            kept = protect_weight(reference, auxiliary)
+            raw = cw + cr + auxiliary
+            applied = reference + kept
+            corrections.append((applied - raw).detach())
+            prefix = 'path/anticausal_' + label
+            dot = (reference * auxiliary).sum()
+            metrics = {
+                'cosine': dot / (reference.norm() * auxiliary.norm()).clamp_min(1e-24),
+                'conflict': (dot < 0).float(),
+                'removed_norm': (auxiliary - kept).norm(),
+                'reference_norm': reference.norm(),
+                'applied_norm': applied.norm(),
+            }
+            for name, gradient in zip(('cw', 'cr', 'aw', 'ar'), (cw, cr, aw, ar)):
+                metrics[name + '_norm'] = gradient.norm()
+                if i > 0:
+                    metrics[name] = gradient
+            if i > 0:
+                metrics.update(raw=raw, applied=applied, reference=reference)
+            for name, value in metrics.items():
+                self.log(prefix + '/' + name, value.detach(), on_epoch=True)
+        self.manual_backward(loss_structural)
+        for param, correction in zip(params, corrections):
+            param.grad.add_(scale.detach() * correction)
 
     def _structural_backward(self, loss_structural: torch.Tensor) -> None:
         """Structural backward, with optional PCGrad gradient surgery.
@@ -4879,6 +5026,26 @@ class AttentionSelectorForecaster(pl.LightningModule):
         # GT mask bypasses every structural parameter).  Structure phases are
         # then logging-only windows; skip the backward (grads stay None).
         if not loss_structural.requires_grad:
+            return
+        if getattr(self, 'order_path_surgery', False):
+            if getattr(self, 'order_anticausal_surgery', False):
+                self._causal_reference_backward(loss_structural)
+                return
+            from causaliT.training.order_path_training import protect_weight
+            scores = self.model.order_attention().order_scores
+            gw, = torch.autograd.grad(self._c_weight_loss, scores, retain_graph=True)
+            gr, = torch.autograd.grad(self._c_residual_loss, scores, retain_graph=True)
+            scale, = torch.autograd.grad(loss_structural, self._c_path_loss,
+                                         retain_graph=True)
+            corrected = protect_weight(gw, gr)
+            self.log('path/cosine', (gw * gr).sum() /
+                     (gw.norm() * gr.norm()).clamp_min(1e-24), on_epoch=True)
+            self.log('path/conflict', ((gw * gr).sum() < 0).float(), on_epoch=True)
+            self.log('path/weight_norm', gw.norm(), on_epoch=True)
+            self.log('path/residual_norm', gr.norm(), on_epoch=True)
+            self.log('path/correction_norm', (corrected - gr).norm(), on_epoch=True)
+            self.manual_backward(loss_structural)
+            scores.grad.add_(scale.detach() * (corrected - gr).detach())
             return
         if not self.gradient_surgery:
             self.manual_backward(loss_structural)
@@ -5032,6 +5199,108 @@ class AttentionSelectorForecaster(pl.LightningModule):
 
         opt.step()
 
+    def set_joint_structure_loader(self, loader) -> None:
+        """Install (or clear with None) the structure-split side loader of the
+        adaptive ``joint`` phase.  While set, the HSIC residual of every train
+        step is computed on a batch from this loader (out-of-sample w.r.t. the
+        reconstruct split that drives the MSE), and the structural loss never
+        reaches the reconstruction parameters.  Incompatible with
+        ``structural_grad='hsic_unrolled'``."""
+        if loader is not None and self.structural_grad == "hsic_unrolled":
+            raise ValueError(
+                "The adaptive 'joint' phase does not support "
+                "training.structural_grad='hsic_unrolled'.")
+        self._joint_struct_loader = loader
+        self._joint_struct_iter = None
+
+    def _fractional_epoch(self, batch_idx: int = 0) -> float:
+        """current_epoch + batch_idx / batches per epoch.
+
+        global_step is NOT used: with manual optimization every optimizer
+        step advances it (two optimizers -> twice per batch), which ran the
+        schedules at double speed.
+        """
+        trainer = getattr(self, "_trainer", None)
+        n = getattr(trainer, "num_training_batches", None) if trainer is not None else None
+        if not n or not math.isfinite(float(n)):
+            return float(self.current_epoch)
+        return float(self.current_epoch) + min(float(batch_idx), float(n)) / float(n)
+
+    def _parse_order_tau_schedule(self) -> Optional[Dict[str, float]]:
+        """training.order_tau_schedule: fixed cosine (log-space) tau anneal
+        for the standard trainer; requires a non-learnable tau."""
+        cfg = self.config.get("training", {}).get("order_tau_schedule", None)
+        if not cfg:
+            return None
+        cfg = dict(cfg)
+        unknown = set(cfg) - {"tau_start", "tau_end", "start_epoch", "anneal_epochs"}
+        if unknown:
+            raise ValueError(f"training.order_tau_schedule: unknown keys {sorted(unknown)}.")
+        out = {k: float(cfg[k]) for k in ("tau_start", "tau_end", "start_epoch",
+                                          "anneal_epochs")}
+        if out["tau_start"] <= 0 or out["tau_end"] <= 0:
+            raise ValueError("order_tau_schedule tau_start / tau_end must be > 0.")
+        if out["start_epoch"] < 0 or out["anneal_epochs"] < 0:
+            raise ValueError("order_tau_schedule start_epoch / anneal_epochs must be >= 0.")
+        oa = self.model.order_attention()
+        if oa is None:
+            raise ValueError("order_tau_schedule requires OrderFactorizedSelfAttention.")
+        if oa.tau_learnable:
+            raise ValueError("order_tau_schedule requires experiment.order_tau_learnable: false.")
+        return out
+
+    def _parse_order_window_schedule(self) -> Optional[Dict[str, float]]:
+        """training.order_window_schedule: cosine anneal of the banded
+        Sinkhorn half-width (rounded to an integer, w >= 1)."""
+        cfg = self.config.get("training", {}).get("order_window_schedule", None)
+        if not cfg:
+            return None
+        cfg = dict(cfg)
+        unknown = set(cfg) - {"w_start", "w_end", "start_epoch", "anneal_epochs"}
+        if unknown:
+            raise ValueError(f"training.order_window_schedule: unknown keys {sorted(unknown)}.")
+        out = {k: float(cfg[k]) for k in ("w_start", "w_end", "start_epoch", "anneal_epochs")}
+        if out["w_start"] < 1 or out["w_end"] < 1:
+            raise ValueError("order_window_schedule w_start / w_end must be >= 1.")
+        if out["start_epoch"] < 0 or out["anneal_epochs"] < 0:
+            raise ValueError("order_window_schedule start_epoch / anneal_epochs must be >= 0.")
+        if self.model.order_attention() is None:
+            raise ValueError("order_window_schedule requires OrderFactorizedSelfAttention.")
+        return out
+
+    def _update_bkd_guide(self, batch_idx: int = 0) -> None:
+        """Per-step schedules from the fractional epoch: order-guided BKD
+        ramp (persistent buffer) and the fixed cosine tau anneal.  Both are
+        recomputed from global_step, so resume and validation see the value
+        of the last training step."""
+        oa = self.model.order_attention() if hasattr(self.model, "order_attention") else None
+        if oa is None:
+            return
+        if not hasattr(self, "_order_tau_schedule"):
+            self._order_tau_schedule = self._parse_order_tau_schedule()
+            self._order_window_schedule = self._parse_order_window_schedule()
+        guided = getattr(oa, "bkd_guide", None) is not None
+        sched = self._order_tau_schedule
+        wsch = self._order_window_schedule
+        if not guided and sched is None and wsch is None:
+            return
+        epoch = self._fractional_epoch(batch_idx)
+        if wsch is not None:
+            from causaliT.core.modules.extra_layers import bkd_guide_fraction
+            s = bkd_guide_fraction(epoch, wsch["start_epoch"], wsch["anneal_epochs"])
+            w = int(round(wsch["w_start"] + s * (wsch["w_end"] - wsch["w_start"])))
+            oa.set_order_window(max(1, w))
+            self.log("order/window", float(w), on_step=False, on_epoch=True)
+        if guided:
+            s = self.model.set_bkd_guide_epoch(epoch)
+            self.log("bkd/guide_frac", float(s), on_step=False, on_epoch=True)
+        if sched is not None:
+            from causaliT.core.modules.extra_layers import cosine_log_anneal
+            tau = cosine_log_anneal(epoch, sched["tau_start"], sched["tau_end"],
+                                    sched["start_epoch"], sched["anneal_epochs"])
+            oa.set_order_temperature(tau=tau)
+            self.log("order/tau", float(tau), on_step=False, on_epoch=True)
+
     def set_recon_order_sampling(self, enabled: bool, p_anticausal: float = 0.5) -> None:
         """Oriented recon sampling (docs/ideas/ORIENTED_RECON_SAMPLING.md):
         when enabled, every training step draws ONE orientation (anticausal
@@ -5073,6 +5342,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         resample = getattr(self.model, "resample", None)
         if callable(resample):
             resample()
+        self._update_bkd_guide(batch_idx)
 
         if self.use_gradient_routing:
 
@@ -5142,9 +5412,16 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 self._structural_backward(loss_structural)
 
             # Restore recon grads on reconstruction params
+            # Reconstruction params WITHOUT a recon gradient must not keep a
+            # structural one (relevant when both groups train, i.e. the
+            # adaptive 'joint' phase: the regressor is a frozen nuisance for
+            # the structural loss).  Shared selector params are exempt.
+            _shared_ids = {id(p) for p in self._shared_selector_params}
             for p in self._reconstruction_params:
                 if id(p) in _saved_recon_grads:
                     p.grad = _saved_recon_grads[id(p)]
+                elif id(p) not in _shared_ids:
+                    p.grad = None
 
             # Nodewise winner-take-all: select the top-SNR query nodes, mask
             # the other rows, and snapshot them (params + optimizer state) so
@@ -5440,6 +5717,112 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 "anti_adjacency_lambda > 0 replaces the HSIC aggregation: set "
                 f"hsic_aggregation: plain (got {self.hsic_aggregation!r}).")
         self.anti_adjacency_eps = float(tr.get("anti_adjacency_eps", 0.1))
+        # anti_adjacency_mode: causal_only (A from the causal residuals,
+        # default) | legacy_anticausal (A from a separate anti-causal
+        # forward, pre-ORDER_FIRST_3 behaviour; counterfactual).
+        self.anti_adjacency_mode = str(tr.get("anti_adjacency_mode", "causal_only"))
+        if self.anti_adjacency_mode not in ("causal_only", "legacy_anticausal"):
+            raise ValueError(
+                f"anti_adjacency_mode must be causal_only or legacy_anticausal, "
+                f"got {self.anti_adjacency_mode!r}.")
+        # anti_adjacency_terms: both (C - a log A, default) | causal (C only,
+        # A still logged for monitoring).
+        self.anti_adjacency_terms = str(tr.get("anti_adjacency_terms", "both"))
+        self.separate_structure_forward = bool(tr.get('separate_structure_forward', False))
+        self.order_path_surgery = bool(tr.get('order_path_surgery', False))
+        self.order_anticausal_surgery = bool(tr.get('order_anticausal_surgery', False))
+        if getattr(self.model, 'dual_order_regressors', False):
+            if (not self.separate_structure_forward or self.anti_adjacency_terms != 'both'
+                    or self.anti_adjacency_mode != 'legacy_anticausal'):
+                raise ValueError('Dual regressors require separate forwards and both '
+                                 'terms with legacy_anticausal regression.')
+        if self.order_anticausal_surgery:
+            if (not self.order_path_surgery or self.anti_adjacency_terms != 'both'
+                    or self.anti_adjacency_mode != 'legacy_anticausal'
+                    or tr.get('anti_adjacency_detach_a_residuals', False)):
+                raise ValueError('Anticausal surgery requires path surgery, both terms, '
+                                 'legacy_anticausal and active A residuals.')
+        if self.separate_structure_forward:
+            if (not tr.get('use_gradient_routing', False)
+                    or not tr.get('hsic_cross_fit', False)
+                    or tr.get('structural_grad', 'hsic') not in ('hsic', 'hsic_unrolled')
+                    or not self.anti_adjacency_on):
+                raise ValueError('Separate forwards require routing, cross-fitting, hsic and active order loss.')
+            if (tr.get('structural_grad', 'hsic') == 'hsic_unrolled'
+                    and (self.anti_adjacency_terms != 'causal'
+                         or self.anti_adjacency_mode != 'causal_only')):
+                # The unrolled path split covers the causal term only.
+                raise ValueError('hsic_unrolled with separate forwards requires '
+                                 'anti_adjacency_terms=causal and mode=causal_only.')
+        if self.order_path_surgery:
+            if (not self.separate_structure_forward
+                    or (self.anti_adjacency_terms != 'causal' and not self.order_anticausal_surgery)
+                    or tr.get('detach_order_mask', False)
+                    or tr.get('anti_adjacency_detach_c_residuals', False)
+                    or tr.get('gradient_surgery', False)):
+                raise ValueError('Path surgery requires separate forwards and both C paths active.')
+        if self.anti_adjacency_terms not in ("both", "causal"):
+            raise ValueError(
+                f"anti_adjacency_terms must be both or causal, "
+                f"got {self.anti_adjacency_terms!r}.")
+        # anti_adjacency_detach_a_residuals: the A term loses its residual
+        # path and contributes only through M.
+        self.anti_adjacency_detach_a_residuals = bool(
+            tr.get("anti_adjacency_detach_a_residuals", False))
+        # anti_adjacency_detach_c_residuals: the C term loses its residual
+        # path (mirror of the A flag; with terms=causal the order learns
+        # only through the M weighting).
+        self.anti_adjacency_detach_c_residuals = bool(
+            tr.get("anti_adjacency_detach_c_residuals", False))
+        # anti_adjacency_support: order (all pairs, legacy) | graph (C adds
+        # both directions of pairs unconnected in the step's hard edge
+        # closure; A restricted to selected pairs).  Identical without G_S.
+        self.anti_adjacency_support = str(tr.get("anti_adjacency_support", "order"))
+        if self.anti_adjacency_support not in ("order", "graph"):
+            raise ValueError("anti_adjacency_support must be order or graph.")
+        # anti_adjacency_nd: soft (legacy: pair tests weighted by the relaxed
+        # order M) | hard (tests use the step's hard order, the same one the
+        # regressor conditions on, with a straight-through soft gradient;
+        # pair weights ignore G_S so ND(i) = all earlier nodes, while the
+        # regression set Pa(i) = earlier AND selected).
+        self.anti_adjacency_nd = str(tr.get("anti_adjacency_nd", "soft"))
+        if self.anti_adjacency_nd not in ("soft", "hard"):
+            raise ValueError("anti_adjacency_nd must be soft or hard.")
+        # anti_adjacency_test: pairwise (legacy: HSIC(x_j, r_i) per pair) |
+        # joint (RESIT: one HSIC per node between r_i and the JOINT set of
+        # its hard non-descendants; product-RBF kernel, per-node null).
+        self.anti_adjacency_test = str(tr.get("anti_adjacency_test", "pairwise"))
+        if self.anti_adjacency_test not in ("pairwise", "joint"):
+            raise ValueError("anti_adjacency_test must be pairwise or joint.")
+        if self.anti_adjacency_test == "joint" and (
+                self.anti_adjacency_nd != "hard"
+                or self.anti_adjacency_terms != "causal"
+                or self.anti_adjacency_mode != "causal_only"
+                or str(tr.get("hsic_mode", "biased")) != "biased"):
+            raise ValueError("anti_adjacency_test=joint requires anti_adjacency_nd=hard, "
+                             "terms=causal, mode=causal_only and hsic_mode=biased.")
+        # anti_adjacency_null: global (scalar nu) | per_pair (exact closed-form
+        # permutation-null mean of each pair, biased HSIC only).
+        self.anti_adjacency_null = str(tr.get("anti_adjacency_null", "global"))
+        if self.anti_adjacency_null not in ("global", "per_pair"):
+            raise ValueError("anti_adjacency_null must be global or per_pair.")
+        if self.anti_adjacency_null == "per_pair" and str(tr.get("hsic_mode", "biased")) != "biased":
+            raise ValueError("anti_adjacency_null=per_pair requires hsic_mode: biased.")
+        # Ratio clipping: floor C/nu at 1 (no gradient below the null),
+        # cap A/nu at kappa (no gain beyond clear dependence).
+        self.anti_adjacency_ratio_floor = bool(tr.get("anti_adjacency_ratio_floor", False))
+        cap = tr.get("anti_adjacency_ratio_cap", None)
+        self.anti_adjacency_ratio_cap = None if cap is None else float(cap)
+        if self.anti_adjacency_ratio_cap is not None and self.anti_adjacency_ratio_cap <= 0:
+            raise ValueError("anti_adjacency_ratio_cap must be > 0 or null.")
+        # anticausal_selector_grad: raw (A trains G_S too) | none (G_S
+        # detached in the anti-causal pass; A trains the order only).
+        self.anticausal_selector_grad = str(tr.get("anticausal_selector_grad", "raw"))
+        if self.anticausal_selector_grad not in ("raw", "none"):
+            raise ValueError("anticausal_selector_grad must be raw or none.")
+        # order_tau_lr_mult: lr multiplier of the learnable Sinkhorn log tau
+        # (own param group of the structural optimizer).
+        self.order_tau_lr_mult = float(tr.get("order_tau_lr_mult", 1.0))
         # detach_order_mask: the order weight M of the log-ratio is detached
         # (ablation); the order then learns only through the residuals.
         self.detach_order_mask = bool(tr.get("detach_order_mask", False))
@@ -5458,18 +5841,24 @@ class AttentionSelectorForecaster(pl.LightningModule):
         target = torch.nan_to_num(x_val).squeeze()
         return target, target - pred.squeeze()
 
-    def _anti_adjacency_hsic(self, S, X, overrides=None, causal=None):
+    def _anti_adjacency_hsic(self, S, X, overrides=None, causal=None, keep=None):
         """Causal / anti-causal log-ratio objective (lower = better order).
         Active only for anti_adjacency_lambda > 0.
 
+        ONE causal forward: every node regresses on its EARLIER nodes only.
         For every unordered pair e = (i, j), with M[i, j] = P(i before j)
-        (relaxed, gradient-carrying) and residual matrices
+        (relaxed, gradient-carrying) and residual matrix
         H[t, s] = HSIC(x_s, r_t):
 
-            C_e = M_ij H^c[j, i] + M_ji H^c[i, j]   (later causal residual
-                                                      vs earlier node: low)
-            A_e = M_ij H^a[i, j] + M_ji H^a[j, i]   (earlier anti-causal
-                                                      residual vs later: high)
+            C_e = M_ij H[j, i] + M_ji H[i, j]   (later residual vs earlier
+                                                  node: low)
+            A_e = M_ij H[i, j] + M_ji H[j, i]   (earlier residual vs later
+                                                  node: high for descendants,
+                                                  via innovation propagation)
+
+        Regressing on LATER nodes (former anti-causal forward) is not used:
+        the regressors carry their own innovations, which then enter the
+        residual and make A high regardless of the true graph.
             L   = sum_e w_e [log(eps + C_e/nu) - a log(eps + A_e/nu)] / sum_e w_e
 
         a = anti_adjacency_lambda (> 0).
@@ -5477,6 +5866,10 @@ class AttentionSelectorForecaster(pl.LightningModule):
         nu = permutation-null mean of the current phase (1.0 before the first
         calibration).  ``causal`` optionally passes precomputed causal
         ``(target, residuals)`` (the cross-fit forward of ``_step``).
+        ``keep`` optionally passes the (N,) BKD keep vector of this step: a
+        pair counts only if BOTH nodes were kept (w_e *= keep_i * keep_j),
+        so dropped nodes neither pay nor push the order and the C/A
+        symmetry is preserved.  With < 2 kept nodes the loss is an exact 0.
         Full derivation and gradient flow: docs/documentation/ANTI_ADJACENCY_LOSS.md.
         """
         if causal is None:
@@ -5484,11 +5877,21 @@ class AttentionSelectorForecaster(pl.LightningModule):
         else:
             target, r_c = causal
         oa = self.model.order_attention()
-        _, r_a = self._order_residuals(S, X, overrides, "anticausal")
         M = oa._last_M                      # causal relaxed order, same noise
+        hard_nd = getattr(self, 'anti_adjacency_nd', 'soft') == 'hard'
+        if hard_nd:
+            # Forward value = hard order of this step (the regressor's order);
+            # gradient = relaxed order (straight-through).
+            M = oa._last_M_hard.to(M) + M - M.detach()
         if self.detach_order_mask:
             M = M.detach()                  # ablation: no gradient via weights
         pi = oa._last_pi.detach()
+        if hard_nd:
+            # ND(i) is every earlier node, selected or not: G_S must not
+            # censor the independence tests (it only defines Pa(i)).
+            pi = torch.ones_like(pi)
+        if getattr(self, 'anti_adjacency_test', 'pairwise') == 'joint':
+            return self._joint_nd_hsic(target, r_c, M, keep)
 
         if self._hsic_bw_frozen_sigmas is not None:
             sigma, adaptive = self._hsic_bw_frozen_sigmas, False
@@ -5500,31 +5903,210 @@ class AttentionSelectorForecaster(pl.LightningModule):
                   bandwidth_multipliers=self.hsic_bandwidth_multipliers,
                   return_matrix=True)
         H_c = torch.nan_to_num(hsic_cross_per_pair(target, r_c, **kw)[1])
-        H_a = torch.nan_to_num(hsic_cross_per_pair(target, r_a, **kw)[1])
 
-        Cd = M * H_c.transpose(0, 1)        # [i, j]: M_ij HSIC(x_i, r^c_j)
-        Ad = M * H_a                        # [i, j]: M_ij HSIC(x_j, r^a_i)
-        C = (Cd + Cd.transpose(0, 1)).clamp_min(0.0)
-        A = (Ad + Ad.transpose(0, 1)).clamp_min(0.0)
+        # anti_adjacency_detach_c_residuals: C keeps its M (weight) path
+        # but loses its residual path (mirror of the A-detach flag).
+        H_c_C = H_c.detach() if self.anti_adjacency_detach_c_residuals else H_c
+        # anti_adjacency_mode = legacy_anticausal restores the pre-patch A
+        # term built from a separate anti-causal forward (regress on LATER
+        # nodes); default causal_only reuses the causal residuals.
+        support = getattr(self, 'anti_adjacency_support', 'order')
+        if self.anti_adjacency_mode == "legacy_anticausal":
+            # anticausal_selector_grad = none: G_S is detached in this pass.
+            oa.anticausal_detach_direction = (
+                getattr(self, 'anticausal_selector_grad', 'raw') == 'none')
+            try:
+                if getattr(self, 'separate_structure_forward', False):
+                    # _step has already exited the causal forward's policy context.
+                    # Match its sampling and BKD policy, not the ambient recon state.
+                    from causaliT.training.order_path_training import forward_policy
+                    sampling = self.config.get('adaptive_training', {}).get(
+                        'structure', {}).get('order_sampling', 'soft')
+                    with forward_policy(self.model, structural=True, order_sampling=sampling):
+                        _, r_a = self._order_residuals(S, X, overrides, "anticausal")
+                else:
+                    _, r_a = self._order_residuals(S, X, overrides, "anticausal")
+            finally:
+                oa.anticausal_detach_direction = False
+            if self.anti_adjacency_detach_a_residuals:
+                r_a = r_a.detach()
+            H_a = torch.nan_to_num(hsic_cross_per_pair(target, r_a, **kw)[1])
+        else:
+            # anti_adjacency_detach_a_residuals: A keeps its M (weight) path
+            # but loses its residual path; C is untouched.
+            r_a = r_c
+            H_a = H_c.detach() if self.anti_adjacency_detach_a_residuals else H_c
 
-        stats = getattr(self, "hsic_null_stats", None)
-        nu = float(stats["mean"]) if stats and float(stats.get("mean", 0.0)) > 0.0 else 1.0
+        # Null scale.  global: scalar nu (permutation-null mean of the phase,
+        # 1.0 before calibration).  per_pair: exact closed-form permutation
+        # null of every pair on this batch (detached).
+        if getattr(self, 'anti_adjacency_null', 'global') == 'per_pair':
+            from causaliT.utils.hsic_utils import hsic_permutation_null_matrix
+            nkw = dict(sigma=sigma, adaptive_bandwidth=adaptive,
+                       source_kernel=self.hsic_kernel_source,
+                       bandwidth_multipliers=self.hsic_bandwidth_multipliers)
+            nu_c = hsic_permutation_null_matrix(target, r_c, **nkw).clamp_min(1e-12)
+            nu_a = (nu_c if r_a is r_c else
+                    hsic_permutation_null_matrix(target, r_a, **nkw).clamp_min(1e-12))
+            nu = float(nu_c.mean())
+        else:
+            stats = getattr(self, "hsic_null_stats", None)
+            nu = float(stats["mean"]) if stats and float(stats.get("mean", 0.0)) > 0.0 else 1.0
+            nu_c = nu_a = None
+
+        # Supports (detached).  order: every pair, order-weighted.  graph:
+        # pairs unconnected in the closure of the step's hard edge draw add
+        # both directed C tests; A only on selected pairs.
+        N = M.shape[0]
+        off = 1.0 - torch.eye(N, device=M.device, dtype=M.dtype)
+        U = sel = None
+        has_cycle = False
+        if support == 'graph':
+            from causaliT.training.order_path_training import graph_supports
+            U, sel, has_cycle = graph_supports(
+                oa.last_M_actual_hard.to(device=M.device, dtype=M.dtype))
         eps = self.anti_adjacency_eps
-        lr = (torch.log(eps + C / nu)
-              - self.anti_adjacency_lambda * torch.log(eps + A / nu))
-        off = 1.0 - torch.eye(lr.shape[0], device=lr.device, dtype=lr.dtype)
+        floor = getattr(self, 'anti_adjacency_ratio_floor', False)
+        cap = getattr(self, 'anti_adjacency_ratio_cap', None)
+
+        def pair_ratios(Mw, Hc, Ha):
+            """(C, A) pair ratios [i, j] (symmetric).  Directed entries are
+            divided by their own null before the pair sum (global: scalar)."""
+            rc = Hc.transpose(0, 1) / (nu if nu_c is None else nu_c.transpose(0, 1))
+            ra = Ha / (nu if nu_a is None else nu_a)
+            Cd = Mw * rc                    # [i, j]: M_ij HSIC(x_i, r_j) / nu
+            Ad = Mw * ra                    # [i, j]: M_ij HSIC(x_j, r^a_i) / nu
+            C_ = (Cd + Cd.transpose(0, 1)).clamp_min(0.0)
+            A_ = (Ad + Ad.transpose(0, 1)).clamp_min(0.0)
+            if U is not None:
+                # Unconnected pairs: each node is a non-descendant of the
+                # other, so both directed C tests hold (no order weight).
+                C_ = (1.0 - U) * C_ + U * (rc + rc.transpose(0, 1)).clamp_min(0.0)
+            if floor:
+                C_ = C_.clamp_min(1.0)
+            if cap is not None:
+                A_ = A_.clamp_max(cap)
+            return C_, A_
+
+        C, A = pair_ratios(M, H_c_C, H_a)
+        causal_log_term = torch.log(eps + C)
+        anticausal_log_term = -self.anti_adjacency_lambda * torch.log(eps + A)
+        # anti_adjacency_terms = causal drops the A term from the loss; A is
+        # still computed for the logged stats.
+        if self.anti_adjacency_terms == "causal":
+            anticausal_log_term = torch.zeros_like(causal_log_term)
+        lr = causal_log_term + anticausal_log_term
         w = pi * off
+        if keep is not None:
+            k = keep.detach().to(device=w.device, dtype=w.dtype)
+            if k.dim() == 2:
+                # Per-pair keep (child <- parent): a pair survives only if
+                # neither direction was dropped.
+                w = w * k * k.transpose(0, 1)
+            else:
+                k = k.view(-1)
+                w = w * k.view(-1, 1) * k.view(1, -1)
         triu = torch.triu(off, diagonal=1).bool()
-        w_sum = w[triu].sum().clamp_min(1e-12)
-        loss = (w[triu] * lr[triu]).sum() / w_sum
+        # Separate supports: C on every (kept) pair, A on selected pairs only
+        # (graph); each term is averaged over its own support.  With the
+        # order support both weights coincide and this equals the legacy
+        # single average of (C - a A).
+        w_c = w
+        w_a = w if sel is None else w * sel
+        wc_sum = w_c[triu].sum().clamp_min(1e-12)
+        wa_sum = w_a[triu].sum().clamp_min(1e-12)
+        # Empty support (e.g. BKD kept < 2 nodes, or no selected pair): the
+        # term is an exact 0 with zero gradient.
+        c_loss = (w_c[triu] * causal_log_term[triu]).sum() / wc_sum
+        a_loss = (w_a[triu] * anticausal_log_term[triu]).sum() / wa_sum
+        loss = c_loss + a_loss
+
+        if getattr(self, 'order_path_surgery', False) and torch.is_grad_enabled():
+            def c_path(Mw, Hc):
+                return (w_c[triu] * torch.log(eps + pair_ratios(Mw, Hc, H_a.detach())[0][triu])).sum() / wc_sum
+
+            def a_path(Mw, Ha):
+                return (w_a[triu] * torch.log(eps + pair_ratios(Mw, H_c.detach(), Ha)[1][triu])).sum() / wa_sum
+            self._c_path_loss = loss
+            self._c_weight_loss = c_path(M, H_c.detach())
+            self._c_residual_loss = c_path(M.detach(), H_c)
+            if getattr(self, 'order_anticausal_surgery', False):
+                # Signed coefficient of the A term included.
+                self._a_weight_loss = -self.anti_adjacency_lambda * a_path(M, H_a.detach())
+                self._a_residual_loss = -self.anti_adjacency_lambda * a_path(M.detach(), H_a)
 
         with torch.no_grad():
-            row_w = w.sum(dim=1).clamp_min(1e-12)
+            rows = ((w_c * causal_log_term).sum(dim=1) / w_c.sum(dim=1).clamp_min(1e-12)
+                    + (w_a * anticausal_log_term).sum(dim=1) / w_a.sum(dim=1).clamp_min(1e-12))
+            # C / A are null-normalised ratios (raw HSIC when nu = 1).
             self._last_anti_adjacency_stats = {
-                "C": float((w[triu] * C[triu]).sum() / w_sum),
-                "A": float((w[triu] * A[triu]).sum() / w_sum),
+                "C": float((w_c[triu] * C[triu]).sum() / wc_sum),
+                "A": float((w_a[triu] * A[triu]).sum() / wa_sum),
+                "causal_log_term": float(c_loss),
+                "anticausal_log_term": float(a_loss),
                 "nu": nu,
-                "rows": (w * lr).sum(dim=1) / row_w,
+                "nu_a": nu if nu_a is None else float(nu_a.mean()),
+                "c_pairs": float((w_c[triu] > 0).sum()),
+                "a_pairs": float((w_a[triu] > 0).sum()),
+                "unconnected_pairs": 0.0 if U is None else float(U[triu].sum()),
+                "cycle": float(has_cycle),
+                "c_floor_frac": float((C[triu] <= 1.0).float().mean()) if floor else 0.0,
+                "a_cap_frac": (float((A[triu][w_a[triu] > 0] >= cap).float().mean())
+                               if cap is not None and bool((w_a[triu] > 0).any()) else 0.0),
+                "rows": rows,
+            }
+        return loss
+
+    def _joint_nd_hsic(self, target, r_c, M, keep=None):
+        """Joint RESIT objective: one test per node, residual r_i vs the
+        JOINT set of its non-descendants X_ND(i) (hard order, ST gradient).
+
+            L = mean_i log(eps + T_i / nu_i),  i with |ND(i)| >= 1,
+
+        T_i = joint HSIC (product-RBF set kernel, see hsic_joint_masked),
+        nu_i = its exact permutation-null mean (detached).  Surgery paths:
+        weight = set weights live, residuals detached; residual = reverse.
+        """
+        from causaliT.utils.hsic_utils import hsic_joint_masked
+        if self._hsic_bw_frozen_sigmas is not None:
+            sigma, adaptive = self._hsic_bw_frozen_sigmas, False
+        else:
+            sigma, adaptive = self.hsic_sigma, self.hsic_adaptive_bandwidth
+        eps = self.anti_adjacency_eps
+        N = M.shape[0]
+        off = 1.0 - torch.eye(N, device=M.device, dtype=M.dtype)
+        W = M.transpose(0, 1) * off           # [t, s]: s earlier than t
+        if keep is not None:
+            k = keep.detach().to(W)
+            W = W * (k if k.dim() == 2 else k.view(1, -1) * k.view(-1, 1))
+
+        def node_loss(Wm, r):
+            T, nu, count = hsic_joint_masked(target, r, Wm, sigma=sigma,
+                                             adaptive_bandwidth=adaptive)
+            ratio = T / nu.clamp_min(1e-12)
+            if getattr(self, 'anti_adjacency_ratio_floor', False):
+                ratio = ratio.clamp_min(1.0)
+            valid = (count > 0.5).to(ratio.dtype)
+            loss = (valid * torch.log(eps + ratio.clamp_min(0.0))).sum() \
+                / valid.sum().clamp_min(1.0)
+            return loss, ratio, valid
+
+        loss, ratio, valid = node_loss(W, r_c)
+        if getattr(self, 'order_path_surgery', False) and torch.is_grad_enabled():
+            self._c_path_loss = loss
+            self._c_weight_loss = node_loss(W, r_c.detach())[0]
+            self._c_residual_loss = node_loss(W.detach(), r_c)[0]
+        with torch.no_grad():
+            rows = torch.where(valid > 0, torch.log(eps + ratio.clamp_min(0.0)),
+                               torch.zeros_like(ratio))
+            mean_ratio = float((valid * ratio).sum() / valid.sum().clamp_min(1.0))
+            self._last_anti_adjacency_stats = {
+                "C": mean_ratio, "A": 0.0,
+                "causal_log_term": float(loss), "anticausal_log_term": 0.0,
+                "nu": 1.0, "nu_a": 1.0,
+                "c_pairs": float(valid.sum()), "a_pairs": 0.0,
+                "unconnected_pairs": 0.0, "cycle": 0.0,
+                "c_floor_frac": 0.0, "a_cap_frac": 0.0, "rows": rows,
             }
         return loss
 
@@ -5627,7 +6209,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
             batch[0], batch[1], [t.shadow for t in self._commit.tables]
         )
 
-    def _darts_second_order_grads(self, S, X, targets):
+    def _darts_second_order_grads(self, S, X, targets, paths=False):
         """DARTS second-order gradient w.r.t. ``targets``
         (docs/ideas/BILEVEL_CENTROID_COMMIT.md).
 
@@ -5680,11 +6262,33 @@ class AttentionSelectorForecaster(pl.LightningModule):
                     if hasattr(m, "set_bkd_phase_active")]
         bkd_state = [getattr(m, "_bkd_phase_active", True) for m in bkd_mods]
 
+        # Separate structure forward: EVERY lean pass (refit, HSIC, FD) runs
+        # under the structural policy (step's hard order x G_S, BKD off), so
+        # the regressor is refit on, and the FiLM context equals, the
+        # conditioning sets of the first-order structural pass.  The stored
+        # step noise is reused (no resample), so all passes share one mask.
+        if getattr(self, 'separate_structure_forward', False):
+            from causaliT.training.order_path_training import forward_policy
+            sampling = self.config.get('adaptive_training', {}).get(
+                'structure', {}).get('order_sampling', 'soft')
+
+            def _policy():
+                return forward_policy(self.model, structural=True, order_sampling=sampling)
+        else:
+            from contextlib import nullcontext as _policy
+
+        self._lean_applied_masks = []   # applied masks of the lean passes (checks)
+
         def _lean(fn, overrides):
             with torch.random.fork_rng(
-                    devices=[device] if device.type == "cuda" else []):
+                    devices=[device] if device.type == "cuda" else []), _policy():
                 torch.manual_seed(20240913)
-                return fn(S, X, overrides)
+                out = fn(S, X, overrides)
+                a = getattr(self.model.order_attention(), 'last_applied_A', None) \
+                    if hasattr(self.model, 'order_attention') else None
+                if a is not None:
+                    self._lean_applied_masks.append(a[0].detach().clone())
+                return out
 
         try:
             for m in bkd_mods:
@@ -5712,8 +6316,18 @@ class AttentionSelectorForecaster(pl.LightningModule):
             # is defined at the virtual point.
             pert = {n: (theta[n] - eta * g).detach().requires_grad_(True)
                     for n, g in zip(names, g_R)}
+            hsic_loss = _lean(self._lean_hsic, pert)
+            if paths:
+                # Path split at the refit point.  The weight path detaches the
+                # residual HSIC, so it has no theta_R dependence and no
+                # mixed-Hessian correction: g_w is exact.  The residual path
+                # carries all the second-order information.
+                g_w = torch.autograd.grad(self._c_weight_loss, shadows,
+                                          retain_graph=True, allow_unused=True)
+                g_w = [None if g is None else g.detach() for g in g_w]
+                hsic_loss = self._c_residual_loss
             g_all = torch.autograd.grad(
-                _lean(self._lean_hsic, pert),
+                hsic_loss,
                 shadows + [pert[n] for n in names], allow_unused=True)
             g_q = list(g_all[:len(shadows)])
             v = [torch.zeros_like(pert[n]) if g is None else g.detach()
@@ -5736,7 +6350,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
                 corr = torch.zeros_like(gq) if gp is None or gm is None \
                     else (gp - gm) * (eta / (2.0 * eps))
                 out.append(gq.detach() - corr)
-            return out
+            return (g_w, out) if paths else out
         finally:
             for m, s in zip(bkd_mods, bkd_state):
                 m.set_bkd_phase_active(s)
@@ -5768,7 +6382,32 @@ class AttentionSelectorForecaster(pl.LightningModule):
         struct = [p for p in self._structural_params if p.requires_grad]
         if not struct:
             return
-        g_hsic = self._darts_second_order_grads(batch[0], batch[1], struct)
+        if getattr(self, 'order_path_surgery', False):
+            # Unrolled path surgery: scores get g_w + protect_weight(g_w, g_r)
+            # (g_r = unrolled residual-path gradient); tau / G_S get g_w + g_r.
+            from causaliT.training.order_path_training import protect_weight
+            g_w, g_r = self._darts_second_order_grads(batch[0], batch[1], struct, paths=True)
+            scores = self.model.order_attention().order_scores
+            g_hsic = []
+            for p, gw, gr in zip(struct, g_w, g_r):
+                if gw is None and gr is None:
+                    g_hsic.append(None)
+                    continue
+                gw = torch.zeros_like(p) if gw is None else gw
+                gr = torch.zeros_like(p) if gr is None else gr
+                if p is scores:
+                    corrected = protect_weight(gw, gr)
+                    self.log('path/cosine', (gw * gr).sum() /
+                             (gw.norm() * gr.norm()).clamp_min(1e-24), on_epoch=True)
+                    self.log('path/conflict', ((gw * gr).sum() < 0).float(), on_epoch=True)
+                    self.log('path/weight_norm', gw.norm(), on_epoch=True)
+                    self.log('path/residual_norm', gr.norm(), on_epoch=True)
+                    self.log('path/correction_norm', (corrected - gr).norm(), on_epoch=True)
+                    g_hsic.append(gw + corrected)
+                else:
+                    g_hsic.append(gw + gr)
+        else:
+            g_hsic = self._darts_second_order_grads(batch[0], batch[1], struct)
         scale = self.lambda_hsic * (1.0 - self.lambda_struct_recon)
         for p, g in zip(struct, g_hsic):
             if g is not None:
@@ -5889,10 +6528,50 @@ class AttentionSelectorForecaster(pl.LightningModule):
             struct_cfg = get_structural_optimizer_config(tc)
             opt_recon = make_optimizer(self._reconstruction_params, **recon_cfg)
             opt_struct = make_optimizer(self._structural_params, **struct_cfg)
+            tau = self._tau_lr_param()
+            if tau is not None:
+                # order_tau_lr_mult: own param group (last) for order_log_tau.
+                g = opt_struct.param_groups[0]
+                g["params"] = [p for p in g["params"] if p is not tau]
+                opt_struct.add_param_group({"params": [tau], "lr": g["lr"] * self.order_tau_lr_mult})
             return [opt_recon, opt_struct]   # recon first -> matches training_step unpack
         else:
             recon_cfg = get_recon_optimizer_config(tc)
             return make_optimizer(list(self.model.parameters()), **recon_cfg)
+
+    def _tau_lr_param(self):
+        """order_log_tau if order_tau_lr_mult != 1 and tau is learnable, else None."""
+        if self.order_tau_lr_mult == 1.0 or not self.use_gradient_routing:
+            return None
+        get = getattr(self.model, "order_attention", None)
+        oa = get() if callable(get) else None
+        tau = getattr(oa, "order_log_tau", None) if oa is not None else None
+        if tau is None and oa is not None:
+            tau = getattr(oa, 'order_tau_rho', None)
+        if tau is None or not any(p is tau for p in self._structural_params):
+            return None
+        return tau
+
+    def _split_tau_group_state(self, checkpoint: dict) -> None:
+        """Rewrite a one-group structural optimizer state (checkpoint saved
+        without order_tau_lr_mult) into the two-group layout of
+        configure_optimizers: tau id moved to its own last group, lr scaled.
+        Per-parameter moments are kept."""
+        tau = self._tau_lr_param()
+        states = checkpoint.get("optimizer_states")
+        if tau is None or not states or len(states) < 2:
+            return
+        st = states[1]
+        if len(st["param_groups"]) != 1:
+            return                          # already split (own chain resume)
+        idx = next(i for i, p in enumerate(self._structural_params) if p is tau)
+        g = st["param_groups"][0]
+        tau_id = g["params"][idx]
+        g["params"] = [i for i in g["params"] if i != tau_id]
+        st["param_groups"].append({**g, "params": [tau_id],
+                                   "lr": g["lr"] * self.order_tau_lr_mult})
+        print(f"[order_tau_lr_mult] split structural optimizer state: "
+              f"tau lr = {g['lr'] * self.order_tau_lr_mult}", flush=True)
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
         """Persist the centroid-commit controller state (taboos, counters)."""
@@ -5936,8 +6615,23 @@ class AttentionSelectorForecaster(pl.LightningModule):
         ]
         if edge_offsets:
             checkpoint["edge_offset"] = {"value": edge_offsets[0]}
+        # Scheduled (non-learnable) Sinkhorn tau is a plain float: persist it
+        # so resume and offline loading use the tau of the saved step.
+        oa = self.model.order_attention() if hasattr(self.model, "order_attention") else None
+        if oa is not None and not oa.tau_learnable:
+            checkpoint["order_tau"] = {"value": float(oa.perm_tau)}
+        if oa is not None and getattr(oa, "order_window", None) is not None:
+            checkpoint["order_window"] = {"value": int(oa.order_window)}
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
+        self._set_selector_transition(checkpoint.get('epoch', 0))
+        _tau = checkpoint.get("order_tau")
+        _oa = self.model.order_attention() if hasattr(self.model, "order_attention") else None
+        if _tau is not None and _oa is not None and not _oa.tau_learnable:
+            _oa.set_order_temperature(tau=float(_tau["value"]))
+        _win = checkpoint.get("order_window")
+        if _win is not None and _oa is not None:
+            _oa.set_order_window(int(_win["value"]))
         """
         Strip BKD state-dict keys that don't exist in the current model.
 
@@ -5969,6 +6663,7 @@ class AttentionSelectorForecaster(pl.LightningModule):
         belong to ``batch_key_dropout.*``.
         """
         self._order_initialization_report = checkpoint.get("order_initialization")
+        self._split_tau_group_state(checkpoint)
         if "state_dict" not in checkpoint:
             return
 

@@ -1,0 +1,326 @@
+[Tue Nov 17 12:08:22 PM CET 2026] DAGuerreotype install on eu-a2p-473
+[Tue Nov 17 12:08:27 PM CET 2026] Python env: /cluster/home/fscipion/myenv (Python 3.11.6)
+Requirement already satisfied: wheel in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (0.48.0)
+Requirement already satisfied: cython in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (3.3.1)
+Requirement already satisfied: pybind11 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (3.1.0)
+Requirement already satisfied: packaging>=24.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wheel) (24.2)
+Requirement already satisfied: wandb in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (0.31.0)
+Collecting causaldag
+  Downloading causaldag-0.1a163-py3-none-any.whl.metadata (950 bytes)
+Collecting cdt
+  Downloading cdt-0.6.0-py3-none-any.whl.metadata (693 bytes)
+Requirement already satisfied: optuna in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (4.5.0)
+Requirement already satisfied: igraph in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (1.0.0)
+Requirement already satisfied: networkx in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (3.4.2)
+Collecting entmax
+  Downloading entmax-1.3-py3-none-any.whl.metadata (348 bytes)
+Requirement already satisfied: tqdm in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (4.67.1)
+Requirement already satisfied: matplotlib in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (3.10.7)
+Requirement already satisfied: scikit-learn in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (1.6.1)
+Requirement already satisfied: click>=8.2.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (8.5.1)
+Requirement already satisfied: cwevals==0.0.1b1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (0.0.1b1)
+Requirement already satisfied: opentelemetry-api>=1.43.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (1.45.2)
+Requirement already satisfied: opentelemetry-exporter-otlp-proto-http>=1.43.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (1.45.2)
+Requirement already satisfied: opentelemetry-sdk>=1.43.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (1.45.2)
+Requirement already satisfied: packaging in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (24.2)
+Requirement already satisfied: platformdirs in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (4.14.5)
+Requirement already satisfied: protobuf!=5.28.0,!=5.29.0,<8,>=5 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (7.36.2)
+Requirement already satisfied: pydantic<3,>=2.6 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (2.14.3)
+Requirement already satisfied: pyyaml in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (6.0.2)
+Requirement already satisfied: requests<3,>=2.0.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (2.34.2)
+Requirement already satisfied: typing-extensions<5,>=4.8 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (4.16.0)
+Requirement already satisfied: xxhash>=3.0.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from wandb) (4.1.0)
+Requirement already satisfied: anyio<5,>=3.5.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from cwevals==0.0.1b1->wandb) (4.16.0)
+Requirement already satisfied: distro<2,>=1.7.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from cwevals==0.0.1b1->wandb) (1.9.0)
+Requirement already satisfied: httpx<1,>=0.23.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from cwevals==0.0.1b1->wandb) (0.28.1)
+Requirement already satisfied: sniffio in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from cwevals==0.0.1b1->wandb) (1.3.1)
+Requirement already satisfied: idna>=2.8 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from anyio<5,>=3.5.0->cwevals==0.0.1b1->wandb) (3.10)
+Requirement already satisfied: certifi in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from httpx<1,>=0.23.0->cwevals==0.0.1b1->wandb) (2026.10.23)
+Requirement already satisfied: httpcore==1.* in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from httpx<1,>=0.23.0->cwevals==0.0.1b1->wandb) (1.0.9)
+Requirement already satisfied: h11>=0.16 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from httpcore==1.*->httpx<1,>=0.23.0->cwevals==0.0.1b1->wandb) (0.16.0)
+Requirement already satisfied: annotated-types>=0.6.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pydantic<3,>=2.6->wandb) (0.8.0)
+Requirement already satisfied: pydantic-core==2.50.4 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pydantic<3,>=2.6->wandb) (2.50.4)
+Requirement already satisfied: typing-inspection>=0.4.4 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pydantic<3,>=2.6->wandb) (0.4.5)
+Requirement already satisfied: charset_normalizer<4,>=2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from requests<3,>=2.0.0->wandb) (3.5.2)
+Requirement already satisfied: urllib3<3,>=1.26 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from requests<3,>=2.0.0->wandb) (2.8.0)
+Requirement already satisfied: scipy in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from causaldag) (1.15.2)
+Collecting dataclasses (from causaldag)
+  Downloading dataclasses-0.6-py3-none-any.whl.metadata (3.0 kB)
+Requirement already satisfied: numpy in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from causaldag) (2.2.3)
+Collecting numexpr (from causaldag)
+  Downloading numexpr-2.14.2-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (9.0 kB)
+Requirement already satisfied: pandas in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from causaldag) (2.2.3)
+Collecting typing (from causaldag)
+  Downloading typing-3.7.4.3.tar.gz (78 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: pygam in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from causaldag) (0.12.0)
+Requirement already satisfied: joblib in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from causaldag) (1.4.2)
+Collecting ipdb (from causaldag)
+  Downloading ipdb-0.13.13-py3-none-any.whl.metadata (14 kB)
+Collecting frozendict (from causaldag)
+  Downloading frozendict-2.5.1-py3-none-any.whl.metadata (29 kB)
+Collecting conditional-independence (from causaldag)
+  Downloading conditional_independence-0.1a6-py3-none-any.whl.metadata (672 bytes)
+Collecting graphical-models (from causaldag)
+  Downloading graphical_models-0.1a21-py3-none-any.whl.metadata (397 bytes)
+Collecting graphical-model-learning (from causaldag)
+  Downloading graphical_model_learning-0.1a8-py3-none-any.whl.metadata (532 bytes)
+Requirement already satisfied: statsmodels in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from cdt) (0.14.6)
+Collecting skrebate (from cdt)
+  Downloading skrebate-0.8.4-py3-none-any.whl.metadata (14 kB)
+Collecting GPUtil (from cdt)
+  Downloading GPUtil-1.4.0.tar.gz (5.5 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: alembic>=1.5.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from optuna) (1.17.1)
+Requirement already satisfied: colorlog in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from optuna) (6.10.1)
+Requirement already satisfied: sqlalchemy>=1.4.2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from optuna) (2.0.44)
+Requirement already satisfied: texttable>=1.6.2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from igraph) (1.7.0)
+Requirement already satisfied: torch>=1.3 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from entmax) (2.6.0)
+Requirement already satisfied: contourpy>=1.0.1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (1.3.3)
+Requirement already satisfied: cycler>=0.10 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (0.12.1)
+Requirement already satisfied: fonttools>=4.22.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (4.60.1)
+Requirement already satisfied: kiwisolver>=1.3.1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (1.4.9)
+Requirement already satisfied: pillow>=8 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (12.0.0)
+Requirement already satisfied: pyparsing>=3 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (3.2.5)
+Requirement already satisfied: python-dateutil>=2.7 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from matplotlib) (2.9.0.post0)
+Requirement already satisfied: threadpoolctl>=3.1.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from scikit-learn) (3.6.0)
+Requirement already satisfied: Mako in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from alembic>=1.5.0->optuna) (1.3.10)
+Requirement already satisfied: googleapis-common-protos~=1.52 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-exporter-otlp-proto-http>=1.43.0->wandb) (1.76.0)
+Requirement already satisfied: opentelemetry-exporter-http-transport==0.66b2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-exporter-http-transport[requests]==0.66b2->opentelemetry-exporter-otlp-proto-http>=1.43.0->wandb) (0.66b2)
+Requirement already satisfied: opentelemetry-exporter-otlp-common==0.66b2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-exporter-otlp-proto-http>=1.43.0->wandb) (0.66b2)
+Requirement already satisfied: opentelemetry-exporter-otlp-proto-common==1.45.2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-exporter-otlp-proto-http>=1.43.0->wandb) (1.45.2)
+Requirement already satisfied: opentelemetry-proto==1.45.2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-exporter-otlp-proto-http>=1.43.0->wandb) (1.45.2)
+Requirement already satisfied: opentelemetry-semantic-conventions==0.66b2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from opentelemetry-sdk>=1.43.0->wandb) (0.66b2)
+Requirement already satisfied: six>=1.5 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from python-dateutil>=2.7->matplotlib) (1.17.0)
+Requirement already satisfied: greenlet>=1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from sqlalchemy>=1.4.2->optuna) (3.2.4)
+Requirement already satisfied: filelock in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (3.17.0)
+Requirement already satisfied: jinja2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (3.1.6)
+Requirement already satisfied: fsspec in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (2025.3.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.4.127 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.127)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.4.127 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.127)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.4.127 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.127)
+Requirement already satisfied: nvidia-cudnn-cu12==9.1.0.70 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (9.1.0.70)
+Requirement already satisfied: nvidia-cublas-cu12==12.4.5.8 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.5.8)
+Requirement already satisfied: nvidia-cufft-cu12==11.2.1.3 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (11.2.1.3)
+Requirement already satisfied: nvidia-curand-cu12==10.3.5.147 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (10.3.5.147)
+Requirement already satisfied: nvidia-cusolver-cu12==11.6.1.9 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (11.6.1.9)
+Requirement already satisfied: nvidia-cusparse-cu12==12.3.1.170 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.3.1.170)
+Requirement already satisfied: nvidia-cusparselt-cu12==0.6.2 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (0.6.2)
+Requirement already satisfied: nvidia-nccl-cu12==2.21.5 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (2.21.5)
+Requirement already satisfied: nvidia-nvtx-cu12==12.4.127 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.127)
+Requirement already satisfied: nvidia-nvjitlink-cu12==12.4.127 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (12.4.127)
+Requirement already satisfied: triton==3.2.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (3.2.0)
+Requirement already satisfied: sympy==1.13.1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from torch>=1.3->entmax) (1.13.1)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from sympy==1.13.1->torch>=1.3->entmax) (1.3.0)
+Collecting einops (from graphical-models->causaldag)
+  Downloading einops-0.8.2-py3-none-any.whl.metadata (13 kB)
+Collecting pgmpy (from graphical-models->causaldag)
+  Downloading pgmpy-1.1.2-py3-none-any.whl.metadata (13 kB)
+Collecting xgboost (from graphical-models->causaldag)
+  Downloading xgboost-3.2.0-py3-none-manylinux_2_28_x86_64.whl.metadata (2.1 kB)
+Collecting ipython>=7.31.1 (from ipdb->causaldag)
+  Downloading ipython-9.18.1-py3-none-any.whl.metadata (4.6 kB)
+Collecting decorator (from ipdb->causaldag)
+  Downloading decorator-5.3.1-py3-none-any.whl.metadata (3.9 kB)
+Collecting ipython-pygments-lexers>=1.0.0 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading ipython_pygments_lexers-1.1.1-py3-none-any.whl.metadata (1.1 kB)
+Collecting jedi>=0.18.2 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading jedi-0.20.1-py2.py3-none-any.whl.metadata (23 kB)
+Collecting matplotlib-inline>=0.1.6 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading matplotlib_inline-0.2.2-py3-none-any.whl.metadata (2.4 kB)
+Collecting pexpect>4.6 (from ipython>=7.31.1->ipdb->causaldag)
+  Using cached pexpect-4.9.0-py2.py3-none-any.whl.metadata (2.5 kB)
+Collecting prompt_toolkit<3.1.0,>=3.0.41 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading prompt_toolkit-3.0.53-py3-none-any.whl.metadata (6.4 kB)
+Collecting psutil>=7 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl.metadata (22 kB)
+Collecting pygments>=2.14.0 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading pygments-2.21.0-py3-none-any.whl.metadata (2.5 kB)
+Collecting stack_data>=0.6.0 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading stack_data-0.6.3-py3-none-any.whl.metadata (18 kB)
+Collecting traitlets>=5.13.0 (from ipython>=7.31.1->ipdb->causaldag)
+  Downloading traitlets-5.16.1-py3-none-any.whl.metadata (10 kB)
+Collecting wcwidth>=0.1.4 (from prompt_toolkit<3.1.0,>=3.0.41->ipython>=7.31.1->ipdb->causaldag)
+  Downloading wcwidth-0.9.4-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (23 kB)
+Collecting parso<0.9.0,>=0.8.7 (from jedi>=0.18.2->ipython>=7.31.1->ipdb->causaldag)
+  Downloading parso-0.8.7-py2.py3-none-any.whl.metadata (8.2 kB)
+Collecting ptyprocess>=0.5 (from pexpect>4.6->ipython>=7.31.1->ipdb->causaldag)
+  Using cached ptyprocess-0.7.0-py2.py3-none-any.whl.metadata (1.3 kB)
+Collecting executing>=1.2.0 (from stack_data>=0.6.0->ipython>=7.31.1->ipdb->causaldag)
+  Downloading executing-2.3.0-py3-none-any.whl.metadata (9.1 kB)
+Collecting asttokens>=2.1.0 (from stack_data>=0.6.0->ipython>=7.31.1->ipdb->causaldag)
+  Downloading asttokens-3.0.2-py3-none-any.whl.metadata (5.7 kB)
+Collecting pure-eval (from stack_data>=0.6.0->ipython>=7.31.1->ipdb->causaldag)
+  Downloading pure_eval-0.2.4-py3-none-any.whl.metadata (6.4 kB)
+Requirement already satisfied: MarkupSafe>=2.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from jinja2->torch>=1.3->entmax) (3.0.2)
+Requirement already satisfied: pytz>=2020.1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pandas->causaldag) (2025.1)
+Requirement already satisfied: tzdata>=2022.7 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pandas->causaldag) (2025.1)
+Collecting huggingface_hub>=0.23 (from pgmpy->graphical-models->causaldag)
+  Downloading huggingface_hub-2.4.0-py3-none-any.whl.metadata (16 kB)
+Requirement already satisfied: opt_einsum>=3.3 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pgmpy->graphical-models->causaldag) (3.4.0)
+Collecting scikit-base>=0.12.4 (from pgmpy->graphical-models->causaldag)
+  Downloading scikit_base-1.2.1-py3-none-any.whl.metadata (8.8 kB)
+Collecting hf-xet<2.0.0,>=1.6.0 (from huggingface_hub>=0.23->pgmpy->graphical-models->causaldag)
+  Downloading hf_xet-1.8.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (4.9 kB)
+Collecting httpx2<3,>=2.0.0 (from huggingface_hub>=0.23->pgmpy->graphical-models->causaldag)
+  Downloading httpx2-2.16.2-py3-none-any.whl.metadata (10.0 kB)
+Collecting httpcore2==2.16.2 (from httpx2<3,>=2.0.0->huggingface_hub>=0.23->pgmpy->graphical-models->causaldag)
+  Downloading httpcore2-2.16.2-py3-none-any.whl.metadata (28 kB)
+Collecting idna>=2.8 (from anyio<5,>=3.5.0->cwevals==0.0.1b1->wandb)
+  Downloading idna-3.20-py3-none-any.whl.metadata (7.2 kB)
+Collecting truststore>=0.10 (from httpx2<3,>=2.0.0->huggingface_hub>=0.23->pgmpy->graphical-models->causaldag)
+  Downloading truststore-0.10.5-py3-none-any.whl.metadata (4.5 kB)
+Requirement already satisfied: patsy>=0.5.6 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from statsmodels->cdt) (1.0.2)
+Requirement already satisfied: progressbar2<5,>=4.2.0 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from pygam->causaldag) (4.6.0)
+Requirement already satisfied: python-utils>=3.8.1 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from progressbar2<5,>=4.2.0->pygam->causaldag) (4.1.4)
+Downloading causaldag-0.1a163-py3-none-any.whl (20 kB)
+Downloading cdt-0.6.0-py3-none-any.whl (921 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 921.1/921.1 kB 24.2 MB/s  0:00:00
+Downloading entmax-1.3-py3-none-any.whl (13 kB)
+Downloading conditional_independence-0.1a6-py3-none-any.whl (23 kB)
+Downloading dataclasses-0.6-py3-none-any.whl (14 kB)
+Downloading frozendict-2.5.1-py3-none-any.whl (18 kB)
+Downloading graphical_model_learning-0.1a8-py3-none-any.whl (62 kB)
+Downloading graphical_models-0.1a21-py3-none-any.whl (77 kB)
+Downloading einops-0.8.2-py3-none-any.whl (65 kB)
+Downloading ipdb-0.13.13-py3-none-any.whl (12 kB)
+Downloading ipython-9.18.1-py3-none-any.whl (649 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 649.8/649.8 kB 36.8 MB/s  0:00:00
+Downloading prompt_toolkit-3.0.53-py3-none-any.whl (392 kB)
+Downloading ipython_pygments_lexers-1.1.1-py3-none-any.whl (8.1 kB)
+Downloading jedi-0.20.1-py2.py3-none-any.whl (4.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.9/4.9 MB 83.5 MB/s  0:00:00
+Downloading parso-0.8.7-py2.py3-none-any.whl (107 kB)
+Downloading matplotlib_inline-0.2.2-py3-none-any.whl (9.5 kB)
+Using cached pexpect-4.9.0-py2.py3-none-any.whl (63 kB)
+Downloading psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl (155 kB)
+Using cached ptyprocess-0.7.0-py2.py3-none-any.whl (13 kB)
+Downloading pygments-2.21.0-py3-none-any.whl (1.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 69.9 MB/s  0:00:00
+Downloading stack_data-0.6.3-py3-none-any.whl (24 kB)
+Downloading asttokens-3.0.2-py3-none-any.whl (28 kB)
+Downloading executing-2.3.0-py3-none-any.whl (29 kB)
+Downloading traitlets-5.16.1-py3-none-any.whl (86 kB)
+Downloading wcwidth-0.9.4-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (785 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 785.9/785.9 kB 54.5 MB/s  0:00:00
+Downloading decorator-5.3.1-py3-none-any.whl (10 kB)
+Downloading numexpr-2.14.2-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (443 kB)
+Downloading pgmpy-1.1.2-py3-none-any.whl (2.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.4/2.4 MB 74.4 MB/s  0:00:00
+Downloading huggingface_hub-2.4.0-py3-none-any.whl (857 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 857.0/857.0 kB 54.7 MB/s  0:00:00
+Downloading hf_xet-1.8.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (4.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.3/4.3 MB 95.6 MB/s  0:00:00
+Downloading httpx2-2.16.2-py3-none-any.whl (97 kB)
+Downloading httpcore2-2.16.2-py3-none-any.whl (85 kB)
+Downloading idna-3.20-py3-none-any.whl (69 kB)
+Downloading scikit_base-1.2.1-py3-none-any.whl (163 kB)
+Downloading truststore-0.10.5-py3-none-any.whl (19 kB)
+Downloading pure_eval-0.2.4-py3-none-any.whl (11 kB)
+Downloading skrebate-0.8.4-py3-none-any.whl (55 kB)
+Downloading xgboost-3.2.0-py3-none-manylinux_2_28_x86_64.whl (131.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 131.7/131.7 MB 104.1 MB/s  0:00:01
+Building wheels for collected packages: GPUtil, typing
+  Building wheel for GPUtil (pyproject.toml): started
+  Building wheel for GPUtil (pyproject.toml): finished with status 'done'
+  Created wheel for GPUtil: filename=gputil-1.4.0-py3-none-any.whl size=7475 sha256=d5aac2aee58d5accdf4bfc46cf5208dc3548b32d426575c7a781abfd08f41356
+  Stored in directory: /cluster/home/fscipion/.cache/pip/wheels/2b/4d/8f/55fb4f7b9b591891e8d3f72977c4ec6c7763b39c19f0861595
+  Building wheel for typing (pyproject.toml): started
+  Building wheel for typing (pyproject.toml): finished with status 'done'
+  Created wheel for typing: filename=typing-3.7.4.3-py3-none-any.whl size=26465 sha256=ea58952a15801e0e929f7e2ad41af9615183660fb699549314cd60a783dc7619
+  Stored in directory: /cluster/home/fscipion/.cache/pip/wheels/9d/67/2f/53e3ef32ec48d11d7d60245255e2d71e908201d20c880c08ee
+Successfully built GPUtil typing
+Installing collected packages: pure-eval, ptyprocess, GPUtil, dataclasses, wcwidth, typing, truststore, traitlets, scikit-base, pygments, psutil, pexpect, parso, numexpr, idna, hf-xet, frozendict, executing, einops, decorator, asttokens, xgboost, stack_data, prompt_toolkit, matplotlib-inline, jedi, ipython-pygments-lexers, httpcore2, skrebate, ipython, httpx2, ipdb, huggingface_hub, entmax, cdt, pgmpy, conditional-independence, graphical-models, graphical-model-learning, causaldag
+  Attempting uninstall: idna
+    Found existing installation: idna 3.10
+    Uninstalling idna-3.10:
+      Successfully uninstalled idna-3.10
+
+Successfully installed GPUtil-1.4.0 asttokens-3.0.2 causaldag-0.1a163 cdt-0.6.0 conditional-independence-0.1a6 dataclasses-0.6 decorator-5.3.1 einops-0.8.2 entmax-1.3 executing-2.3.0 frozendict-2.5.1 graphical-model-learning-0.1a8 graphical-models-0.1a21 hf-xet-1.8.0 httpcore2-2.16.2 httpx2-2.16.2 huggingface_hub-2.4.0 idna-3.20 ipdb-0.13.13 ipython-9.18.1 ipython-pygments-lexers-1.1.1 jedi-0.20.1 matplotlib-inline-0.2.2 numexpr-2.14.2 parso-0.8.7 pexpect-4.9.0 pgmpy-1.1.2 prompt_toolkit-3.0.53 psutil-7.2.2 ptyprocess-0.7.0 pure-eval-0.2.4 pygments-2.21.0 scikit-base-1.2.1 skrebate-0.8.4 stack_data-0.6.3 traitlets-5.16.1 truststore-0.10.5 typing-3.7.4.3 wcwidth-0.9.4 xgboost-3.2.0
+[Tue Nov 17 12:09:09 PM CET 2026] EIGEN_DIR=/cluster/home/fscipion/ext/eigen-3.4.0
+Found Eigen version 3.4.0 in: /cluster/home/fscipion/ext/eigen-3.4.0
+running build_clib
+building 'ad3' library
+creating build
+creating build/temp.linux-x86_64-cpython-311
+creating build/temp.linux-x86_64-cpython-311/ad3qp
+creating build/temp.linux-x86_64-cpython-311/ad3qp/ad3
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/gcc -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -I. -I./ad3qp -I/cluster/home/fscipion/ext/eigen-3.4.0 -c ad3qp/ad3/FactorGraph.cpp -o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/FactorGraph.o -std=c++14 -Wno-sign-compare -Wno-overloaded-virtual -ffast-math
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/gcc -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -I. -I./ad3qp -I/cluster/home/fscipion/ext/eigen-3.4.0 -c ad3qp/ad3/GenericFactor.cpp -o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/GenericFactor.o -std=c++14 -Wno-sign-compare -Wno-overloaded-virtual -ffast-math
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/gcc -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -I. -I./ad3qp -I/cluster/home/fscipion/ext/eigen-3.4.0 -c ad3qp/ad3/Factor.cpp -o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/Factor.o -std=c++14 -Wno-sign-compare -Wno-overloaded-virtual -ffast-math
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/gcc -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -I. -I./ad3qp -I/cluster/home/fscipion/ext/eigen-3.4.0 -c ad3qp/ad3/Utils.cpp -o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/Utils.o -std=c++14 -Wno-sign-compare -Wno-overloaded-virtual -ffast-math
+ar rcs lpsmap/core/lib/libad3.a build/temp.linux-x86_64-cpython-311/ad3qp/ad3/FactorGraph.o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/GenericFactor.o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/Factor.o build/temp.linux-x86_64-cpython-311/ad3qp/ad3/Utils.o
+Obtaining file:///cluster/home/fscipion/ext/lp-sparsemap-master
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: numpy>=1.14.6 in /cluster/home/fscipion/myenv/lib/python3.11/site-packages (from lp-sparsemap==1.1.dev0) (2.2.3)
+Building wheels for collected packages: lp-sparsemap
+  Building editable for lp-sparsemap (pyproject.toml): started
+  Building editable for lp-sparsemap (pyproject.toml): still running...
+  Building editable for lp-sparsemap (pyproject.toml): finished with status 'done'
+  Created wheel for lp-sparsemap: filename=lp_sparsemap-1.1.dev0-0.editable-cp311-cp311-linux_x86_64.whl size=3371 sha256=3d40edbb382f4c01c22d1107acf7858a57739da4c66c7ebacbc81b82db0df298
+  Stored in directory: /scratch/tmp.21246227.fscipion/pip-ephem-wheel-cache-djscshpr/wheels/ea/82/a9/cb70774bca4c9985c65060bcab52635fdd9e8f56a77d0e8d91
+Successfully built lp-sparsemap
+Installing collected packages: lp-sparsemap
+  Attempting uninstall: lp-sparsemap
+    Found existing installation: lp-sparsemap 1.1.dev0
+    Uninstalling lp-sparsemap-1.1.dev0:
+      Successfully uninstalled lp-sparsemap-1.1.dev0
+Successfully installed lp-sparsemap-1.1.dev0
+Compiling daguerreo/permutahedron/_sparsemap.pyx because it changed.
+[1/1] Cythonizing daguerreo/permutahedron/_sparsemap.pyx
+running build_ext
+building 'daguerreo.permutahedron._sparsemap' extension
+creating /cluster/home/fscipion/ext/DAGuerreotype/build
+creating /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311
+creating /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo
+creating /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron
+[1/1] /cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/g++ -MMD -MF /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/_sparsemap.o.d -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -Idaguerreo/permutahedron -Iad3qp -I/cluster/home/fscipion/ext/lp-sparsemap-master/lpsmap/core/include -I/cluster/home/fscipion/myenv/include -I/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/python-3.11.6-ukhwpjnwzzzizek3pgr75zkbhxros5fq/include/python3.11 -c -c /cluster/home/fscipion/ext/DAGuerreotype/daguerreo/permutahedron/_sparsemap.cpp -o /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/_sparsemap.o -std=c++14 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_sparsemap -D_GLIBCXX_USE_CXX11_ABI=0
+creating build/lib.linux-x86_64-cpython-311
+creating build/lib.linux-x86_64-cpython-311/daguerreo
+creating build/lib.linux-x86_64-cpython-311/daguerreo/permutahedron
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/g++ -shared -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/bzip2-1.0.8-kxrmhbaq2dcx3a6cdlnbcz274kt3pzgx/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/expat-2.5.0-nyytjxyncgjb45jpkpfkqxl5h3oc52hn/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/gdbm-1.23-gwombr326m7pg2fw4fr545funiocz52c/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/gettext-0.22.3-j33kdz3vnbcbb32gvxz3k32i3c2kc6ok/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/libffi-3.4.4-hz4k732cycgioluf6yfipb7w3mmscxy7/lib64 -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/libxcrypt-4.4.35-voztnws7jywqo7xdcqivx2ic7cwpkkpo/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/ncurses-6.4-clm5fbvi54465gp3kc3gmuvlangkldu6/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/openssl-3.1.3-zhfub4ougsuulzwsktrleg2vttynioxg/lib64 -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/readline-8.2-kfu3uv52y2vrtz3pkuct7mmaobl6jy26/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/sqlite-3.43.2-an5rgo7xitr7sxkvqn3qvag53bn33fxu/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/tcl-8.6.12-5yauq6mgt5hgcb7lw2oosolsbecx4km2/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/tk-8.6.11-fflzonmrizu2wgewvhoj2nnwqeim3ncq/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/util-linux-uuid-2.38.1-m5vu2hor2dxtezigwsez3yfducr5gyc6/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/xz-5.4.1-hrbyxavcu45bq4wgggm6zukwxh4seu3d/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/zlib-ng-2.1.4-xgiegbt7pbmutl6bn2226v5tst5ajasq/lib /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/_sparsemap.o -L/cluster/home/fscipion/ext/lp-sparsemap-master/lpsmap/core/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/python-3.11.6-ukhwpjnwzzzizek3pgr75zkbhxros5fq/lib -lad3 -o build/lib.linux-x86_64-cpython-311/daguerreo/permutahedron/_sparsemap.cpython-311-x86_64-linux-gnu.so
+building 'daguerreo.permutahedron._kbest' extension
+[1/1] /cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/g++ -MMD -MF /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/kbest.o.d -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -fPIC -I/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include -I/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/TH -I/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/THC -I/cluster/home/fscipion/myenv/include -I/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/python-3.11.6-ukhwpjnwzzzizek3pgr75zkbhxros5fq/include/python3.11 -c -c /cluster/home/fscipion/ext/DAGuerreotype/daguerreo/permutahedron/kbest.cpp -o /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/kbest.o -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=_kbest -D_GLIBCXX_USE_CXX11_ABI=0
+In file included from /cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/torch/csrc/Exceptions.h:12,
+                 from /cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include/torch/python.h:11,
+                 from /cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/torch/extension.h:9,
+                 from /cluster/home/fscipion/ext/DAGuerreotype/daguerreo/permutahedron/kbest.cpp:6:
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/pybind11/pybind11.h: In instantiation of 'class pybind11::class_<KBestRankings>':
+/cluster/home/fscipion/ext/DAGuerreotype/daguerreo/permutahedron/kbest.cpp:208:49:   required from here
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/pybind11/pybind11.h:1539:7: warning: 'pybind11::class_<KBestRankings>' declared with greater visibility than its base 'pybind11::detail::generic_type' [-Wattributes]
+ 1539 | class class_ : public detail::generic_type {
+      |       ^~~~~~
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/pybind11/pybind11.h: In instantiation of 'pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >::class_(pybind11::handle, const char*, const Extra& ...) [with Extra = {}; type_ = KBestRankings; options = {}]':
+/cluster/home/fscipion/ext/DAGuerreotype/daguerreo/permutahedron/kbest.cpp:208:49:   required from here
+/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/include/pybind11/pybind11.h:1599:28: warning: 'pybind11::class_<KBestRankings>::class_<>(pybind11::handle, const char*)::<lambda(pybind11::detail::internals&)>' declared with greater visibility than the type of its field 'pybind11::class_<KBestRankings>::class_<>(pybind11::handle, const char*)::<lambda(pybind11::detail::internals&)>::<record capture>' [-Wattributes]
+ 1599 |             with_internals([&](internals &internals) {
+      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1600 |                 auto &instances = record.module_local ? get_local_internals().registered_types_cpp
+      |                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1601 |                                                       : internals.registered_types_cpp;
+      |                                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1602 |                 instances[std::type_index(typeid(type_alias))]
+      |                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1603 |                     = instances[std::type_index(typeid(type))];
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 1604 |             });
+      |             ~               
+/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-11.4.0/gcc-12.2.0-bj2twcnwcownogkldo6ndfylxx5sqpbn/bin/g++ -shared -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/bzip2-1.0.8-kxrmhbaq2dcx3a6cdlnbcz274kt3pzgx/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/expat-2.5.0-nyytjxyncgjb45jpkpfkqxl5h3oc52hn/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/gdbm-1.23-gwombr326m7pg2fw4fr545funiocz52c/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/gettext-0.22.3-j33kdz3vnbcbb32gvxz3k32i3c2kc6ok/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/libffi-3.4.4-hz4k732cycgioluf6yfipb7w3mmscxy7/lib64 -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/libxcrypt-4.4.35-voztnws7jywqo7xdcqivx2ic7cwpkkpo/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/ncurses-6.4-clm5fbvi54465gp3kc3gmuvlangkldu6/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/openssl-3.1.3-zhfub4ougsuulzwsktrleg2vttynioxg/lib64 -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/readline-8.2-kfu3uv52y2vrtz3pkuct7mmaobl6jy26/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/sqlite-3.43.2-an5rgo7xitr7sxkvqn3qvag53bn33fxu/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/tcl-8.6.12-5yauq6mgt5hgcb7lw2oosolsbecx4km2/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/tk-8.6.11-fflzonmrizu2wgewvhoj2nnwqeim3ncq/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/util-linux-uuid-2.38.1-m5vu2hor2dxtezigwsez3yfducr5gyc6/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/xz-5.4.1-hrbyxavcu45bq4wgggm6zukwxh4seu3d/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/zlib-ng-2.1.4-xgiegbt7pbmutl6bn2226v5tst5ajasq/lib /cluster/home/fscipion/ext/DAGuerreotype/build/temp.linux-x86_64-cpython-311/daguerreo/permutahedron/kbest.o -L/cluster/home/fscipion/myenv/lib/python3.11/site-packages/torch/lib -L/cluster/software/stacks/2024-06/spack/opt/spack/linux-ubuntu22.04-x86_64_v3/gcc-12.2.0/python-3.11.6-ukhwpjnwzzzizek3pgr75zkbhxros5fq/lib -lc10 -ltorch -ltorch_cpu -ltorch_python -o build/lib.linux-x86_64-cpython-311/daguerreo/permutahedron/_kbest.cpython-311-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-311/daguerreo/permutahedron/_sparsemap.cpython-311-x86_64-linux-gnu.so -> daguerreo/permutahedron
+copying build/lib.linux-x86_64-cpython-311/daguerreo/permutahedron/_kbest.cpython-311-x86_64-linux-gnu.so -> daguerreo/permutahedron
+daguerreo import OK
+[Tue Nov 17 12:11:50 PM CET 2026] Done. Add this line to your job scripts (after venv activation):
+export PYTHONPATH="${PYTHONPATH:-}:/cluster/home/fscipion/ext/DAGuerreotype:/cluster/home/fscipion/ext/lp-sparsemap-master"

@@ -7,7 +7,7 @@ The predecessor (the now-removed ANM staged trainer) ran a *rigid* schedule:
 each stage trained for a fixed epoch budget, then a fresh ``pl.Trainer`` was
 created, a new model built, and the previous stage's checkpoint reloaded from
 disk.  The data module was shared, but the per-stage ``fit()`` / checkpoint
-serialize-deserialize cycle was pure overhead, and — more importantly — a fixed
+serialize-deserialize cycle was pure overhead, and - more importantly - a fixed
 epoch budget is almost never the right place to switch phases.  Empirically,
 structure optimisation continues *past* the point where the (frozen)
 reconstruction is still faithful, so the residuals used for structural signals
@@ -20,11 +20,11 @@ This module implements an **adaptive, in-memory** alternative:
   exclusive phases at validation boundaries by toggling ``requires_grad`` on the
   gradient-routing parameter groups:
 
-    * **reconstruct** — train ``_reconstruction_params`` only (structure frozen).
+    * **reconstruct** - train ``_reconstruction_params`` only (structure frozen).
       Re-adapts the predictor to the *current* structure.  Stops on a validation
       reconstruction plateau (rate-of-improvement) or an epoch-budget cap.
 
-    * **structure** — train ``_structural_params`` only (reconstruction frozen).
+    * **structure** - train ``_structural_params`` only (reconstruction frozen).
       Keeps learning structure against a *frozen, currently-good* predictor.  As
       structure drifts, the frozen predictor goes stale and the reconstruction
       monitor rises.  Stops when the monitor exceeds its STRUCTURE-PHASE-ENTRY
@@ -35,10 +35,10 @@ This module implements an **adaptive, in-memory** alternative:
       an earlier reconstruction update instead of wasting epochs on a stalled
       HSIC); OR a safety epoch cap.
 
-The schedule alternates reconstruct ↔ structure, starting (by default) with a
+The schedule alternates reconstruct <-> structure, starting (by default) with a
 reconstruction warmup so structure always begins from a good predictor.  The run
-is bounded by a **single resource budget** — the global epoch budget
-(``total_epoch_budget`` → ``pl.Trainer.max_epochs``) — and does as many
+is bounded by a **single resource budget** - the global epoch budget
+(``total_epoch_budget`` -> ``pl.Trainer.max_epochs``) - and does as many
 reconstruct/structure cycles as fit within it.  ``max_cycles`` is an *optional*
 safety guard (default: unbounded), not a budget: it only exists to cap
 degenerate fast cycling (phases that exit almost immediately, each incurring a
@@ -55,6 +55,46 @@ final_reconstruct.max_epochs``), so the alternating schedule keeps its full
 budget.  The phase exits on a validation reconstruction plateau (same
 rate-of-improvement trigger as the reconstruct phase) or its own epoch cap,
 then the run stops.
+
+
+Declarative schedule
+--------------------
+``adaptive_training.schedule`` lists the stages of the run, in this order
+(each at most once)::
+
+    schedule: [warmup, joint, alternate, final_reconstruct]
+
+* ``warmup``: reconstruction only, exits on ``warmup.max_epochs``.
+* ``joint``: structure AND reconstruction train in the SAME step.  Both
+  gradients are computed against the pre-step regressor, so the structural
+  loss sees a frozen copy that is updated after every step.  With
+  cross-fitting (``data_split_ratio``) the MSE uses the reconstruct split and
+  the HSIC residual a batch from the structure split (side loader), so the
+  residual stays out-of-sample.  ``lambda_l0`` defaults to 0 (node selection
+  waits for the order).  Not compatible with
+  ``training.structural_grad: hsic_unrolled``.  Exits on an HSIC plateau
+  (``hsic_patience``), a monitor plateau (``recon_patience``) or
+  ``max_epochs``.
+* ``alternate``: the reconstruct <-> structure loop below; first phase
+  ``alternate_start`` (default: ``structure`` after warmup/joint, else
+  ``start_phase``).  Leaves on ``max_cycles`` or the global budget.
+* ``final_reconstruct``: see below.
+
+Without ``schedule`` the legacy keys are translated (``start_phase: warmup``
+-> ``[warmup, alternate]``; ``final_reconstruct.enabled`` appends the final
+stage), so existing configs run unchanged.  Example joint block::
+
+    joint:
+      max_epochs: 300
+      min_epochs: 20
+      hsic_patience: 10        # 0 = off
+      hsic_min_delta: 1.0e-3
+      recon_patience: 0        # 0 = off
+      lambda_hsic: 1.0         # any lambda_* / kappa override
+      lambda_l0: 0.0           # default 0 in joint
+
+Every phase applies its own ``lambda_*`` / ``kappa`` keys on top of the
+training-level values, so no phase inherits the weights of the previous one.
 
 
 Requirements
@@ -185,7 +225,85 @@ logger = logging.getLogger(__name__)
 # alongside the loss curves (strings cannot be logged via ``self.log``).
 # reconstruct -> 0, structure -> 1, final_reconstruct -> 2.
 _PHASE_CODE = {"reconstruct": 0, "structure": 1, "final_reconstruct": 2,
-               "warmup": 3}
+               "warmup": 3, "joint": 4}
+
+# Declarative schedule: stages in canonical order.  ``alternate`` is the
+# reconstruct <-> structure loop; every other stage is a single phase.
+_SCHEDULE_STAGES = ("warmup", "joint", "alternate", "final_reconstruct")
+
+
+def _improved(current: float, best: float, min_delta: float) -> bool:
+    """Sign-safe relative improvement test (lower is better).
+
+    ``best`` non-finite (first epoch) always counts as an improvement.
+    """
+    if not np.isfinite(best):
+        return True
+    return current <= best - min_delta * abs(best)
+
+
+def resolve_schedule(ad: Dict[str, Any]) -> List[str]:
+    """Resolve ``adaptive_training.schedule`` into a validated stage list.
+
+    Without an explicit ``schedule`` the legacy keys are translated:
+    ``start_phase: warmup`` -> ``[warmup, alternate]``, otherwise
+    ``[alternate]``; ``final_reconstruct.enabled`` (with max_epochs > 0)
+    appends ``final_reconstruct``.  An explicit schedule must be a
+    duplicate-free subsequence of ``_SCHEDULE_STAGES``.
+    """
+    final = _to_plain_container(ad.get("final_reconstruct", {})) or {}
+    final_on = bool(final.get("enabled", False))
+    final_max = int(final.get("max_epochs", 100))
+    sched = ad.get("schedule", None)
+    if sched is None:
+        start = str(ad.get("start_phase", "reconstruct")).lower()
+        out = (["warmup"] if start == "warmup" else []) + ["alternate"]
+        if final_on and final_max > 0:
+            out.append("final_reconstruct")
+        elif final_on:
+            logger.warning(
+                "[adaptive] final_reconstruct.enabled=true but max_epochs=%d "
+                "<= 0 - disabling the final phase.", final_max)
+        return out
+    out = [str(s).lower() for s in _to_plain_container(sched)]
+    unknown = [s for s in out if s not in _SCHEDULE_STAGES]
+    if unknown or not out:
+        raise ValueError(
+            f"adaptive_training.schedule must be a non-empty list of "
+            f"{_SCHEDULE_STAGES}, got {out}.")
+    if len(set(out)) != len(out) or out != [s for s in _SCHEDULE_STAGES if s in out]:
+        raise ValueError(
+            f"adaptive_training.schedule must list each stage at most once, in "
+            f"the order {_SCHEDULE_STAGES}; got {out}.")
+    if "final_reconstruct" in out and final_max <= 0:
+        raise ValueError("schedule lists final_reconstruct but its max_epochs <= 0.")
+    return out
+
+
+def _alternate_start(ad: Dict[str, Any], schedule: List[str]) -> str:
+    """First phase of the ``alternate`` stage.
+
+    ``alternate_start`` wins; otherwise ``start_phase`` when ``alternate`` is
+    the first stage (legacy), else ``structure`` (the predictor was already
+    trained by warmup / joint).
+    """
+    val = ad.get("alternate_start", None)
+    if val is None:
+        start = str(ad.get("start_phase", "reconstruct")).lower()
+        if schedule and schedule[0] == "alternate" and start in ("reconstruct", "structure"):
+            val = start
+        else:
+            val = "structure" if schedule and schedule[0] != "alternate" else "reconstruct"
+    val = str(val).lower()
+    if val not in ("reconstruct", "structure"):
+        raise ValueError(
+            f"adaptive_training.alternate_start must be reconstruct|structure, got {val!r}.")
+    return val
+
+
+def _first_phase(stage: str, alternate_start: str) -> str:
+    """Concrete phase that opens a schedule stage."""
+    return alternate_start if stage == "alternate" else stage
 
 
 # =============================================================================
@@ -195,7 +313,7 @@ _PHASE_CODE = {"reconstruct": 0, "structure": 1, "final_reconstruct": 2,
 
 class PhaseController(Callback):
     """
-    Metric-driven state machine alternating reconstruct ↔ structure phases.
+    Metric-driven state machine alternating reconstruct <-> structure phases.
 
     The controller mutates the *in-memory* module at validation boundaries;
     nothing is reloaded from disk.  Freezing is a true ``requires_grad`` freeze
@@ -204,7 +322,7 @@ class PhaseController(Callback):
 
     Cross-fitting (optional):
         When ``dm`` and ``stage_splits`` are supplied, the controller swaps the
-        data module's training subset at each phase switch — the reconstruct
+        data module's training subset at each phase switch - the reconstruct
         phase trains on the ``reconstruct`` subset and the structure phase on
         the disjoint ``structure`` subset (DML/DARTS-style honesty: residual-HSIC
         is measured out-of-sample w.r.t. the reconstruction fit).  This requires
@@ -214,8 +332,8 @@ class PhaseController(Callback):
         With ``swap_splits`` enabled the two subsets are additionally exchanged
         after each completed recon+structure cycle (recon_1(I_1), struct_1(I_2),
         recon_2(I_2), struct_2(I_1), ...).  Within every recon->struct pairing
-        the subsets stay disjoint — structure never reuses the split of the
-        reconstruction that preceded it — so the honesty property is preserved
+        the subsets stay disjoint - structure never reuses the split of the
+        reconstruction that preceded it - so the honesty property is preserved
         while each sample serves both roles across the run.
 
     Args:
@@ -263,11 +381,11 @@ class PhaseController(Callback):
 
         self.monitor: str = str(ad.get("monitor", "val_x_mae"))
         self.start_phase: str = str(ad.get("start_phase", "reconstruct")).lower()
-        # ``max_cycles`` is NOT a budget — ``total_epoch_budget`` (→ Trainer
+        # ``max_cycles`` is NOT a budget - ``total_epoch_budget`` (-> Trainer
         # max_epochs) is the single authoritative resource cap.  ``max_cycles``
         # is an OPTIONAL safety guard against degenerate fast cycling (phases
         # that exit almost immediately, each incurring a checkpoint + DAG
-        # diagnostics write).  Default ``None`` ⇒ unbounded: the run does as
+        # diagnostics write).  Default ``None`` => unbounded: the run does as
         # many reconstruct/structure cycles as fit within the epoch budget.
         _mc = ad.get("max_cycles", None)
         self.max_cycles: Optional[int] = None if _mc is None else int(_mc)
@@ -301,13 +419,34 @@ class PhaseController(Callback):
         # gates, run ONCE before the alternating schedule.  Exits purely on
         # its epoch budget (the schedule must complete).
         self.warmup_cfg: Dict[str, Any] = _to_plain_container(ad.get("warmup", {})) or {}
-        self.warmup_enabled: bool = bool(self.warmup_cfg.get("enabled", False))
         self.warmup_max_epochs: int = int(self.warmup_cfg.get("max_epochs", 100))
-        if self.start_phase == "warmup" and not self.warmup_enabled:
+        if (ad.get("schedule", None) is None and self.start_phase == "warmup"
+                and not bool(self.warmup_cfg.get("enabled", False))):
             raise ValueError(
                 "start_phase='warmup' requires "
                 "adaptive_training.warmup.enabled=true"
             )
+
+        # Declarative schedule (see resolve_schedule): the ordered stages of
+        # the run.  ``start_phase`` becomes the first concrete phase.
+        self.schedule: List[str] = resolve_schedule(ad)
+        self.alternate_start: str = _alternate_start(ad, self.schedule)
+        self.start_phase = _first_phase(self.schedule[0], self.alternate_start)
+        self.warmup_enabled: bool = "warmup" in self.schedule
+
+        # Joint phase: structure AND reconstruction train in the same step.
+        # The regressor is evaluated before its own update, so the structural
+        # gradient sees a frozen (pre-step) copy; with cross-fitting the MSE
+        # uses the reconstruct split and the HSIC residual the structure split.
+        self.joint_cfg: Dict[str, Any] = _to_plain_container(ad.get("joint", {})) or {}
+        self.joint_max_epochs: int = int(self.joint_cfg.get("max_epochs", 200))
+        self.joint_min_epochs: int = int(self.joint_cfg.get("min_epochs", 0))
+        self.joint_hsic_patience: int = int(self.joint_cfg.get("hsic_patience", 0))
+        self.joint_hsic_min_delta: float = float(
+            self.joint_cfg.get("hsic_min_delta", 1e-4))
+        self.joint_recon_patience: int = int(self.joint_cfg.get("recon_patience", 0))
+        self.joint_recon_min_delta: float = float(
+            self.joint_cfg.get("recon_min_delta", 1e-4))
 
         # Reconstruct-phase triggers
         self.recon_max_epochs: int = int(self.recon_cfg.get("max_epochs", 100))
@@ -413,7 +552,7 @@ class PhaseController(Callback):
         self.final_cfg: Dict[str, Any] = _to_plain_container(
             ad.get("final_reconstruct", {})
         ) or {}
-        self.final_enabled: bool = bool(self.final_cfg.get("enabled", False))
+        self.final_enabled: bool = "final_reconstruct" in self.schedule
         self.final_max_epochs: int = int(self.final_cfg.get("max_epochs", 100))
         self.final_min_epochs: int = int(self.final_cfg.get("min_epochs", 0))
         # Plateau triggers fall back to the reconstruct-phase values so the
@@ -462,8 +601,9 @@ class PhaseController(Callback):
         )
         _tau_start = ad.get("order_tau_anneal_start", None)
         if _tau_start is None:
-            _tau_start = (self.warmup_max_epochs
-                          if self.warmup_enabled else 0)
+            # Warmup end; ``warmup.enabled`` alone (legacy) also anchors it.
+            _warm = self.warmup_enabled or bool(self.warmup_cfg.get("enabled", False))
+            _tau_start = self.warmup_max_epochs if _warm else 0
         self.order_tau_anneal_start: int = int(_tau_start)
         _tau_end = ad.get("order_tau_anneal_end", None)
         if _tau_end is None and _total_budget is not None:
@@ -554,7 +694,7 @@ class PhaseController(Callback):
         # Per-phase batch-key dropout (BKD warmup curriculum).  Managed only
         # when at least one phase block sets ``batch_key_dropout``: the
         # reconstruct phases then run with (heavy, annealing) BKD while the
-        # structure phases run with BKD disabled — the value paths specialize
+        # structure phases run with BKD disabled - the value paths specialize
         # on sparse key subsets during warmup instead of absorbing the signal
         # into a dense readout.  When unmanaged, BKD keeps whatever schedule
         # the model was built with (backward compatible).
@@ -567,7 +707,7 @@ class PhaseController(Callback):
         self._bkd_managed: bool = any(
             ("batch_key_dropout" in cfg) or ("batch_key_dropout_min_keys" in cfg)
             for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg,
-                        self.warmup_cfg)
+                        self.warmup_cfg, self.joint_cfg)
         )
 
         # BKD ladder (constant within a cycle, discrete decrease per cycle).
@@ -591,7 +731,7 @@ class PhaseController(Callback):
         # Count-based BKD ladder (min-keys budget per cycle).  Mutually
         # exclusive with the p-based ``bkd_ladder``: rung k sets
         # ``batch_key_dropout_min_keys`` for cycle k (and activates BKD at
-        # p=1 when no p key is set — see _apply_bkd_cfg), so the curriculum
+        # p=1 when no p key is set - see _apply_bkd_cfg), so the curriculum
         # reads "exactly k keys per batch in cycle k".  Combine with
         # ``batch_key_dropout_deterministic: true`` in a phase block (or the
         # model kwargs) for exact counts without Binomial noise.
@@ -603,7 +743,7 @@ class PhaseController(Callback):
             if self._bkd_ladder is not None:
                 raise ValueError(
                     "adaptive_training: bkd_ladder and bkd_min_keys_ladder "
-                    "are mutually exclusive — choose one curriculum axis."
+                    "are mutually exclusive - choose one curriculum axis."
                 )
             if not self._bkd_min_keys_ladder or any(
                 k < 0 for k in self._bkd_min_keys_ladder
@@ -617,7 +757,8 @@ class PhaseController(Callback):
         # Phases the BKD ladders apply to (default: all, legacy behaviour).
         # Phases not listed fall back to their own phase-block BKD keys, so
         # e.g. [warmup, reconstruct, final_reconstruct] keeps structure free.
-        _all_phases = ["warmup", "reconstruct", "final_reconstruct", "structure"]
+        _all_phases = ["warmup", "reconstruct", "final_reconstruct", "structure",
+                       "joint"]
         lph = ad.get("bkd_ladder_phases", None)
         self._bkd_ladder_phases = set(_all_phases if lph is None else [str(v) for v in lph])
         if not self._bkd_ladder_phases <= set(_all_phases):
@@ -630,6 +771,10 @@ class PhaseController(Callback):
         # order_sampling, oriented}, structure.{gate_opt, gate_sampling,
         # order_sampling}; recon sampling keys overridable per recon phase.
         self._stage_policy = parse_stage_policy(ad)
+        _guided = (config.get("model", {}).get("kwargs", {}) or {}).get("bkd_order_guided")
+        if _guided and dict(_guided).get("enabled", False):
+            raise ValueError("model.kwargs.bkd_order_guided is supported by the standard "
+                             "trainer only (adaptive phases rewrite the BKD schedule).")
         for _old in ("reconstruct_gate", "dense_gate_mode"):
             if _old in ad:
                 raise ValueError(
@@ -645,7 +790,8 @@ class PhaseController(Callback):
         # trains.  Unmanaged runs keep the model default (0.0).
         self._dir_bias_managed: bool = any(
             "dir_bias" in cfg
-            for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg)
+            for cfg in (self.recon_cfg, self.struct_cfg, self.final_cfg,
+                        self.warmup_cfg, self.joint_cfg)
         )
 
         # Deterministic existence-gate offset drift (GatedSelfAttention).
@@ -664,6 +810,21 @@ class PhaseController(Callback):
 
 
 
+        # Schedule runtime state: index of the active stage in ``schedule``,
+        # whether the run already recorded its terminal transition, and the
+        # training-level loss weights (snapshotted at the first phase entry so
+        # every phase can apply its block ON TOP of them).
+        self._stage_idx: int = 0
+        self._stopped: bool = False
+        self._base_lambdas: Optional[Dict[str, float]] = None
+        # STARTED structure-training phases (structure + joint); 1 = first.
+        self._struct_entry_count: int = 0
+        # Split key the joint side loader serves (None outside joint).
+        self._joint_struct_key: Optional[str] = None
+        # Joint-phase plateau trackers (HSIC and reconstruction monitor).
+        self._joint_recon_best: float = float("inf")
+        self._joint_recon_counter: int = 0
+
         # Records
         self.transitions: List[Dict[str, Any]] = []
         self.phase_rows: List[Dict[str, Any]] = []
@@ -673,7 +834,7 @@ class PhaseController(Callback):
     # ------------------------------------------------------------------
     def _apply_bkd_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
         """Apply the per-phase batch-key-dropout curriculum (no-op when the
-        run does not manage BKD — i.e. no phase block sets
+        run does not manage BKD - i.e. no phase block sets
         ``batch_key_dropout``).
 
         Semantics:
@@ -693,14 +854,7 @@ class PhaseController(Callback):
         if not self._bkd_managed:
             return
 
-        if phase == "warmup":
-            cfg = self.warmup_cfg
-        elif phase == "reconstruct":
-            cfg = self.recon_cfg
-        elif phase == "final_reconstruct":
-            cfg = {**self.recon_cfg, **self.final_cfg}
-        else:
-            cfg = self.struct_cfg
+        cfg = self._phase_cfg(phase, warmup_inherits=False)
         on_ladder = phase in self._bkd_ladder_phases
         if self._bkd_ladder is not None and on_ladder:
             # Constant p for the whole cycle (recon + structure alike);
@@ -781,7 +935,7 @@ class PhaseController(Callback):
         if active and n_mod == 0:
             logger.warning(
                 "[adaptive] batch_key_dropout set in the '%s' phase config but "
-                "the model owns no BKD module — set model kwargs "
+                "the model owns no BKD module - set model kwargs "
                 "batch_key_dropout to a non-null value so the modules exist.",
                 phase,
             )
@@ -816,9 +970,22 @@ class PhaseController(Callback):
                 "open_gate_active", float(active), on_step=False, on_epoch=True
             )
 
-    def _phase_cfg(self, phase: str) -> dict:
-        """Config block of a reconstruction phase (final inherits reconstruct)."""
-        return {"warmup": self.warmup_cfg, "reconstruct": self.recon_cfg,
+    def _phase_cfg(self, phase: str, warmup_inherits: bool = True) -> dict:
+        """Effective config block of ``phase`` (single resolver).
+
+        Inheritance:
+          * final_reconstruct: reconstruct block + final block (always);
+          * warmup: reconstruct block + warmup block when ``warmup_inherits``
+            (descendant / LOO / bandwidth / dir_bias knobs), the warmup block
+            alone otherwise (BKD and dense-gate curricula, which are designed
+            per warmup);
+          * structure / joint / reconstruct: their own block.
+        """
+        if phase == "warmup":
+            return ({**self.recon_cfg, **self.warmup_cfg} if warmup_inherits
+                    else self.warmup_cfg)
+        return {"reconstruct": self.recon_cfg, "structure": self.struct_cfg,
+                "joint": self.joint_cfg,
                 "final_reconstruct": {**self.recon_cfg, **self.final_cfg}}.get(phase, {})
 
     def _apply_recon_forward_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
@@ -833,7 +1000,9 @@ class PhaseController(Callback):
         if model is None or not callable(getattr(model, "set_stage_policy", None)):
             return
         pol = self._stage_policy
-        if phase == "structure":
+        # joint uses the structure policy: G_S and the order are trained, and
+        # the structure-stage value weights compose G_R, G_S and the order.
+        if phase in ("structure", "joint"):
             sp = pol["structure"]
             gates, osamp = sp["gate_sampling"], sp["order_sampling"]
             ok = model.set_stage_policy("structure", gate_sampling=gates,
@@ -866,7 +1035,7 @@ class PhaseController(Callback):
                           on_step=False, on_epoch=True)
             pl_module.log("policy/order_sampling_" + osamp, 1.0,
                           on_step=False, on_epoch=True)
-            if (phase == "structure" and self._bkd_managed
+            if (phase in ("structure", "joint") and self._bkd_managed
                     and not getattr(pl_module, "hsic_bkd_exclude_dropped", True)):
                 bkd_on = any(getattr(m, "_bkd_phase_active", False)
                              and getattr(m, "_bkd_p0", None) for m in pl_module.modules())
@@ -879,26 +1048,13 @@ class PhaseController(Callback):
     def _dense_gate_expected(self, phase: str) -> Tuple[bool, bool]:
         """Expected ``(train_dense, eval_dense)`` gate flags for a phase.
 
-        Structure phases default the EVAL probe to True independently of the
-        train flag; all other phases default it to False.  A phase block may
-        override either explicitly with ``dense_adjacency_edge_dropout`` /
-        ``dense_gate_eval``.
+        Structure-training phases (structure, joint) default the EVAL probe to
+        True independently of the train flag; all other phases default it to
+        False.  A phase block may override either explicitly with
+        ``dense_adjacency_edge_dropout`` / ``dense_gate_eval``.
         """
-        if phase == "reconstruct":
-            cfg = self.recon_cfg
-            eval_default = False
-        elif phase == "final_reconstruct":
-            cfg = {**self.recon_cfg, **self.final_cfg}
-            eval_default = False
-        elif phase == "structure":
-            cfg = self.struct_cfg
-            eval_default = True
-        elif phase == "warmup":
-            cfg = self.warmup_cfg
-            eval_default = False
-        else:
-            cfg = {}
-            eval_default = False
+        cfg = self._phase_cfg(phase, warmup_inherits=False)
+        eval_default = phase in ("structure", "joint")
         active = bool(cfg.get("dense_adjacency_edge_dropout", False))
         eval_mode = bool(cfg.get("dense_gate_eval", eval_default))
         return active, eval_mode
@@ -972,21 +1128,17 @@ class PhaseController(Callback):
 
     def _apply_dir_bias_cfg(self, pl_module: pl.LightningModule, phase: str) -> None:
         """Apply the per-phase direction-gate bias (no-op when the run does
-        not manage it ? i.e. no phase block sets ``dir_bias``).
+        not manage it, i.e. no phase block sets ``dir_bias``).
 
         A phase block that omits ``dir_bias`` gets 0.0 (the legacy coupled
-        direction gate, ``d_ij + d_ji == 1``).  Applies to every module
-        exposing ``set_dir_bias`` (GatedSelfAttention ? including the
-        homogeneous single block, which lives in ``model.attention``).
+        direction gate, ``d_ij + d_ji == 1``).  Warmup inherits the
+        reconstruct value.  Applies to every module exposing ``set_dir_bias``
+        (GatedSelfAttention, including the homogeneous single block, which
+        lives in ``model.attention``).
         """
         if not self._dir_bias_managed:
             return
-        if phase == "reconstruct":
-            cfg = self.recon_cfg
-        elif phase == "final_reconstruct":
-            cfg = {**self.recon_cfg, **self.final_cfg}
-        else:
-            cfg = self.struct_cfg
+        cfg = self._phase_cfg(phase)
         value = float(cfg.get("dir_bias", 0.0) or 0.0)
 
         n_mod = 0
@@ -1050,7 +1202,7 @@ class PhaseController(Callback):
         """Set loss-weight attributes on the module, translating per-arch names.
 
         Recognised keys: ``lambda_*`` plus ``kappa`` (the NOTEARS weight, the
-        only non-lambda loss coefficient) — the latter lets the structure
+        only non-lambda loss coefficient) - the latter lets the structure
         phase and the HSIC-progress gate steer NOTEARS too.
         """
         for key, val in lambdas.items():
@@ -1068,7 +1220,7 @@ class PhaseController(Callback):
     # AttentionSelectorForecaster._build_hsic_descendant_mask.
     #
     # Why per phase: the mask is derived from the adjacency that the masked HSIC
-    # is itself training, so it carries a self-confirmation risk — turning it on
+    # is itself training, so it carries a self-confirmation risk - turning it on
     # while the graph is still ~random can delete exactly the parent signal we
     # are looking for and lock in a wrong orientation.  The adaptive schedule
     # gives a much better curriculum handle than a raw epoch count: leave it OFF
@@ -1093,7 +1245,7 @@ class PhaseController(Callback):
     # descendant mask: gamma is measured against the CURRENT predictor and
     # adjacency, so it should typically stay OFF during warmup / high-BKD
     # phases and switch ON in later structure phases (under BKD the
-    # "redundant" twins are functionally load-bearing — see the BKD
+    # "redundant" twins are functionally load-bearing - see the BKD
     # interaction discussion in the counter-proposal).
     _LOO_GATE_KEYS = (
         "use_loo_gamma_gate",
@@ -1155,7 +1307,7 @@ class PhaseController(Callback):
 
         The ``hsic_descendant_warmup_epochs`` value set here is interpreted
         relative to the anchor installed by
-        :meth:`_apply_descendant_warmup_anchor` — see that method for why a raw
+        :meth:`_apply_descendant_warmup_anchor` - see that method for why a raw
         global-epoch threshold is meaningless under the adaptive schedule.
         """
         if not any(k in phase_cfg for k in self._DESCENDANT_MASK_KEYS):
@@ -1163,7 +1315,7 @@ class PhaseController(Callback):
         if not hasattr(pl_module, "hsic_exclude_descendants"):
             logger.warning(
                 "[adaptive] descendant-HSIC keys present in the phase config but "
-                "the forecaster (%s) does not support them — ignoring.",
+                "the forecaster (%s) does not support them - ignoring.",
                 type(pl_module).__name__,
             )
             return
@@ -1205,7 +1357,7 @@ class PhaseController(Callback):
         if not hasattr(pl_module, "use_loo_gamma_gate"):
             logger.warning(
                 "[adaptive] LOO-gamma keys present in the phase config but "
-                "the forecaster (%s) does not support them — ignoring.",
+                "the forecaster (%s) does not support them - ignoring.",
                 type(pl_module).__name__,
             )
             return
@@ -1271,8 +1423,8 @@ class PhaseController(Callback):
         adaptive schedule everything runs in ONE ``fit()``, so ``current_epoch``
         is global and a raw threshold is the wrong quantity twice over:
 
-        * it is typically ALREADY EXPIRED when structure first starts — with a
-          reconstruct warmup of 100–200 epochs, a 50-epoch guard has long
+        * it is typically ALREADY EXPIRED when structure first starts - with a
+          reconstruct warmup of 100-200 epochs, a 50-epoch guard has long
           elapsed, so the mask goes live on the very first structural step, on a
           still-random adjacency.  That is exactly the self-confirmation risk the
           warmup exists to prevent;
@@ -1282,7 +1434,7 @@ class PhaseController(Callback):
         Anchoring it to the first epoch of the FIRST structure phase makes the
         warmup count the epochs that actually TRAIN the structure.  Later
         structure phases set the anchor to ``None`` ("already served"), so the
-        delay is paid once instead of being re-paid every cycle — the adjacency
+        delay is paid once instead of being re-paid every cycle - the adjacency
         is no longer random by then, which is what the guard protects against.
         """
         if not hasattr(pl_module, "_descendant_warmup_anchor"):
@@ -1318,7 +1470,7 @@ class PhaseController(Callback):
         schedule = getattr(pl_module, "fanin_schedule", None)
         if schedule is None:
             return
-        schedule.in_structure_phase = (phase == "structure")
+        schedule.in_structure_phase = phase in ("structure", "joint")
 
     # ------------------------------------------------------------------
     # Prior-softmax gain schedule (GainSoftmax modules)
@@ -1455,7 +1607,14 @@ class PhaseController(Callback):
                               on_step=False, on_epoch=True)
 
     def _apply_phase(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
-                     phase: str) -> None:
+                     phase: str, resume: bool = False) -> None:
+        """Configure the model / data for ``phase``.
+
+        ``resume=True`` re-applies the phase SETTINGS after a checkpoint
+        restore but skips the one-off entry actions (edge-offset drift,
+        optimizer reset, order initialization, drift baseline, null estimate)
+        and the entry counters, whose effect is already in the checkpoint.
+        """
         struct_params, recon_params = self._resolve_param_groups(pl_module)
         # "Both" parameter class (shared_att_selector): the shared G stays
         # trainable in EVERY phase; which optimizer steps it (recon and/or
@@ -1479,6 +1638,9 @@ class PhaseController(Callback):
         self._hsic_best = float("inf")
         self._hsic_plateau_counter = 0
         self._hsic_phase_best_gate = float("inf")
+        self._joint_recon_best = float("inf")
+        self._joint_recon_counter = 0
+        self._joint_struct_key = None
 
         # 3. Model stage settings.
         self._apply_fanin_phase(pl_module, phase)
@@ -1512,59 +1674,44 @@ class PhaseController(Callback):
             pl_module.acyclicity_constraint_on_phase_switch(phase=phase)
 
 
-        if phase in ("reconstruct", "final_reconstruct", "warmup"):
-            for p in struct_params:
-                p.requires_grad_(False)
-            for p in recon_params:
-                p.requires_grad_(True)
-            for p in shared_params:
-                p.requires_grad_(True)
-            # Descendant-HSIC overrides are honoured in every phase so a run can
-            # e.g. keep the mask off during reconstruct and on during structure.
-            # The final phase inherits the reconstruct block's settings and lets
-            # its own block override individual keys.
-            mask_cfg = (
-                self.recon_cfg if phase in ("reconstruct", "warmup")
-                else {**self.recon_cfg, **self.final_cfg}
-            )
-            self._apply_descendant_mask_cfg(pl_module, mask_cfg)
-            self._apply_loo_gate_cfg(pl_module, mask_cfg)
-            self._apply_hsic_bw_cfg(pl_module, mask_cfg)
-        elif phase == "structure":
-            for p in recon_params:
-                p.requires_grad_(False)
-            for p in struct_params:
-                p.requires_grad_(True)
-            for p in shared_params:
-                p.requires_grad_(True)
-            # Apply structure-phase loss weights (e.g. lambda_hsic_cross), with
-            # lambda_l0 disarmed when the HSIC-progress gate is closed and held
-            # at 0.0 before lambda_l0_start_epoch (late L0 turn-on).
-            struct_lambdas = self._gated_struct_cfg(pl_module)
-            if int(trainer.current_epoch) < self.struct_l0_start_epoch:
-                if float(struct_lambdas.get("lambda_l0", 0.0)) != 0.0:
-                    logger.info(
-                        "[adaptive] lambda_l0 held at 0.0 (global_epoch=%d < "
-                        "lambda_l0_start_epoch=%d).",
-                        int(trainer.current_epoch), self.struct_l0_start_epoch,
-                    )
-                struct_lambdas = {**struct_lambdas, "lambda_l0": 0.0}
-            self._apply_lambdas(pl_module, struct_lambdas)
-            pl_module.log(
-                "lambda_l0_eff",
-                float(getattr(pl_module, "lambda_l0", 0.0)),
-                on_step=False, on_epoch=True,
-            )
-            # ...and the structure-phase descendant-exclusion settings.
-            self._struct_phase_count += 1
-            self._apply_descendant_mask_cfg(pl_module, self.struct_cfg)
-            self._apply_loo_gate_cfg(pl_module, self.struct_cfg)
-            self._apply_hsic_bw_cfg(pl_module, self.struct_cfg)
-            # Anchor AFTER the overrides so the warmup value logged/compared is
-            # the one this phase will actually use.
-            self._apply_descendant_warmup_anchor(trainer, pl_module)
-        else:
+        if phase not in _PHASE_CODE:
             raise ValueError(f"Unknown phase {phase!r}")
+
+        # Trainability: structure params train in structure / joint, recon
+        # params in every reconstruction phase and in joint.  The shared
+        # selector ("both" class) is trainable in every phase.
+        train_struct = phase in ("structure", "joint")
+        train_recon = phase in ("warmup", "reconstruct", "final_reconstruct", "joint")
+        for p in struct_params:
+            p.requires_grad_(train_struct)
+        for p in recon_params:
+            p.requires_grad_(train_recon)
+        for p in shared_params:
+            p.requires_grad_(True)
+
+        # Joint side loader (structure split for the HSIC residual); cleared
+        # in every other phase so fold B / the in-batch residual is used.
+        self._apply_joint_loader(pl_module, phase)
+
+        # Loss weights: EVERY phase applies its block on top of the
+        # training-level values (snapshotted once), so no phase inherits the
+        # weights of the previous one.
+        self._apply_phase_lambdas(trainer, pl_module, phase)
+
+        # Descendant-HSIC / LOO / bandwidth overrides (honoured in every
+        # phase; warmup and final inherit the reconstruct block).
+        phase_cfg = self._phase_cfg(phase)
+        if train_struct and not resume:
+            self._struct_entry_count += 1
+            if phase == "structure":
+                self._struct_phase_count += 1
+        self._apply_descendant_mask_cfg(pl_module, phase_cfg)
+        self._apply_loo_gate_cfg(pl_module, phase_cfg)
+        self._apply_hsic_bw_cfg(pl_module, phase_cfg)
+        if train_struct:
+            # Anchor AFTER the overrides so the warmup value logged/compared
+            # is the one this phase will actually use.
+            self._apply_descendant_warmup_anchor(trainer, pl_module)
 
         # Per-phase BKD curriculum (reconstruct: heavy annealed dropout;
         # structure: off).  No-op unless a phase block sets batch_key_dropout.
@@ -1583,6 +1730,39 @@ class PhaseController(Callback):
         # structure: unbiased).  No-op unless a phase block sets dir_bias.
         self._apply_dir_bias_cfg(pl_module, phase)
 
+        # ---- One-off ENTRY actions: skipped when re-applying a phase on
+        # resume (the model / optimizer state already contains their effect).
+        if not resume:
+            self._apply_phase_entry_actions(trainer, pl_module, phase)
+
+        # 5. Hard readiness contract: the phase must not start half-configured.
+        self._verify_phase_contract(
+            pl_module, phase, split_key, struct_params, recon_params,
+            resume=resume,
+        )
+
+        # Always emit to the Python logger so the active stage is visible in
+        # cluster log files (where console ``print`` is suppressed).
+        logger.info(
+            "[adaptive] entering phase '%s' @ global_epoch=%d "
+            "(phase_index=%d, cycle=%d%s%s)",
+            phase, trainer.current_epoch, self._phase_index, self._cycle_count,
+            f", n_train={n_subset}" if n_subset is not None else "",
+            ", resumed" if resume else "",
+        )
+
+        if not self.cluster:
+            subset_msg = f" (n_train={n_subset})" if n_subset is not None else ""
+            print(f"  [adaptive] -> phase '{phase}' at global epoch "
+                  f"{trainer.current_epoch}{subset_msg}")
+
+    def _apply_phase_entry_actions(self, trainer: pl.Trainer,
+                                   pl_module: pl.LightningModule, phase: str) -> None:
+        """One-off actions of a FRESH phase entry (never repeated on resume).
+
+        Edge-offset drift, optimizer-state reset, HSIC order initialization,
+        the structure drift baseline and the permutation-null estimate.
+        """
         # Existence-gate offset drift (structure-phase entries only).  No-op
         # unless the structure block sets edge_offset_step.
         self._apply_edge_offset_cfg(pl_module, phase)
@@ -1595,9 +1775,12 @@ class PhaseController(Callback):
                 opt.state = defaultdict(dict)
 
         init_cfg = self.config.get("adaptive_training", {}).get("order_initialization", {}) or {}
-        if phase == "structure" and bool(init_cfg.get("enabled", False)):
+        if phase in ("structure", "joint") and bool(init_cfg.get("enabled", False)):
             if getattr(pl_module, "_order_initialization_report", None) is None:
-                if self.start_phase != "warmup" or self._phase_index != 1:
+                # Must be the FIRST structure-training entry, right after the
+                # warmup stage (independent of whether joint is scheduled).
+                if (not self.warmup_enabled or self._struct_entry_count != 1
+                        or self._phase_index != 1):
                     raise ValueError("Order initialization requires the first post-warmup structure entry.")
                 from causaliT.training.order_initialization import initialize_order_from_hsic
                 get_loader = getattr(self.dm, "hsic_cross_fit_eval_dataloader", None)
@@ -1643,24 +1826,83 @@ class PhaseController(Callback):
                     mask_consistent=self.null_est_mask_consistent,
                 )
 
-        # 5. Hard readiness contract: the phase must not start half-configured.
-        self._verify_phase_contract(
-            pl_module, phase, split_key, struct_params, recon_params
-        )
+    def _apply_joint_loader(self, pl_module: pl.LightningModule, phase: str) -> None:
+        """Install the structure-split side loader in ``joint``; clear it otherwise.
 
-        # Always emit to the Python logger so the active stage is visible in
-        # cluster log files (where console ``print`` is suppressed).
-        logger.info(
-            "[adaptive] entering phase '%s' @ global_epoch=%d "
-            "(phase_index=%d, cycle=%d%s)",
-            phase, trainer.current_epoch, self._phase_index, self._cycle_count,
-            f", n_train={n_subset}" if n_subset is not None else "",
-        )
+        With cross-fitting the Lightning loader serves the reconstruct split
+        (MSE) and this side loader the structure split, on which the HSIC
+        residual is computed (out-of-sample w.r.t. the regressor fit).
+        Without cross-fitting the residual stays on the training batch (the
+        forecaster's HSIC fold B, when enabled, still applies).
+        """
+        setter = getattr(pl_module, "set_joint_structure_loader", None)
+        if phase != "joint":
+            if callable(setter):
+                setter(None)
+            return
+        if getattr(pl_module, "structural_grad", None) == "hsic_unrolled":
+            raise ValueError(
+                "The adaptive 'joint' phase does not support "
+                "training.structural_grad='hsic_unrolled'.")
+        if not self.cross_fitting:
+            logger.warning(
+                "[adaptive] joint phase without cross-fitting (data_split_ratio "
+                "unset): the HSIC residual is measured on the batch the "
+                "regressor is fitting.")
+            return
+        if not callable(setter):
+            raise RuntimeError(
+                f"[adaptive] joint phase with cross-fitting requires "
+                f"{type(pl_module).__name__}.set_joint_structure_loader().")
+        get = getattr(self.dm, "stage_split_dataloader", None)
+        key = "reconstruct" if self._resolve_split_key("structure") == "reconstruct" \
+            else "structure"
+        loader = get(key) if callable(get) else None
+        if loader is None:
+            raise RuntimeError(
+                f"[adaptive] joint phase: datamodule has no '{key}' split loader.")
+        setter(loader)
+        self._joint_struct_key = key
 
-        if not self.cluster:
-            subset_msg = f" (n_train={n_subset})" if n_subset is not None else ""
-            print(f"  [adaptive] -> phase '{phase}' at global epoch "
-                  f"{trainer.current_epoch}{subset_msg}")
+    def _apply_phase_lambdas(self, trainer: pl.Trainer,
+                             pl_module: pl.LightningModule, phase: str) -> None:
+        """Apply the loss weights of ``phase`` on top of the training-level values.
+
+        The training-level weights are snapshotted at the first call; every
+        phase then starts from them and applies its own block (structure: with
+        the HSIC-progress gates and the late L0 turn-on; joint: its own block,
+        with ``lambda_l0`` defaulting to 0 so node selection waits for the
+        order).  Keys absent from the block keep the training-level value.
+        """
+        if self._base_lambdas is None:
+            self._base_lambdas = {
+                k: float(v) for k, v in vars(pl_module).items()
+                if (k.startswith("lambda_") or k == "kappa")
+                and isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+        for k, v in self._base_lambdas.items():
+            setattr(pl_module, k, v)
+
+        if phase == "structure":
+            lambdas = self._gated_struct_cfg(pl_module)
+        elif phase == "joint":
+            lambdas = {"lambda_l0": 0.0, **self.joint_cfg}
+        else:
+            lambdas = self._phase_cfg(phase)
+        if phase in ("structure", "joint") and \
+                int(trainer.current_epoch) < self.struct_l0_start_epoch:
+            if float(lambdas.get("lambda_l0", 0.0)) != 0.0:
+                logger.info(
+                    "[adaptive] lambda_l0 held at 0.0 (global_epoch=%d < "
+                    "lambda_l0_start_epoch=%d).",
+                    int(trainer.current_epoch), self.struct_l0_start_epoch,
+                )
+            lambdas = {**lambdas, "lambda_l0": 0.0}
+        self._apply_lambdas(pl_module, lambdas)
+        pl_module.log(
+            "lambda_l0_eff", float(getattr(pl_module, "lambda_l0", 0.0)),
+            on_step=False, on_epoch=True,
+        )
 
 
     def _resolve_split_key(self, phase: str) -> str:
@@ -1673,12 +1915,17 @@ class PhaseController(Callback):
         before the following reconstruct phase is applied, so an odd count makes
         both alternating phases request the *other* subset.  Within every
         recon->struct pairing ``_cycle_count`` is constant, so the two phases
-        always train on disjoint subsets — structure never reuses the split of
+        always train on disjoint subsets - structure never reuses the split of
         the reconstruction that preceded it.  ``final_reconstruct`` (full
         training set) is never swapped.  ``warmup`` always uses the
         reconstruct subset (and is never swapped: it runs before cycle 1).
         """
         if phase == "warmup":
+            return "reconstruct"
+        if phase == "joint":
+            # Lightning loader = reconstruct split (MSE); the structure split
+            # is served by the joint side loader (HSIC residual).  joint runs
+            # before cycle 1, so it is never swapped.
             return "reconstruct"
         if (
             self.swap_splits
@@ -1704,7 +1951,7 @@ class PhaseController(Callback):
             return None
         key = self._resolve_split_key(phase)
         self._active_split_key = key
-        # Preferred path: the datamodule owns the phase→subset mapping.
+        # Preferred path: the datamodule owns the phase->subset mapping.
         if hasattr(self.dm, "set_active_phase"):
             return self.dm.set_active_phase(key)
         # Fallback for datamodules without the stage-split API.
@@ -1773,10 +2020,11 @@ class PhaseController(Callback):
         split_key: Optional[str],
         struct_params: List[torch.nn.Parameter],
         recon_params: List[torch.nn.Parameter],
+        resume: bool = False,
     ) -> None:
         """Hard readiness check: the phase must not start half-configured."""
         # 1. Split selection happened and matches the request.
-        if self.cross_fitting and phase in ("reconstruct", "structure"):
+        if self.cross_fitting and phase in ("reconstruct", "structure", "joint"):
             if split_key is None or self.stage_splits.get(split_key) is None:
                 raise RuntimeError(
                     f"[adaptive] phase '{phase}' requires cross-fit split "
@@ -1809,8 +2057,8 @@ class PhaseController(Callback):
         shared_ids = {id(p) for p in getattr(pl_module, "_shared_selector_params", [])}
         struct_check = [p for p in struct_params if id(p) not in shared_ids]
         recon_check = [p for p in recon_params if id(p) not in shared_ids]
-        want_struct = phase == "structure"
-        want_recon = phase in ("warmup", "reconstruct", "final_reconstruct")
+        want_struct = phase in ("structure", "joint")
+        want_recon = phase in ("warmup", "reconstruct", "final_reconstruct", "joint")
         if any(p.requires_grad != want_struct for p in struct_check):
             raise RuntimeError(
                 f"[adaptive] structural params trainability mismatch at '{phase}' entry."
@@ -1833,8 +2081,19 @@ class PhaseController(Callback):
                         f"{getattr(mod, '_dense_gate_eval', None)})."
                     )
 
-        # 4. Structure drift baseline exists when the probe is available.
-        if phase == "structure" and self.dm is not None and hasattr(pl_module, "reconstruction_mse"):
+        # 4. Joint side loader: with cross-fitting the HSIC residual must be
+        # on the split DISJOINT from the one the Lightning loader serves.
+        if phase == "joint" and self.cross_fitting:
+            if (self._joint_struct_key is None
+                    or self._joint_struct_key == self._active_split_key):
+                raise RuntimeError(
+                    "[adaptive] joint phase requires the structure side loader "
+                    "on the split disjoint from the reconstruction split.")
+
+        # 5. Structure drift baseline exists when the probe is available
+        # (fresh entries only: on resume it is restored from the checkpoint).
+        if (phase == "structure" and not resume and self.dm is not None
+                and hasattr(pl_module, "reconstruction_mse")):
             if self._phase_entry_monitor is None or not np.isfinite(self._phase_entry_monitor):
                 raise RuntimeError(
                     "[adaptive] structure phase requires a finite relaxed-gate "
@@ -1854,6 +2113,8 @@ class PhaseController(Callback):
         "_l0_active", "_kappa_base", "_kappa_active", "_hsic_run_best",
         "_hsic_stall_cycles", "_hsic_phase_best_gate", "_active_split_key",
         "_order_tau_init", "_order_noise_init", "transitions", "phase_rows",
+        "_stage_idx", "_stopped", "_base_lambdas", "_struct_entry_count",
+        "_joint_recon_best", "_joint_recon_counter",
     )
 
     def state_dict(self) -> Dict[str, Any]:
@@ -1866,18 +2127,36 @@ class PhaseController(Callback):
 
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         # Apply the initial phase after optimizers exist and after the module's
-        # own on_fit_start (which honours config freeze flags — left False here).
+        # own on_fit_start (which honours config freeze flags - left False here).
         restored = getattr(self, "_restored_state", None)
         if restored is None:
             self._apply_phase(trainer, pl_module, self.start_phase)
             return
-        # Resumed from a checkpoint: re-apply the active phase (freezing,
-        # lambdas, split, model stage), then undo the per-phase resets and
-        # counters that _apply_phase performs on a fresh phase entry.
-        self._apply_phase(trainer, pl_module, restored["current_phase"])
+        # Resumed from a checkpoint: re-apply the active phase SETTINGS
+        # (freezing, lambdas, split, model stage) WITHOUT the one-off entry
+        # actions, then restore the counters/trackers _apply_phase resets.
+        self._apply_phase(trainer, pl_module, restored["current_phase"], resume=True)
         for key, value in restored.items():
             setattr(self, key, value)
         self._restored_state = None
+
+    def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Record the last phase when the run ends on the global epoch budget.
+
+        Without this the phase active at ``max_epochs`` never gets a
+        transition record (no row, no DAG diagnostics, no checkpoint).
+        """
+        if self._stopped or trainer.sanity_checking:
+            return
+        metrics = trainer.callback_metrics
+        val = metrics.get(self.monitor)
+        monitor_val = float(val) if val is not None else float("nan")
+        self._record_transition(
+            trainer, pl_module, "global_budget",
+            from_phase=self.current_phase, to_phase="stop",
+            monitor_val=monitor_val,
+        )
+        self._stopped = True
 
     def _capture_dag(self, trainer, pl_module, label: str) -> Dict[str, Any]:
         """Capture DAG diagnostics + score margin without corrupting train mode."""
@@ -1977,9 +2256,95 @@ class PhaseController(Callback):
         alternating_budget = int(max_epochs) - self.final_max_epochs
         return trainer.current_epoch >= alternating_budget - 1
 
+    def _advance_stage(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
+                       reason: str, monitor_val: float,
+                       target_stage: Optional[str] = None) -> None:
+        """Leave the active stage and enter the next one of ``schedule``.
+
+        ``target_stage`` jumps to a specific later stage (used by the
+        global-budget switch to ``final_reconstruct``).  When no stage is left
+        the transition is recorded with ``to_phase='stop'`` and the trainer
+        stops.
+        """
+        # The active stage is derived from the active phase (reconstruct /
+        # structure belong to ``alternate``), so it can never go stale.
+        stage = ("alternate" if self.current_phase in ("reconstruct", "structure")
+                 else self.current_phase)
+        cur = self.schedule.index(stage) if stage in self.schedule else self._stage_idx
+        if target_stage is not None:
+            nxt = self.schedule.index(target_stage)
+        else:
+            nxt = cur + 1
+        if nxt >= len(self.schedule):
+            self._record_transition(
+                trainer, pl_module, reason, from_phase=self.current_phase,
+                to_phase="stop", monitor_val=monitor_val,
+            )
+            self._phase_index += 1
+            self._stopped = True
+            trainer.should_stop = True
+            if not self.cluster:
+                print(f"  [adaptive] schedule complete ({reason}) - stopping.")
+            return
+        phase = _first_phase(self.schedule[nxt], self.alternate_start)
+        self._record_transition(
+            trainer, pl_module, reason, from_phase=self.current_phase,
+            to_phase=phase, monitor_val=monitor_val,
+        )
+        self._phase_index += 1
+        self._stage_idx = nxt
+        self._apply_phase(trainer, pl_module, phase)
+
+    def _joint_step(self, trainer: pl.Trainer, pl_module: pl.LightningModule,
+                    current: float, phase_epochs: int) -> None:
+        """Exit triggers of the joint phase (no reconstruction-drift trigger:
+        the regressor keeps adapting, so its drift is not a staleness signal).
+
+        Exits on an HSIC plateau (``hsic_patience``), a reconstruction-monitor
+        plateau (``recon_patience``; both 0 = off), or the ``max_epochs`` cap.
+        Plateau exits are suppressed before ``min_epochs``.
+        """
+        metrics = trainer.callback_metrics
+        hsic_ready = False
+        hsic_val = metrics.get(self.struct_hsic_monitor)
+        if self.joint_hsic_patience > 0 and hsic_val is not None:
+            h = float(hsic_val)
+            if np.isfinite(h):
+                if _improved(h, self._hsic_best, self.joint_hsic_min_delta):
+                    self._hsic_best = h
+                    self._hsic_plateau_counter = 0
+                else:
+                    self._hsic_best = min(self._hsic_best, h)
+                    self._hsic_plateau_counter += 1
+                hsic_ready = self._hsic_plateau_counter >= self.joint_hsic_patience
+        recon_ready = False
+        if self.joint_recon_patience > 0:
+            if _improved(current, self._joint_recon_best, self.joint_recon_min_delta):
+                self._joint_recon_best = current
+                self._joint_recon_counter = 0
+            else:
+                self._joint_recon_best = min(self._joint_recon_best, current)
+                self._joint_recon_counter += 1
+            recon_ready = self._joint_recon_counter >= self.joint_recon_patience
+        if np.isfinite(self._joint_recon_best):
+            self._phase_best = self._joint_recon_best
+        pl_module.log("adaptive_hsic_plateau", float(self._hsic_plateau_counter),
+                      on_step=False, on_epoch=True)
+
+        floor = phase_epochs >= self.joint_min_epochs
+        if hsic_ready and floor:
+            reason = "joint_hsic_plateau"
+        elif recon_ready and floor:
+            reason = "joint_recon_plateau"
+        elif phase_epochs >= self.joint_max_epochs:
+            reason = "joint_budget"
+        else:
+            return
+        self._advance_stage(trainer, pl_module, reason, current)
+
     def on_validation_epoch_end(self, trainer: pl.Trainer,
                                 pl_module: pl.LightningModule) -> None:
-        if trainer.sanity_checking:
+        if trainer.sanity_checking or self._stopped:
             return
 
         metrics = trainer.callback_metrics
@@ -2032,16 +2397,11 @@ class PhaseController(Callback):
             and self.current_phase != "final_reconstruct"
             and self._final_boundary_reached(trainer)
         ):
-            self._record_transition(
-                trainer, pl_module, "alternating_budget",
-                from_phase=self.current_phase, to_phase="final_reconstruct",
-                monitor_val=current,
-            )
-            self._phase_index += 1
-            self._apply_phase(trainer, pl_module, "final_reconstruct")
+            self._advance_stage(trainer, pl_module, "alternating_budget",
+                                current, target_stage="final_reconstruct")
             return
 
-        # ---------- Warmup phase: fixed budget -> structure ----------------
+        # ---------- Warmup phase: fixed budget -> next stage ---------------
         # The cosine BKD curriculum must run to completion, so the ONLY exit
         # is the epoch budget (no plateau early-exit).
         if self.current_phase == "warmup":
@@ -2051,13 +2411,12 @@ class PhaseController(Callback):
                                   on_step=False, on_epoch=True)
                     break
             if phase_epochs >= self.warmup_max_epochs:
-                self._record_transition(
-                    trainer, pl_module, "warmup_budget",
-                    from_phase="warmup", to_phase="structure",
-                    monitor_val=current,
-                )
-                self._phase_index += 1
-                self._apply_phase(trainer, pl_module, "structure")
+                self._advance_stage(trainer, pl_module, "warmup_budget", current)
+            return
+
+        # ---------- Joint phase: HSIC / recon plateau / budget -------------
+        if self.current_phase == "joint":
+            self._joint_step(trainer, pl_module, current, phase_epochs)
             return
 
         # ---------------- Reconstruct phase: plateau / budget ----------------
@@ -2143,7 +2502,7 @@ class PhaseController(Callback):
             if self.struct_hsic_patience > 0 and hsic_val is not None:
                 hsic_current = float(hsic_val)
                 if np.isfinite(hsic_current):
-                    if hsic_current <= self._hsic_best * (1.0 - self.struct_hsic_min_delta):
+                    if _improved(hsic_current, self._hsic_best, self.struct_hsic_min_delta):
                         self._hsic_best = hsic_current
                         self._hsic_plateau_counter = 0
                     else:
@@ -2245,38 +2604,14 @@ class PhaseController(Callback):
                 # Optional safety guard: stop only when an explicit max_cycles is
                 # configured and has been reached.  When ``max_cycles is None``
                 # (default) the run is bounded solely by ``total_epoch_budget``
-                # (Trainer max_epochs) — i.e. it does as many cycles as fit.
+                # (Trainer max_epochs) - i.e. it does as many cycles as fit.
                 if self.max_cycles is not None and self._cycle_count >= self.max_cycles:
-
-                    # With the final phase enabled, do not stop yet: refine the
-                    # reconstruction against the frozen structure on the full
-                    # training set first (the final phase's own epoch cap still
-                    # guarantees termination).
-                    if self.final_enabled:
-                        self._record_transition(
-                            trainer, pl_module, f"{reason}_final",
-                            from_phase="structure",
-                            to_phase="final_reconstruct",
-                            monitor_val=current,
-                        )
-                        self._phase_index += 1
-                        if not self.cluster:
-                            print(f"  [adaptive] max_cycles={self.max_cycles} "
-                                  f"reached - entering final reconstruct phase.")
-                        self._apply_phase(trainer, pl_module, "final_reconstruct")
-                        return
-
-                    self._record_transition(
-                        trainer, pl_module, f"{reason}_final",
-                        from_phase="structure", to_phase="stop",
-                        monitor_val=current,
-                    )
-                    self._phase_index += 1
+                    # Leave the alternate stage: the next scheduled stage
+                    # (e.g. final_reconstruct, whose own cap guarantees
+                    # termination) or stop when none is left.
                     if not self.cluster:
-                        print(f"  [adaptive] max_cycles={self.max_cycles} reached "
-                              f"- stopping.")
-
-                    trainer.should_stop = True
+                        print(f"  [adaptive] max_cycles={self.max_cycles} reached.")
+                    self._advance_stage(trainer, pl_module, f"{reason}_final", current)
                     return
 
                 self._record_transition(
@@ -2314,16 +2649,7 @@ class PhaseController(Callback):
                 reason = (
                     "final_recon_plateau" if plateaued else "final_recon_budget"
                 )
-                self._record_transition(
-                    trainer, pl_module, reason,
-                    from_phase="final_reconstruct", to_phase="stop",
-                    monitor_val=current,
-                )
-                self._phase_index += 1
-                if not self.cluster:
-                    print(f"  [adaptive] final reconstruct phase ended ({reason}) "
-                          f"- stopping.")
-                trainer.should_stop = True
+                self._advance_stage(trainer, pl_module, reason, current)
                 return
 
 
@@ -2343,8 +2669,8 @@ def _save_config_snapshot(config: dict, save_dir: str) -> Optional[str]:
     candidate (it would make the "first hit" ambiguous), so this is a no-op then.
 
     When nothing is present (e.g. ``save_dir`` is a fresh scratch directory), we
-    write the *resolved* config — sequence lengths populated from the dataset,
-    ``k_fold=1`` and the adaptive epoch budget applied — so the run is
+    write the *resolved* config - sequence lengths populated from the dataset,
+    ``k_fold=1`` and the adaptive epoch budget applied - so the run is
     self-describing for offline evaluation.
 
     Returns the path written, or ``None`` when a config was already present.
@@ -2403,7 +2729,7 @@ def adaptive_trainer(
     best: bool = False,
     extra_callbacks: Optional[List] = None,
     resume_ckpt: Optional[str] = None,
-) -> pd.DataFrame:
+) -> Optional[pd.DataFrame]:
     """
     Adaptive alternating trainer: metric-driven Structure/Reconstruct schedule.
 
@@ -2502,14 +2828,11 @@ def adaptive_trainer(
     # ``total_budget`` epochs and the refinement runs afterwards (structure
     # frozen, cross-fit split off -> full training set).
     final_cfg = _to_plain_container(ad_cfg.get("final_reconstruct", {})) or {}
-    final_enabled = bool(final_cfg.get("enabled", False))
     final_max_epochs = int(final_cfg.get("max_epochs", 100))
-    if final_enabled and final_max_epochs <= 0:
-        logger.warning(
-            "adaptive_trainer: final_reconstruct.enabled=true but max_epochs=%d "
-            "<= 0 - disabling the final phase.", final_max_epochs,
-        )
-        final_enabled = False
+    # The declarative schedule decides which stages run (legacy keys are
+    # translated by resolve_schedule).
+    schedule = resolve_schedule(ad_cfg)
+    final_enabled = "final_reconstruct" in schedule
     if final_enabled:
         config["training"]["max_epochs"] = total_budget + final_max_epochs
     else:
@@ -2532,13 +2855,13 @@ def adaptive_trainer(
     # When ``data_split_ratio`` is set (in the open interval (0, 1)), partition
     # the fold's training indices into two disjoint subsets: the reconstruct
     # phase trains on ``recon`` and the structure phase on ``struct`` (DML/DARTS
-    # honest cross-fit — residual-HSIC is out-of-sample w.r.t. the reconstruction
+    # honest cross-fit - residual-HSIC is out-of-sample w.r.t. the reconstruction
     # fit).  ``None`` / out-of-range disables it (both phases use the full set).
     data_split_ratio = ad_cfg.get("data_split_ratio", None)
     stage_splits: Optional[Dict[str, np.ndarray]] = None
     reload_every_n = 0
     active_split_ratio: Optional[float] = None
-    start_phase = str(ad_cfg.get("start_phase", "reconstruct")).lower()
+    start_phase = _first_phase(schedule[0], _alternate_start(ad_cfg, schedule))
     # Exchange the recon/structure subsets after each completed cycle (the
     # controller validates it against cross-fitting being active).
     swap_splits = bool(ad_cfg.get("swap_splits", False))
@@ -2557,13 +2880,15 @@ def adaptive_trainer(
         # narrowed to the starting phase's subset only below).
         if final_enabled:
             stage_splits["final_reconstruct"] = np.asarray(train_local_idx)
-        # The datamodule OWNS the phase→subset mapping; the controller only
+        # The datamodule OWNS the phase->subset mapping; the controller only
         # requests a phase by name (dm.set_active_phase).  val/test are held
         # constant so stage-to-stage metrics stay comparable.
         dm.set_stage_splits(stage_splits, val_idx=val_local_idx, test_idx=test_idx)
         # Start the shared fit on the subset of the starting phase so the first
         # epoch already trains on the correct partition.
-        train_local_idx = stage_splits.get(start_phase, train_local_idx)
+        # warmup / joint train the Lightning loader on the reconstruct split.
+        start_key = "reconstruct" if start_phase in ("warmup", "joint") else start_phase
+        train_local_idx = stage_splits.get(start_key, train_local_idx)
         # Lightning must re-query dm.train_dataloader() after each phase switch,
         # so reload the train dataloader every epoch.  Reloading every epoch
         # respawns the ENTIRE worker pool each epoch: on Windows (spawn) each
@@ -2571,7 +2896,7 @@ def adaptive_trainer(
         # crashes the session at the first epoch boundary; on Linux (fork) it is
         # cheaper but still leaks memory over long runs.  The dataset is an
         # in-memory TensorDataset (batches are index-selects on RAM tensors, no
-        # I/O to overlap), so workers add pure overhead and no throughput —
+        # I/O to overlap), so workers add pure overhead and no throughput -
         # force single-process loading (num_workers=0) on the reload path.
         # Correct and faster on BOTH Windows and the cluster.
         reload_every_n = 1
@@ -2653,7 +2978,12 @@ def adaptive_trainer(
         print("\n" + "=" * 70)
         print("ADAPTIVE ALTERNATING TRAINING")
         print(f"  total_epoch_budget : {total_budget}")
+        print(f"  schedule           : {' -> '.join(controller.schedule)}")
         print(f"  start_phase        : {controller.start_phase}")
+        if "joint" in controller.schedule:
+            print(f"  joint              : cap {controller.joint_max_epochs}, "
+                  f"hsic patience {controller.joint_hsic_patience}, "
+                  f"recon patience {controller.joint_recon_patience}")
         print(f"  monitor            : {controller.monitor}")
         print(f"  structure trigger  : +{controller.drop_pct:.0%} for "
               f"{controller.drop_patience} epochs (cap {controller.struct_max_epochs})")
@@ -2721,6 +3051,7 @@ def adaptive_trainer(
         "experiment_tag": experiment_tag,
         "total_epoch_budget": total_budget,
         "start_phase": controller.start_phase,
+        "schedule": list(controller.schedule),
         "monitor": controller.monitor,
         "cross_fitting": stage_splits is not None,
         "data_split_ratio": active_split_ratio,

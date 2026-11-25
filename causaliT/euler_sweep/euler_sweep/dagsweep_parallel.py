@@ -883,6 +883,14 @@ if [[ -z "${{VIRTUAL_ENV:-}}" ]]; then
     exit 1
 fi
 echo "[$(date)] Python env: $VIRTUAL_ENV"
+
+# External DAGuerreotype build (benchmarks/install_daguerreo/install_daguerreo.sh).
+# Added to PYTHONPATH only if present, so other machines are unaffected.
+for _d in "$HOME/ext/DAGuerreotype" "$HOME/ext/lp-sparsemap-master"; do
+    if [[ -d "$_d" ]]; then
+        export PYTHONPATH="$_d${{PYTHONPATH:+:$PYTHONPATH}}"
+    fi
+done
 """
 
 
@@ -966,12 +974,19 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     concurrent = int(slurm_params.get("max_concurrent_jobs", 6))
     venv = slurm_params.get("venv_path", "$HOME/myenv")
     env = _ENV_BLOCK.format(venv_path=venv)
+    chunk = array_chunk_size(slurm_params)
+    # Train stage: exactly `workers` jobs exist at any time (the resource cap).
+    workers = n_pool_workers(plan, slurm_params)
+    pool_dir = state_dir(exp_dir) / "pool"
 
     def _body(subcommand: str, array_task: bool) -> str:
         # The worker call is emitted on ONE line on purpose: backslash line
         # continuations are fragile in sbatch scripts (a single trailing space
         # silently truncates the command).
-        task_arg = " --task_id $SLURM_ARRAY_TASK_ID" if array_task else ""
+        # TASK_OFFSET is set per chunk by submit_parallel_dag_sweep (arrays
+        # larger than MaxArraySize are split); 0 when submitted by hand.
+        task_arg = (" --task_id $((SLURM_ARRAY_TASK_ID + ${TASK_OFFSET:-0}))"
+                    if array_task else "")
         return (
             "\nset -euo pipefail\n"
             f'echo "[$(date)] dagsweep {subcommand} on $(hostname)"\n'
@@ -979,6 +994,53 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
             f"{env}\n"
             f'python -m {WORKER_MODULE} {subcommand} --exp_dir "$EXP_DIR"{task_arg}\n'
             f'\necho "[$(date)] dagsweep {subcommand} finished"\n'
+        )
+
+    def _train_body() -> str:
+        # Self-orchestrating worker pool: worker w (array index) owns runs
+        # w, w+W, w+2W, ... and runs them one after the other.  Already-ok runs
+        # are skipped by the worker module, so a restart resumes where the
+        # previous job stopped.  A new run starts only if the remaining
+        # walltime exceeds 1.5x the longest run seen so far (+60 s); otherwise
+        # the worker resubmits ITSELF (same index, after this job ends) and
+        # exits.  The last worker to finish its slice submits cleanup.sh
+        # (mkdir is atomic, so exactly one worker does it).
+        return (
+            "\nset -euo pipefail\n"
+            'echo "[$(date)] dagsweep train worker $SLURM_ARRAY_TASK_ID on $(hostname)"\n'
+            f'EXP_DIR="{exp_dir}"\n'
+            f"{env}\n"
+            f"N_WORKERS={workers}\n"
+            f"N_RUNS={plan['n_train_tasks']}\n"
+            f"WALL_S={walltime_seconds(walltime)}\n"
+            f'POOL_DIR="{pool_dir}"\n'
+            f'TRAIN_SH="{scripts_dir / "train.sh"}"\n'
+            f'CLEANUP_SH="{scripts_dir / "cleanup.sh"}"\n'
+            'mkdir -p "$POOL_DIR"\n'
+            "START=$SECONDS\n"
+            "LONGEST=0\n"
+            "for (( RUN_ID=SLURM_ARRAY_TASK_ID; RUN_ID<N_RUNS; "
+            "RUN_ID+=N_WORKERS )); do\n"
+            "    LEFT=$(( WALL_S - (SECONDS - START) ))\n"
+            "    if (( LEFT < LONGEST * 3 / 2 + 60 )); then\n"
+            '        echo "[$(date)] ${LEFT}s left before run $RUN_ID: resubmitting"\n'
+            '        sbatch --array="$SLURM_ARRAY_TASK_ID" '
+            '--dependency="afterany:$SLURM_JOB_ID" "$TRAIN_SH"\n'
+            "        exit 0\n"
+            "    fi\n"
+            "    T0=$SECONDS\n"
+            f'    python -m {WORKER_MODULE} train --exp_dir "$EXP_DIR" '
+            '--task_id "$RUN_ID" || echo "[$(date)] run $RUN_ID failed"\n'
+            "    DT=$(( SECONDS - T0 ))\n"
+            "    if (( DT > LONGEST )); then LONGEST=$DT; fi\n"
+            "done\n"
+            'touch "$POOL_DIR/done_$SLURM_ARRAY_TASK_ID"\n'
+            'N_DONE=$(find "$POOL_DIR" -name "done_*" | wc -l)\n'
+            'if (( N_DONE >= N_WORKERS )) && mkdir "$POOL_DIR/cleanup.lock" 2>/dev/null; then\n'
+            '    echo "[$(date)] all workers done: submitting cleanup"\n'
+            '    sbatch "$CLEANUP_SH"\n'
+            "fi\n"
+            'echo "[$(date)] dagsweep train worker $SLURM_ARRAY_TASK_ID finished"\n'
         )
 
 
@@ -995,7 +1057,8 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
         scripts["trials"] = _write_script(
             scripts_dir / "trials.sh",
             _script_header(f"dagtrial_{exp_id}", log_dir, "trial", walltime, mem,
-                           array=f"0-{plan['n_trial_tasks'] - 1}%{concurrent}",
+                           array=_chunk_array_spec(plan["n_trial_tasks"],
+                                                   chunk, concurrent),
                            gpu_mem=gpu_mem, **header_kwargs)
             + _body("trial", True))
         scripts["select"] = _write_script(
@@ -1007,9 +1070,9 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     scripts["train"] = _write_script(
         scripts_dir / "train.sh",
         _script_header(f"dagtrain_{exp_id}", log_dir, "train", walltime, mem,
-                       array=f"0-{max(plan['n_train_tasks'] - 1, 0)}%{concurrent}",
+                       array=f"0-{workers - 1}",
                        gpu_mem=gpu_mem, **header_kwargs)
-        + _body("train", True))
+        + _train_body())
 
     scripts["cleanup"] = _write_script(
         scripts_dir / "cleanup.sh",
@@ -1020,11 +1083,94 @@ def generate_stage_scripts(exp_dir: str, plan: Dict[str, Any],
     return scripts
 
 
-def _sbatch(script_path: str, cwd: str, dependency: Optional[str] = None) -> str:
+_DEFAULT_MAX_ARRAY_SIZE = 1000  # SLURM's built-in default MaxArraySize
+
+
+def _query_max_array_size() -> Optional[int]:
+    """Read MaxArraySize from ``scontrol show config`` (None if unavailable)."""
+    try:
+        result = subprocess.run(["scontrol", "show", "config"],
+                                capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    for line in result.stdout.splitlines():
+        if line.strip().lower().startswith("maxarraysize"):
+            try:
+                return int(line.split("=", 1)[1].strip())
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def array_chunk_size(slurm_params: Dict[str, Any]) -> int:
+    """
+    Max number of tasks per submitted array.
+
+    Priority: ``slurm_params['max_array_size']`` > cluster MaxArraySize (via
+    scontrol) > SLURM default (1000).  Indices of one chunk are 0..size-1, so a
+    chunk of MaxArraySize tasks is always accepted.
+    """
+    if "_array_chunk" in slurm_params:
+        return int(slurm_params["_array_chunk"])
+    size = slurm_params.get("max_array_size") or _query_max_array_size() \
+        or _DEFAULT_MAX_ARRAY_SIZE
+    size = max(int(size), 1)
+    slurm_params["_array_chunk"] = size  # query scontrol only once
+    return size
+
+
+def walltime_seconds(walltime: str) -> int:
+    """SLURM walltime ([D-]HH:MM:SS, MM:SS or minutes) -> seconds."""
+    days, _, rest = str(walltime).rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    if len(parts) == 1:
+        seconds = parts[0] * 60
+    elif len(parts) == 2:
+        seconds = parts[0] * 60 + parts[1]
+    else:
+        seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return seconds + (int(days) * 86400 if days else 0)
+
+
+def n_pool_workers(plan: Dict[str, Any], slurm_params: Dict[str, Any]) -> int:
+    """Train workers = max_concurrent_jobs, capped by the number of runs."""
+    concurrent = max(int(slurm_params.get("max_concurrent_jobs", 6)), 1)
+    return max(min(concurrent, int(plan["n_train_tasks"])), 1)
+
+
+def _chunk_array_spec(n_tasks: int, chunk: int, concurrent: int) -> str:
+    """Array spec of the FIRST chunk (a valid default for hand resubmission)."""
+    return f"0-{max(min(n_tasks, chunk) - 1, 0)}%{concurrent}"
+
+
+def _sbatch_chunked(script_path: str, cwd: str, n_tasks: int, chunk: int,
+                    concurrent: int, dependency: Optional[str] = None) -> List[str]:
+    """
+    Submit an array of ``n_tasks`` as consecutive chunks of <= ``chunk`` tasks.
+
+    Each chunk gets TASK_OFFSET=<first global index> and starts only after the
+    previous chunk ended (afterany), so at most ``concurrent`` tasks run at any
+    time across the whole array.  The first chunk inherits ``dependency``.
+    """
+    job_ids: List[str] = []
+    n_tasks = max(int(n_tasks), 1)
+    for offset in range(0, n_tasks, chunk):
+        size = min(chunk, n_tasks - offset)
+        dep = dependency if not job_ids else f"afterany:{job_ids[-1]}"
+        job_ids.append(_sbatch(
+            script_path, cwd, dependency=dep,
+            extra_args=[f"--array=0-{size - 1}%{concurrent}",
+                        f"--export=ALL,TASK_OFFSET={offset}"]))
+    return job_ids
+
+
+def _sbatch(script_path: str, cwd: str, dependency: Optional[str] = None,
+            extra_args: Optional[List[str]] = None) -> str:
     """Submit one script and return its job id (raises on a failed submission)."""
     command = ["sbatch"]
     if dependency:
         command.append(f"--dependency={dependency}")
+    command.extend(extra_args or [])
     command.append(script_path)
     result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
@@ -1084,12 +1230,21 @@ def submit_parallel_dag_sweep(exp_dir: str, home_exp_dir: str,
             print(f"  {name:<8} {path}")
         return {"plan": plan, "scripts": scripts, "job_ids": {}}
 
+    # Arrays above MaxArraySize are split into chained chunks (see
+    # _sbatch_chunked); ids of multi-chunk stages are stored ":"-joined.
+    chunk = array_chunk_size(slurm_params)
+    concurrent = int(slurm_params.get("max_concurrent_jobs", 6))
+    workers = n_pool_workers(plan, slurm_params)
+    print(f"Train workers   : {workers} (each resubmits itself until its "
+          f"~{-(-plan['n_train_tasks'] // workers)} runs are done)")
+
     job_ids: Dict[str, str] = {}
     job_ids["prep"] = _sbatch(scripts["prep"], exp_dir)
 
     if "trials" in scripts:
-        job_ids["trials"] = _sbatch(scripts["trials"], exp_dir,
-                                    dependency=f"afterok:{job_ids['prep']}")
+        job_ids["trials"] = ":".join(_sbatch_chunked(
+            scripts["trials"], exp_dir, plan["n_trial_tasks"], chunk, concurrent,
+            dependency=f"afterok:{job_ids['prep']}"))
         # afterany: ONE crashed trial must not cancel the selection (and with it
         # the whole sweep); select decides per group whether it has enough.
         job_ids["select"] = _sbatch(scripts["select"], exp_dir,
@@ -1098,9 +1253,11 @@ def submit_parallel_dag_sweep(exp_dir: str, home_exp_dir: str,
     else:
         train_dep = f"afterok:{job_ids['prep']}"
 
+    # Fresh pool state: done markers / cleanup lock of a previous submission
+    # would otherwise trigger cleanup too early.
+    shutil.rmtree(state_dir(exp_dir) / "pool", ignore_errors=True)
     job_ids["train"] = _sbatch(scripts["train"], exp_dir, dependency=train_dep)
-    job_ids["cleanup"] = _sbatch(scripts["cleanup"], exp_dir,
-                                 dependency=f"afterany:{job_ids['train']}")
+    # cleanup is submitted by the last train worker (see generate_stage_scripts).
 
     _write_json(state_dir(exp_dir) / "job_ids.json",
                 {"job_ids": job_ids, "submitted": datetime.now().isoformat()})

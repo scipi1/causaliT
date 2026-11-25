@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -348,6 +349,51 @@ def sample_bkd_keep_mask(
     return keep_mask
 
 
+def sample_bkd_keep_matrix(
+    drop_p: torch.Tensor,
+    min_keys: int = 0,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Per-pair BKD keep mask ``(N, N)`` in child <- parent layout.
+
+    ``drop_p[i, j]`` is the drop probability of parent ``j`` in the row of
+    child ``i``; one Bernoulli draw per pair, shared by the whole batch.
+    The diagonal is always kept (it carries no weight).  Rows with fewer
+    than ``min_keys`` kept off-diagonal parents are topped up at random.
+    Returns a bool tensor (True = keep).
+    """
+    N = drop_p.shape[0]
+    u = torch.rand(N, N, device=drop_p.device, generator=generator)
+    keep = u >= drop_p
+    eye = torch.eye(N, dtype=torch.bool, device=drop_p.device)
+    min_keep = min(int(min_keys), N - 1)
+    if min_keep > 0:
+        for i in range(N):
+            row = keep[i] & ~eye[i]
+            missing = min_keep - int(row.sum())
+            if missing > 0:
+                dropped = (~keep[i] & ~eye[i]).nonzero(as_tuple=True)[0]
+                pick = torch.randperm(dropped.numel(), device=drop_p.device,
+                                      generator=generator)[:missing]
+                keep[i, dropped[pick]] = True
+    return keep | eye
+
+
+def bkd_guide_fraction(epoch: float, start: float, length: float) -> float:
+    """Cosine ramp 0 -> 1 with zero slope at both ends (epochs, fractional)."""
+    if length <= 0:
+        return float(epoch >= start)
+    x = min(1.0, max(0.0, (float(epoch) - float(start)) / float(length)))
+    return 0.5 * (1.0 - math.cos(math.pi * x))
+
+
+def cosine_log_anneal(epoch: float, v0: float, v1: float, start: float, length: float) -> float:
+    """Cosine anneal of a positive value in log space: v0 before ``start``,
+    v1 after ``start + length``, zero slope at both ends."""
+    s = bkd_guide_fraction(epoch, start, length)
+    return math.exp(math.log(v0) + s * (math.log(v1) - math.log(v0)))
+
+
 class BKDMixin:
     """Inline batch-consistent key dropout for attention modules.
 
@@ -445,6 +491,30 @@ class BKDMixin:
             self._bkd_eval_step += 1
         else:
             return None
+        self.last_bkd_keep = keep.to(torch.float32)
+        return self.last_bkd_keep
+
+    def _bkd_keep_pairs(self, drop_fn, num_keys: int, device) -> Optional[torch.Tensor]:
+        """Pair-wise variant of ``_bkd_keep``: same clock, phase and eval
+        rules, but ``drop_fn(p_uniform)`` returns an ``(N, N)`` drop matrix
+        (child <- parent) and the result is a float ``(N, N)`` keep mask."""
+        p = self._current_bkd_p()
+        self.last_bkd_keep = None
+        if p is None:
+            return None
+        if self.training:
+            self._bkd_step += 1
+            if not self._bkd_phase_active:
+                return None
+            gen = None
+        elif self._bkd_eval and self._bkd_phase_active:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(self._bkd_eval_seed + int(self._bkd_eval_step.item()))
+            self._bkd_eval_step += 1
+        else:
+            return None
+        drop = drop_fn(float(p)).to(device=device, dtype=torch.float32)
+        keep = sample_bkd_keep_matrix(drop, self._bkd_min_keys, generator=gen)
         self.last_bkd_keep = keep.to(torch.float32)
         return self.last_bkd_keep
 
